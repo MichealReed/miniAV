@@ -143,7 +143,34 @@ This section details the public C API exposed by `miniav_c`.
         MINIAV_BUFFER_TYPE_AUDIO
     } MiniAVBufferType;
 
-    // ... other enums for MiniAVPixelFormat, MiniAVAudioFormat ...
+    // Common Pixel Formats (Extend as needed)
+
+  typedef enum {
+      MINIAV_PIXEL_FORMAT_UNKNOWN = 0,
+      MINIAV_PIXEL_FORMAT_I420,    // Planar YUV 4:2:0 (YYYY... UU... VV...)
+      MINIAV_PIXEL_FORMAT_NV12,    // Semi-Planar YUV 4:2:0 (YYYY... UVUV...)
+      MINIAV_PIXEL_FORMAT_NV21,    // Semi-Planar YUV 4:2:0 (YYYY... VUVU...)
+      MINIAV_PIXEL_FORMAT_YUY2,    // Packed YUV 4:2:2 (YUYV YUYV...)
+      MINIAV_PIXEL_FORMAT_UYVY,    // Packed YUV 4:2:2 (UYVY UYVY...)
+      MINIAV_PIXEL_FORMAT_RGB24,   // Packed RGB (RGB RGB...)
+      MINIAV_PIXEL_FORMAT_BGR24,   // Packed BGR (BGR BGR...)
+      MINIAV_PIXEL_FORMAT_RGBA32,  // Packed RGBA (RGBA RGBA...)
+      MINIAV_PIXEL_FORMAT_BGRA32,  // Packed BGRA (BGRA BGRA...)
+      MINIAV_PIXEL_FORMAT_ARGB32,  // Packed ARGB (ARGB ARGB...)
+      MINIAV_PIXEL_FORMAT_ABGR32,  // Packed ABGR (ABGR ABGR...)
+      MINIAV_PIXEL_FORMAT_MJPEG,   // Motion JPEG (Compressed format)
+      // Add other formats like grayscale (Y8/GREY), specific Bayer patterns if needed
+  } MiniAVPixelFormat;
+
+  // Common Audio Sample Formats (Align with miniaudio where possible)
+  typedef enum {
+      MINIAV_AUDIO_FORMAT_UNKNOWN = 0,
+      MINIAV_AUDIO_FORMAT_U8,      // Unsigned 8-bit integer
+      MINIAV_AUDIO_FORMAT_S16,     // Signed 16-bit integer
+      MINIAV_AUDIO_FORMAT_S24,     // Signed 24-bit integer (often packed in 32 bits)
+      MINIAV_AUDIO_FORMAT_S32,     // Signed 32-bit integer
+      MINIAV_AUDIO_FORMAT_F32,     // 32-bit floating point
+  } MiniAVAudioFormat;
 
     typedef struct {
         MiniAVBufferType type;

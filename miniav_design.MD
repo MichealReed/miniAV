@@ -159,7 +159,6 @@ This section details the public C API exposed by `miniav_c`.
       MINIAV_PIXEL_FORMAT_ARGB32,  // Packed ARGB (ARGB ARGB...)
       MINIAV_PIXEL_FORMAT_ABGR32,  // Packed ABGR (ABGR ABGR...)
       MINIAV_PIXEL_FORMAT_MJPEG,   // Motion JPEG (Compressed format)
-      // Add other formats like grayscale (Y8/GREY), specific Bayer patterns if needed
   } MiniAVPixelFormat;
 
   // Common Audio Sample Formats (Align with miniaudio where possible)
@@ -183,7 +182,7 @@ This section details the public C API exposed by `miniav_c`.
                 MiniAVPixelFormat pixel_format;
                 uint32_t stride_bytes[4]; // Stride for each plane (up to 4 for planar formats)
                 void* planes[4];          // Pointers to data planes. Valid until MiniAV_ReleaseBuffer is called.
-                // Optional: Camera Intrinsics (fx, fy, cx, cy, distortion coeffs)
+                // Camera Intrinsics (fx, fy, cx, cy, distortion coeffs)
                 // double intrinsics[...];
             } video;
             struct {

@@ -17,35 +17,87 @@ MiniAV is a lightweight, cross-platform library focused on encapsulating audio a
 
 ```console
 miniav(monorepo)/
-├── miniav_ffi/               # Dart package providing FFI bindings and building the native library.
-│   ├── lib/                  # Dart code (bindings, API implementation).
+├── miniav_ffi/                     # Dart package providing FFI bindings and building the native library.
+│   ├── lib/
+│   │   ├── src/
+│   │   │   ├── miniav_bindings.dart      # Generated FFI bindings (using ffigen).
+│   │   │   ├── miniav_impl_ffi.dart      # FFI implementation of the platform interface.
+│   │   │   ├── camera_controller_ffi.dart # FFI implementation for camera.
+│   │   │   ├── screen_controller_ffi.dart # FFI implementation for screen.
+│   │   │   └── audio_controller_ffi.dart  # FFI implementation for audio.
+│   │   └── miniav_ffi.dart             # Main package export file.
 │   ├── pubspec.yaml
-│   ├── build.dart            # Native assets build script.
-│   └── miniav_c/             # Core C implementation (buffers, capture API, platform backends).
-│       ├── CMakeLists.txt    # CMake build configuration for the native library.
-│       ├── cmake/
-│       ├── include/          # Public C headers (miniav_buffer.h, miniav_capture.h, miniav_types.h).
-│       └── src/              # Native C/C++ source code.
-│           ├── common/       # Logging, utilities, common context logic.
-│           ├── audio/        # Audio capture implementation (wraps miniaudio).
-│           ├── camera/       # Camera capture implementation.
-│           │   ├── camera_context.h # Common camera context logic/interface
-│           │   ├── windows/  # Windows-specific camera code (Media Foundation, etc.).
-│           │   ├── macos/    # macOS-specific camera code (AVFoundation, etc.).
-│           │   └── linux/    # Linux-specific camera code (V4L2, PipeWire, etc.).
-│           └── screen/       # Screen capture implementation.
-│               ├── screen_context.h # Common screen context logic/interface
-│               ├── windows/  # Windows-specific screen code (DXGI, GDI, etc.).
-│               ├── macos/    # macOS-specific screen code (AVFoundation, CoreGraphics, etc.).
-│               └── linux/    # Linux-specific screen code (X11, PipeWire, etc.).
+│   ├── build.dart                    # Native assets build script (invokes CMake).
+│   └── miniav_c/                     # Core C implementation.
+│       ├── CMakeLists.txt            # Main CMake build configuration for miniav_c.
+│       ├── cmake/                      # CMake helper modules.
+│       │   └── FindMiniAudio.cmake     # Example CMake module.
+│       ├── include/                  # Public C headers.
+│       │   ├── miniav_buffer.h         # Defines MiniAVBuffer, format enums.
+│       │   ├── miniav_capture.h        # Defines capture API functions, callback types.
+│       │   └── miniav_types.h          # Defines MiniAVResultCode, MiniAVDeviceInfo, handles, etc.
+│       └── src/                      # Native C/C++ source code.
+│           ├── common/               # Platform-independent utilities.
+│           │   ├── miniav_context_base.h # Base struct/functions for contexts.
+│           │   ├── miniav_logging.c
+│           │   ├── miniav_logging.h
+│           │   ├── miniav_utils.c      # Memory allocation, string helpers.
+│           │   ├── miniav_utils.h
+│           │   └── miniav_time.c       # Monotonic clock functions.
+│           │   └── miniav_time.h
+│           ├── audio/                # Audio capture implementation (wraps miniaudio).
+│           │   ├── audio_context.c     # Implementation of audio context functions.
+│           │   └── audio_context.h     # Internal audio context struct.
+│           ├── camera/               # Camera capture implementation.
+│           │   ├── camera_api.c        # Implementation of public MiniAV_Camera_* functions.
+│           │   ├── camera_context.h    # Internal camera context struct and common logic interface.
+│           │   ├── windows/
+│           │   │   ├── camera_context_win_mf.c # Media Foundation implementation.
+│           │   │   └── camera_context_win_mf.h
+│           │   │   └── (camera_context_win_ds.c) # Optional DirectShow fallback.
+│           │   ├── macos/
+│           │   │   ├── camera_context_macos_avf.m # AVFoundation implementation (Objective-C).
+│           │   │   └── camera_context_macos_avf.h
+│           │   └── linux/
+│           │       ├── camera_context_linux_v4l2.c # V4L2 implementation.
+│           │       └── camera_context_linux_v4l2.h
+│           │       └── (camera_context_linux_pipewire.c) # Optional PipeWire.
+│           └── screen/               # Screen capture implementation.
+│               ├── screen_api.c        # Implementation of public MiniAV_Screen_* functions.
+│               ├── screen_context.h    # Internal screen context struct and common logic interface.
+│               ├── windows/
+│               │   ├── screen_context_win_dxgi.c # Desktop Duplication implementation.
+│               │   └── screen_context_win_dxgi.h
+│               │   └── (screen_context_win_gdi.c) # Optional GDI fallback.
+│               ├── macos/
+│               │   ├── screen_context_macos_cg.m # CoreGraphics implementation (Objective-C).
+│               │   └── screen_context_macos_cg.h
+│               │   └── (screen_context_macos_avf.m) # Optional AVFoundation screen input.
+│               └── linux/
+│                   ├── screen_context_linux_pipewire.c # PipeWire portal implementation.
+│                   └── screen_context_linux_pipewire.h
+│                   └── (screen_context_linux_x11.c) # Optional X11 fallback.
 │
-├── miniav_web/               # Web-specific implementation using browser APIs and WASM.
-│   ├── lib/                  # Dart code for web platform.
+├── miniav_web/                     # Web-specific implementation.
+│   ├── lib/
+│   │   ├── src/
+│   │   │   ├── miniav_impl_web.dart      # Web implementation of the platform interface.
+│   │   │   ├── camera_controller_web.dart # Web implementation for camera.
+│   │   │   ├── screen_controller_web.dart # Web implementation for screen.
+│   │   │   └── audio_controller_web.dart  # Web implementation for audio.
+│   │   └── miniav_web.dart             # Main package export file.
 │   ├── pubspec.yaml
-│   └── ...                   # WASM build artifacts, JS interop code.
+│   └── web/                          # Potential location for JS interop files or WASM artifacts.
+│       └── interop.js
 │
-└── miniav_platform_interface/ # Defines the common Dart API interface.
-    ├── lib/                  # Abstract Dart classes/interfaces.
+└── miniav_platform_interface/      # Defines the common Dart API interface.
+    ├── lib/
+    │   ├── src/
+    │   │   ├── miniav_platform_interface_base.dart # Base class for platform implementations.
+    │   │   ├── miniav_controller.dart    # Abstract controller interface.
+    │   │   ├── miniav_models.dart        # Dart equivalents of MiniAVBuffer, MiniAVDeviceInfo etc.
+    │   │   └── miniav_enums.dart         # Dart equivalents of C enums.
+    │   └── miniav_platform_interface.dart # Main package export file.
     └── pubspec.yaml
 ```
 
@@ -225,8 +277,6 @@ This section details the public C API exposed by `miniav_c`.
 
 * `MiniAVResultCode MiniAV_GetVersion(uint32_t* major, uint32_t* minor, uint32_t* patch);`
 * `const char* MiniAV_GetVersionString();`
-* `MiniAVResultCode MiniAV_Initialize();` // Optional: For global setup if needed (e.g., COM on Windows)
-* `MiniAVResultCode MiniAV_Shutdown();` // Optional: For global cleanup
 * `MiniAVResultCode MiniAV_SetLogCallback(MiniAVLogCallback callback, void* user_data);`
 * `MiniAVResultCode MiniAV_SetLogLevel(MiniAVLogLevel level);`
 * `const char* MiniAV_GetErrorString(MiniAVResultCode code);` // Get human-readable string for an error code
@@ -282,7 +332,7 @@ This section details the public C API exposed by `miniav_c`.
 * `MiniAVResultCode MiniAV_Audio_Configure(MiniAVAudioContextHandle context, const char* device_id, const MiniAVAudioFormatInfo* format);`
 * `MiniAVResultCode MiniAV_Audio_StartCapture(MiniAVAudioContextHandle context, MiniAVBufferCallback callback, void* user_data);`
 * `MiniAVResultCode MiniAV_Audio_StopCapture(MiniAVAudioContextHandle context);`
-* *(Property API - TBD: Define specific properties like gain/volume if available)*
+* *(Property API - TBD: Define specific properties like gain/volume/loopback if available)*
   * `MiniAV_Audio_GetProperty(...)`
   * `MiniAV_Audio_SetProperty(...)`
 

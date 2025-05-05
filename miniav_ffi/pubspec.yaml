@@ -1,3 +1,4 @@
+publish_to: none
 name: miniav_ffi
 description: A starting point for Dart libraries or applications.
 version: 1.0.0
@@ -5,11 +6,46 @@ version: 1.0.0
 
 environment:
   sdk: ^3.8.0-133.0.dev
+  flutter: ">=1.20.0"
 
 # Add regular dependencies here.
 dependencies:
-  # path: ^1.8.0
+  flutter:
+    sdk: flutter
+  ffi: ^2.0.2
+  miniav_platform_interface:
+    path: ../miniav_platform_interface
+  native_toolchain_cmake: ^0.0.4
 
 dev_dependencies:
   lints: ^5.0.0
   test: ^1.24.0
+  ffigen: ^18.0.0
+
+  #####
+
+ffigen:
+  name: miniavFfiBindings
+  description: Bindings for miniav.h
+  output: "lib/miniav_ffi_bindings.dart"
+  headers:
+    entry-points:
+      - "miniav_c/include/miniav.h"
+    include-directives:
+      - "miniav_c/include/*.h"
+      - "/usr/lib/clang/18/include/stdbool.h"
+      - "/usr/lib/clang/18/include/stdint.h"
+  preamble: |
+    // ignore_for_file: camel_case_types
+    // ignore_for_file: prefer_double_quotes
+    // ignore_for_file: non_constant_identifier_names
+    // ignore_for_file: constant_identifier_names
+    // ignore_for_file: prefer_expression_function_bodies
+    // ignore_for_file: sort_constructors_first
+    // ignore_for_file: unused_element 
+  llvm-path:
+    - /usr/lib64/libclang.so
+  compiler-opts:
+    - "-I/usr/lib/clang/18/include/"
+  ffi-native:
+  silence-enum-warning: true

@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
 project(miniav_c LANGUAGES C CXX)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
 
 # --- Options ---
 option(MINIAV_ENABLE_DIRECTSHOW_FALLBACK "Enable DirectShow fallback for camera on Windows" OFF)
@@ -219,6 +222,34 @@ install(TARGETS miniav_c
 install(DIRECTORY include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+
+if(NOT CMAKE_SYSTEM_NAME MATCHES "(Android|iOS|Emscripten)")
+    add_executable(test_audio_capture src/audio/test/test_audio_capture.c)
+
+    # Link the test against the miniav_c library
+    target_link_libraries(test_audio_capture PRIVATE miniav_c)
+
+    # Add include directories for the test
+    target_include_directories(test_audio_capture PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src" # If common headers are needed
+    )
+
+    # Add platform-specific libraries needed by miniaudio (already linked by miniav_c usually)
+    # This might already be handled by linking miniav_c, but explicitly:
+    if(WIN32)
+        target_link_libraries(test_audio_capture PRIVATE ole32 user32)
+    elseif(APPLE)
+        target_link_libraries(test_audio_capture PRIVATE "-framework CoreFoundation -framework CoreAudio -framework AudioToolbox")
+    elseif(UNIX AND NOT APPLE AND NOT ANDROID)
+        # Assuming PulseAudio or ALSA linked via miniav_c
+        # May need explicit linking depending on miniaudio config
+        # target_link_libraries(test_audio_capture PRIVATE pthread dl m)
+    endif()
+
+    # Optional: Install the test executable if desired
+    # install(TARGETS test_audio_capture DESTINATION bin)
+endif()
 
 # --- Output ---
 message(STATUS "miniav_c sources: ${COMMON_SOURCES};${AUDIO_SOURCES};${CAMERA_API_SOURCE};${SCREEN_API_SOURCE};${PLATFORM_SOURCES}")

@@ -56,7 +56,7 @@ int main() {
 
     // 1. Initialize Logging
     MiniAV_SetLogCallback(test_log_callback, NULL);
-    MiniAV_SetLogLevel(MINIAV_LOG_LEVEL_DEBUG); // Set to DEBUG for more info
+    MiniAV_SetLogLevel(MINIAV_LOG_LEVEL_DEBUG);
 
     MiniAV_GetVersion(&major, &minor, &patch);
     printf("MiniAV Version: %u.%u.%u (%s)\n", major, minor, patch, MiniAV_GetVersionString());
@@ -102,7 +102,7 @@ int main() {
     res = MiniAV_Audio_CreateContext(&context);
     if (res != MINIAV_SUCCESS) {
         fprintf(stderr, "Failed to create audio context: %s\n", MiniAV_GetErrorString(res));
-        MiniAV_Audio_FreeDeviceList(devices, device_count); // Free device list
+        MiniAV_FreeDeviceList(devices, device_count); // Free device list
         return 1;
     }
 
@@ -118,7 +118,7 @@ int main() {
     if (res != MINIAV_SUCCESS) {
         fprintf(stderr, "Failed to configure audio context: %s\n", MiniAV_GetErrorString(res));
         MiniAV_Audio_DestroyContext(context);
-        MiniAV_Audio_FreeDeviceList(devices, device_count);
+        MiniAV_FreeDeviceList(devices, device_count);
         return 1;
     }
 
@@ -128,7 +128,7 @@ int main() {
     if (res != MINIAV_SUCCESS) {
         fprintf(stderr, "Failed to start audio capture: %s\n", MiniAV_GetErrorString(res));
         MiniAV_Audio_DestroyContext(context);
-        MiniAV_Audio_FreeDeviceList(devices, device_count);
+        MiniAV_FreeDeviceList(devices, device_count);
         return 1;
     }
 
@@ -148,7 +148,7 @@ int main() {
     MiniAV_Audio_DestroyContext(context);
 
     printf("Freeing device list...\n");
-    MiniAV_Audio_FreeDeviceList(devices, device_count); // Free the enumerated list
+    MiniAV_FreeDeviceList(devices, device_count); // Free the enumerated list
 
     printf("\nAudio capture test finished.\n");
     return 0;

@@ -57,11 +57,15 @@ if(WIN32)
         "src/screen/windows/screen_context_win_dxgi.h"
     )
     set(PLATFORM_LINK_LIBS
-        mfplat # Media Foundation Platform
+        ole32       # For CoInitialize, CoTaskMemFree etc.
+        uuid
+        mfplat      # Media Foundation Platform
+        mf
         mfreadwrite # Media Foundation Source Reader
-        mfuuid # Media Foundation UUIDs
-        dxgi # DXGI for Desktop Duplication
-        d3d11 # Required by DXGI
+        mfuuid      # Media Foundation UUIDs
+        shlwapi     # For StrCpyN, Path* functions etc.
+        dxgi        # DXGI for Desktop Duplication
+        d3d11       # Required by DXGI
     )
     list(APPEND PLATFORM_DEFINITIONS "MINIAV_PLATFORM_WINDOWS")
 
@@ -225,14 +229,20 @@ install(DIRECTORY include/
 
 if(NOT CMAKE_SYSTEM_NAME MATCHES "(Android|iOS|Emscripten)")
     add_executable(test_audio_capture src/audio/test/test_audio_capture.c)
+    add_executable(test_camera_capture src/camera/test/test_camera_capture.c)
 
     # Link the test against the miniav_c library
     target_link_libraries(test_audio_capture PRIVATE miniav_c)
+    target_link_libraries(test_camera_capture PRIVATE miniav_c)
 
     # Add include directories for the test
     target_include_directories(test_audio_capture PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/src" # If common headers are needed
+    )
+    target_include_directories(test_camera_capture PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" 
     )
 
     # Add platform-specific libraries needed by miniaudio (already linked by miniav_c usually)

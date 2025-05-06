@@ -101,8 +101,8 @@ MiniAVResultCode MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices,
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
   }
 
-  ma_device_info *playbackInfos; // Unused for capture
-  ma_uint32 playbackCount;       // Unused for capture
+  ma_device_info *playbackInfos;
+  ma_uint32 playbackCount;
   ma_device_info *captureInfos;
   ma_uint32 captureCount;
   res = ma_context_get_devices(&ma_ctx, &playbackInfos, &playbackCount,
@@ -117,7 +117,7 @@ MiniAVResultCode MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices,
   if (captureCount == 0) {
     miniav_log(MINIAV_LOG_LEVEL_WARN, "No audio capture devices found.");
     ma_context_uninit(&ma_ctx);
-    return MINIAV_SUCCESS; // No devices is not an error
+    return MINIAV_SUCCESS;
   }
 
   *devices =
@@ -137,15 +137,6 @@ MiniAVResultCode MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices,
   ma_context_uninit(&ma_ctx); // Use the temporary context
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "Enumerated %u audio capture devices.",
              *count);
-  return MINIAV_SUCCESS;
-}
-
-MiniAVResultCode MiniAV_Audio_FreeDeviceList(MiniAVDeviceInfo *devices,
-                                             uint32_t count) {
-  MINIAV_UNUSED(count); // If count is not needed
-  if (devices) {
-    miniav_free(devices);
-  }
   return MINIAV_SUCCESS;
 }
 
@@ -194,16 +185,6 @@ MiniAV_Audio_GetSupportedFormats(const char *device_id_str,
 
   return MINIAV_SUCCESS;
   // --- End Placeholder ---
-}
-
-// Helper to free the list allocated by GetSupportedFormats
-MiniAVResultCode MiniAV_Audio_FreeFormatList(MiniAVAudioFormatInfo *formats,
-                                             uint32_t count) {
-  MINIAV_UNUSED(count); // count might be useful if allocation was complex
-  if (formats) {
-    miniav_free(formats);
-  }
-  return MINIAV_SUCCESS;
 }
 
 MiniAVResultCode MiniAV_Audio_CreateContext(MiniAVAudioContextHandle *context) {
@@ -422,7 +403,6 @@ MiniAVResultCode MiniAV_Audio_StartCapture(MiniAVAudioContextHandle context,
   deviceConfig.sampleRate = ctx->format_info.sample_rate;
   deviceConfig.dataCallback = ma_data_callback;
   deviceConfig.pUserData = ctx;
-  // Disable playback part explicitly
   deviceConfig.playback.format = ma_format_unknown;
   deviceConfig.playback.channels = 0;
 

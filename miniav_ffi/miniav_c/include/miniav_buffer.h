@@ -16,8 +16,18 @@ typedef enum {
   MINIAV_BUFFER_TYPE_AUDIO
 } MiniAVBufferType;
 
-// --- Pixel Formats --- (Removed from here)
-// --- Audio Formats --- (Removed from here)
+typedef enum {
+    MINIAV_NATIVE_HANDLE_TYPE_UNKNOWN = 0,
+    MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA,
+    MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN,
+    MINIAV_NATIVE_HANDLE_TYPE_AUDIO
+} MiniAVNativeHandleType;
+
+typedef struct MiniAVNativeBufferInternalPayload {
+    MiniAVNativeHandleType handle_type;
+    void* context_owner;       // e.g., MiniAVCameraContextHandle, MiniAVAudioContextHandle
+    void* native_resource_ptr; // e.g., IMFMediaBuffer*, v4l2_buffer*, CMSampleBufferRef
+} MiniAVNativeBufferInternalPayload;
 
 // --- Buffer Struct ---
 typedef struct {

@@ -25,18 +25,20 @@ MINIAV_API MiniAVResultCode MiniAV_SetLogCallback(MiniAVLogCallback callback,
 MINIAV_API MiniAVResultCode MiniAV_SetLogLevel(MiniAVLogLevel level);
 MINIAV_API const char *MiniAV_GetErrorString(MiniAVResultCode code);
 MINIAV_API MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle);
+MINIAV_API MiniAVResultCode MiniAV_Free(void *ptr);
+MINIAV_API MiniAVResultCode MiniAV_FreeDeviceList(MiniAVDeviceInfo *devices,
+                                                  uint32_t count);
+MINIAV_API MiniAVResultCode
+MiniAV_FreeFormatList(void *formats,
+                      uint32_t count); // Placeholder for MiniAVVideoFormatInfo
 
 // --- Camera Capture API ---
 MINIAV_API MiniAVResultCode
 MiniAV_Camera_EnumerateDevices(MiniAVDeviceInfo **devices, uint32_t *count);
-MINIAV_API MiniAVResultCode MiniAV_FreeDeviceList(MiniAVDeviceInfo *devices,
-                                                  uint32_t count);
 MINIAV_API MiniAVResultCode MiniAV_Camera_GetSupportedFormats(
     const char *device_id, void **formats,
     uint32_t *count); // Placeholder for MiniAVVideoFormatInfo
-MINIAV_API MiniAVResultCode
-MiniAV_FreeFormatList(void *formats,
-                      uint32_t count); // Placeholder for MiniAVVideoFormatInfo
+
 MINIAV_API MiniAVResultCode
 MiniAV_Camera_CreateContext(MiniAVCameraContextHandle *context);
 MINIAV_API MiniAVResultCode
@@ -79,8 +81,6 @@ MiniAV_Screen_StopCapture(MiniAVScreenContextHandle context);
 // --- Audio Capture API ---
 MINIAV_API MiniAVResultCode
 MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices, uint32_t *count);
-MINIAV_API MiniAVResultCode
-MiniAV_Audio_FreeDeviceList(MiniAVDeviceInfo *devices, uint32_t count);
 
 MINIAV_API MiniAVResultCode MiniAV_Audio_GetSupportedFormats(
     const char *device_id, MiniAVAudioFormatInfo **formats, uint32_t *count);

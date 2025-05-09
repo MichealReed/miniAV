@@ -1,4 +1,5 @@
 #include "miniav_utils.h"
+#include "miniav_logging.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -15,8 +16,19 @@ void* miniav_realloc(void* ptr, size_t size) {
     return realloc(ptr, size);
 }
 
-void miniav_free(void* ptr) {
-    free(ptr);
+void miniav_free(void *ptr) {
+    if (!ptr) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "miniav_free: NULL pointer detected.");
+        return;
+    }
+
+    if (_CrtIsValidHeapPointer(ptr)) { // Use _CrtIsValidHeapPointer in debug mode
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "miniav_free: Freeing pointer: %p", ptr);
+        free(ptr);
+        ptr = NULL; // Mark as freed
+    } else {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "miniav_free: Invalid pointer detected: %p", ptr);
+    }
 }
 
 char* miniav_strdup(const char* src) {

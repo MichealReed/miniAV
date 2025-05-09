@@ -54,27 +54,7 @@ void test_camera_buffer_callback(const MiniAVBuffer *buffer, void *user_data) {
         g_frame_count);
 
     if (buffer->internal_handle) {
-      // Cast the internal_handle to the payload type
-      MiniAVNativeBufferInternalPayload *payload =
-          (MiniAVNativeBufferInternalPayload *)buffer->internal_handle;
-
-      // Step 1: Release the native resource (e.g., IMFSample) via
-      // MiniAV_ReleaseBuffer MiniAV_ReleaseBuffer expects the payload pointer
-      // itself.
-      MiniAVResultCode release_res = MiniAV_ReleaseBuffer(payload);
-      if (release_res != MINIAV_SUCCESS) {
-        fprintf(stderr,
-                "TestCallback: MiniAV_ReleaseBuffer failed with code %d\n",
-                release_res);
-      }
-
-      // Step 2: Free the MiniAVNativeBufferInternalPayload struct itself.
-      // This memory was allocated in MFPlatform_OnReadSample using
-      // miniav_calloc.
-      MiniAV_Free(payload);
-      // No need to set buffer->internal_handle to NULL here as 'buffer' is
-      // const and its lifetime is just this callback invocation.
-
+      MiniAV_ReleaseBuffer(buffer->internal_handle); // Release the buffer
     } else {
       fprintf(stderr, "TestCallback: Warning - buffer->internal_handle is "
                       "NULL, cannot release.\n");
@@ -163,8 +143,17 @@ int main() {
            devices[i].is_default ? "Yes" : "No");
   }
 
-  // Select the first device for testing
-  MiniAVDeviceInfo selected_device = devices[0];
+  // Prompt the user to select a device
+  uint32_t selected_device_index = 0;
+  printf("\nEnter the index of the device to use (0-%u): ", device_count - 1);
+  if (scanf("%u", &selected_device_index) != 1 ||
+      selected_device_index >= device_count) {
+    fprintf(stderr, "Invalid device index. Exiting.\n");
+    MiniAV_FreeDeviceList(devices, device_count);
+    return 1;
+  }
+
+  MiniAVDeviceInfo selected_device = devices[selected_device_index];
   printf("\nSelected device for testing: '%s'\n", selected_device.name);
 
   MiniAVVideoFormatInfo *formats = NULL;
@@ -222,6 +211,7 @@ int main() {
   }
   printf("Camera context created.\n");
 
+  selected_format.output_preference = MINIAV_OUTPUT_PREFERENCE_CPU;
   printf("\nConfiguring camera...\n");
   res = MiniAV_Camera_Configure(cam_ctx, selected_device.device_id,
                                 &selected_format);

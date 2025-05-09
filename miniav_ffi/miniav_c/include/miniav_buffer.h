@@ -17,42 +17,68 @@ typedef enum {
 } MiniAVBufferType;
 
 typedef enum {
-    MINIAV_NATIVE_HANDLE_TYPE_UNKNOWN = 0,
-    MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA,
-    MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN,
-    MINIAV_NATIVE_HANDLE_TYPE_AUDIO
+  MINIAV_NATIVE_HANDLE_TYPE_UNKNOWN = 0,
+  MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA,
+  MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN,
+  MINIAV_NATIVE_HANDLE_TYPE_AUDIO
 } MiniAVNativeHandleType;
 
 typedef struct MiniAVNativeBufferInternalPayload {
-    MiniAVNativeHandleType handle_type;
-    void* context_owner;       // e.g., MiniAVCameraContextHandle, MiniAVAudioContextHandle
-    void* native_resource_ptr; // e.g., IMFMediaBuffer*, v4l2_buffer*, CMSampleBufferRef
+  MiniAVNativeHandleType handle_type;
+  void *context_owner;       // e.g., MiniAVCameraContextHandle,
+                             // MiniAVAudioContextHandle
+  void *native_resource_ptr; // e.g., IMFMediaBuffer*, v4l2_buffer*,
+                             // CMSampleBufferRef
 } MiniAVNativeBufferInternalPayload;
 
-// --- Buffer Struct ---
+typedef enum {
+  MINIAV_BUFFER_CONTENT_TYPE_CPU, // CPU-accessible memory. Check
+                                  // MiniAVBuffer.type to interpret data.video
+                                  // or data.audio.
+  MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE, // Video:
+                                               // data.video.native_gpu_shared_handle
+                                               // is a D3D11 NT HANDLE
+  MINIAV_BUFFER_CONTENT_TYPE_GPU_METAL_TEXTURE, // Video:
+                                                // data.video.native_gpu_texture_ptr
+                                                // is an id<MTLTexture>
+  MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD, // Video:
+                                            // data.video.native_gpu_dmabuf_fd
+                                            // is a DMA-BUF file descriptor
+  // ... other GPU types as needed for video.
+} MiniAVBufferContentType;
+
 typedef struct {
   MiniAVBufferType type;
-  int64_t timestamp_us; // Monotonic timestamp in microseconds
+  MiniAVBufferContentType content_type; // CPU or GPU type
+  int64_t timestamp_us;
 
   union {
     struct {
       uint32_t width;
       uint32_t height;
-      MiniAVPixelFormat pixel_format; // Now defined via miniav_types.h
-      uint32_t stride_bytes[4]; // Stride for each plane (up to 4)
-      void *planes[4];          // Data pointers for each plane
+      MiniAVPixelFormat pixel_format;
+
+      // CPU data
+      uint32_t stride_bytes[4];
+      void *planes[4];
+
+      // GPU handles
+      void *native_gpu_shared_handle; // e.g., NT HANDLE for D3D11
+      void *native_gpu_texture_ptr;   // e.g., ID3D11Texture2D*
+      int native_gpu_dmabuf_fd;       // e.g., DMA-BUF file descriptor
     } video;
+
     struct {
       uint32_t frame_count;
       uint32_t channel_count;
-      MiniAVAudioFormat sample_format; // Now defined via miniav_types.h
-      void *data; // Pointer to audio data
+      MiniAVAudioFormat sample_format;
+      void *data; // CPU-accessible audio data
     } audio;
   } data;
 
-  size_t data_size_bytes; // Total size of the raw data
-  void *user_data;        // User data pointer for callback
-  void *internal_handle;  // Opaque handle for MiniAV_ReleaseBuffer
+  size_t data_size_bytes;
+  void *user_data;
+  void *internal_handle;
 } MiniAVBuffer;
 
 #ifdef __cplusplus

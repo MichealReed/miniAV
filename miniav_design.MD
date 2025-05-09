@@ -116,32 +116,46 @@ This standalone C library contains the core buffer definitions, the public C cap
 * **Windows:**
   * **Camera:** Media Foundation (preferred: `IMFSourceReader`), DirectShow (fallback).
   * **Screen:** Desktop Duplication API (preferred), GDI/BitBlt (fallback).
+    * **System Audio (Loopback):** If requested via `MiniAV_Screen_StartCapture`, WASAPI loopback capture will be initiated via miniaudio.
   * **Audio:** WASAPI (via `miniaudio`).
-  * **Zero-Copy:** `IMFMediaBuffer::Lock` (Media Foundation), potentially direct access via GDI. Buffer release involves unlocking/releasing MF buffers.
+  * **Zero-Copy / GPU Handles:**
+    * **Media Foundation / DXGI:** Leverage `IMFDXGIDeviceManager` for camera and DXGI for screen to obtain `ID3D11Texture2D*`. These can be copied to textures created with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` (or `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`) to export an NT `HANDLE`. This `HANDLE` can then be imported by other D3D11/D3D12/WebGPU instances.
+    * **CPU Buffers:** `IMFMediaBuffer::Lock` (Media Foundation), mapping DXGI staging textures, or GDI access.
+  * **Buffer Release:** Involves unlocking/releasing MF buffers, unmapping staging textures, or releasing D3D11 textures and closing NT `HANDLE`s.
 
 * **macOS:**
   * **Camera:** AVFoundation (`AVCaptureSession`, `AVCaptureVideoDataOutput`).
   * **Screen:** AVFoundation (`AVCaptureScreenInput`), Core Graphics (`CGDisplayStream`).
+    * **System Audio:** If requested, the AVFoundation session will be configured to include system audio output, or appropriate Core Audio APIs will be used for loopback.
   * **Audio:** Core Audio (via `miniaudio`).
-  * **Zero-Copy:** `CVPixelBufferGetBaseAddress` on `CMSampleBufferRef` from AVFoundation. Buffer release involves releasing the `CMSampleBufferRef`.
+  * **Zero-Copy / GPU Handles:**
+    * **AVFoundation:** `CVPixelBufferRef` from `CMSampleBufferRef` can often be backed by an `IOSurfaceRef` or a Metal texture (`MTLTexture`). `IOSurfaceRef` can be shared between processes or converted to `MTLTexture`.
+    * **CPU Buffers:** `CVPixelBufferGetBaseAddress` on `CMSampleBufferRef`.
+  * **Buffer Release:** Involves releasing the `CMSampleBufferRef`, `CVPixelBufferRef`, `IOSurfaceRef`, or `MTLTexture`.
 
 * **Linux:**
   * **Camera:** V4L2 (Video for Linux 2). PipeWire as a higher-level alternative.
   * **Screen:** X11 (`XShmGetImage`), Wayland (requires compositor-specific protocols or PipeWire portal). PipeWire screen capture portal is preferred for broader compatibility.
+    * **System Audio:** If requested, PipeWire will be asked to provide a system audio loopback stream alongside the screen video stream.
   * **Audio:** ALSA / PulseAudio (via `miniaudio`). PipeWire for modern systems.
-  * **Zero-Copy:** V4L2 buffer mapping (`mmap`), X11 shared memory extension (`XShm`). Buffer release involves unmapping/returning buffers to the kernel/server.
+  * **Zero-Copy / GPU Handles:**
+    * **V4L2 / PipeWire:** Can provide DMA-BUF file descriptors (`dmabuf fd`). These can be imported into Vulkan (`vkImportSemaphoreFdKHR`, `vkImportMemoryFdKHR`) or EGL/OpenGL (`eglCreateImageKHR` with `EGL_LINUX_DMA_BUF_EXT`) to create GPU textures.
+    * **CPU Buffers:** V4L2 buffer mapping (`mmap`), X11 shared memory extension (`XShm`).
+  * **Buffer Release:** Involves unmapping/returning buffers to the kernel/server, or closing `dmabuf fd`s and releasing associated GPU resources.
 
 * **Android (`src/android/` - Future):**
   * **Camera:** Camera2 API (Java/Kotlin via JNI) or NDK Camera (`ACameraManager`).
   * **Screen:** `MediaProjection` API (Java/Kotlin via JNI).
   * **Audio:** AAudio (preferred), OpenSL ES (fallback) - likely via `miniaudio`.
-  * **Zero-Copy:** `AHardwareBuffer` access via NDK, `ImageReader` direct buffer access. Release involves specific NDK/API calls.
+  * **Zero-Copy / GPU Handles:** `AHardwareBuffer` can be acquired and imported into Vulkan or OpenGL ES.
+  * **Buffer Release:** Specific NDK/API calls for `AHardwareBuffer` or `ImageReader` buffers.
 
 * **iOS (`src/ios/` - Future):**
   * **Camera:** AVFoundation (`AVCaptureSession`, `AVCaptureVideoDataOutput`).
   * **Screen:** ReplayKit (`RPScreenRecorder`).
   * **Audio:** Core Audio (via `miniaudio` or direct implementation).
-  * **Zero-Copy:** `CVPixelBufferGetBaseAddress` on `CMSampleBufferRef`. Release involves releasing the `CMSampleBufferRef`.
+  * **Zero-Copy / GPU Handles:** `CVPixelBufferRef` can be backed by `IOSurfaceRef` or `MTLTexture`.
+  * **Buffer Release:** Releasing `CMSampleBufferRef`, `CVPixelBufferRef`, `IOSurfaceRef`, or `MTLTexture`.
 
 ### 2. MiniAV FFI (`miniav_ffi`)
 
@@ -185,7 +199,7 @@ This section details the public C API exposed by `miniav_c`.
     } MiniAVDeviceInfo;
     ```
 
-* **Buffer (`MiniAVBuffer`):** Struct containing the core data and metadata. **The data pointers are valid after the callback returns, until `MiniAV_ReleaseBuffer` is called.**
+* **Buffer (`MiniAVBuffer`):** Struct containing the core data and metadata. **The data pointers or GPU handles are valid after the callback returns, until `MiniAV_ReleaseBuffer` is called.**
 
     ```c
     // filepath: miniav_ffi/miniav_c/include/miniav_buffer.h
@@ -194,6 +208,20 @@ This section details the public C API exposed by `miniav_c`.
         MINIAV_BUFFER_TYPE_VIDEO,
         MINIAV_BUFFER_TYPE_AUDIO
     } MiniAVBufferType;
+
+    // Indicates the nature of the buffer's primary data content
+    typedef enum {
+        MINIAV_BUFFER_CONTENT_TYPE_CPU,
+        MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE, // data.video.native_gpu_shared_handle is a D3D11 NT HANDLE
+        MINIAV_BUFFER_CONTENT_TYPE_GPU_METAL_TEXTURE, // data.video.native_gpu_texture_ptr is an id<MTLTexture>
+        MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD,     // data.video.native_gpu_dmabuf_fd is a DMA-BUF file descriptor
+    } MiniAVBufferContentType;
+
+    // Output Preference (set during configuration)
+    typedef enum {
+        MINIAV_OUTPUT_PREFERENCE_CPU,         // Prefer CPU-accessible buffers.
+        MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE // Prefer GPU handles if supported, otherwise fallback to CPU.
+    } MiniAVOutputPreference;
 
     // Common Pixel Formats (Extend as needed)
 
@@ -223,8 +251,29 @@ This section details the public C API exposed by `miniav_c`.
       MINIAV_AUDIO_FORMAT_F32,     // 32-bit floating point
   } MiniAVAudioFormat;
 
+  // Video Format Information (used for configuration)
+  typedef struct {
+      uint32_t width;                       // Desired width (can be 0 for default)
+      uint32_t height;                      // Desired height (can be 0 for default)
+      MiniAVPixelFormat pixel_format;       // Desired pixel format for CPU output, or hint for GPU.
+      uint32_t frame_rate_numerator;
+      uint32_t frame_rate_denominator;
+      MiniAVOutputPreference output_preference; // User's preference for CPU or GPU output.
+      // Potentially other fields like color_space, etc.
+    } MiniAVVideoFormatInfo;
+
+    // Audio Format Information (used for configuration)
+    typedef struct {
+      uint32_t sample_rate;
+      uint32_t channel_count;
+      MiniAVAudioFormat sample_format;
+      // MiniAVOutputPreference output_preference; // Currently ignored for audio, defaults to CPU.
+      // uint32_t buffer_frame_count; // Desired number of frames per callback
+    } MiniAVAudioFormatInfo;
+
     typedef struct {
         MiniAVBufferType type;
+        MiniAVBufferContentType content_type;
         int64_t timestamp_us; // Monotonic timestamp in microseconds since an arbitrary epoch (e.g., capture start or system boot)
 
         union {
@@ -234,6 +283,10 @@ This section details the public C API exposed by `miniav_c`.
                 MiniAVPixelFormat pixel_format;
                 uint32_t stride_bytes[4]; // Stride for each plane (up to 4 for planar formats)
                 void* planes[4];          // Pointers to data planes. Valid until MiniAV_ReleaseBuffer is called.
+                // Valid if content_type is a GPU type (e.g., MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE)
+                void* native_gpu_shared_handle; 
+                void* native_gpu_texture_ptr;   
+                int native_gpu_dmabuf_fd;     
                 // Camera Intrinsics (fx, fy, cx, cy, distortion coeffs)
                 // double intrinsics[...];
             } video;
@@ -294,7 +347,7 @@ This section details the public C API exposed by `miniav_c`.
 * `MiniAVResultCode MiniAV_Camera_CreateContext(MiniAVCameraContextHandle* context);`
 * `MiniAVResultCode MiniAV_Camera_DestroyContext(MiniAVCameraContextHandle context);`
 * `MiniAVResultCode MiniAV_Camera_Configure(MiniAVCameraContextHandle context, const char* device_id, const MiniAVVideoFormatInfo* format);`
-  * Must be called before `StartCapture`. Can potentially be called after `StopCapture` to reconfigure.
+  * `format->output_preference` guides the library on whether to attempt GPU handle output.
 * `MiniAVResultCode MiniAV_Camera_StartCapture(MiniAVCameraContextHandle context, MiniAVBufferCallback callback, void* user_data);`
 * `MiniAVResultCode MiniAV_Camera_StopCapture(MiniAVCameraContextHandle context);`
 * *(Property API - TBD: Define `MiniAVPropertyKey` enum and `MiniAVPropertyValue` variant struct/union)*
@@ -311,12 +364,17 @@ This section details the public C API exposed by `miniav_c`.
   * Allocates memory; caller must free using `MiniAV_FreeDeviceList`.
 * `MiniAVResultCode MiniAV_Screen_CreateContext(MiniAVScreenContextHandle* context);`
 * `MiniAVResultCode MiniAV_Screen_DestroyContext(MiniAVScreenContextHandle context);`
-* `MiniAVResultCode MiniAV_Screen_ConfigureDisplay(MiniAVScreenContextHandle context, const char* display_id, const MiniAVVideoFormatInfo* format);` // Format might be less strict, often just target FPS
-* `MiniAVResultCode MiniAV_Screen_ConfigureWindow(MiniAVScreenContextHandle context, const char* window_id, const MiniAVVideoFormatInfo* format);` // `window_id` might be HWND, Window ID, etc.
-* `MiniAVResultCode MiniAV_Screen_ConfigureRegion(MiniAVScreenContextHandle context, const char* display_id, int x, int y, int width, int height, const MiniAVVideoFormatInfo* format);`
-* `MiniAVResultCode MiniAV_Screen_StartCapture(MiniAVScreenContextHandle context, MiniAVBufferCallback callback, void* user_data);`
+* `MiniAVResultCode MiniAV_Screen_ConfigureDisplay(MiniAVScreenContextHandle context, const char* display_id, const MiniAVVideoFormatInfo* video_format);`
+  * `video_format->output_preference` guides the library for video. Audio is configured at StartCapture.
+* `MiniAVResultCode MiniAV_Screen_ConfigureWindow(MiniAVScreenContextHandle context, const char* window_id, const MiniAVVideoFormatInfo* video_format);`
+  * `video_format->output_preference` guides the library for video. Audio is configured at StartCapture.
+* `MiniAVResultCode MiniAV_Screen_ConfigureRegion(MiniAVScreenContextHandle context, const char* display_id, int x, int y, int width, int height, const MiniAVVideoFormatInfo* video_format);`
+  * `video_format->output_preference` guides the library for video. Audio is configured at StartCapture.
+* `MiniAVResultCode MiniAV_Screen_StartCapture(MiniAVScreenContextHandle context, MiniAVBufferCallback callback, void* user_data, const MiniAVAudioFormatInfo* optional_audio_format_for_system_audio);`
+  * If `optional_audio_format_for_system_audio` is not NULL, the library will attempt to capture system audio alongside the screen video.
+  * The callback will receive buffers of `type = MINIAV_BUFFER_TYPE_VIDEO` and, if audio capture is enabled and successful, `type = MINIAV_BUFFER_TYPE_AUDIO`.
 * `MiniAVResultCode MiniAV_Screen_StopCapture(MiniAVScreenContextHandle context);`
-* *(Property API - TBD: Define specific properties like cursor visibility, capture rate control)*
+* *(Property API - TBD: Define specific properties like cursor visibility, capture rate control, audio source selection if multiple loopbacks exist)*
   * `MiniAV_Screen_GetProperty(...)`
   * `MiniAV_Screen_SetProperty(...)`
 
@@ -326,7 +384,7 @@ This section details the public C API exposed by `miniav_c`.
   * Allocates memory; caller must free using `MiniAV_FreeDeviceList`.
 * `MiniAVResultCode MiniAV_Audio_GetSupportedFormats(const char* device_id, MiniAVAudioFormatInfo** formats, uint32_t* count);`
   * Describes supported sample format, channel count, sample rate combinations.
-  * Allocates memory; caller must free using `MiniAV_FreeFormatList`. // Needs distinct audio format list freeing
+  * Allocates memory; caller must free using `MiniAV_FreeFormatList`.
 * `MiniAVResultCode MiniAV_Audio_CreateContext(MiniAVAudioContextHandle* context);`
 * `MiniAVResultCode MiniAV_Audio_DestroyContext(MiniAVAudioContextHandle context);`
 * `MiniAVResultCode MiniAV_Audio_Configure(MiniAVAudioContextHandle context, const char* device_id, const MiniAVAudioFormatInfo* format);`
@@ -339,13 +397,20 @@ This section details the public C API exposed by `miniav_c`.
 ## Technical Considerations
 
 * **Data Ownership & Buffer Strategy:**
-  * The `MiniAVBuffer` passed to the `MiniAVBufferCallback` provides access to native buffer memory. The buffer's data pointers (`planes`, `data`) and its `internal_handle` are **valid after the callback returns**.
-  * The user (e.g., the Dart FFI layer) is **responsible for explicitly releasing** the underlying native buffer when it is no longer needed by calling `MiniAV_ReleaseBuffer(buffer->internal_handle)` via FFI.
-  * **Failure to call `MiniAV_ReleaseBuffer` will result in resource leaks** (e.g., holding onto camera frames, screen capture resources, audio buffers).
-  * **Frame Drops:** If the user does not release buffers promptly via `MiniAV_ReleaseBuffer`, the underlying native capture APIs may run out of their internal buffers, potentially leading to dropped frames or errors. The exact behavior is platform-specific.
-  * This explicit release mechanism allows the user to pass the raw data pointers (`buffer->data.video.planes[0]`, `buffer->data.audio.data`) and metadata to other libraries (like `minigpu`) for direct processing or GPU upload, avoiding a CPU-side copy in the FFI layer.
-  * **Internal Buffering:** `miniav_c` itself aims to be a thin layer and generally does *not* implement deep internal buffering (like large circular buffers) beyond what native APIs provide. This avoids extra copies and latency within `miniav_c`. If the consuming application requires more complex buffering (e.g., queuing multiple frames), it should implement that logic *after* receiving the buffer pointer and release handle from the callback.
-  * **Zero-Copy Goal:** Internally, `miniav_c` aims for zero-copy where platform APIs allow. This explicit release strategy enables consumers to leverage this by avoiding the Dart FFI copy, facilitating direct CPU->GPU uploads. True zero-copy (GPU texture sharing without CPU involvement) is highly platform-specific and complex, potentially a future enhancement beyond direct pointer access.
+  * The `MiniAVBuffer` passed to the `MiniAVBufferCallback` has its `content_type` field indicating the nature of its data.
+  * If `content_type` is `MINIAV_BUFFER_CONTENT_TYPE_CPU`, the relevant `planes` or `data` pointers in the union are valid.
+  * If `content_type` is a GPU type, the relevant `native_gpu_...` fields are valid.
+  * The library attempts to honor the `MiniAVOutputPreference` set during configuration. If `MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE` was set but GPU output failed or is not supported, the buffer's `content_type` will be `MINIAV_BUFFER_CONTENT_TYPE_CPU`.
+  * The user (e.g., the Dart FFI layer) is **responsible for explicitly releasing** the underlying native buffer/resource when it is no longer needed by calling `MiniAV_ReleaseBuffer(buffer->internal_handle)` via FFI.
+  * **Failure to call `MiniAV_ReleaseBuffer` will result in resource leaks** (e.g., holding onto camera frames, screen capture resources, D3D11 textures, NT HANDLES, audio buffers).
+  * **Frame Drops:** If the user does not release buffers promptly, underlying native capture APIs may run out of internal buffers or resources, potentially leading to dropped frames or errors.
+  * This explicit release mechanism allows the user to:
+    * Pass raw CPU data pointers (`buffer->data.video.planes[0]`) for direct processing or CPU->GPU uploads.
+    * Pass native GPU handles (`buffer->data.video.native_gpu_shared_handle`) to other GPU-aware libraries (like `minigpu` or WebGPU) for direct import and use, enabling true zero-copy GPU-to-GPU pipelines.
+  * **Internal Buffering:** `miniav_c` aims to be a thin layer. If the consuming application requires more complex buffering, it should implement that logic *after* receiving the buffer and its release handle.
+  * **Zero-Copy Goal:**
+    * **CPU Path:** `miniav_c` aims for minimal copies to provide CPU pointers. The explicit release enables consumers to avoid further copies in the FFI layer for CPU->GPU uploads.
+    * **GPU Path:** When `MiniAVBuffer` provides a `native_gpu_shared_handle` (or similar), the goal is to enable true zero-copy by allowing direct import of this GPU resource into another GPU context (e.g., WebGPU, another D3D11 device). This is highly platform-specific. The `internal_handle` and `MiniAV_ReleaseBuffer` will manage the lifetime of these shared GPU resources (e.g., releasing the underlying `ID3D11Texture2D` and closing the NT `HANDLE`).
 
 * **Threading:**
   * The `MiniAVBufferCallback` is invoked on an **internal library thread** managed by `miniav_c` (or potentially the underlying native API's thread).
@@ -368,23 +433,40 @@ This section details the public C API exposed by `miniav_c`.
   * `MiniAV_ReleaseBuffer` should return a `MiniAVResultCode` (e.g., `MINIAV_SUCCESS`, `MINIAV_ERROR_INVALID_HANDLE`).
 
 * **FFI Considerations (Dart):**
-  * **Callbacks:** The `miniav_ffi` package manages `NativeCallable` lifetime. The `user_data` is crucial for associating the callback with Dart state.
-  * **Pointer Ownership & Release:** The FFI layer receives the `MiniAVBuffer` pointer in the callback. It extracts the data pointers, metadata, and the `internal_handle`. It **must not copy** the pixel/audio data if zero-copy is desired. It needs to provide a mechanism (e.g., a Dart object representing the buffer) that holds the `internal_handle` and ensures `MiniAV_ReleaseBuffer` is called via FFI when the Dart object is disposed or the data is no longer needed (potentially using `NativeFinalizer` or manual calls).
-  * **Structs & String Handling:** Ensure Dart struct definitions (`package:ffi`) precisely match the C layout and alignment. Use tools like `ffigen`. Be mindful of UTF-8 encoding for strings (`Utf8` pointers from `package:ffi`).
+  * **Callbacks:** `miniav_ffi` manages `NativeCallable`.
+  * **Pointer/Handle Ownership & Release:** The FFI layer receives `MiniAVBuffer`. It inspects `content_type`.
+    * If CPU data, it extracts pointers, metadata, and `internal_handle`.
+    * If GPU handle, it extracts the `native_gpu_shared_handle`, `native_gpu_texture_ptr` (if applicable), metadata, and `internal_handle`.
+    * It provides a Dart object representing the buffer, holding the `internal_handle` and relevant data/handles, ensuring `MiniAV_ReleaseBuffer` is called via FFI when the Dart object is disposed.
+  * **Structs & String Handling:** Match C layout. Use `Utf8` for strings.
 
 ## Data Flow (Native via FFI - Explicit Release)
 
 1. **Initialization:** Dart application calls an initialization method defined in `miniav_platform_interface`. The `miniav_ffi` implementation might call `MiniAV_Initialize` (C API) if needed.
 2. **Context Creation:** Application requests a camera/screen/audio context via the platform interface. `miniav_ffi` calls the corresponding `MiniAV_<Type>_CreateContext` (C API) via FFI.
 3. **Device Discovery:** Application calls device listing methods. `miniav_ffi` calls `MiniAV_<Type>_EnumerateDevices` (C API) via FFI. `miniav_c` executes platform-specific discovery code. Results are marshalled back to Dart, and the native list is freed using `MiniAV_FreeDeviceList`.
-4. **Configuration:** Application selects device/format via Dart objects/methods. `miniav_ffi` translates these to C structs/calls (e.g., `MiniAV_Camera_Configure`).
+4. **Configuration:** Application selects device/format and sets `output_preference` in `MiniAVVideoFormatInfo` (or `MiniAVAudioFormatInfo`). `miniav_ffi` translates these to C structs/calls (e.g., `MiniAV_Camera_Configure`). `miniav_c` stores this preference.
 5. **Capture Start:** Application calls start capture method, providing a Dart callback. `miniav_ffi` sets up a native FFI callback (`NativeCallable`) that wraps the Dart callback (potentially sending data via a `SendPort`) and passes its pointer (and user data containing necessary Dart state/ports) to `MiniAV_<Type>_StartCapture` (C API). `miniav_c` sets up the platform context and registers the native FFI callback.
-6. **Data Production:**
-    * The platform-specific C code (`miniav_c/src/<type>/<platform>/...`) captures data using native APIs.
-    * It obtains a timestamp and populates a `miniAVBuffer`, including the `internal_handle` needed for release.
-    * It invokes the native FFI callback pointer provided by `miniav_ffi`.
-7. **Callback Invocation:** The native FFI callback executes. It reads the `MiniAVBuffer` data. It extracts the data pointers (`planes`/`data`), metadata (`width`, `height`, `format`, `timestamp_us`, etc.), and the `internal_handle`. It passes these pieces of information (potentially wrapped in a Dart object) to the Dart callback or `SendPort`. **No pixel/audio data is copied here.**
-8. **Buffer Consumption:** The Dart application receives the pointers, metadata, and the release handle (e.g., within a custom Dart `MiniAVBuffer` object). It can now pass the data pointer and metadata to a consumer like `minigpu` for direct GPU upload or processing. The Dart object holds onto the `internal_handle`.
+6. **Data Production (C Library):**
+    * Platform-specific C code captures data, respecting the stored `output_preference`.
+    * For video:
+      * **If `output_preference` was `_GPU_IF_AVAILABLE` and GPU output is successful:**
+          * Populates `MiniAVBuffer` with `type = MINIAV_BUFFER_TYPE_VIDEO`, `content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_...`, GPU handles, metadata, and `internal_handle`.
+      * **Else (preference was `_CPU`, or GPU preferred but failed/unavailable):**
+          * Populates `MiniAVBuffer` with `type = MINIAV_BUFFER_TYPE_VIDEO`, `content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU`, CPU data pointers, metadata, and `internal_handle`.
+    * For audio (if screen capture with audio is active):
+        * Captures system audio.
+        * Populates `MiniAVBuffer` with `type = MINIAV_BUFFER_TYPE_AUDIO`, `content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU`, audio data, metadata, and `internal_handle`.
+    * Invokes the native FFI callback for each buffer (video or audio).
+7. **Callback Invocation (FFI Layer):**
+    * Native FFI callback executes. Reads `MiniAVBuffer`.
+    * Based on `content_type`, extracts either CPU data pointers or GPU handles, along with metadata and `internal_handle`.
+    * Passes these (e.g., in a Dart object) to the Dart callback/`SendPort`.
+8. **Buffer Consumption (Dart Application):**
+    * Receives the Dart object representing the buffer.
+    * **If GPU Handle:** Passes the `native_gpu_shared_handle` and metadata to a GPU-aware library (e.g., `minigpu`, WebGPU interop layer) for import and direct GPU processing.
+    * **If CPU Data:** Passes data pointers and metadata for CPU processing or CPU->GPU upload.
+    * The Dart object holds the `internal_handle`.
 9. **GPU Interaction / Processing:** The consumer library (`minigpu`) uses the provided data pointer and metadata to perform its operations (e.g., upload to texture).
 10. **Buffer Release:** Once the Dart application determines the buffer data is no longer needed (e.g., GPU upload is complete, processing is finished), it **must** trigger the release. This typically involves calling a method on the Dart `MiniAVBuffer` object which, in turn, calls the `MiniAV_ReleaseBuffer(internal_handle)` C function via FFI.
 11. **Capture Stop:** Application calls stop method. `miniav_ffi` calls `MiniAV_<Type>_StopCapture` (C API). The associated `NativeCallable` can be freed. Any outstanding buffers should ideally be released before or shortly after stopping.

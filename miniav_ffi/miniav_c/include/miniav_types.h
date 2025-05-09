@@ -1,8 +1,8 @@
 #ifndef MINIAV_TYPES_H
 #define MINIAV_TYPES_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,11 +31,11 @@ typedef enum {
 #define MINIAV_DEVICE_NAME_MAX_LEN 256
 
 typedef struct {
-  char device_id[MINIAV_DEVICE_ID_MAX_LEN]; // Platform-specific unique identifier
-  char name[MINIAV_DEVICE_NAME_MAX_LEN];      // Human-readable name (UTF-8)
-  bool is_default;     // True if this is the default device
+  char device_id[MINIAV_DEVICE_ID_MAX_LEN]; // Platform-specific unique
+                                            // identifier
+  char name[MINIAV_DEVICE_NAME_MAX_LEN];    // Human-readable name (UTF-8)
+  bool is_default; // True if this is the default device
 } MiniAVDeviceInfo;
-
 
 // --- Pixel Formats (Moved Here) ---
 typedef enum {
@@ -63,14 +63,26 @@ typedef enum {
   MINIAV_AUDIO_FORMAT_F32  // 32-bit floating point
 } MiniAVAudioFormat;
 
+// --- Capture Target Type (for Screen Capture) ---
+typedef enum {
+  MINIAV_CAPTURE_TYPE_DISPLAY, // Capture an entire display/monitor
+  MINIAV_CAPTURE_TYPE_WINDOW,  // Capture a specific window
+  MINIAV_CAPTURE_TYPE_REGION // Capture a specific region of a display or window
+} MiniAVCaptureType;
+
+typedef enum {
+  MINIAV_OUTPUT_PREFERENCE_CPU,
+  MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE
+} MiniAVOutputPreference;
 
 // -- Format Info Structs (Now after enums) ---
 typedef struct {
-  MiniAVPixelFormat pixel_format;
   uint32_t width;
   uint32_t height;
-  uint32_t frame_rate_numerator; // Optional: For specifying desired frame rate
-  uint32_t frame_rate_denominator; // Optional: For specifying desired frame rate
+  MiniAVPixelFormat pixel_format;
+  uint32_t frame_rate_numerator;
+  uint32_t frame_rate_denominator;
+  MiniAVOutputPreference output_preference;
 } MiniAVVideoFormatInfo;
 
 typedef struct {
@@ -78,7 +90,6 @@ typedef struct {
   uint32_t sample_rate;
   uint8_t channels;
 } MiniAVAudioFormatInfo;
-
 
 // --- Opaque Handles ---
 typedef struct MiniAVCameraContext *MiniAVCameraContextHandle;

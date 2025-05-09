@@ -83,94 +83,40 @@ MiniAVResultCode MiniAV_SetLogLevel(MiniAVLogLevel level) {
 
 MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
   if (!internal_handle_payload_ptr) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "MiniAV_ReleaseBuffer: Called with NULL payload.");
+    miniav_log(MINIAV_LOG_LEVEL_ERROR, "MiniAV_ReleaseBuffer: NULL payload.");
     return MINIAV_ERROR_INVALID_ARG;
   }
 
   MiniAVNativeBufferInternalPayload *payload =
       (MiniAVNativeBufferInternalPayload *)internal_handle_payload_ptr;
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "Releasing payload: %p", payload);
+
+  // Release the native resource
   MiniAVResultCode res = MINIAV_ERROR_NOT_SUPPORTED;
-
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "MiniAV_ReleaseBuffer: Releasing buffer of type %d, owner %p, "
-             "native_ptr %p",
-             payload->handle_type, payload->context_owner,
-             payload->native_resource_ptr);
-
-  switch (payload->handle_type) {
-  case MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA: {
+  if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA) {
     MiniAVCameraContext *cam_ctx =
         (MiniAVCameraContext *)payload->context_owner;
     if (cam_ctx && cam_ctx->ops && cam_ctx->ops->release_buffer) {
       res = cam_ctx->ops->release_buffer(cam_ctx, payload->native_resource_ptr);
     } else {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "MiniAV_ReleaseBuffer: Camera context (owner: %p) or "
-                 "release_buffer op not valid for releasing buffer.",
-                 payload->context_owner);
+                 "Invalid camera context or release_buffer op.");
       res = MINIAV_ERROR_INVALID_HANDLE;
     }
-    break;
-  }
-  case MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN:
-    // TODO: Implement screen buffer release dispatch
-    miniav_log(
-        MINIAV_LOG_LEVEL_WARN,
-        "MiniAV_ReleaseBuffer: Screen buffer release not implemented yet.");
-    // Example:
-    // MiniAVScreenContext* screen_ctx =
-    // (MiniAVScreenContext*)payload->context_owner; if (screen_ctx &&
-    // screen_ctx->ops && screen_ctx->ops->release_buffer) {
-    //     res = screen_ctx->ops->release_buffer(screen_ctx,
-    //     payload->native_resource_ptr);
-    // } else {
-    //     res = MINIAV_ERROR_INVALID_HANDLE;
-    // }
-    break;
-  case MINIAV_NATIVE_HANDLE_TYPE_AUDIO:
-    // Audio buffers from miniaudio (as currently implemented in
-    // audio_context.c) don't use this explicit release. If a different audio
-    // backend were used that required explicit release, it would be handled
-    // here.
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "MiniAV_ReleaseBuffer: Audio buffer does not require explicit "
-               "release with current backend.");
-    res = MINIAV_SUCCESS; // Or an error if it was expected to be releasable
-    break;
-  default:
-    miniav_log(
-        MINIAV_LOG_LEVEL_ERROR,
-        "MiniAV_ReleaseBuffer: Unknown or unsupported buffer handle type: %d.",
-        payload->handle_type);
-    res = MINIAV_ERROR_INVALID_HANDLE;
-    break;
   }
 
-  // The MiniAVNativeBufferInternalPayload struct itself was allocated by the
-  // platform layer (e.g., in simulate_mf_frame_arrival). The FFI/consuming
-  // layer (e.g., Dart code) is responsible for freeing this payload struct
-  // *after* MiniAV_ReleaseBuffer returns. MiniAV_ReleaseBuffer only releases
-  // the *native_resource_ptr* it contains via the platform-specific op. So, no
-  // miniav_free(payload) here. If the old stub `free(internal_handle)` was
-  // meant for the payload, that responsibility is now shifted to the caller of
-  // MiniAV_ReleaseBuffer.
-
-  if (res != MINIAV_SUCCESS) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "MiniAV_ReleaseBuffer: Failed to release native resource for "
-               "handle type %d. Result: %d",
-               payload->handle_type, res);
+  // Ensure the payload is not freed twice
+  if (res == MINIAV_SUCCESS) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "Payload released successfully: %p",
+               payload);
   } else {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "MiniAV_ReleaseBuffer: Successfully dispatched release for "
-               "native resource of type %d.",
-               payload->handle_type);
+    miniav_log(MINIAV_LOG_LEVEL_ERROR, "Failed to release payload: %p",
+               payload);
   }
 
   return res;
 }
-
 MiniAVResultCode MiniAV_Free(void *ptr) {
   if (ptr) {
     free(ptr);

@@ -29100,7 +29100,7 @@ typedef pa_channel_map_def_t ma_pa_channel_map_def_t;
 #define MA_PA_CHANNEL_MAP_OSS                          PA_CHANNEL_MAP_OSS
 #define MA_PA_CHANNEL_MAP_DEFAULT                      PA_CHANNEL_MAP_DEFAULT
 
-typedef pa_sample_format_t ma_pa_sample_format_t;
+typedef pa_format_t ma_pa_format_t;
 #define MA_PA_SAMPLE_INVALID                           PA_SAMPLE_INVALID
 #define MA_PA_SAMPLE_U8                                PA_SAMPLE_U8
 #define MA_PA_SAMPLE_ALAW                              PA_SAMPLE_ALAW
@@ -29303,7 +29303,7 @@ typedef int ma_pa_channel_map_def_t;
 #define MA_PA_CHANNEL_MAP_OSS                          4
 #define MA_PA_CHANNEL_MAP_DEFAULT                      MA_PA_CHANNEL_MAP_AIFF
 
-typedef int ma_pa_sample_format_t;
+typedef int ma_pa_format_t;
 #define MA_PA_SAMPLE_INVALID                           -1
 #define MA_PA_SAMPLE_U8                                0
 #define MA_PA_SAMPLE_ALAW                              1
@@ -29350,7 +29350,7 @@ typedef struct
 
 typedef struct
 {
-    ma_pa_sample_format_t format;
+    ma_pa_format_t format;
     ma_uint32 rate;
     ma_uint8 channels;
 } ma_pa_sample_spec;
@@ -29506,7 +29506,7 @@ static ma_result ma_result_from_pulse(int result)
 }
 
 #if 0
-static ma_pa_sample_format_t ma_format_to_pulse(ma_format format)
+static ma_pa_format_t ma_format_to_pulse(ma_format format)
 {
     if (ma_is_little_endian()) {
         switch (format) {
@@ -29534,7 +29534,7 @@ static ma_pa_sample_format_t ma_format_to_pulse(ma_format format)
 }
 #endif
 
-static ma_format ma_format_from_pulse(ma_pa_sample_format_t format)
+static ma_format ma_format_from_pulse(ma_pa_format_t format)
 {
     if (ma_is_little_endian()) {
         switch (format) {

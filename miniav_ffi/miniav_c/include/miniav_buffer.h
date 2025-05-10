@@ -70,9 +70,8 @@ typedef struct {
 
     struct {
       uint32_t frame_count;
-      uint32_t channel_count;
-      MiniAVAudioFormat sample_format;
-      void *data; // CPU-accessible audio data
+      MiniAVAudioInfo info;
+      void *data;
     } audio;
   } data;
 

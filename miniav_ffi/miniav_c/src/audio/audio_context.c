@@ -1,6 +1,6 @@
 // Core type definitions first
 #include "../../include/miniav_buffer.h" // Defines MiniAVBuffer, MiniAVBufferType, MiniAVPixelFormat, MiniAVSampleFormat
-#include "../../include/miniav_types.h" // Defines MiniAVResultCode, handles, MiniAVDeviceInfo, MiniAVAudioFormatInfo, MiniAVVideoFormatInfo, etc.
+#include "../../include/miniav_types.h" // Defines MiniAVResultCode, handles, MiniAVDeviceInfo, MiniAVAudioInfo, MiniAVVideoFormatInfo, etc.
 
 // API header using the types
 #include "../../include/miniav_capture.h" // Defines MiniAVBufferCallback and the capture functions
@@ -63,7 +63,7 @@ struct MiniAVAudioContext {
   ma_context ma_ctx;
   ma_device ma_device;
   ma_device_id ma_capture_device_id; // Store the actual miniaudio device ID
-  MiniAVAudioFormatInfo format_info; // Store the configured format
+  MiniAVAudioInfo format_info; // Store the configured format
   MiniAVBufferCallback callback;
   void *callback_user_data;
   int has_ma_context; // Flag to track ma_context initialization
@@ -144,7 +144,7 @@ MiniAVResultCode MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices,
 // miniaudio
 MiniAVResultCode
 MiniAV_Audio_GetSupportedFormats(const char *device_id_str,
-                                 MiniAVAudioFormatInfo **formats,
+                                 MiniAVAudioInfo **formats,
                                  uint32_t *count) {
   if (!device_id_str || !formats || !count)
     return MINIAV_ERROR_INVALID_ARG;
@@ -158,27 +158,27 @@ MiniAV_Audio_GetSupportedFormats(const char *device_id_str,
              "implementation.");
 
   *count = 4; // Number of formats we'll return
-  *formats = (MiniAVAudioFormatInfo *)miniav_calloc(
-      *count, sizeof(MiniAVAudioFormatInfo));
+  *formats = (MiniAVAudioInfo *)miniav_calloc(
+      *count, sizeof(MiniAVAudioInfo));
   if (!*formats) {
     *count = 0;
     return MINIAV_ERROR_OUT_OF_MEMORY;
   }
 
   (*formats)[0] =
-      (MiniAVAudioFormatInfo){.sample_format = MINIAV_AUDIO_FORMAT_F32,
+      (MiniAVAudioInfo){.format = MINIAV_AUDIO_FORMAT_F32,
                               .sample_rate = 48000,
                               .channels = 2};
   (*formats)[1] =
-      (MiniAVAudioFormatInfo){.sample_format = MINIAV_AUDIO_FORMAT_S16,
+      (MiniAVAudioInfo){.format = MINIAV_AUDIO_FORMAT_S16,
                               .sample_rate = 48000,
                               .channels = 2};
   (*formats)[2] =
-      (MiniAVAudioFormatInfo){.sample_format = MINIAV_AUDIO_FORMAT_F32,
+      (MiniAVAudioInfo){.format = MINIAV_AUDIO_FORMAT_F32,
                               .sample_rate = 44100,
                               .channels = 2};
   (*formats)[3] =
-      (MiniAVAudioFormatInfo){.sample_format = MINIAV_AUDIO_FORMAT_S16,
+      (MiniAVAudioInfo){.format = MINIAV_AUDIO_FORMAT_S16,
                               .sample_rate = 44100,
                               .channels = 2};
   // Add more common formats or query properly later
@@ -247,7 +247,7 @@ MiniAVResultCode MiniAV_Audio_DestroyContext(MiniAVAudioContextHandle context) {
 MiniAVResultCode MiniAV_Audio_Configure(
     MiniAVAudioContextHandle context,
     const char *device_name_str, // Parameter renamed for clarity
-    const MiniAVAudioFormatInfo *format) {
+    const MiniAVAudioInfo *format) {
   MiniAVAudioContext *ctx = (MiniAVAudioContext *)context;
   if (!ctx || !format || !ctx->has_ma_context)
     return MINIAV_ERROR_INVALID_ARG;
@@ -335,7 +335,7 @@ MiniAVResultCode MiniAV_Audio_Configure(
 
   miniav_log(MINIAV_LOG_LEVEL_INFO,
              "Audio context configured: Format=%d, Rate=%u, Channels=%u",
-             format->sample_format, format->sample_rate, format->channels);
+             format->format, format->sample_rate, format->channels);
   return MINIAV_SUCCESS;
 }
 
@@ -360,10 +360,10 @@ static void ma_data_callback(ma_device *pDevice, void *pOutput,
 
   // --- Populate audio specific data ---
   // Use the field names defined in miniav_buffer.h
-  buffer.data.audio.sample_format =
+  buffer.data.audio.info.channels =
       ma_format_to_miniav_format(pDevice->capture.format);
   // sample_rate is not part of the buffer struct itself
-  buffer.data.audio.channel_count =
+  buffer.data.audio.info.channels =
       pDevice->capture.channels; // Use channel_count
   buffer.data.audio.frame_count = frameCount;
   buffer.data.audio.data =
@@ -398,7 +398,7 @@ MiniAVResultCode MiniAV_Audio_StartCapture(MiniAVAudioContextHandle context,
   ma_device_config deviceConfig = ma_device_config_init(ma_device_type_capture);
   deviceConfig.capture.pDeviceID = &ctx->ma_capture_device_id;
   deviceConfig.capture.format =
-      miniav_format_to_ma_format(ctx->format_info.sample_format);
+      miniav_format_to_ma_format(ctx->format_info.format);
   deviceConfig.capture.channels = ctx->format_info.channels;
   deviceConfig.sampleRate = ctx->format_info.sample_rate;
   deviceConfig.dataCallback = ma_data_callback;

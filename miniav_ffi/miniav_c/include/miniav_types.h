@@ -23,7 +23,11 @@ typedef enum {
   MINIAV_ERROR_ALREADY_RUNNING = -10,
   MINIAV_ERROR_NOT_RUNNING = -11,
   MINIAV_ERROR_OUT_OF_MEMORY = -12,
-  MINIAV_ERROR_TIMEOUT = -13
+  MINIAV_ERROR_TIMEOUT = -13,
+  MINIAV_ERROR_DEVICE_LOST = -14,
+  MINIAV_ERROR_FORMAT_NOT_SUPPORTED = -15,
+  MINIAV_ERROR_INVALID_OPERATION = -16,
+
 } MiniAVResultCode;
 
 // --- Device Info ---
@@ -86,15 +90,34 @@ typedef struct {
 } MiniAVVideoFormatInfo;
 
 typedef struct {
-  MiniAVAudioFormat sample_format;
+  MiniAVAudioFormat format;
   uint32_t sample_rate;
   uint8_t channels;
-} MiniAVAudioFormatInfo;
+  uint32_t num_frames;
+} MiniAVAudioInfo;
+
+typedef enum MiniAVLoopbackTargetType {
+  MINIAV_LOOPBACK_TARGET_NONE,
+  MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO,
+  MINIAV_LOOPBACK_TARGET_PROCESS,
+  MINIAV_LOOPBACK_TARGET_WINDOW
+} MiniAVLoopbackTargetType;
+
+typedef struct MiniAVLoopbackTargetInfo {
+  MiniAVLoopbackTargetType type;
+  union {
+    uint32_t process_id;
+    void *window_handle; // Platform-specific: HWND, NSWindow*, XID, etc.
+    // char internal_target_id[256]; // Could be used if resolving from a
+    // device_id
+  } TARGETHANDLE;
+} MiniAVLoopbackTargetInfo;
 
 // --- Opaque Handles ---
 typedef struct MiniAVCameraContext *MiniAVCameraContextHandle;
 typedef struct MiniAVScreenContext *MiniAVScreenContextHandle;
 typedef struct MiniAVAudioContext *MiniAVAudioContextHandle;
+typedef struct MiniAVLoopbackContext *MiniAVLoopbackContextHandle;
 
 // --- Logging ---
 typedef enum {

@@ -35,8 +35,8 @@ void test_audio_buffer_callback(const MiniAVBuffer *buffer, void *user_data) {
     // Print basic info about the received audio buffer
     printf("Received Audio Buffer: Timestamp=%" PRIu64 "us, Format=%d, Channels=%u, Frames=%u, Size=%zu bytes\n",
            buffer->timestamp_us,
-           buffer->data.audio.sample_format,
-           buffer->data.audio.channel_count,
+           buffer->data.audio.info.channels,
+           buffer->data.audio.info.channels,
            buffer->data.audio.frame_count,
            buffer->data_size_bytes);
 }
@@ -108,8 +108,8 @@ int main() {
 
     // 4. Configure Context (Using default device and a common format)
     printf("Configuring Audio Context for default device...\n");
-    MiniAVAudioFormatInfo config_format = {
-        .sample_format = MINIAV_AUDIO_FORMAT_F32, // Request 32-bit float
+    MiniAVAudioInfo config_format = {
+        .format = MINIAV_AUDIO_FORMAT_F32, // Request 32-bit float
         .sample_rate = 48000,                      // Request 48kHz
         .channels = 2                              // Request stereo
     };

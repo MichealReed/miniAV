@@ -211,7 +211,7 @@ int main() {
   }
   printf("Camera context created.\n");
 
-  selected_format.output_preference = MINIAV_OUTPUT_PREFERENCE_CPU;
+  selected_format.output_preference = MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE;
   printf("\nConfiguring camera...\n");
   res = MiniAV_Camera_Configure(cam_ctx, selected_device.device_id,
                                 &selected_format);

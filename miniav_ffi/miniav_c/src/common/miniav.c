@@ -3,7 +3,7 @@
 #include "../include/miniav_buffer.h" // For MiniAVNativeBufferInternalPayload
 #include "miniav_logging.h"
 #include "miniav_utils.h"
-// #include "../screen/screen_context.h" // Add when screen capture is
+#include "../screen/screen_context.h" // Add when screen capture is
 // implemented #include "../audio/audio_context.h"   // Add if audio needs
 // explicit buffer release
 
@@ -90,7 +90,8 @@ MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
   MiniAVNativeBufferInternalPayload *payload =
       (MiniAVNativeBufferInternalPayload *)internal_handle_payload_ptr;
 
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "Releasing payload: %p", payload);
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "Releasing payload: %p, Type: %d", payload,
+             payload->handle_type);
 
   // Release the native resource
   MiniAVResultCode res = MINIAV_ERROR_NOT_SUPPORTED;
@@ -101,22 +102,57 @@ MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
       res = cam_ctx->ops->release_buffer(cam_ctx, payload->native_resource_ptr);
     } else {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "Invalid camera context or release_buffer op.");
+                 "Invalid camera context or release_buffer op for payload %p.",
+                 payload);
       res = MINIAV_ERROR_INVALID_HANDLE;
     }
+  } else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN) {
+    MiniAVScreenContext *screen_ctx =
+        (MiniAVScreenContext *)payload->context_owner;
+    if (screen_ctx && screen_ctx->ops && screen_ctx->ops->release_buffer) {
+      res = screen_ctx->ops->release_buffer(screen_ctx,
+                                            payload->native_resource_ptr);
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "Invalid screen context or release_buffer op for payload %p.",
+                 payload);
+      res = MINIAV_ERROR_INVALID_HANDLE;
+    }
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "Unsupported payload handle_type: %d for payload %p.",
+               payload->handle_type, payload);
+    res = MINIAV_ERROR_INVALID_HANDLE; // Or a more specific error
   }
 
-  // Ensure the payload is not freed twice
+  // The actual miniav_free of the 'payload' (MiniAVNativeBufferInternalPayload)
+  // itself should happen in the platform-specific release_buffer implementation
+  // if that platform allocated it (e.g. dxgi_release_buffer frees the
+  // DXGIFrameReleasePayload and then the MiniAVNativeBufferInternalPayload).
+  // OR, if MiniAV_ReleaseBuffer is always responsible for freeing the 'payload'
+  // wrapper, it should be done here *after* the platform-specific release.
+  // Based on current dxgi_capture_thread_proc, the
+  // MiniAVNativeBufferInternalPayload and the DXGIFrameReleasePayload are
+  // allocated there and passed up. dxgi_release_buffer frees
+  // DXGIFrameReleasePayload. It seems MiniAV_ReleaseBuffer should be
+  // responsible for freeing the MiniAVNativeBufferInternalPayload.
+
   if (res == MINIAV_SUCCESS) {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "Payload released successfully: %p",
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "Platform release_buffer successful for payload: %p. Freeing "
+               "internal payload.",
                payload);
   } else {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR, "Failed to release payload: %p",
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "Platform release_buffer failed for payload: %p. Freeing "
+               "internal payload anyway.",
                payload);
   }
+  miniav_free(payload); // Free the wrapper payload itself
 
   return res;
 }
+
 MiniAVResultCode MiniAV_Free(void *ptr) {
   if (ptr) {
     free(ptr);
@@ -134,83 +170,11 @@ MiniAVResultCode MiniAV_FreeDeviceList(MiniAVDeviceInfo *devices,
 }
 
 // Helper to free the list allocated by GetSupportedFormats
-MiniAVResultCode MiniAV_FreeFormatList(MiniAVAudioFormatInfo *formats,
+MiniAVResultCode MiniAV_FreeFormatList(MiniAVAudioInfo *formats,
                                        uint32_t count) {
   MINIAV_UNUSED(count); // count might be useful if allocation was complex
   if (formats) {
     miniav_free(formats);
   }
   return MINIAV_SUCCESS;
-}
-
-MiniAVResultCode MiniAV_Screen_EnumerateDisplays(MiniAVDeviceInfo **displays,
-                                                 uint32_t *count) {
-  (void)displays;
-  (void)count;
-  return MINIAV_ERROR_NOT_SUPPORTED;
-}
-
-MiniAVResultCode MiniAV_Screen_EnumerateWindows(MiniAVDeviceInfo **windows,
-                                                uint32_t *count) {
-  (void)windows;
-  (void)count;
-  return MINIAV_ERROR_NOT_SUPPORTED;
-}
-
-MiniAVResultCode
-MiniAV_Screen_CreateContext(MiniAVScreenContextHandle *context) {
-  (void)context;
-  return MINIAV_ERROR_NOT_SUPPORTED;
-}
-
-MiniAVResultCode
-MiniAV_Screen_DestroyContext(MiniAVScreenContextHandle context) {
-  (void)context;
-  return MINIAV_ERROR_NOT_SUPPORTED;
-}
-
-MiniAVResultCode
-MiniAV_Screen_ConfigureDisplay(MiniAVScreenContextHandle context,
-                               const char *display_id, const void *format) {
-  (void)context;
-  (void)display_id;
-  (void)format;
-  return MINIAV_ERROR_NOT_SUPPORTED;
-}
-
-MiniAVResultCode
-MiniAV_Screen_ConfigureWindow(MiniAVScreenContextHandle context,
-                              const char *window_id, const void *format) {
-  (void)context;
-  (void)window_id;
-  (void)format;
-  return MINIAV_ERROR_NOT_SUPPORTED;
-}
-
-MiniAVResultCode
-MiniAV_Screen_ConfigureRegion(MiniAVScreenContextHandle context,
-                              const char *display_id, int x, int y, int width,
-                              int height, const void *format) {
-  (void)context;
-  (void)display_id;
-  (void)x;
-  (void)y;
-  (void)width;
-  (void)height;
-  (void)format;
-  return MINIAV_ERROR_NOT_SUPPORTED;
-}
-
-MiniAVResultCode MiniAV_Screen_StartCapture(MiniAVScreenContextHandle context,
-                                            MiniAVBufferCallback callback,
-                                            void *user_data) {
-  (void)context;
-  (void)callback;
-  (void)user_data;
-  return MINIAV_ERROR_NOT_SUPPORTED;
-}
-
-MiniAVResultCode MiniAV_Screen_StopCapture(MiniAVScreenContextHandle context) {
-  (void)context;
-  return MINIAV_ERROR_NOT_SUPPORTED;
 }

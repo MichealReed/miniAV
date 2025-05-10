@@ -667,10 +667,9 @@ final class UnnamedStruct2 extends ffi.Struct {
   external int channel_count;
 
   @ffi.Uint32()
-  external int sample_formatAsInt;
+  external int formatAsInt;
 
-  MiniAVAudioFormat get sample_format =>
-      MiniAVAudioFormat.fromValue(sample_formatAsInt);
+  MiniAVAudioFormat get format => MiniAVAudioFormat.fromValue(formatAsInt);
 
   external ffi.Pointer<ffi.Void> data;
 }

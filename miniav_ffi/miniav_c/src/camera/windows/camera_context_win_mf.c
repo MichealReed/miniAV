@@ -207,8 +207,8 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   // shared_texture_handle, native_gpu_texture_ptr)
   // buffer.data.video.actual_output_preference_achieved =
   // MINIAV_OUTPUT_PREFERENCE_CPU; // Default
-  // buffer.data.video.shared_texture_handle = NULL;
-  // buffer.data.video.native_gpu_texture_ptr = NULL;
+  buffer.data.video.native_gpu_shared_handle = NULL;
+  buffer.data.video.native_gpu_texture_ptr = NULL;
 
   MiniAVOutputPreference desired_output_pref =
       parent_ctx->configured_format.output_preference;
@@ -284,10 +284,14 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                              "MF: Successfully created DXGI shared handle from "
                              "copied texture: %p",
                              shared_handle);
-                  buffer.data.video.planes[0] = (BYTE *)shared_handle;
+                  buffer.data.video.planes[0] = NULL;
+                  buffer.data.video.native_gpu_texture_ptr = d3d11_texture;
+                  buffer.data.video.native_gpu_shared_handle = shared_handle;
                   buffer.data.video.stride_bytes[0] = 0;
                   buffer.data_size_bytes = 0;
                   processed_as_gpu_texture = TRUE;
+                  buffer.content_type =
+                      MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
                   // The application is responsible for
                   // CloseHandle(shared_handle) The shareable_texture itself is
                   // released below.
@@ -327,10 +331,14 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                            "MF: Successfully created DXGI shared handle from "
                            "original texture: %p",
                            shared_handle);
-                buffer.data.video.planes[0] = (BYTE *)shared_handle;
+                buffer.data.video.planes[0] = NULL;
+                buffer.data.video.native_gpu_shared_handle = shared_handle;
+                buffer.data.video.native_gpu_texture_ptr = d3d11_texture;
                 buffer.data.video.stride_bytes[0] = 0;
                 buffer.data_size_bytes = 0;
                 processed_as_gpu_texture = TRUE;
+                buffer.content_type =
+                    MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
               } else {
                 miniav_log(MINIAV_LOG_LEVEL_ERROR,
                            "MF: Failed to create DXGI shared handle from "
@@ -374,6 +382,7 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   // CPU Path (if not processed as GPU texture, or if CPU is preferred, or if
   // GPU_IF_AVAILABLE failed to produce shareable texture)
   if (!processed_as_gpu_texture) {
+    buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
     if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE) {
       miniav_log(MINIAV_LOG_LEVEL_INFO,
                  "MF: GPU_IF_AVAILABLE preference: Falling back to CPU path "

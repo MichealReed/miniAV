@@ -41,7 +41,7 @@ typedef struct MiniAVScreenContext {
     MiniAVBufferCallback app_callback;
     void *app_callback_user_data;
 
-    volatile BOOL is_running; // TRUE if capture is active
+    bool is_running; // TRUE if capture is active
     MiniAVVideoFormatInfo configured_format; // The format requested by the user and/or confirmed by the backend
 
     // Add any other common state needed across platforms

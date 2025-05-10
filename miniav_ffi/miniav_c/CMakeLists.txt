@@ -5,10 +5,9 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
 
 # --- Options ---
-option(MINIAV_ENABLE_DIRECTSHOW_FALLBACK "Enable DirectShow fallback for camera on Windows" OFF)
-option(MINIAV_ENABLE_GDI_FALLBACK "Enable GDI fallback for screen capture on Windows" OFF)
-option(MINIAV_ENABLE_X11_FALLBACK "Enable X11 fallback for screen capture on Linux" OFF)
-option(MINIAV_ENABLE_PIPEWIRE_CAMERA "Enable PipeWire camera support on Linux" OFF) # Default to V4L2
+option(USE_WGC "Use WGC for Windows screen capture" ON)
+option(USE_DXGI "Use DXGI for Windows screen capture" OFF)
+
 
 # --- Standard & Settings ---
 set(CMAKE_C_STANDARD 11)
@@ -40,6 +39,9 @@ set(CAMERA_API_SOURCE "src/camera/camera_api.c")
 # Screen API Source
 set(SCREEN_API_SOURCE "src/screen/screen_api.c")
 
+# Loopback API Source
+set(LOOPBACK_API_SOURCE "src/loopback/loopback_api.c")
+
 # Platform-Specific Sources
 set(PLATFORM_SOURCES "")
 set(PLATFORM_HEADERS "")
@@ -51,14 +53,20 @@ if(WIN32)
     set(PLATFORM_SOURCES
         "src/camera/windows/camera_context_win_mf.c"
         "src/screen/windows/screen_context_win_dxgi.c"
+        "src/screen/windows/screen_context_win_wgc.cpp"
+        "src/loopback/windows/loopback_context_win_wasapi.c"
     )
     set(PLATFORM_HEADERS
         "src/camera/windows/camera_context_win_mf.h"
         "src/screen/windows/screen_context_win_dxgi.h"
+        "src/screen/windows/screen_context_win_wgc.h"
+        "src/loopback/windows/loopback_context_win_wasapi.h"
+
     )
     set(PLATFORM_LINK_LIBS
         ole32       # For CoInitialize, CoTaskMemFree etc.
         uuid
+        ksuser
         mfplat      # Media Foundation Platform
         mf
         mfreadwrite # Media Foundation Source Reader
@@ -69,19 +77,15 @@ if(WIN32)
     )
     list(APPEND PLATFORM_DEFINITIONS "MINIAV_PLATFORM_WINDOWS")
 
-    if(MINIAV_ENABLE_DIRECTSHOW_FALLBACK)
-        message(STATUS "Enabling DirectShow fallback")
-        list(APPEND PLATFORM_SOURCES "src/camera/windows/camera_context_win_ds.c")
-        # list(APPEND PLATFORM_HEADERS "src/camera/windows/camera_context_win_ds.h") # Add if header exists
-        list(APPEND PLATFORM_LINK_LIBS strmiids quartz) # DirectShow libs
-        list(APPEND PLATFORM_DEFINITIONS "MINIAV_SUPPORT_DIRECTSHOW")
-    endif()
-    if(MINIAV_ENABLE_GDI_FALLBACK)
-        message(STATUS "Enabling GDI fallback")
-        list(APPEND PLATFORM_SOURCES "src/screen/windows/screen_context_win_gdi.c")
-        # list(APPEND PLATFORM_HEADERS "src/screen/windows/screen_context_win_gdi.h") # Add if header exists
-        list(APPEND PLATFORM_LINK_LIBS gdi32 user32) # GDI libs
-        list(APPEND PLATFORM_DEFINITIONS "MINIAV_SUPPORT_GDI")
+    if(USE_WGC)
+        message(STATUS "Windows: Enabling WGC screen capture.")
+        list(APPEND PLATFORM_DEFINITIONS "USE_WGC")
+    elseif(USE_DXGI) # Use elseif to ensure only one is active if both were somehow ON
+        message(STATUS "Windows: Enabling DXGI screen capture.")
+        list(APPEND PLATFORM_DEFINITIONS "USE_DXGI")
+    else()
+        message(WARNING "Windows: No screen capture backend (WGC or DXGI) selected. Screen capture will not be available.")
+        # If neither is selected, the C code will hit the #else block as you observed.
     endif()
 
     # Definition for building DLL
@@ -166,6 +170,7 @@ target_sources(miniav_c PRIVATE
     ${AUDIO_SOURCES}
     ${CAMERA_API_SOURCE}
     ${SCREEN_API_SOURCE}
+    ${LOOPBACK_API_SOURCE}
     ${PLATFORM_SOURCES}
     ${PLATFORM_HEADERS}
     "include/miniav_buffer.h"
@@ -184,6 +189,7 @@ target_include_directories(miniav_c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
         ${CMAKE_CURRENT_SOURCE_DIR}/src/camera
         ${CMAKE_CURRENT_SOURCE_DIR}/src/screen
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/loopback
         # Add platform specific include dirs if they exist and are needed internally
         # ${CMAKE_CURRENT_SOURCE_DIR}/src/camera/windows
         # ... etc
@@ -230,10 +236,14 @@ install(DIRECTORY include/
 if(NOT CMAKE_SYSTEM_NAME MATCHES "(Android|iOS|Emscripten)")
     add_executable(test_audio_capture src/audio/test/test_audio_capture.c)
     add_executable(test_camera_capture src/camera/test/test_camera_capture.c)
+    add_executable(test_screen_capture src/screen/test/test_screen_capture.c)
+    add_executable(test_loopback_capture src/loopback/test/test_loopback_capture.c)
 
     # Link the test against the miniav_c library
     target_link_libraries(test_audio_capture PRIVATE miniav_c)
     target_link_libraries(test_camera_capture PRIVATE miniav_c)
+    target_link_libraries(test_screen_capture PRIVATE miniav_c)
+    target_link_libraries(test_loopback_capture PRIVATE miniav_c)
 
     # Add include directories for the test
     target_include_directories(test_audio_capture PRIVATE
@@ -243,6 +253,15 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "(Android|iOS|Emscripten)")
     target_include_directories(test_camera_capture PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/src" 
+    )
+    target_include_directories(test_screen_capture PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src" 
+    )
+
+    target_include_directories(test_loopback_capture PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src" 
     )
 
     # Add platform-specific libraries needed by miniaudio (already linked by miniav_c usually)

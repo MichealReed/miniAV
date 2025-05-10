@@ -48,6 +48,15 @@ miniav(monorepo)/
 │           ├── audio/                # Audio capture implementation (wraps miniaudio).
 │           │   ├── audio_context.c     # Implementation of audio context functions.
 │           │   └── audio_context.h     # Internal audio context struct.
+│           ├── loopback/             # Loopback audio capture (system/application audio output).
+│           │   ├── loopback_api.c      # Implementation of public MiniAV_Loopback_* functions.
+│           │   ├── loopback_context.h  # Internal loopback context struct and common logic interface.
+│           │   ├── windows/
+│           │   │   └── loopback_context_win_wasapi.c
+│           │   ├── macos/
+│           │   │   └── loopback_context_macos_coreaudio.m
+│           │   └── linux/
+│           │       └── loopback_context_linux_pulse.c
 │           ├── camera/               # Camera capture implementation.
 │           │   ├── camera_api.c        # Implementation of public MiniAV_Camera_* functions.
 │           │   ├── camera_context.h    # Internal camera context struct and common logic interface.
@@ -117,7 +126,9 @@ This standalone C library contains the core buffer definitions, the public C cap
   * **Camera:** Media Foundation (preferred: `IMFSourceReader`), DirectShow (fallback).
   * **Screen:** Desktop Duplication API (preferred), GDI/BitBlt (fallback).
     * **System Audio (Loopback):** If requested via `MiniAV_Screen_StartCapture`, WASAPI loopback capture will be initiated via miniaudio.
-  * **Audio:** WASAPI (via `miniaudio`).
+  * **Audio (Input):** WASAPI (via `miniaudio`).
+  * **Loopback Audio (Output Capture):** Direct WASAPI loopback capture (`IAudioClient3` with `AUDCLNT_STREAMFLAGS_LOOPBACK`). Attempt `AUDCLNT_STREAMFLAGS_LOOPBACK_PROCESS_ID_ONLY` for per-application audio when a process ID is targeted.
+
   * **Zero-Copy / GPU Handles:**
     * **Media Foundation / DXGI:** Leverage `IMFDXGIDeviceManager` for camera and DXGI for screen to obtain `ID3D11Texture2D*`. These can be copied to textures created with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` (or `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`) to export an NT `HANDLE`. This `HANDLE` can then be imported by other D3D11/D3D12/WebGPU instances.
     * **CPU Buffers:** `IMFMediaBuffer::Lock` (Media Foundation), mapping DXGI staging textures, or GDI access.
@@ -127,7 +138,9 @@ This standalone C library contains the core buffer definitions, the public C cap
   * **Camera:** AVFoundation (`AVCaptureSession`, `AVCaptureVideoDataOutput`).
   * **Screen:** AVFoundation (`AVCaptureScreenInput`), Core Graphics (`CGDisplayStream`).
     * **System Audio:** If requested, the AVFoundation session will be configured to include system audio output, or appropriate Core Audio APIs will be used for loopback.
-  * **Audio:** Core Audio (via `miniaudio`).
+  * **Audio (Input):** Core Audio (via `miniaudio`).
+  * **Loopback Audio (Output Capture):** Core Audio APIs (e.g., `AudioUnit` with a tap on an output device, or `AVAudioEngine` taps) to capture system audio or attempt per-application audio.
+
   * **Zero-Copy / GPU Handles:**
     * **AVFoundation:** `CVPixelBufferRef` from `CMSampleBufferRef` can often be backed by an `IOSurfaceRef` or a Metal texture (`MTLTexture`). `IOSurfaceRef` can be shared between processes or converted to `MTLTexture`.
     * **CPU Buffers:** `CVPixelBufferGetBaseAddress` on `CMSampleBufferRef`.
@@ -138,6 +151,9 @@ This standalone C library contains the core buffer definitions, the public C cap
   * **Screen:** X11 (`XShmGetImage`), Wayland (requires compositor-specific protocols or PipeWire portal). PipeWire screen capture portal is preferred for broader compatibility.
     * **System Audio:** If requested, PipeWire will be asked to provide a system audio loopback stream alongside the screen video stream.
   * **Audio:** ALSA / PulseAudio (via `miniaudio`). PipeWire for modern systems.
+  * **Loopback Audio (Output Capture):**
+    * **PipeWire:** Preferred. If capturing screen via PipeWire portal, request associated audio stream from the portal for per-application/window audio. For standalone system audio, connect to appropriate PipeWire audio sink/monitor.
+    * **PulseAudio:** Fallback for system-wide audio loopback by capturing from a monitor source of a sink. Per-application audio is difficult and unreliable.
   * **Zero-Copy / GPU Handles:**
     * **V4L2 / PipeWire:** Can provide DMA-BUF file descriptors (`dmabuf fd`). These can be imported into Vulkan (`vkImportSemaphoreFdKHR`, `vkImportMemoryFdKHR`) or EGL/OpenGL (`eglCreateImageKHR` with `EGL_LINUX_DMA_BUF_EXT`) to create GPU textures.
     * **CPU Buffers:** V4L2 buffer mapping (`mmap`), X11 shared memory extension (`XShm`).
@@ -251,6 +267,21 @@ This section details the public C API exposed by `miniav_c`.
       MINIAV_AUDIO_FORMAT_F32,     // 32-bit floating point
   } MiniAVAudioFormat;
 
+  typedef enum {
+      MINIAV_LOOPBACK_TARGET_NONE,          // No target specified or invalid
+      MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO,  // Capture all system audio output (e.g., speaker output)
+      MINIAV_LOOPBACK_TARGET_PROCESS,       // Capture audio from a specific process ID
+      MINIAV_LOOPBACK_TARGET_WINDOW         // Capture audio associated with a specific window (platform-dependentfeasibility)
+  } MiniAVLoopbackTargetType;
+
+  typedef struct {
+        MiniAVLoopbackTargetType type;
+        union {
+            uint32_t process_id;        // For MINIAV_LOOPBACK_TARGET_PROCESS
+            void* window_handle;        // For MINIAV_LOOPBACK_TARGET_WINDOW (platform-specific: HWND, NSWindow*, XID, etc.)
+        } TARGETHANDLE; 
+    } MiniAVLoopbackTargetInfo;
+
   // Video Format Information (used for configuration)
   typedef struct {
       uint32_t width;                       // Desired width (can be 0 for default)
@@ -266,10 +297,10 @@ This section details the public C API exposed by `miniav_c`.
     typedef struct {
       uint32_t sample_rate;
       uint32_t channel_count;
-      MiniAVAudioFormat sample_format;
+      MiniAVAudioFormat format;
       // MiniAVOutputPreference output_preference; // Currently ignored for audio, defaults to CPU.
       // uint32_t buffer_frame_count; // Desired number of frames per callback
-    } MiniAVAudioFormatInfo;
+    } MiniAVAudioInfo;
 
     typedef struct {
         MiniAVBufferType type;
@@ -293,7 +324,7 @@ This section details the public C API exposed by `miniav_c`.
             struct {
                 uint32_t frame_count;
                 uint32_t channel_count;
-                MiniAVAudioFormat sample_format;
+                MiniAVAudioFormat format;
                 void* data; // Pointer to interleaved or planar audio data. Valid until MiniAV_ReleaseBuffer is called.
             } audio;
         } data;
@@ -370,8 +401,9 @@ This section details the public C API exposed by `miniav_c`.
   * `video_format->output_preference` guides the library for video. Audio is configured at StartCapture.
 * `MiniAVResultCode MiniAV_Screen_ConfigureRegion(MiniAVScreenContextHandle context, const char* display_id, int x, int y, int width, int height, const MiniAVVideoFormatInfo* video_format);`
   * `video_format->output_preference` guides the library for video. Audio is configured at StartCapture.
-* `MiniAVResultCode MiniAV_Screen_StartCapture(MiniAVScreenContextHandle context, MiniAVBufferCallback callback, void* user_data, const MiniAVAudioFormatInfo* optional_audio_format_for_system_audio);`
-  * If `optional_audio_format_for_system_audio` is not NULL, the library will attempt to capture system audio alongside the screen video.
+* `MiniAVResultCode MiniAV_Screen_StartCapture(MiniAVScreenContextHandle context, MiniAVBufferCallback callback, void* user_data, const MiniAVAudioInfo* optional_audio_format_for_loopback);`
+  * If `optional_audio_format_for_loopback` is not NULL, the library will attempt to capture system/application audio (depending on platform capabilities and configuration of the screen capture target) alongside the screen video **by utilizing the audio buffer the screen capture api provides or the Loopback Audio module**.
+  * The callback will receive buffers of `type = MINIAV_BUFFER_TYPE_VIDEO` and, if audio capture is enabled and successful, `type = MINIAV_BUFFER_TYPE_AUDIO`.
   * The callback will receive buffers of `type = MINIAV_BUFFER_TYPE_VIDEO` and, if audio capture is enabled and successful, `type = MINIAV_BUFFER_TYPE_AUDIO`.
 * `MiniAVResultCode MiniAV_Screen_StopCapture(MiniAVScreenContextHandle context);`
 * *(Property API - TBD: Define specific properties like cursor visibility, capture rate control, audio source selection if multiple loopbacks exist)*
@@ -382,17 +414,49 @@ This section details the public C API exposed by `miniav_c`.
 
 * `MiniAVResultCode MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo** devices, uint32_t* count);`
   * Allocates memory; caller must free using `MiniAV_FreeDeviceList`.
-* `MiniAVResultCode MiniAV_Audio_GetSupportedFormats(const char* device_id, MiniAVAudioFormatInfo** formats, uint32_t* count);`
+* `MiniAVResultCode MiniAV_Audio_GetSupportedFormats(const char* device_id, MiniAVAudioInfo** formats, uint32_t* count);`
   * Describes supported sample format, channel count, sample rate combinations.
   * Allocates memory; caller must free using `MiniAV_FreeFormatList`.
 * `MiniAVResultCode MiniAV_Audio_CreateContext(MiniAVAudioContextHandle* context);`
 * `MiniAVResultCode MiniAV_Audio_DestroyContext(MiniAVAudioContextHandle context);`
-* `MiniAVResultCode MiniAV_Audio_Configure(MiniAVAudioContextHandle context, const char* device_id, const MiniAVAudioFormatInfo* format);`
+* `MiniAVResultCode MiniAV_Audio_Configure(MiniAVAudioContextHandle context, const char* device_id, const MiniAVAudioInfo* format);`
 * `MiniAVResultCode MiniAV_Audio_StartCapture(MiniAVAudioContextHandle context, MiniAVBufferCallback callback, void* user_data);`
 * `MiniAVResultCode MiniAV_Audio_StopCapture(MiniAVAudioContextHandle context);`
 * *(Property API - TBD: Define specific properties like gain/volume/loopback if available)*
   * `MiniAV_Audio_GetProperty(...)`
   * `MiniAV_Audio_SetProperty(...)`
+
+### Loopback Audio API
+
+This API is for capturing audio output from the system or specific applications. It is distinct from the `MiniAV_Audio_*` API which targets input devices like microphones. The Screen Capture API may internally use this module.
+
+* `MiniAVResultCode MiniAV_Loopback_EnumerateTargets(MiniAVLoopbackTargetType target_type_filter, MiniAVDeviceInfo** targets, uint32_t* count);`
+  * Enumerates potential audio loopback targets based on the `target_type_filter`.
+  * If `target_type_filter` is `MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO`, lists available system-level loopback options (e.g., "Default Output Monitor"). The `device_id` in `MiniAVDeviceInfo` would be a special identifier for these.
+  * If `target_type_filter` is `MINIAV_LOOPBACK_TARGET_PROCESS` or `MINIAV_LOOPBACK_TARGET_WINDOW`, attempts to list currently audio-producing applications or windows. The `device_id` in `MiniAVDeviceInfo` would be an identifier that the library can use to resolve to a specific process or window internally for configuration.
+  * Platform support for enumerating specific applications/windows varies.
+  * Allocates memory for the target list; caller must free using `MiniAV_FreeDeviceList`.
+
+* `MiniAVResultCode MiniAV_Loopback_CreateContext(MiniAVLoopbackContextHandle* context);`
+* `MiniAVResultCode MiniAV_Loopback_DestroyContext(MiniAVLoopbackContextHandle context);`
+
+* `MiniAVResultCode MiniAV_Loopback_Configure(MiniAVLoopbackContextHandle context, const char* target_device_id, const MiniAVAudioInfo* format);`
+  * Configures loopback using a `target_device_id`.
+  * If `target_device_id` is `NULL` or a special predefined string (e.g., `"system_default"` or an ID from `MiniAV_Loopback_EnumerateTargets` with `MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO`), it configures system-wide audio loopback.
+  * If `target_device_id` is an ID obtained from `MiniAV_Loopback_EnumerateTargets` (for process/window types) or `MiniAV_Screen_EnumerateWindows`, the library attempts to derive the necessary internal process ID or native window handle to target audio from that specific source.
+  * Platform support for reliably targeting specific windows/applications from a generic ID varies.
+
+* `MiniAVResultCode MiniAV_Loopback_ConfigureWithTargetInfo(MiniAVLoopbackContextHandle context, const MiniAVLoopbackTargetInfo* target_info, const MiniAVAudioInfo* format);`
+  * Advanced configuration using explicit low-level target information.
+  * `target_info` directly specifies whether to capture system-wide audio, or provides a specific process ID or native window handle. Useful when the application obtains this information through other means.
+
+* `MiniAVResultCode MiniAV_Loopback_StartCapture(MiniAVLoopbackContextHandle context, MiniAVBufferCallback callback, void* user_data);`
+* `MiniAVResultCode MiniAV_Loopback_StopCapture(MiniAVLoopbackContextHandle context);`
+* `MiniAVResultCode MiniAV_Loopback_GetConfiguredFormat(MiniAVLoopbackContextHandle context, MiniAVAudioInfo* format_out);`
+  * Gets the actual format configured by the backend.
+* *(Property API - TBD: Define specific properties like confirming if per-process capture is active, or selecting a specific underlying audio device if multiple system loopback options exist)*
+  * `MiniAV_Loopback_GetProperty(...)`
+  * `MiniAV_Loopback_SetProperty(...)`
 
 ## Technical Considerations
 
@@ -445,7 +509,7 @@ This section details the public C API exposed by `miniav_c`.
 1. **Initialization:** Dart application calls an initialization method defined in `miniav_platform_interface`. The `miniav_ffi` implementation might call `MiniAV_Initialize` (C API) if needed.
 2. **Context Creation:** Application requests a camera/screen/audio context via the platform interface. `miniav_ffi` calls the corresponding `MiniAV_<Type>_CreateContext` (C API) via FFI.
 3. **Device Discovery:** Application calls device listing methods. `miniav_ffi` calls `MiniAV_<Type>_EnumerateDevices` (C API) via FFI. `miniav_c` executes platform-specific discovery code. Results are marshalled back to Dart, and the native list is freed using `MiniAV_FreeDeviceList`.
-4. **Configuration:** Application selects device/format and sets `output_preference` in `MiniAVVideoFormatInfo` (or `MiniAVAudioFormatInfo`). `miniav_ffi` translates these to C structs/calls (e.g., `MiniAV_Camera_Configure`). `miniav_c` stores this preference.
+4. **Configuration:** Application selects device/format and sets `output_preference` in `MiniAVVideoFormatInfo` (or `MiniAVAudioInfo`). `miniav_ffi` translates these to C structs/calls (e.g., `MiniAV_Camera_Configure`). `miniav_c` stores this preference.
 5. **Capture Start:** Application calls start capture method, providing a Dart callback. `miniav_ffi` sets up a native FFI callback (`NativeCallable`) that wraps the Dart callback (potentially sending data via a `SendPort`) and passes its pointer (and user data containing necessary Dart state/ports) to `MiniAV_<Type>_StartCapture` (C API). `miniav_c` sets up the platform context and registers the native FFI callback.
 6. **Data Production (C Library):**
     * Platform-specific C code captures data, respecting the stored `output_preference`.

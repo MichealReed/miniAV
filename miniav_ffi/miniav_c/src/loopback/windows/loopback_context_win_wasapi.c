@@ -1,8 +1,7 @@
 #ifdef _WIN32
-#include <initguid.h> // Step 1: Define INITGUID to make DEFINE_GUID create definitions
+#include <initguid.h>
 
-// Step 2: Include the headers that declare the GUIDs we need.
-// DEFINE_GUID in these headers will now generate actual definitions.
+
 #include <Audioclient.h>
 #include <mmdeviceapi.h> // For IID_IMMDeviceEnumerator, CLSID_MMDeviceEnumerator, IMMDevice
 #include <windows.h> // Base Windows types
@@ -237,9 +236,6 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
             MINIAV_BUFFER_CONTENT_TYPE_CPU; // WASAPI gives CPU buffer
         buffer.timestamp_us = miniav_get_time_us();
 
-        // Assuming DUMMYUNIONNAME_BUFFER_PAYLOAD is the union member name in
-        // MiniAVBuffer And audio_buffer is the struct within that union for
-        // audio data.
         buffer.data.audio.data = data_ptr;
         buffer.data_size_bytes =
             num_frames_available * platform_ctx->capture_format->nBlockAlign;

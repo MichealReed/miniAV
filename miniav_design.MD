@@ -127,7 +127,7 @@ This standalone C library contains the core buffer definitions, the public C cap
   * **Screen:** Desktop Duplication API (preferred), GDI/BitBlt (fallback).
     * **System Audio (Loopback):** If requested via `MiniAV_Screen_StartCapture`, WASAPI loopback capture will be initiated via miniaudio.
   * **Audio (Input):** WASAPI (via `miniaudio`).
-  * **Loopback Audio (Output Capture):** Direct WASAPI loopback capture (`IAudioClient3` with `AUDCLNT_STREAMFLAGS_LOOPBACK`). Attempt `AUDCLNT_STREAMFLAGS_LOOPBACK_PROCESS_ID_ONLY` for per-application audio when a process ID is targeted.
+  * **Loopback Audio (Output Capture):** Direct WASAPI loopback capture (`IAudioClient3` with `AUDCLNT_STREAMFLAGS_LOOPBACK`).
 
   * **Zero-Copy / GPU Handles:**
     * **Media Foundation / DXGI:** Leverage `IMFDXGIDeviceManager` for camera and DXGI for screen to obtain `ID3D11Texture2D*`. These can be copied to textures created with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` (or `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`) to export an NT `HANDLE`. This `HANDLE` can then be imported by other D3D11/D3D12/WebGPU instances.

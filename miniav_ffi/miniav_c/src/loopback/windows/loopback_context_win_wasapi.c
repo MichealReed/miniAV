@@ -1,12 +1,12 @@
 #ifdef _WIN32
 #include <initguid.h>
 
-
 #include <Audioclient.h>
 #include <mmdeviceapi.h> // For IID_IMMDeviceEnumerator, CLSID_MMDeviceEnumerator, IMMDevice
 #include <windows.h> // Base Windows types
 // For PKEY_Device_FriendlyName, IPropertyStore. propsys.h includes objidl.h
 // which might also declare GUIDs.
+#include <audiopolicy.h> // For IAudioSessionManager2, IAudioSessionControl, IAudioSessionControl2
 #include <functiondiscoverykeys_devpkey.h> // Often needed for PKEY definitions
 #include <propsys.h>
 // ksmedia.h was for KSDATAFORMAT_... GUIDs, which seem resolved now, but good
@@ -22,6 +22,33 @@
 #include <stdio.h> // For swprintf_s
 
 #ifdef _WIN32
+
+const IID IID_IAudioCaptureClient = {
+    0xc8adbd64,
+    0xe71e,
+    0x48a0,
+    {0xa4, 0xde, 0x18, 0x5c, 0x39, 0x5c, 0xd3, 0x17}};
+
+// Add these:
+const IID IID_IAudioSessionManager2 = {
+
+    0x77AA99A0,
+    0x1BD6,
+    0x484F,
+    {0x8B, 0xC7, 0x2C, 0x65, 0x4C, 0x9A, 0x9B, 0x6F}};
+
+const IID IID_IAudioSessionControl2 = {
+    0xbfb7ff88,
+    0x7239,
+    0x4fc9,
+    {0x8f, 0xa2, 0x07, 0xc9, 0x50, 0xbe, 0x9c, 0x6d}};
+
+// IID for the IAudioSessionEnumerator interface
+const IID IID_IAudioSessionEnumerator = {
+    0xe2f5bb11,
+    0x0570,
+    0x40ca,
+    {0xac, 0xdd, 0x3a, 0xa0, 0x12, 0x77, 0xde, 0xe8}};
 
 const CLSID CLSID_MMDeviceEnumerator = {
     0xbcde0395,
@@ -46,11 +73,11 @@ const IID IID_IAudioClient3 = {
     0x4cd4,
     {0x8c, 0x1a, 0x2b, 0x7a, 0x59, 0x87, 0xad, 0x42}};
 
-const IID IID_IAudioCaptureClient = {
-    0xc8adbd64,
-    0xe71e,
-    0x48a0,
-    {0xa4, 0xde, 0x18, 0x5c, 0x39, 0x5c, 0xd3, 0x17}};
+const IID IID_IAudioSessionManager = {
+    0xA37CF45F,
+    0x692C,
+    0x4A3D,
+    {0x95, 0x6A, 0x26, 0x10, 0x44, 0x4F, 0x74, 0xCC}};
 
 // --- Helper Functions ---
 
@@ -361,6 +388,79 @@ MiniAVResultCode wasapi_destroy_platform(MiniAVLoopbackContext *ctx) {
   return MINIAV_SUCCESS;
 }
 
+static BOOL get_process_name_by_pid(DWORD pid, char *name_buffer,
+                                    DWORD buffer_size) {
+  HANDLE process_handle =
+      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (process_handle == NULL) {
+    // Try with PROCESS_QUERY_INFORMATION | PROCESS_VM_READ for older systems or
+    // if more rights are needed
+    process_handle =
+        OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (process_handle == NULL)
+      return FALSE;
+  }
+
+  BOOL result = FALSE;
+  WCHAR image_path[MAX_PATH];
+  if (QueryFullProcessImageNameW(process_handle, 0, image_path,
+                                 &((DWORD){MAX_PATH}))) {
+    LPCWSTR exe_name = wcsrchr(image_path, L'\\');
+    exe_name = exe_name ? exe_name + 1 : image_path;
+    char *utf8_exe_name = lpwstr_to_utf8(exe_name);
+    if (utf8_exe_name) {
+      strncpy(name_buffer, utf8_exe_name, buffer_size - 1);
+      name_buffer[buffer_size - 1] = '\0';
+      miniav_free(utf8_exe_name);
+      result = TRUE;
+    }
+  }
+  CloseHandle(process_handle);
+  return result;
+}
+
+typedef struct EnumWindowsCallbackData {
+  MiniAVDeviceInfo *devices;
+  uint32_t current_count;
+  uint32_t max_count;
+} EnumWindowsCallbackData;
+
+static BOOL CALLBACK enum_windows_proc(HWND hwnd, LPARAM lParam) {
+  EnumWindowsCallbackData *data = (EnumWindowsCallbackData *)lParam;
+  if (data->current_count >= data->max_count) {
+    return FALSE; // Stop enumeration if buffer is full
+  }
+
+  if (!IsWindowVisible(hwnd)) {
+    return TRUE; // Skip non-visible windows
+  }
+
+  int length = GetWindowTextLengthW(hwnd);
+  if (length == 0) {
+    return TRUE; // Skip windows with no title
+  }
+
+  WCHAR title_wstr[MINIAV_DEVICE_NAME_MAX_LEN]; // Assuming similar max length
+                                                // for names
+  GetWindowTextW(hwnd, title_wstr, MINIAV_DEVICE_NAME_MAX_LEN);
+
+  char *title_utf8 = lpwstr_to_utf8(title_wstr);
+  if (title_utf8) {
+    // Use HWND as a string for device_id. Format: "hwnd:0xADDRESS"
+    snprintf(data->devices[data->current_count].device_id,
+             MINIAV_DEVICE_ID_MAX_LEN, "hwnd:%p", hwnd);
+    strncpy(data->devices[data->current_count].name, title_utf8,
+            MINIAV_DEVICE_NAME_MAX_LEN - 1);
+    data->devices[data->current_count].name[MINIAV_DEVICE_NAME_MAX_LEN - 1] =
+        '\0';
+    data->devices[data->current_count].is_default =
+        FALSE; // Windows are not "default" targets
+    data->current_count++;
+    miniav_free(title_utf8);
+  }
+  return TRUE;
+}
+
 MiniAVResultCode miniav_loopback_enumerate_targets_win(
     MiniAVLoopbackTargetType target_type_filter, MiniAVDeviceInfo **targets_out,
     uint32_t *count_out) {
@@ -370,158 +470,417 @@ MiniAVResultCode miniav_loopback_enumerate_targets_win(
   *count_out = 0;
 
   HRESULT hr;
-  IMMDeviceEnumerator *enumerator = NULL;
-  IMMDeviceCollection *collection = NULL;
-  MiniAVDeviceInfo *devices = NULL;
-  uint32_t device_count = 0;
+  MiniAVDeviceInfo *temp_devices_list = NULL;
+  uint32_t found_count = 0;
+  const uint32_t MAX_POTENTIAL_TARGETS =
+      256; // Max devices/processes/windows to list
+  MiniAVResultCode result_code = MINIAV_SUCCESS;
 
-  // Ensure COM is initialized for this thread/function
   BOOL com_initialized_here = FALSE;
   hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
   if (SUCCEEDED(hr)) {
     com_initialized_here = TRUE;
-    if (hr == S_FALSE) { // Already initialized, but we don't own it
-      com_initialized_here = FALSE;
-    }
+    if (hr == S_FALSE)
+      com_initialized_here = FALSE; // Already initialized
   } else if (hr != RPC_E_CHANGED_MODE) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "WASAPI Enum: CoInitializeEx failed: 0x%lx", hr);
     return hresult_to_miniavresult(hr);
   }
 
-  if (target_type_filter == MINIAV_LOOPBACK_TARGET_PROCESS ||
-      target_type_filter == MINIAV_LOOPBACK_TARGET_WINDOW) {
-    miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "WASAPI: Enumerating specific process/window audio targets is "
-               "not fully implemented, returning system devices.");
+  temp_devices_list = (MiniAVDeviceInfo *)miniav_calloc(
+      MAX_POTENTIAL_TARGETS, sizeof(MiniAVDeviceInfo));
+  if (!temp_devices_list) {
+    result_code = MINIAV_ERROR_OUT_OF_MEMORY;
+    goto cleanup_enum;
   }
 
-  hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
-                        &IID_IMMDeviceEnumerator, (void **)&enumerator);
-  if (FAILED(hr)) {
-    miniav_log(
-        MINIAV_LOG_LEVEL_ERROR,
-        "WASAPI Enum: CoCreateInstance for MMDeviceEnumerator failed: 0x%lx",
-        hr);
-    if (com_initialized_here)
-      CoUninitialize();
-    return hresult_to_miniavresult(hr);
-  }
+  if (target_type_filter == MINIAV_LOOPBACK_TARGET_PROCESS) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "WASAPI Enum: Enumerating process targets across all active "
+               "render devices.");
+    IMMDeviceEnumerator *all_device_enumerator = NULL;
+    IMMDeviceCollection *device_collection = NULL;
+    // session_manager, session_enum, etc. will be obtained per-device in the
+    // loop
 
-  hr = enumerator->lpVtbl->EnumAudioEndpoints(enumerator, eRender,
-                                              DEVICE_STATE_ACTIVE, &collection);
-  if (FAILED(hr)) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WASAPI Enum: EnumAudioEndpoints failed: 0x%lx", hr);
-    enumerator->lpVtbl->Release(enumerator);
-    if (com_initialized_here)
-      CoUninitialize();
-    return hresult_to_miniavresult(hr);
-  }
-
-  hr = collection->lpVtbl->GetCount(collection, &device_count);
-  if (FAILED(hr)) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR, "WASAPI Enum: GetCount failed: 0x%lx",
-               hr);
-    collection->lpVtbl->Release(collection);
-    enumerator->lpVtbl->Release(enumerator);
-    if (com_initialized_here)
-      CoUninitialize();
-    return hresult_to_miniavresult(hr);
-  }
-
-  if (device_count == 0) {
-    miniav_log(MINIAV_LOG_LEVEL_INFO,
-               "WASAPI Enum: No active audio render devices found.");
-    collection->lpVtbl->Release(collection);
-    enumerator->lpVtbl->Release(enumerator);
-    if (com_initialized_here)
-      CoUninitialize();
-    return MINIAV_SUCCESS;
-  }
-
-  devices =
-      (MiniAVDeviceInfo *)miniav_calloc(device_count, sizeof(MiniAVDeviceInfo));
-  if (!devices) {
-    collection->lpVtbl->Release(collection);
-    enumerator->lpVtbl->Release(enumerator);
-    if (com_initialized_here)
-      CoUninitialize();
-    return MINIAV_ERROR_OUT_OF_MEMORY;
-  }
-
-  for (UINT i = 0; i < device_count; ++i) {
-    IMMDevice *device = NULL;
-    LPWSTR device_id_wstr = NULL;
-    IPropertyStore *props = NULL;
-    PROPVARIANT var_name;
-    PropVariantInit(&var_name);
-
-    hr = collection->lpVtbl->Item(collection, i, &device);
-    if (FAILED(hr))
-      continue;
-
-    hr = device->lpVtbl->GetId(device, &device_id_wstr);
+    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                          &IID_IMMDeviceEnumerator,
+                          (void **)&all_device_enumerator);
     if (FAILED(hr)) {
-      device->lpVtbl->Release(device);
-      continue;
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI Enum Process: CoCreateInstance for "
+                 "IMMDeviceEnumerator failed: 0x%lx",
+                 hr);
+      result_code = hresult_to_miniavresult(hr);
+      goto cleanup_proc_enum_all_devices; // New cleanup label
     }
 
-    char *device_id_utf8 = lpwstr_to_utf8(device_id_wstr);
-    if (device_id_utf8) {
-      strncpy(devices[i].device_id, device_id_utf8,
-              MINIAV_DEVICE_ID_MAX_LEN - 1);
-      devices[i].device_id[MINIAV_DEVICE_ID_MAX_LEN - 1] = '\0';
-      miniav_free(device_id_utf8);
+    hr = all_device_enumerator->lpVtbl->EnumAudioEndpoints(
+        all_device_enumerator, eRender, DEVICE_STATE_ACTIVE,
+        &device_collection);
+    if (FAILED(hr)) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI Enum Process: EnumAudioEndpoints failed: 0x%lx", hr);
+      result_code = hresult_to_miniavresult(hr);
+      goto cleanup_proc_enum_all_devices;
     }
-    CoTaskMemFree(device_id_wstr);
 
-    hr = device->lpVtbl->OpenPropertyStore(device, STGM_READ, &props);
-    if (SUCCEEDED(hr)) {
-      hr = props->lpVtbl->GetValue(props, &PKEY_Device_FriendlyName, &var_name);
-      if (SUCCEEDED(hr) && var_name.vt == VT_LPWSTR) {
-        char *friendly_name_utf8 = lpwstr_to_utf8(var_name.pwszVal);
-        if (friendly_name_utf8) {
-          strncpy(devices[i].name, friendly_name_utf8,
-                  MINIAV_DEVICE_NAME_MAX_LEN - 1);
-          devices[i].name[MINIAV_DEVICE_NAME_MAX_LEN - 1] = '\0';
-          miniav_free(friendly_name_utf8);
-        }
+    UINT device_count = 0;
+    hr = device_collection->lpVtbl->GetCount(device_collection, &device_count);
+    if (FAILED(hr)) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI Enum Process: DeviceCollection GetCount failed: 0x%lx",
+                 hr);
+      result_code = hresult_to_miniavresult(hr);
+      goto cleanup_proc_enum_all_devices;
+    }
+
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "WASAPI Enum Process: Found %u active render devices to check.",
+               device_count);
+
+    for (UINT i = 0; i < device_count; ++i) {
+      IMMDevice *current_device = NULL;
+      IAudioSessionManager2 *session_manager = NULL;
+      IAudioSessionEnumerator *session_enum = NULL;
+
+      hr = device_collection->lpVtbl->Item(device_collection, i,
+                                           &current_device);
+      if (FAILED(hr) || !current_device) {
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "WASAPI Enum Process: Failed to get device item %u: 0x%lx",
+                   i, hr);
+        continue;
       }
-      PropVariantClear(&var_name);
-      props->lpVtbl->Release(props);
+
+      // Attempt to activate IAudioSessionManager2 on the current_device
+      hr = current_device->lpVtbl->Activate(
+          current_device, &IID_IAudioSessionManager2, CLSCTX_ALL, NULL,
+          (void **)&session_manager);
+
+      if (FAILED(hr)) {
+        if (hr == E_NOINTERFACE) {
+          // Log that this specific device doesn't support it, but continue to
+          // the next device
+          LPWSTR dbg_dev_id_wstr = NULL;
+          current_device->lpVtbl->GetId(current_device, &dbg_dev_id_wstr);
+          char *dbg_dev_id_utf8 = dbg_dev_id_wstr
+                                      ? lpwstr_to_utf8(dbg_dev_id_wstr)
+                                      : miniav_strdup("(unknown ID)");
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "WASAPI Enum Process: Device %s does not support "
+                     "IAudioSessionManager2 (0x%lx). Skipping.",
+                     dbg_dev_id_utf8 ? dbg_dev_id_utf8 : "(conversion failed)",
+                     hr);
+          if (dbg_dev_id_wstr)
+            CoTaskMemFree(dbg_dev_id_wstr);
+          if (dbg_dev_id_utf8)
+            miniav_free(dbg_dev_id_utf8);
+        } else {
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "WASAPI Enum Process: Failed to activate "
+                     "IAudioSessionManager2 on device %u: 0x%lx. Skipping.",
+                     i, hr);
+        }
+        if (session_manager)
+          session_manager->lpVtbl->Release(
+              session_manager); // Should be NULL if Activate failed
+        current_device->lpVtbl->Release(current_device);
+        continue; // Try next device
+      }
+      miniav_log(
+          MINIAV_LOG_LEVEL_DEBUG,
+          "WASAPI Enum Process: IAudioSessionManager2 activated for device %u.",
+          i);
+
+      hr = session_manager->lpVtbl->GetSessionEnumerator(session_manager,
+                                                         &session_enum);
+      if (FAILED(hr) || !session_enum) {
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "WASAPI Enum Process: GetSessionEnumerator failed for "
+                   "device %u: 0x%lx. Skipping.",
+                   i, hr);
+        if (session_enum)
+          session_enum->lpVtbl->Release(session_enum);
+        session_manager->lpVtbl->Release(session_manager);
+        current_device->lpVtbl->Release(current_device);
+        continue;
+      }
+
+      int session_count = 0;
+      hr = session_enum->lpVtbl->GetCount(session_enum, &session_count);
+      if (FAILED(hr)) {
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "WASAPI Enum Process: SessionEnumerator GetCount failed for "
+                   "device %u: 0x%lx. Skipping.",
+                   i, hr);
+        session_enum->lpVtbl->Release(session_enum);
+        session_manager->lpVtbl->Release(session_manager);
+        current_device->lpVtbl->Release(current_device);
+        continue;
+      }
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WASAPI Enum Process: Device %u has %d audio sessions.", i,
+                 session_count);
+
+      for (int j = 0; j < session_count && found_count < MAX_POTENTIAL_TARGETS;
+           ++j) {
+        IAudioSessionControl *session_control = NULL;
+        IAudioSessionControl2 *session_control2 = NULL;
+        DWORD process_id = 0;
+
+        hr =
+            session_enum->lpVtbl->GetSession(session_enum, j, &session_control);
+        if (FAILED(hr) || !session_control) {
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "WASAPI Enum Process: GetSession failed for session %d on "
+                     "device %u: 0x%lx",
+                     j, i, hr);
+          continue;
+        }
+
+        hr = session_control->lpVtbl->QueryInterface(
+            session_control, &IID_IAudioSessionControl2,
+            (void **)&session_control2);
+        if (SUCCEEDED(hr) && session_control2) {
+          hr = session_control2->lpVtbl->GetProcessId(session_control2,
+                                                      &process_id);
+          if (SUCCEEDED(hr) && process_id != 0 &&
+              process_id != GetCurrentProcessId()) {
+            char process_name[MINIAV_DEVICE_NAME_MAX_LEN] = "Unknown Process";
+            get_process_name_by_pid(process_id, process_name,
+                                    MINIAV_DEVICE_NAME_MAX_LEN);
+
+            BOOL already_added = FALSE;
+            char pid_str_check[MINIAV_DEVICE_ID_MAX_LEN];
+            snprintf(pid_str_check, MINIAV_DEVICE_ID_MAX_LEN, "pid:%lu",
+                     process_id);
+            for (uint32_t k = 0; k < found_count; ++k) {
+              if (strcmp(temp_devices_list[k].device_id, pid_str_check) == 0) {
+                already_added = TRUE;
+                break;
+              }
+            }
+
+            if (!already_added) {
+              strncpy(temp_devices_list[found_count].name, process_name,
+                      MINIAV_DEVICE_NAME_MAX_LEN - 1);
+              temp_devices_list[found_count]
+                  .name[MINIAV_DEVICE_NAME_MAX_LEN - 1] = '\0';
+              snprintf(temp_devices_list[found_count].device_id,
+                       MINIAV_DEVICE_ID_MAX_LEN, "pid:%lu", process_id);
+              temp_devices_list[found_count].is_default =
+                  FALSE; // Individual processes are not "default" targets
+              found_count++;
+            }
+          } else if (FAILED(hr) && hr != AUDCLNT_E_ENDPOINT_CREATE_FAILED) {
+            miniav_log(MINIAV_LOG_LEVEL_WARN,
+                       "WASAPI Enum Process: GetProcessId failed for session "
+                       "%d on device %u: 0x%lx",
+                       j, i, hr);
+          }
+          session_control2->lpVtbl->Release(session_control2);
+        } else if (FAILED(hr)) {
+          miniav_log(
+              MINIAV_LOG_LEVEL_WARN,
+              "WASAPI Enum Process: QueryInterface for IAudioSessionControl2 "
+              "failed for session %d on device %u: 0x%lx",
+              j, i, hr);
+        }
+        session_control->lpVtbl->Release(session_control);
+      } // end for each session
+
+      if (session_enum)
+        session_enum->lpVtbl->Release(session_enum);
+      if (session_manager)
+        session_manager->lpVtbl->Release(session_manager);
+      if (current_device)
+        current_device->lpVtbl->Release(current_device);
+    } // end for each device
+
+  cleanup_proc_enum_all_devices: // New cleanup label
+    if (device_collection)
+      device_collection->lpVtbl->Release(device_collection);
+    if (all_device_enumerator)
+      all_device_enumerator->lpVtbl->Release(all_device_enumerator);
+    // result_code should be set if an error occurred before this point that
+    // warrants aborting. If we successfully iterated all devices, result_code
+    // remains MINIAV_SUCCESS.
+
+  } else if (target_type_filter == MINIAV_LOOPBACK_TARGET_WINDOW) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "WASAPI Enum: Enumerating window targets.");
+    EnumWindowsCallbackData callback_data = {temp_devices_list, 0,
+                                             MAX_POTENTIAL_TARGETS};
+    EnumWindows(enum_windows_proc, (LPARAM)&callback_data);
+    found_count = callback_data.current_count;
+  } else if (target_type_filter == MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO ||
+             target_type_filter == MINIAV_LOOPBACK_TARGET_NONE) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "WASAPI Enum: Enumerating system audio render devices.");
+    IMMDeviceEnumerator *enumerator = NULL;
+    IMMDeviceCollection *collection = NULL;
+    uint32_t system_device_count = 0;
+
+    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                          &IID_IMMDeviceEnumerator, (void **)&enumerator);
+    if (FAILED(hr)) {
+      result_code = hresult_to_miniavresult(hr);
+      goto cleanup_sys_enum;
     }
-    device->lpVtbl->Release(device);
+
+    hr = enumerator->lpVtbl->EnumAudioEndpoints(
+        enumerator, eRender, DEVICE_STATE_ACTIVE, &collection);
+    if (FAILED(hr)) {
+      result_code = hresult_to_miniavresult(hr);
+      goto cleanup_sys_enum;
+    }
+
+    hr = collection->lpVtbl->GetCount(collection, &system_device_count);
+    if (FAILED(hr)) {
+      result_code = hresult_to_miniavresult(hr);
+      goto cleanup_sys_enum;
+    }
+
+    if (system_device_count > 0) {
+      for (UINT i = 0;
+           i < system_device_count && found_count < MAX_POTENTIAL_TARGETS;
+           ++i) {
+        IMMDevice *device = NULL;
+        LPWSTR device_id_wstr = NULL;
+        IPropertyStore *props = NULL;
+        PROPVARIANT var_name;
+        PropVariantInit(&var_name);
+
+        hr = collection->lpVtbl->Item(collection, i, &device);
+        if (FAILED(hr))
+          continue;
+
+        hr = device->lpVtbl->GetId(device, &device_id_wstr);
+        if (SUCCEEDED(hr)) {
+          char *device_id_utf8 = lpwstr_to_utf8(device_id_wstr);
+          if (device_id_utf8) {
+            strncpy(temp_devices_list[found_count].device_id, device_id_utf8,
+                    MINIAV_DEVICE_ID_MAX_LEN - 1);
+            temp_devices_list[found_count]
+                .device_id[MINIAV_DEVICE_ID_MAX_LEN - 1] = '\0';
+            miniav_free(device_id_utf8);
+          }
+          CoTaskMemFree(device_id_wstr);
+        } else {
+          device->lpVtbl->Release(device);
+          continue;
+        }
+
+        hr = device->lpVtbl->OpenPropertyStore(device, STGM_READ, &props);
+        if (SUCCEEDED(hr)) {
+          hr = props->lpVtbl->GetValue(props, &PKEY_Device_FriendlyName,
+                                       &var_name);
+          if (SUCCEEDED(hr) && var_name.vt == VT_LPWSTR) {
+            char *friendly_name_utf8 = lpwstr_to_utf8(var_name.pwszVal);
+            if (friendly_name_utf8) {
+              strncpy(temp_devices_list[found_count].name, friendly_name_utf8,
+                      MINIAV_DEVICE_NAME_MAX_LEN - 1);
+              temp_devices_list[found_count]
+                  .name[MINIAV_DEVICE_NAME_MAX_LEN - 1] = '\0';
+              miniav_free(friendly_name_utf8);
+            }
+          }
+          PropVariantClear(&var_name);
+          props->lpVtbl->Release(props);
+        }
+        // Check if this is the default device
+        IMMDevice *defaultRenderDevice = NULL;
+        if (SUCCEEDED(enumerator->lpVtbl->GetDefaultAudioEndpoint(
+                enumerator, eRender, eConsole, &defaultRenderDevice))) {
+          LPWSTR defaultDeviceIdWstr = NULL;
+          if (SUCCEEDED(defaultRenderDevice->lpVtbl->GetId(
+                  defaultRenderDevice, &defaultDeviceIdWstr))) {
+            if (wcscmp(device_id_wstr, defaultDeviceIdWstr) == 0) {
+              temp_devices_list[found_count].is_default = TRUE;
+            } else {
+              temp_devices_list[found_count].is_default = FALSE;
+            }
+            CoTaskMemFree(defaultDeviceIdWstr);
+          }
+          defaultRenderDevice->lpVtbl->Release(defaultRenderDevice);
+        } else {
+          temp_devices_list[found_count].is_default = FALSE;
+        }
+
+        device->lpVtbl->Release(device);
+        found_count++;
+      }
+    }
+  cleanup_sys_enum:
+    if (collection)
+      collection->lpVtbl->Release(collection);
+    if (enumerator)
+      enumerator->lpVtbl->Release(enumerator);
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "WASAPI Enum: Unsupported target_type_filter: %d",
+               target_type_filter);
+    result_code = MINIAV_ERROR_INVALID_ARG;
   }
 
-  *targets_out = devices;
-  *count_out = device_count;
+  if (result_code == MINIAV_SUCCESS && found_count > 0) {
+    *targets_out = (MiniAVDeviceInfo *)miniav_calloc(found_count,
+                                                     sizeof(MiniAVDeviceInfo));
+    if (*targets_out) {
+      memcpy(*targets_out, temp_devices_list,
+             found_count * sizeof(MiniAVDeviceInfo));
+      *count_out = found_count;
+    } else {
+      result_code = MINIAV_ERROR_OUT_OF_MEMORY;
+      *count_out = 0;
+    }
+  } else if (result_code == MINIAV_SUCCESS && found_count == 0) {
+    miniav_log(MINIAV_LOG_LEVEL_INFO,
+               "WASAPI Enum: No targets found for filter type %d.",
+               target_type_filter);
+    // Still success, just no devices.
+  }
 
-  collection->lpVtbl->Release(collection);
-  enumerator->lpVtbl->Release(enumerator);
+cleanup_enum:
+  if (temp_devices_list)
+    miniav_free(temp_devices_list);
   if (com_initialized_here)
     CoUninitialize();
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "WASAPI Enum: Enumerated %u loopback target devices.",
-             device_count);
-  return MINIAV_SUCCESS;
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WASAPI Enum: Enumerated %u targets.",
+             *count_out);
+  return result_code;
 }
 
-MiniAVResultCode
-wasapi_configure_loopback(MiniAVLoopbackContext *ctx,
-                          const MiniAVLoopbackTargetInfo *target_info,
-                          const char *target_device_id_utf8,
-                          const MiniAVAudioInfo *requested_format) {
+MiniAVResultCode wasapi_configure_loopback(
+    MiniAVLoopbackContext *ctx,
+    const MiniAVLoopbackTargetInfo *target_info, // Primary identifier
+    const char *target_device_id_utf8, // Used if target_info is NULL or type
+                                       // is SYSTEM_AUDIO for specific device
+    const MiniAVAudioInfo
+        *requested_format) { // requested_format is for reference, WASAPI uses
+                             // mix format
   LoopbackPlatformContextWinWasapi *platform_ctx =
       (LoopbackPlatformContextWinWasapi *)ctx->platform_ctx;
   HRESULT hr;
+  MiniAVResultCode mres = MINIAV_SUCCESS;
+  IAudioClient *temp_audio_client = NULL;
+  IAudioClient3 *audio_client3 = NULL;
+  IMMDevice *target_imm_device = NULL;
 
-  if (platform_ctx->capture_format)
+  MINIAV_UNUSED(
+      requested_format); // WASAPI loopback uses the device's mix format
+
+  // --- Cleanup existing resources if re-configuring ---
+  if (platform_ctx->capture_format) {
     CoTaskMemFree(platform_ctx->capture_format);
-  platform_ctx->capture_format = NULL;
-  if (platform_ctx->mix_format)
+    platform_ctx->capture_format = NULL;
+  }
+  if (platform_ctx->mix_format) {
     CoTaskMemFree(platform_ctx->mix_format);
-  platform_ctx->mix_format = NULL;
+    platform_ctx->mix_format = NULL;
+  }
   if (platform_ctx->capture_client) {
     platform_ctx->capture_client->lpVtbl->Release(platform_ctx->capture_client);
     platform_ctx->capture_client = NULL;
@@ -534,133 +893,292 @@ wasapi_configure_loopback(MiniAVLoopbackContext *ctx,
     platform_ctx->audio_device->lpVtbl->Release(platform_ctx->audio_device);
     platform_ctx->audio_device = NULL;
   }
-  if (platform_ctx->device_enumerator) {
-    platform_ctx->device_enumerator->lpVtbl->Release(
-        platform_ctx->device_enumerator);
-    platform_ctx->device_enumerator = NULL;
+  // Keep device_enumerator if already created by init, or create if needed
+  if (!platform_ctx->device_enumerator) {
+    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                          &IID_IMMDeviceEnumerator,
+                          (void **)&platform_ctx->device_enumerator);
+    if (FAILED(hr)) {
+      miniav_log(
+          MINIAV_LOG_LEVEL_ERROR,
+          "WASAPI Cfg: CoCreateInstance for MMDeviceEnumerator failed: 0x%lx",
+          hr);
+      return hresult_to_miniavresult(hr);
+    }
   }
 
   platform_ctx->attempt_process_specific_capture = FALSE;
   platform_ctx->target_process_id = 0;
+  DWORD actual_target_pid_for_init = 0;
 
-  hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
-                        &IID_IMMDeviceEnumerator,
-                        (void **)&platform_ctx->device_enumerator);
-  if (FAILED(hr)) {
-    miniav_log(
-        MINIAV_LOG_LEVEL_ERROR,
-        "WASAPI Cfg: CoCreateInstance for MMDeviceEnumerator failed: 0x%lx",
-        hr);
-    return hresult_to_miniavresult(hr);
+  // --- Determine target IMMDevice and PID for process-specific capture ---
+  if (target_info != NULL) {
+    if (target_info->type == MINIAV_LOOPBACK_TARGET_PROCESS) {
+      actual_target_pid_for_init = target_info->TARGETHANDLE.process_id;
+      platform_ctx->attempt_process_specific_capture = TRUE;
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WASAPI Cfg: Target type PROCESS, PID: %lu",
+                 actual_target_pid_for_init);
+      // For process-specific, loopback is on the default render device,
+      // filtered by PID
+      hr = platform_ctx->device_enumerator->lpVtbl->GetDefaultAudioEndpoint(
+          platform_ctx->device_enumerator, eRender, eConsole,
+          &target_imm_device);
+    } else if (target_info->type == MINIAV_LOOPBACK_TARGET_WINDOW) {
+      HWND hwnd = (HWND)target_info->TARGETHANDLE.window_handle;
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WASAPI Cfg: Target type WINDOW, HWND: %p", hwnd);
+      if (hwnd != NULL &&
+          GetWindowThreadProcessId(hwnd, &actual_target_pid_for_init) &&
+          actual_target_pid_for_init != 0) {
+        platform_ctx->attempt_process_specific_capture = TRUE;
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "WASAPI Cfg: Resolved HWND to PID: %lu",
+                   actual_target_pid_for_init);
+      } else {
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "WASAPI Cfg: Could not get PID for HWND %p or HWND is NULL. "
+                   "Falling back.",
+                   hwnd);
+        actual_target_pid_for_init = 0; // Fallback
+      }
+      // For window (process-specific), loopback is on the default render
+      // device, filtered by PID
+      hr = platform_ctx->device_enumerator->lpVtbl->GetDefaultAudioEndpoint(
+          platform_ctx->device_enumerator, eRender, eConsole,
+          &target_imm_device);
+    } else if (target_info->type == MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO ||
+               target_info->type == MINIAV_LOOPBACK_TARGET_NONE) {
+      if (target_device_id_utf8 && strlen(target_device_id_utf8) > 0) {
+        LPWSTR device_id_wstr = utf8_to_lpwstr(target_device_id_utf8);
+        if (!device_id_wstr) {
+          mres = MINIAV_ERROR_OUT_OF_MEMORY;
+          goto config_cleanup;
+        }
+        hr = platform_ctx->device_enumerator->lpVtbl->GetDevice(
+            platform_ctx->device_enumerator, device_id_wstr,
+            &target_imm_device);
+        miniav_free(device_id_wstr);
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "WASAPI Cfg: Target type SYSTEM_AUDIO with specific "
+                   "device ID: %s",
+                   target_device_id_utf8);
+      } else {
+        hr = platform_ctx->device_enumerator->lpVtbl->GetDefaultAudioEndpoint(
+            platform_ctx->device_enumerator, eRender, eConsole,
+            &target_imm_device);
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "WASAPI Cfg: Target type SYSTEM_AUDIO (default device)");
+      }
+    } else { // Should not happen if public API validates type
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI Cfg: Invalid target_info->type: %d",
+                 target_info->type);
+      mres = MINIAV_ERROR_INVALID_ARG;
+      goto config_cleanup;
+    }
+  } else { // target_info is NULL, rely on target_device_id_utf8 or default
+    if (target_device_id_utf8 && strlen(target_device_id_utf8) > 0) {
+      LPWSTR device_id_wstr = utf8_to_lpwstr(target_device_id_utf8);
+      if (!device_id_wstr) {
+        mres = MINIAV_ERROR_OUT_OF_MEMORY;
+        goto config_cleanup;
+      }
+      hr = platform_ctx->device_enumerator->lpVtbl->GetDevice(
+          platform_ctx->device_enumerator, device_id_wstr, &target_imm_device);
+      miniav_free(device_id_wstr);
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WASAPI Cfg: target_info NULL, using specific device ID: %s",
+                 target_device_id_utf8);
+    } else {
+      hr = platform_ctx->device_enumerator->lpVtbl->GetDefaultAudioEndpoint(
+          platform_ctx->device_enumerator, eRender, eConsole,
+          &target_imm_device);
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WASAPI Cfg: target_info NULL, using default render device.");
+    }
   }
 
-  if (target_info && target_info->type == MINIAV_LOOPBACK_TARGET_PROCESS) {
-    platform_ctx->target_process_id = target_info->TARGETHANDLE.process_id;
-    platform_ctx->attempt_process_specific_capture = TRUE;
-    miniav_log(MINIAV_LOG_LEVEL_INFO,
-               "WASAPI Cfg: Attempting process-specific loopback for PID: %lu",
-               platform_ctx->target_process_id);
-    hr = platform_ctx->device_enumerator->lpVtbl->GetDefaultAudioEndpoint(
-        platform_ctx->device_enumerator, eRender, eConsole,
-        &platform_ctx->audio_device);
-  } else if (target_device_id_utf8 && strlen(target_device_id_utf8) > 0) {
-    LPWSTR device_id_wstr = utf8_to_lpwstr(target_device_id_utf8);
-    if (!device_id_wstr)
-      return MINIAV_ERROR_OUT_OF_MEMORY;
-    hr = platform_ctx->device_enumerator->lpVtbl->GetDevice(
-        platform_ctx->device_enumerator, device_id_wstr,
-        &platform_ctx->audio_device);
-    miniav_free(device_id_wstr);
-  } else {
-    hr = platform_ctx->device_enumerator->lpVtbl->GetDefaultAudioEndpoint(
-        platform_ctx->device_enumerator, eRender, eConsole,
-        &platform_ctx->audio_device);
-  }
-
-  if (FAILED(hr)) {
+  if (FAILED(hr) || !target_imm_device) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WASAPI Cfg: Failed to get audio device: 0x%lx", hr);
-    return hresult_to_miniavresult(hr);
+               "WASAPI Cfg: Failed to get target IMMDevice: 0x%lx", hr);
+    mres = hresult_to_miniavresult(hr);
+    goto config_cleanup;
   }
+  platform_ctx->audio_device =
+      target_imm_device; // Store it, it's now owned by platform_ctx
 
+  // --- Activate IAudioClient from the chosen IMMDevice ---
   hr = platform_ctx->audio_device->lpVtbl->Activate(
       platform_ctx->audio_device, &IID_IAudioClient, CLSCTX_ALL, NULL,
-      (void **)&platform_ctx->audio_client);
+      (void **)&temp_audio_client);
   if (FAILED(hr)) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WASAPI Cfg: Failed to activate audio client: 0x%lx", hr);
-    return hresult_to_miniavresult(hr);
+               "WASAPI Cfg: Failed to activate IAudioClient: 0x%lx", hr);
+    mres = hresult_to_miniavresult(hr);
+    goto config_cleanup;
   }
-
-  hr = platform_ctx->audio_client->lpVtbl->GetMixFormat(
-      platform_ctx->audio_client, &platform_ctx->mix_format);
-  if (FAILED(hr)) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WASAPI Cfg: Failed to get mix format: 0x%lx", hr);
-    return hresult_to_miniavresult(hr);
-  }
-
-  platform_ctx->capture_format = (WAVEFORMATEX *)CoTaskMemAlloc(
-      sizeof(WAVEFORMATEX) + platform_ctx->mix_format->cbSize);
-  if (!platform_ctx->capture_format)
-    return MINIAV_ERROR_OUT_OF_MEMORY;
-  memcpy(platform_ctx->capture_format, platform_ctx->mix_format,
-         sizeof(WAVEFORMATEX) + platform_ctx->mix_format->cbSize);
-
-  waveformat_to_miniav_audio_format(platform_ctx->capture_format,
-                                    &ctx->configured_format);
 
   DWORD stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK;
 
+  // --- Attempt Process-Specific Path (IAudioClient3) ---
   if (platform_ctx->attempt_process_specific_capture &&
-      platform_ctx->target_process_id != 0) {
-    IAudioClient3 *audio_client3 = NULL;
-    hr = platform_ctx->audio_client->lpVtbl->QueryInterface(
-        platform_ctx->audio_client, &IID_IAudioClient3,
-        (void **)&audio_client3);
+      actual_target_pid_for_init != 0) {
+    platform_ctx->target_process_id =
+        actual_target_pid_for_init; // Store for logging/debugging
+    hr = temp_audio_client->lpVtbl->QueryInterface(
+        temp_audio_client, &IID_IAudioClient3, (void **)&audio_client3);
     if (SUCCEEDED(hr) && audio_client3) {
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "WASAPI Cfg: IAudioClient3 available. Process-specific "
-                 "capture might be possible via InitializeSharedAudioStream.");
-      // The AUDCLNT_STREAMFLAGS_LOOPBACK_PROCESS_ID_ONLY flag is used with
-      // IAudioClient3::InitializeSharedAudioStream.
-      // This simplified example uses IAudioClient::Initialize, which doesn't
-      // support that flag. A full implementation would need to use the
-      // IAudioClient3 path here.
-      miniav_log(
-          MINIAV_LOG_LEVEL_WARN,
-          "WASAPI Cfg: Process-specific capture requested, but this example "
-          "uses IAudioClient::Initialize. True process isolation requires "
-          "IAudioClient3::InitializeSharedAudioStream.");
-      audio_client3->lpVtbl->Release(audio_client3);
+                 "WASAPI Cfg: IAudioClient3 obtained. Attempting "
+                 "process-specific stream for PID: %lu",
+                 actual_target_pid_for_init);
+
+      hr = temp_audio_client->lpVtbl->GetMixFormat(temp_audio_client,
+                                                   &platform_ctx->mix_format);
+      if (FAILED(hr)) {
+        miniav_log(
+            MINIAV_LOG_LEVEL_ERROR,
+            "WASAPI Cfg: GetMixFormat (for IAudioClient3 path) failed: 0x%lx",
+            hr);
+        mres = hresult_to_miniavresult(hr);
+        audio_client3->lpVtbl->Release(audio_client3);
+        audio_client3 = NULL;
+        goto config_cleanup_after_temp_client;
+      }
+      platform_ctx->capture_format = (WAVEFORMATEX *)CoTaskMemAlloc(
+          sizeof(WAVEFORMATEX) + platform_ctx->mix_format->cbSize);
+      if (!platform_ctx->capture_format) {
+        mres = MINIAV_ERROR_OUT_OF_MEMORY;
+        audio_client3->lpVtbl->Release(audio_client3);
+        audio_client3 = NULL;
+        goto config_cleanup_after_temp_client;
+      }
+      memcpy(platform_ctx->capture_format, platform_ctx->mix_format,
+             sizeof(WAVEFORMATEX) + platform_ctx->mix_format->cbSize);
+
+      AudioClientProperties client_props = {0};
+      client_props.cbSize = sizeof(AudioClientProperties);
+      client_props.bIsOffload = FALSE;
+      client_props.eCategory = AudioCategory_Other;
+      hr = audio_client3->lpVtbl->SetClientProperties(audio_client3,
+                                                      &client_props);
+      if (FAILED(hr)) {
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "WASAPI Cfg: SetClientProperties failed: 0x%lx (continuing)",
+                   hr);
+      }
+
+      hr = audio_client3->lpVtbl->InitializeSharedAudioStream(
+          audio_client3,
+          stream_flags, // This should contain AUDCLNT_STREAMFLAGS_LOOPBACK
+          actual_target_pid_for_init, // This non-zero PID enables
+                                      // process-specific capture
+          platform_ctx->capture_format, NULL);
+
+      if (SUCCEEDED(hr)) {
+        platform_ctx->audio_client = (IAudioClient *)
+            audio_client3; // Store IAudioClient3 as IAudioClient
+        temp_audio_client->lpVtbl->Release(
+            temp_audio_client); // temp_audio_client is now superseded
+        temp_audio_client = NULL;
+        // audio_client3 is now platform_ctx->audio_client, don't release
+        // audio_client3 here
+      } else {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "WASAPI Cfg: InitializeSharedAudioStream for PID %lu "
+                   "failed: 0x%lx. Falling back to standard loopback.",
+                   actual_target_pid_for_init, hr);
+        audio_client3->lpVtbl->Release(audio_client3);
+        audio_client3 = NULL;
+        platform_ctx->attempt_process_specific_capture = FALSE;
+        platform_ctx->target_process_id = 0;
+        stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK; // Reset flags
+        platform_ctx->audio_client = temp_audio_client;
+        temp_audio_client =
+            NULL; // temp_audio_client is now platform_ctx->audio_client
+      }
     } else {
       miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "WASAPI Cfg: IAudioClient3 not available. Process-specific "
-                 "capture may not work as intended.");
+                 "WASAPI Cfg: IAudioClient3 not available/QueryInterface "
+                 "failed (0x%lx). Falling back to standard loopback.",
+                 hr);
+      platform_ctx->attempt_process_specific_capture = FALSE;
+      platform_ctx->target_process_id = 0;
+      platform_ctx->audio_client = temp_audio_client;
+      temp_audio_client =
+          NULL; // temp_audio_client is now platform_ctx->audio_client
     }
+  } else { // Standard device/system loopback or fallback from
+           // process-specific
+    platform_ctx->attempt_process_specific_capture =
+        FALSE; // Ensure it's false if we didn't even try
+    platform_ctx->target_process_id = 0;
+    platform_ctx->audio_client = temp_audio_client;
+    temp_audio_client =
+        NULL; // temp_audio_client is now platform_ctx->audio_client
   }
 
-  REFERENCE_TIME hns_requested_duration = 0;
-  hr = platform_ctx->audio_client->lpVtbl->Initialize(
-      platform_ctx->audio_client, AUDCLNT_SHAREMODE_SHARED, stream_flags,
-      hns_requested_duration, 0, platform_ctx->capture_format, NULL);
-
-  if (FAILED(hr)) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WASAPI Cfg: Failed to initialize audio client: 0x%lx", hr);
-    if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
+  // --- Common Initialization (if not done by IAudioClient3 or if fallback)
+  // ---
+  if (!platform_ctx
+           ->capture_format) { // If format wasn't set by IAudioClient3 path
+    hr = platform_ctx->audio_client->lpVtbl->GetMixFormat(
+        platform_ctx->audio_client, &platform_ctx->mix_format);
+    if (FAILED(hr)) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "WASAPI Cfg: Requested format not supported by endpoint.");
+                 "WASAPI Cfg: GetMixFormat (standard path) failed: 0x%lx", hr);
+      mres = hresult_to_miniavresult(hr);
+      goto config_cleanup;
     }
-    return hresult_to_miniavresult(hr);
+    platform_ctx->capture_format = (WAVEFORMATEX *)CoTaskMemAlloc(
+        sizeof(WAVEFORMATEX) + platform_ctx->mix_format->cbSize);
+    if (!platform_ctx->capture_format) {
+      mres = MINIAV_ERROR_OUT_OF_MEMORY;
+      goto config_cleanup;
+    }
+    memcpy(platform_ctx->capture_format, platform_ctx->mix_format,
+           sizeof(WAVEFORMATEX) + platform_ctx->mix_format->cbSize);
   }
+
+  // Initialize IAudioClient if IAudioClient3 path wasn't taken or failed and
+  // fell back to IAudioClient The IAudioClient3 path calls
+  // InitializeSharedAudioStream which is its form of Initialize. So, only
+  // call Initialize if platform_ctx->audio_client is an IAudioClient that
+  // hasn't been initialized yet. A simple way to check: if it's not an
+  // IAudioClient3 (audio_client3 is NULL after attempts) or if we explicitly
+  // fell back.
+  if (!audio_client3 &&
+      platform_ctx->audio_client) { // audio_client3 is NULL if IAudioClient3
+                                    // path wasn't taken or failed before its
+                                    // assignment to platform_ctx->audio_client
+    REFERENCE_TIME hns_requested_duration = 0;
+    hr = platform_ctx->audio_client->lpVtbl->Initialize(
+        platform_ctx->audio_client, AUDCLNT_SHAREMODE_SHARED, stream_flags,
+        hns_requested_duration, 0, platform_ctx->capture_format, NULL);
+    if (FAILED(hr)) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI Cfg: IAudioClient::Initialize failed: 0x%lx", hr);
+      if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "WASAPI Cfg: Format not supported by endpoint for "
+                   "IAudioClient::Initialize.");
+      }
+      mres = hresult_to_miniavresult(hr);
+      goto config_cleanup;
+    }
+  }
+
+  waveformat_to_miniav_audio_format(platform_ctx->capture_format,
+                                    &ctx->configured_format);
 
   hr = platform_ctx->audio_client->lpVtbl->GetBufferSize(
       platform_ctx->audio_client, &platform_ctx->buffer_frame_count);
   if (FAILED(hr)) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WASAPI Cfg: Failed to get buffer size: 0x%lx", hr);
-    return hresult_to_miniavresult(hr);
+               "WASAPI Cfg: GetBufferSize failed: 0x%lx", hr);
+    mres = hresult_to_miniavresult(hr);
+    goto config_cleanup;
   }
 
   hr = platform_ctx->audio_client->lpVtbl->GetService(
@@ -668,15 +1186,56 @@ wasapi_configure_loopback(MiniAVLoopbackContext *ctx,
       (void **)&platform_ctx->capture_client);
   if (FAILED(hr)) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WASAPI Cfg: Failed to get capture client service: 0x%lx", hr);
-    return hresult_to_miniavresult(hr);
+               "WASAPI Cfg: GetService for IAudioCaptureClient failed: 0x%lx",
+               hr);
+    mres = hresult_to_miniavresult(hr);
+    goto config_cleanup;
   }
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "WASAPI Cfg: Loopback configured. Buffer frame count: %u",
-             platform_ctx->buffer_frame_count);
+             "WASAPI Cfg: Loopback configured. Buffer frames: %u. Process "
+             "specific: %s (PID: %lu)",
+             platform_ctx->buffer_frame_count,
+             platform_ctx->attempt_process_specific_capture ? "Yes" : "No",
+             platform_ctx->target_process_id);
   ctx->is_configured = true;
-  return MINIAV_SUCCESS;
+  mres = MINIAV_SUCCESS;
+
+config_cleanup_after_temp_client:
+  if (temp_audio_client) { // Only release if it wasn't assigned to
+                           // platform_ctx->audio_client or superseded
+    temp_audio_client->lpVtbl->Release(temp_audio_client);
+  }
+config_cleanup:
+  // platform_ctx->audio_device is released by wasapi_destroy_platform or if
+  // it's replaced. platform_ctx->device_enumerator is kept.
+  // platform_ctx->audio_client and capture_client are released by destroy or
+  // if replaced.
+  if (mres != MINIAV_SUCCESS) {
+    // Minimal cleanup here, full cleanup in destroy_platform
+    if (platform_ctx->capture_client) {
+      platform_ctx->capture_client->lpVtbl->Release(
+          platform_ctx->capture_client);
+      platform_ctx->capture_client = NULL;
+    }
+    if (platform_ctx->audio_client) {
+      platform_ctx->audio_client->lpVtbl->Release(platform_ctx->audio_client);
+      platform_ctx->audio_client = NULL;
+    }
+    // audio_device is tricky, it's owned by platform_ctx now. If config fails
+    // early, it might not be set. If it was set and then config failed,
+    // destroy_platform will get it.
+    if (platform_ctx->capture_format) {
+      CoTaskMemFree(platform_ctx->capture_format);
+      platform_ctx->capture_format = NULL;
+    }
+    if (platform_ctx->mix_format) {
+      CoTaskMemFree(platform_ctx->mix_format);
+      platform_ctx->mix_format = NULL;
+    }
+    ctx->is_configured = false;
+  }
+  return mres;
 }
 
 MiniAVResultCode wasapi_start_capture(MiniAVLoopbackContext *ctx,
@@ -761,7 +1320,7 @@ MiniAVResultCode wasapi_get_configured_format(MiniAVLoopbackContext *ctx,
 static const LoopbackContextInternalOps g_wasapi_loopback_ops = {
     .init_platform = wasapi_init_platform,
     .destroy_platform = wasapi_destroy_platform,
-    .enumerate_targets_platform = NULL,
+    .enumerate_targets_platform = miniav_loopback_enumerate_targets_win,
     .configure_loopback = wasapi_configure_loopback,
     .start_capture = wasapi_start_capture,
     .stop_capture = wasapi_stop_capture,

@@ -5,6 +5,7 @@
 #include "../../common/miniav_logging.h"
 #include "../../common/miniav_time.h"
 #include "../../common/miniav_utils.h" // For miniav_calloc, miniav_free, strncpy_s_miniav
+#include "../../loopback/loopback_context.h" // For MiniAVLoopbackContextHandle and related API
 
 #include <DispatcherQueue.h>
 #include <d3d11_4.h>
@@ -14,16 +15,11 @@
 #include <roapi.h>
 #include <windows.h>
 
-// C++/WinRT Headers
-#pragma warning(push)
-#pragma warning(                                                               \
-    disable : 4244 4267) // C++/WinRT generates some conversion warnings
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <winrt/Windows.System.h>
-#pragma warning(pop)
 
 // Interop header for creating GraphicsCaptureItem from HWND/HMONITOR
 #include <windows.graphics.capture.interop.h>
@@ -155,6 +151,11 @@ typedef struct WGCScreenPlatformContext {
   HWND selected_hwnd;                              // If window capture
   HMONITOR selected_hmonitor;                      // If display capture
 
+  // --- Audio Loopback Members ---
+  MiniAVLoopbackContextHandle loopback_audio_ctx;
+  BOOL audio_loopback_enabled_and_configured;
+  MiniAVAudioInfo configured_audio_format; // Actual format from loopback
+
 } WGCScreenPlatformContext;
 
 // --- Forward declarations for static functions ---
@@ -227,6 +228,8 @@ static MiniAVResultCode wgc_init_platform(MiniAVScreenContext *ctx) {
   wgc_ctx->pixel_format = MINIAV_PIXEL_FORMAT_BGRA32; // WGC default
   wgc_ctx->is_streaming = FALSE;
   wgc_ctx->qpc_frequency = miniav_get_qpc_frequency();
+  wgc_ctx->loopback_audio_ctx = NULL; // Initialize audio loopback members
+  wgc_ctx->audio_loopback_enabled_and_configured = FALSE;
 
   wgc_ctx->stop_event_handle =
       CreateEvent(NULL, TRUE, FALSE, NULL); // Manual-reset, non-signaled
@@ -276,17 +279,25 @@ static MiniAVResultCode wgc_destroy_platform(MiniAVScreenContext *ctx) {
     miniav_log(
         MINIAV_LOG_LEVEL_WARN,
         "WGC: Platform being destroyed while streaming. Attempting to stop.");
-    // This should ideally be called by MiniAV_Screen_StopCapture,
-    // but as a fallback:
+    // Ensure audio is stopped first if it was running
+    if (wgc_ctx->loopback_audio_ctx &&
+        wgc_ctx->audio_loopback_enabled_and_configured) {
+      MiniAV_Loopback_StopCapture(wgc_ctx->loopback_audio_ctx);
+    }
     if (wgc_ctx->stop_event_handle)
       SetEvent(wgc_ctx->stop_event_handle);
-    // Actual stopping logic is in wgc_stop_capture, which waits for thread.
-    // Here we just ensure resources are cleaned up.
-    // The session and frame pool are closed in wgc_stop_capture or
-    // wgc_cleanup_capture_resources
   }
   wgc_cleanup_capture_resources(wgc_ctx); // Cleans session, frame_pool, item
   wgc_cleanup_d3d_device(wgc_ctx);
+
+  // Destroy loopback audio context if it exists
+  if (wgc_ctx->loopback_audio_ctx) {
+    MiniAV_Loopback_DestroyContext(wgc_ctx->loopback_audio_ctx);
+    wgc_ctx->loopback_audio_ctx = NULL;
+    wgc_ctx->audio_loopback_enabled_and_configured = FALSE;
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "WGC: Loopback audio context destroyed.");
+  }
 
   if (wgc_ctx->stop_event_handle) {
     CloseHandle(wgc_ctx->stop_event_handle);
@@ -470,6 +481,13 @@ static MiniAVResultCode wgc_configure_capture_item(
   wgc_cleanup_capture_resources(
       wgc_ctx); // Clean up previous item, session, pool
 
+  // Clean up previous audio context if any, before configuring new video item
+  if (wgc_ctx->loopback_audio_ctx) {
+    MiniAV_Loopback_DestroyContext(wgc_ctx->loopback_audio_ctx);
+    wgc_ctx->loopback_audio_ctx = NULL;
+    wgc_ctx->audio_loopback_enabled_and_configured = FALSE;
+  }
+
   HMONITOR hmonitor = NULL;
   HWND hwnd = NULL;
 
@@ -529,7 +547,7 @@ static MiniAVResultCode wgc_configure_capture_item(
       wgc_ctx->target_fps =
           format->frame_rate_numerator / format->frame_rate_denominator;
     } else {
-      wgc_ctx->target_fps = 30; // Default
+      wgc_ctx->target_fps = 60;
     }
     if (wgc_ctx->target_fps == 0)
       wgc_ctx->target_fps = 1;
@@ -552,11 +570,101 @@ static MiniAVResultCode wgc_configure_capture_item(
     miniav_strlcpy(wgc_ctx->selected_item_id, item_id_utf8,
                    MINIAV_DEVICE_ID_MAX_LEN);
 
+    // --- Configure Audio Loopback (after video item is successfully created)
+    // ---
+    wgc_ctx->audio_loopback_enabled_and_configured = FALSE; // Default
+    if (wgc_ctx->parent_ctx->capture_audio_requested) {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WGC: Audio capture requested. Attempting to configure audio "
+                 "loopback.");
+      MiniAVResultCode audio_res =
+          MiniAV_Loopback_CreateContext(&wgc_ctx->loopback_audio_ctx);
+      if (audio_res == MINIAV_SUCCESS) {
+        MiniAVAudioInfo desired_audio_format; // Define your desired format
+        memset(&desired_audio_format, 0, sizeof(MiniAVAudioInfo));
+        desired_audio_format.format = MINIAV_AUDIO_FORMAT_F32;
+        desired_audio_format.channels = 2;
+        desired_audio_format.sample_rate = 48000;
+
+        const char *audio_target_device_id_str = NULL;
+        char process_id_string_buffer[64]; // Buffer for "PID:XXXXX"
+
+        if (target_type == WGC_TARGET_WINDOW && wgc_ctx->selected_hwnd) {
+          DWORD process_id = 0;
+          GetWindowThreadProcessId(wgc_ctx->selected_hwnd, &process_id);
+          if (process_id != 0) {
+            miniav_log(
+                MINIAV_LOG_LEVEL_DEBUG,
+                "WGC: Targeting audio from process PID: %lu for HWND: %p",
+                process_id, wgc_ctx->selected_hwnd);
+            // Construct the target_device_id_str for process
+            // Ensure your MiniAV_Loopback_Configure expects this format e.g.
+            // "PID:1234"
+            snprintf(process_id_string_buffer, sizeof(process_id_string_buffer),
+                     "PID:%lu", process_id);
+            audio_target_device_id_str = process_id_string_buffer;
+          } else {
+            miniav_log(MINIAV_LOG_LEVEL_WARN,
+                       "WGC: Could not get PID for HWND %p. Falling back to "
+                       "default system audio loopback.",
+                       wgc_ctx->selected_hwnd);
+            // audio_target_device_id_str remains NULL for default
+          }
+        }
+        // If not window target, or PID failed, audio_target_device_id_str
+        // remains NULL for default system audio
+
+        audio_res = MiniAV_Loopback_Configure(
+            wgc_ctx->loopback_audio_ctx,
+            audio_target_device_id_str, // Pass NULL for default system audio,
+                                        // or "PID:XXXX" for process
+            &desired_audio_format);
+
+        if (audio_res == MINIAV_SUCCESS) {
+          audio_res = MiniAV_Loopback_GetConfiguredFormat(
+              wgc_ctx->loopback_audio_ctx, &wgc_ctx->configured_audio_format);
+          if (audio_res == MINIAV_SUCCESS) {
+            wgc_ctx->audio_loopback_enabled_and_configured = TRUE;
+            miniav_log(
+                MINIAV_LOG_LEVEL_INFO,
+                "WGC: Audio loopback configured. Format: %d, Ch: %u, Rate: %u",
+                wgc_ctx->configured_audio_format.format,
+                wgc_ctx->configured_audio_format.channels,
+                wgc_ctx->configured_audio_format.sample_rate);
+          } else {
+            miniav_log(MINIAV_LOG_LEVEL_WARN,
+                       "WGC: Failed to get configured audio format: %s. Audio "
+                       "disabled.",
+                       MiniAV_GetErrorString(audio_res));
+            MiniAV_Loopback_DestroyContext(wgc_ctx->loopback_audio_ctx);
+            wgc_ctx->loopback_audio_ctx = NULL;
+          }
+        } else {
+          miniav_log(
+              MINIAV_LOG_LEVEL_WARN,
+              "WGC: Failed to configure audio loopback: %s. Audio disabled.",
+              MiniAV_GetErrorString(audio_res));
+          MiniAV_Loopback_DestroyContext(wgc_ctx->loopback_audio_ctx);
+          wgc_ctx->loopback_audio_ctx = NULL;
+        }
+      } else {
+        miniav_log(
+            MINIAV_LOG_LEVEL_WARN,
+            "WGC: Failed to create audio loopback context: %s. Audio disabled.",
+            MiniAV_GetErrorString(audio_res));
+      }
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: Audio capture not requested.");
+    }
+    // --- End Audio Loopback Configuration ---
+
     miniav_log(MINIAV_LOG_LEVEL_INFO,
                "WGC: Configured for item %s. Actual res: %ux%u, Target FPS: "
-               "%u, OutputPref: %d",
+               "%u, OutputPref: %d, Audio: %s",
                item_id_utf8, wgc_ctx->frame_width, wgc_ctx->frame_height,
-               wgc_ctx->target_fps, format->output_preference);
+               wgc_ctx->target_fps, format->output_preference,
+               wgc_ctx->audio_loopback_enabled_and_configured ? "Enabled"
+                                                              : "Disabled");
 
   } catch (winrt::hresult_error const &ex) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
@@ -617,6 +725,7 @@ static MiniAVResultCode wgc_start_capture(MiniAVScreenContext *ctx,
     return MINIAV_ERROR_INVALID_ARG;
   WGCScreenPlatformContext *wgc_ctx =
       (WGCScreenPlatformContext *)ctx->platform_ctx;
+  MiniAVResultCode res = MINIAV_SUCCESS;
 
   EnterCriticalSection(&wgc_ctx->critical_section);
   if (wgc_ctx->is_streaming) {
@@ -637,6 +746,28 @@ static MiniAVResultCode wgc_start_capture(MiniAVScreenContext *ctx,
   // Also update parent context's callback info
   wgc_ctx->parent_ctx->app_callback = callback;
   wgc_ctx->parent_ctx->app_callback_user_data = user_data;
+
+  // --- Start Audio Loopback Capture ---
+  if (wgc_ctx->loopback_audio_ctx &&
+      wgc_ctx->audio_loopback_enabled_and_configured) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: Starting audio loopback capture.");
+    res = MiniAV_Loopback_StartCapture(
+        wgc_ctx->loopback_audio_ctx,
+        wgc_ctx->app_callback_internal, // Use the same callback
+        wgc_ctx->app_callback_user_data_internal);
+    if (res != MINIAV_SUCCESS) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WGC: Failed to start audio loopback capture: %s. Proceeding "
+                 "with video only.",
+                 MiniAV_GetErrorString(res));
+      // Video will still attempt to start. Audio is considered optional here.
+      // To be very robust, you might set audio_loopback_enabled_and_configured
+      // to FALSE here.
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_INFO, "WGC: Audio loopback capture started.");
+    }
+  }
+  // --- End Audio Loopback Capture ---
 
   try {
     // Pixel format for frame pool is typically B8G8R8A8_UNORM
@@ -689,7 +820,8 @@ static MiniAVResultCode wgc_start_capture(MiniAVScreenContext *ctx,
         });
 
     ResetEvent(wgc_ctx->stop_event_handle);
-    wgc_ctx->is_streaming = TRUE;
+    wgc_ctx->is_streaming =
+        TRUE; // Set after potential audio start, before WGC session start
     wgc_ctx->session.StartCapture();
 
   } catch (winrt::hresult_error const &ex) {
@@ -697,6 +829,14 @@ static MiniAVResultCode wgc_start_capture(MiniAVScreenContext *ctx,
                ex.message().c_str(), ex.code().value);
     wgc_cleanup_capture_resources(wgc_ctx); // Clean up session, pool, item
     wgc_ctx->is_streaming = FALSE;
+    // If audio started successfully but video failed, stop audio
+    if (wgc_ctx->loopback_audio_ctx &&
+        wgc_ctx->audio_loopback_enabled_and_configured &&
+        res == MINIAV_SUCCESS) { // res checks if audio start was ok
+      MiniAV_Loopback_StopCapture(wgc_ctx->loopback_audio_ctx);
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WGC: Stopped audio loopback due to video start failure.");
+    }
     LeaveCriticalSection(&wgc_ctx->critical_section);
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
   }
@@ -712,23 +852,29 @@ static MiniAVResultCode wgc_stop_capture(MiniAVScreenContext *ctx) {
     return MINIAV_ERROR_NOT_INITIALIZED;
   WGCScreenPlatformContext *wgc_ctx =
       (WGCScreenPlatformContext *)ctx->platform_ctx;
+  BOOL was_streaming_video = FALSE;
 
   EnterCriticalSection(&wgc_ctx->critical_section);
-  if (!wgc_ctx->is_streaming) {
+  if (!wgc_ctx->is_streaming) { // This flag covers video streaming primarily
     LeaveCriticalSection(&wgc_ctx->critical_section);
     miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "WGC: Capture not started or already stopped.");
+               "WGC: Video capture not started or already stopped.");
+    // Audio might still be running if video failed to start but audio
+    // succeeded. However, the public API stop should ideally handle this. For
+    // now, if video wasn't streaming, we assume audio also isn't (or shouldn't
+    // be).
     return MINIAV_SUCCESS;
   }
+  was_streaming_video = wgc_ctx->is_streaming;
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: Stopping capture for item %s.",
              wgc_ctx->selected_item_id);
   SetEvent(
       wgc_ctx
           ->stop_event_handle);  // Signal any waiting in frame handler to stop
-  wgc_ctx->is_streaming = FALSE; // Set flag early
+  wgc_ctx->is_streaming = FALSE; // Set video streaming flag early
 
-  // Unregister event handler and close session/pool
+  // Unregister event handler and close session/pool for video
   // This needs to happen before releasing wgc_ctx if the lambda captures it.
   try {
     if (wgc_ctx->frame_pool && wgc_ctx->frame_arrived_token.value != 0) {
@@ -757,6 +903,27 @@ static MiniAVResultCode wgc_stop_capture(MiniAVScreenContext *ctx) {
   // threads managed by WinRT/WGC. Setting is_streaming to FALSE and closing
   // the session should stop new frames from being processed by
   // wgc_on_frame_arrived.
+
+  // --- Stop Audio Loopback Capture ---
+  // Check if audio was successfully configured and we *think* it might have
+  // started
+  if (wgc_ctx->loopback_audio_ctx &&
+      wgc_ctx->audio_loopback_enabled_and_configured && was_streaming_video) {
+    // We check was_streaming_video because if video never started, audio start
+    // might have been skipped or failed. A more precise check would be an
+    // 'is_audio_running' flag set by MiniAV_Loopback_StartCapture's success.
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: Stopping audio loopback capture.");
+    MiniAVResultCode audio_stop_res =
+        MiniAV_Loopback_StopCapture(wgc_ctx->loopback_audio_ctx);
+    if (audio_stop_res == MINIAV_SUCCESS) {
+      miniav_log(MINIAV_LOG_LEVEL_INFO, "WGC: Audio loopback capture stopped.");
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "WGC: Failed to stop audio loopback capture cleanly: %s",
+                 MiniAV_GetErrorString(audio_stop_res));
+    }
+  }
+  // --- End Audio Loopback Capture ---
 
   miniav_log(MINIAV_LOG_LEVEL_INFO, "WGC: Capture stopped for item %s.",
              wgc_ctx->selected_item_id);
@@ -1182,7 +1349,6 @@ static void wgc_on_frame_arrived(
           mapped_rect_cpu.RowPitch * buffer.data.video.height;
 
       texture_for_payload_ref_com = per_frame_staging_texture_com;
-      texture_for_payload_ref_com->AddRef(); // AddRef for payload
     } else {                                 // GPU Path successful
       buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
       buffer.data.video.native_gpu_shared_handle = shared_handle_for_app;
@@ -1237,26 +1403,60 @@ static void wgc_on_frame_arrived(
                "WGC: Error in on_frame_arrived: %ls (0x%08X)",
                ex.message().c_str(), ex.code().value);
     // Cleanup partially created resources
-    if (shared_handle_for_app)
+    if (shared_handle_for_app) // From GPU path attempt
       CloseHandle(shared_handle_for_app);
-    if (texture_for_payload_ref_com)
-      texture_for_payload_ref_com =
-          nullptr; // Release if AddRef'd and not detached
-    if (frame_payload_app)
+
+    if (frame_payload_app) {
+      // Release any D3D textures held by the payload before freeing the struct
+      if (frame_payload_app->cpu_staging_texture_to_unmap_release) {
+        frame_payload_app->cpu_staging_texture_to_unmap_release->Release();
+        frame_payload_app->cpu_staging_texture_to_unmap_release = nullptr;
+      }
+      if (frame_payload_app->gpu_texture_to_release) { // Should be null if CPU
+                                                       // path was taken
+        frame_payload_app->gpu_texture_to_release->Release();
+        frame_payload_app->gpu_texture_to_release = nullptr;
+      }
       miniav_free(frame_payload_app);
-    if (internal_payload)
+      frame_payload_app = nullptr; // Avoid double free if another catch happens
+    }
+
+    // If texture_for_payload_ref_com still holds a reference (i.e., not
+    // detached yet)
+    if (texture_for_payload_ref_com) {
+      texture_for_payload_ref_com = nullptr; // com_ptr releases it
+    }
+
+    if (internal_payload) {
       miniav_free(internal_payload);
+      internal_payload = nullptr;
+    }
   } catch (...) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "WGC: Unknown error in on_frame_arrived.");
     if (shared_handle_for_app)
       CloseHandle(shared_handle_for_app);
-    if (texture_for_payload_ref_com)
-      texture_for_payload_ref_com = nullptr;
-    if (frame_payload_app)
+
+    if (frame_payload_app) {
+      if (frame_payload_app->cpu_staging_texture_to_unmap_release) {
+        frame_payload_app->cpu_staging_texture_to_unmap_release->Release();
+        frame_payload_app->cpu_staging_texture_to_unmap_release = nullptr;
+      }
+      if (frame_payload_app->gpu_texture_to_release) {
+        frame_payload_app->gpu_texture_to_release->Release();
+        frame_payload_app->gpu_texture_to_release = nullptr;
+      }
       miniav_free(frame_payload_app);
-    if (internal_payload)
+      frame_payload_app = nullptr;
+    }
+
+    if (texture_for_payload_ref_com) {
+      texture_for_payload_ref_com = nullptr;
+    }
+    if (internal_payload) {
       miniav_free(internal_payload);
+      internal_payload = nullptr;
+    }
   }
 
   LeaveCriticalSection(&wgc_ctx->critical_section);

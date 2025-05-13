@@ -4,10 +4,10 @@
 
 // Platform-specific includes. These would typically be guarded by #ifdefs
 #ifdef _WIN32
-#ifdef USE_DXGI
+#ifdef USE_DXGI 1
 #include "windows/screen_context_win_dxgi.h"
 #endif
-#ifdef USE_WGC
+#ifdef USE_WGC 1
 #include "windows/screen_context_win_wgc.h"
 #endif
 #endif
@@ -187,9 +187,8 @@ MiniAV_Screen_ConfigureDisplay(MiniAVScreenContext *ctx, const char *display_id,
     return MINIAV_ERROR_ALREADY_RUNNING;
   }
   ctx->capture_target_type = MINIAV_CAPTURE_TYPE_DISPLAY;
-  // TODO: Store or handle capture_audio in ctx if needed
-  // For now, just pass it to the platform operation
-  return ctx->ops->configure_display(ctx, display_id, format, capture_audio);
+  ctx->capture_audio_requested = capture_audio;
+  return ctx->ops->configure_display(ctx, display_id, format);
 }
 
 MiniAVResultCode
@@ -206,8 +205,8 @@ MiniAV_Screen_ConfigureWindow(MiniAVScreenContext *ctx, const char *window_id,
     return MINIAV_ERROR_ALREADY_RUNNING;
   }
   ctx->capture_target_type = MINIAV_CAPTURE_TYPE_WINDOW;
-  // TODO: Store or handle capture_audio in ctx if needed
-  return ctx->ops->configure_window(ctx, window_id, format, capture_audio);
+  ctx->capture_audio_requested = capture_audio;
+  return ctx->ops->configure_window(ctx, window_id, format);
 }
 
 MiniAVResultCode MiniAV_Screen_ConfigureRegion(
@@ -223,9 +222,9 @@ MiniAVResultCode MiniAV_Screen_ConfigureRegion(
     return MINIAV_ERROR_ALREADY_RUNNING;
   }
   ctx->capture_target_type = MINIAV_CAPTURE_TYPE_REGION;
-  // TODO: Store or handle capture_audio in ctx if needed
-  return ctx->ops->configure_region(ctx, target_id, x, y, width, height, format,
-                                    capture_audio);
+  ctx->capture_audio_requested = capture_audio;
+  return ctx->ops->configure_region(ctx, target_id, x, y, width, height,
+                                    format);
 }
 
 MiniAVResultCode MiniAV_Screen_StartCapture(MiniAVScreenContext *ctx,

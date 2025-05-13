@@ -66,6 +66,11 @@ typedef struct DXGIScreenPlatformContext {
 
   LARGE_INTEGER qpc_frequency;
 
+  // --- Audio Loopback Members ---
+  MiniAVLoopbackContextHandle loopback_audio_ctx;
+  BOOL audio_loopback_enabled_and_configured;
+  MiniAVAudioInfo configured_audio_format;
+
 } DXGIScreenPlatformContext;
 
 // --- Forward declarations for static functions ---
@@ -116,6 +121,8 @@ static MiniAVResultCode dxgi_init_platform(MiniAVScreenContext *ctx) {
   }
 
   dxgi_ctx->qpc_frequency = miniav_get_qpc_frequency();
+  dxgi_ctx->loopback_audio_ctx = NULL; // Initialize audio loopback members
+  dxgi_ctx->audio_loopback_enabled_and_configured = FALSE;
 
   miniav_log(MINIAV_LOG_LEVEL_INFO,
              "DXGI: Platform context initialized successfully.");
@@ -135,6 +142,11 @@ static MiniAVResultCode dxgi_destroy_platform(MiniAVScreenContext *ctx) {
         MINIAV_LOG_LEVEL_WARN,
         "DXGI: Platform being destroyed while streaming. Attempting to stop.");
     // This should have been called by MiniAV_Screen_StopCapture
+    // Ensure audio is stopped first if it was running
+    if (dxgi_ctx->loopback_audio_ctx &&
+        dxgi_ctx->audio_loopback_enabled_and_configured) {
+      MiniAV_Loopback_StopCapture(dxgi_ctx->loopback_audio_ctx);
+    }
     if (dxgi_ctx->stop_event_handle)
       SetEvent(dxgi_ctx->stop_event_handle);
     if (dxgi_ctx->capture_thread_handle) {
@@ -146,6 +158,15 @@ static MiniAVResultCode dxgi_destroy_platform(MiniAVScreenContext *ctx) {
   }
 
   dxgi_cleanup_d3d_and_duplication(dxgi_ctx);
+
+  // Destroy loopback audio context if it exists
+  if (dxgi_ctx->loopback_audio_ctx) {
+    MiniAV_Loopback_DestroyContext(dxgi_ctx->loopback_audio_ctx);
+    dxgi_ctx->loopback_audio_ctx = NULL;
+    dxgi_ctx->audio_loopback_enabled_and_configured = FALSE;
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "DXGI: Loopback audio context destroyed.");
+  }
 
   if (dxgi_ctx->stop_event_handle) {
     CloseHandle(dxgi_ctx->stop_event_handle);
@@ -441,6 +462,13 @@ dxgi_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
     return MINIAV_ERROR_ALREADY_RUNNING;
   }
 
+  // Clean up previous audio context if any
+  if (dxgi_ctx->loopback_audio_ctx) {
+    MiniAV_Loopback_DestroyContext(dxgi_ctx->loopback_audio_ctx);
+    dxgi_ctx->loopback_audio_ctx = NULL;
+    dxgi_ctx->audio_loopback_enabled_and_configured = FALSE;
+  }
+
   MiniAVResultCode res =
       dxgi_init_d3d_and_duplication(dxgi_ctx, adapter_idx, output_idx);
   if (res != MINIAV_SUCCESS) {
@@ -479,13 +507,72 @@ dxgi_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
       dxgi_ctx->configured_format
           .output_preference; // Ensure parent context also has it
 
+  // --- Configure Audio Loopback ---
+  dxgi_ctx->audio_loopback_enabled_and_configured = FALSE; // Default to false
+  if (dxgi_ctx->parent_ctx->capture_audio_requested) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "DXGI: Attempting to configure audio loopback.");
+    res = MiniAV_Loopback_CreateContext(&dxgi_ctx->loopback_audio_ctx);
+    if (res == MINIAV_SUCCESS) {
+      MiniAVAudioInfo desired_audio_format;
+      memset(&desired_audio_format, 0, sizeof(MiniAVAudioInfo));
+      desired_audio_format.format =
+          MINIAV_AUDIO_FORMAT_F32;              // Request float 32-bit
+      desired_audio_format.channels = 2;        // Stereo
+      desired_audio_format.sample_rate = 48000; // 48kHz
+
+      // Configure for default system audio output loopback
+      res = MiniAV_Loopback_Configure(dxgi_ctx->loopback_audio_ctx, NULL,
+                                      &desired_audio_format);
+      if (res == MINIAV_SUCCESS) {
+        res = MiniAV_Loopback_GetConfiguredFormat(
+            dxgi_ctx->loopback_audio_ctx, &dxgi_ctx->configured_audio_format);
+        if (res == MINIAV_SUCCESS) {
+          dxgi_ctx->audio_loopback_enabled_and_configured = TRUE;
+          miniav_log(
+              MINIAV_LOG_LEVEL_INFO,
+              "DXGI: Audio loopback configured successfully. Format: %d, "
+              "Channels: %u, Rate: %u",
+              dxgi_ctx->configured_audio_format.format,
+              dxgi_ctx->configured_audio_format.channels,
+              dxgi_ctx->configured_audio_format.sample_rate);
+        } else {
+          miniav_log(
+              MINIAV_LOG_LEVEL_WARN,
+              "DXGI: Failed to get configured audio loopback format: %s. "
+              "Audio disabled.",
+              MiniAV_GetErrorString(res));
+          MiniAV_Loopback_DestroyContext(dxgi_ctx->loopback_audio_ctx);
+          dxgi_ctx->loopback_audio_ctx = NULL;
+        }
+      } else {
+        miniav_log(
+            MINIAV_LOG_LEVEL_WARN,
+            "DXGI: Failed to configure audio loopback: %s. Audio disabled.",
+            MiniAV_GetErrorString(res));
+        MiniAV_Loopback_DestroyContext(dxgi_ctx->loopback_audio_ctx);
+        dxgi_ctx->loopback_audio_ctx = NULL;
+      }
+    } else {
+      miniav_log(
+          MINIAV_LOG_LEVEL_WARN,
+          "DXGI: Failed to create audio loopback context: %s. Audio disabled.",
+          MiniAV_GetErrorString(res));
+      // loopback_audio_ctx is already NULL or will be set to NULL
+    }
+  }
+  // --- End Audio Loopback Configuration ---
+
   LeaveCriticalSection(&dxgi_ctx->critical_section);
   miniav_log(MINIAV_LOG_LEVEL_INFO,
              "DXGI: Configured for display %s. Actual resolution: %ux%u, "
-             "Target FPS: %u.",
+             "Target FPS: %u. Audio Loopback: %s",
              display_id_utf8, dxgi_ctx->frame_width, dxgi_ctx->frame_height,
-             dxgi_ctx->target_fps);
-  return MINIAV_SUCCESS;
+             dxgi_ctx->target_fps,
+             dxgi_ctx->audio_loopback_enabled_and_configured ? "Enabled"
+                                                             : "Disabled");
+  return MINIAV_SUCCESS; // Return success even if audio loopback failed, video
+                         // can still work
 }
 
 static MiniAVResultCode
@@ -523,6 +610,7 @@ static MiniAVResultCode dxgi_start_capture(MiniAVScreenContext *ctx,
     return MINIAV_ERROR_INVALID_ARG;
   DXGIScreenPlatformContext *dxgi_ctx =
       (DXGIScreenPlatformContext *)ctx->platform_ctx;
+  MiniAVResultCode res = MINIAV_SUCCESS;
 
   EnterCriticalSection(&dxgi_ctx->critical_section);
   if (dxgi_ctx->is_streaming) {
@@ -539,24 +627,58 @@ static MiniAVResultCode dxgi_start_capture(MiniAVScreenContext *ctx,
 
   dxgi_ctx->app_callback_internal = callback;
   dxgi_ctx->app_callback_user_data_internal = user_data;
-  dxgi_ctx->parent_ctx->app_callback = callback; // Also update parent
+  dxgi_ctx->parent_ctx->app_callback = callback;
   dxgi_ctx->parent_ctx->app_callback_user_data = user_data;
 
+  // --- Start Audio Loopback Capture ---
+  if (dxgi_ctx->loopback_audio_ctx &&
+      dxgi_ctx->audio_loopback_enabled_and_configured) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "DXGI: Starting audio loopback capture.");
+    res = MiniAV_Loopback_StartCapture(
+        dxgi_ctx->loopback_audio_ctx,
+        dxgi_ctx->app_callback_internal, // Use the same callback
+        dxgi_ctx->app_callback_user_data_internal);
+    if (res != MINIAV_SUCCESS) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "DXGI: Failed to start audio loopback capture: %s. Proceeding "
+                 "with video only.",
+                 MiniAV_GetErrorString(res));
+      // Optionally, you might want to disable
+      // audio_loopback_enabled_and_configured here or allow video to continue.
+      // For now, just log and continue.
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_INFO,
+                 "DXGI: Audio loopback capture started.");
+    }
+  }
+  // --- End Audio Loopback Capture ---
+
   ResetEvent(dxgi_ctx->stop_event_handle); // Ensure stop event is not signaled
-  dxgi_ctx->is_streaming = TRUE;
+  dxgi_ctx->is_streaming =
+      TRUE; // Set after potential audio start failure, before video thread
 
   dxgi_ctx->capture_thread_handle =
       CreateThread(NULL, 0, dxgi_capture_thread_proc, dxgi_ctx, 0, NULL);
   if (dxgi_ctx->capture_thread_handle == NULL) {
-    dxgi_ctx->is_streaming = FALSE;
+    dxgi_ctx->is_streaming = FALSE; // Video thread failed
+    // If audio started, stop it
+    if (dxgi_ctx->loopback_audio_ctx &&
+        dxgi_ctx->audio_loopback_enabled_and_configured) {
+      // Check if audio is actually running (MiniAV_Loopback_StartCapture was
+      // successful) This requires the loopback API to correctly manage its
+      // is_running state. For simplicity, we'll call stop if it was configured
+      // and we attempted to start.
+      MiniAV_Loopback_StopCapture(dxgi_ctx->loopback_audio_ctx);
+    }
     LeaveCriticalSection(&dxgi_ctx->critical_section);
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "DXGI: Failed to create capture thread.");
+               "DXGI: Failed to create video capture thread.");
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
   }
 
   LeaveCriticalSection(&dxgi_ctx->critical_section);
-  miniav_log(MINIAV_LOG_LEVEL_INFO, "DXGI: Capture started.");
+  miniav_log(MINIAV_LOG_LEVEL_INFO, "DXGI: Video capture thread started.");
   return MINIAV_SUCCESS;
 }
 
@@ -571,25 +693,47 @@ static MiniAVResultCode dxgi_stop_capture(MiniAVScreenContext *ctx) {
     LeaveCriticalSection(&dxgi_ctx->critical_section);
     miniav_log(MINIAV_LOG_LEVEL_WARN,
                "DXGI: Capture not started or already stopped.");
-    return MINIAV_SUCCESS; // Or MINIAV_ERROR_INVALID_OPERATION
+    return MINIAV_SUCCESS;
   }
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "DXGI: Stopping capture.");
-  SetEvent(dxgi_ctx->stop_event_handle);
+  SetEvent(dxgi_ctx->stop_event_handle); // Signal video thread to stop
+  BOOL was_streaming = dxgi_ctx->is_streaming;
   dxgi_ctx->is_streaming = FALSE; // Set flag early
   LeaveCriticalSection(
       &dxgi_ctx->critical_section); // Release lock before waiting
 
   if (dxgi_ctx->capture_thread_handle) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "DXGI: Waiting for capture thread to exit...");
+               "DXGI: Waiting for video capture thread to exit...");
     WaitForSingleObject(dxgi_ctx->capture_thread_handle, INFINITE);
     CloseHandle(dxgi_ctx->capture_thread_handle);
     dxgi_ctx->capture_thread_handle = NULL;
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "DXGI: Capture thread exited.");
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "DXGI: Video capture thread exited.");
   }
 
-  // Re-acquire lock if further cleanup needs it, but for now, just log.
+  // --- Stop Audio Loopback Capture ---
+  // Check if audio was successfully started and needs stopping
+  // This check relies on audio_loopback_enabled_and_configured and potentially
+  // an is_running state from loopback API For now, if it was configured and we
+  // attempted to start, we attempt to stop.
+  if (dxgi_ctx->loopback_audio_ctx &&
+      dxgi_ctx->audio_loopback_enabled_and_configured && was_streaming) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "DXGI: Stopping audio loopback capture.");
+    MiniAVResultCode audio_stop_res =
+        MiniAV_Loopback_StopCapture(dxgi_ctx->loopback_audio_ctx);
+    if (audio_stop_res == MINIAV_SUCCESS) {
+      miniav_log(MINIAV_LOG_LEVEL_INFO,
+                 "DXGI: Audio loopback capture stopped.");
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "DXGI: Failed to stop audio loopback capture cleanly: %s",
+                 MiniAV_GetErrorString(audio_stop_res));
+    }
+  }
+  // --- End Audio Loopback Capture ---
+
   miniav_log(MINIAV_LOG_LEVEL_INFO, "DXGI: Capture stopped.");
   return MINIAV_SUCCESS;
 }
@@ -782,8 +926,7 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
         shareable_desc.SampleDesc.Count = 1;
         shareable_desc.SampleDesc.Quality = 0;
         shareable_desc.Usage = D3D11_USAGE_DEFAULT;
-        shareable_desc.BindFlags =
-            D3D11_BIND_SHADER_RESOURCE;
+        shareable_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         shareable_desc.CPUAccessFlags = 0;
         shareable_desc.MiscFlags =
             D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;

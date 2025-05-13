@@ -47,6 +47,8 @@ typedef struct MiniAVScreenContext {
     // Add any other common state needed across platforms
     MiniAVCaptureType capture_target_type; // DISPLAY, WINDOW, REGION
 
+    bool capture_audio_requested; // Whether the user requested audio capture
+
 } MiniAVScreenContext;
 
 #ifdef __cplusplus

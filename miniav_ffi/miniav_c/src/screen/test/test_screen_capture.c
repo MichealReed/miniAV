@@ -10,8 +10,9 @@
 #include <unistd.h> // For sleep() and usleep()
 #endif
 
-volatile int g_screen_frame_count = 0;
-const int SCREEN_CAPTURE_DURATION_SECONDS = 10;
+volatile int g_video_frame_count = 0;
+volatile int g_audio_packet_count = 0;
+// SCREEN_CAPTURE_DURATION_SECONDS removed
 
 // Simple logging callback for the test
 void test_screen_log_callback(MiniAVLogLevel level, const char *message,
@@ -35,46 +36,71 @@ void test_screen_log_callback(MiniAVLogLevel level, const char *message,
   fprintf(stderr, "[MiniAV Screen Test - %s] %s\n", level_str, message);
 }
 
-// Simple buffer callback for the test
+// Buffer callback to show real-time speed
 void test_screen_buffer_callback(const MiniAVBuffer *buffer, void *user_data) {
   (void)user_data;
+  static uint64_t last_video_timestamp_us = 0;
+  static uint64_t last_audio_timestamp_us = 0;
+
   if (!buffer) {
     fprintf(stderr, "ScreenTestCallback: Received NULL buffer!\n");
+    fflush(stderr);
     return;
   }
 
   if (buffer->type == MINIAV_BUFFER_TYPE_VIDEO) {
-    g_screen_frame_count++;
-    printf("ScreenTestCallback: Received Video Buffer: Timestamp=%" PRIu64
-           "us, %ux%u, Format=%d (ContentType: %d), Size=%zu bytes, Plane0 "
-           "Stride=%u, Frame #%d\n",
-           buffer->timestamp_us, buffer->data.video.width,
-           buffer->data.video.height, buffer->data.video.pixel_format,
-           buffer->content_type, buffer->data_size_bytes,
-           buffer->data.video.stride_bytes[0], g_screen_frame_count);
+    g_video_frame_count++;
+    double delta_ms = 0.0;
+    if (last_video_timestamp_us != 0 && buffer->timestamp_us > last_video_timestamp_us) {
+      delta_ms = (double)(buffer->timestamp_us - last_video_timestamp_us) / 1000.0;
+      printf("Video: +%.3f ms (Frame #%d, %ux%u, TS: %" PRIu64 "us)\n",
+             delta_ms, g_video_frame_count, buffer->data.video.width, buffer->data.video.height, buffer->timestamp_us);
+    } else {
+      printf("Video: First frame (Frame #%d, %ux%u, TS: %" PRIu64 "us)\n",
+             g_video_frame_count, buffer->data.video.width, buffer->data.video.height, buffer->timestamp_us);
+    }
+    last_video_timestamp_us = buffer->timestamp_us;
 
     if (buffer->content_type == MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE) {
-      printf("  GPU Buffer: Shared Handle = %p, Texture Ptr = %p\n",
-             buffer->data.video.native_gpu_shared_handle,
-             buffer->data.video.native_gpu_texture_ptr);
-      // For GPU buffers, the application would typically use the shared handle
-      // and then call CloseHandle on it when done.
-      // The native_gpu_texture_ptr is for internal tracking by MiniAV for
-      // release.
+      // Minimal print, can be commented out if not needed for speed test
+      // printf("  GPU Buffer: Shared Handle = %p\n", buffer->data.video.native_gpu_shared_handle);
     }
 
     if (buffer->internal_handle) {
-      MiniAV_ReleaseBuffer(buffer->internal_handle); // Release the buffer
+      MiniAV_ReleaseBuffer(buffer->internal_handle);
     } else {
-      fprintf(stderr, "ScreenTestCallback: Warning - buffer->internal_handle "
-                      "is NULL, cannot release.\n");
+      fprintf(stderr, "ScreenTestCallback: Warning - Video buffer->internal_handle is NULL.\n");
+      fflush(stderr);
     }
+
+  } else if (buffer->type == MINIAV_BUFFER_TYPE_AUDIO) {
+    g_audio_packet_count++;
+    double delta_ms = 0.0;
+    if (last_audio_timestamp_us != 0 && buffer->timestamp_us > last_audio_timestamp_us) {
+      delta_ms = (double)(buffer->timestamp_us - last_audio_timestamp_us) / 1000.0;
+      printf("Audio: +%.3f ms (Packet #%d, Size: %zu, TS: %" PRIu64 "us)\n",
+             delta_ms, g_audio_packet_count, buffer->data_size_bytes, buffer->timestamp_us);
+    } else {
+      printf("Audio: First packet (Packet #%d, Size: %zu, TS: %" PRIu64 "us)\n",
+             g_audio_packet_count, buffer->data_size_bytes, buffer->timestamp_us);
+    }
+    last_audio_timestamp_us = buffer->timestamp_us;
+
+    if (buffer->internal_handle) {
+      MiniAV_ReleaseBuffer(buffer->internal_handle);
+    }
+    // else it might be normal for audio buffers not to have an internal_handle needing this specific release path
 
   } else {
     fprintf(stderr,
-            "ScreenTestCallback: Received buffer of unexpected type: %d\n",
-            buffer->type);
+            "ScreenTestCallback: Received buffer of unexpected type: %d, TS: %" PRIu64 "us\n",
+            buffer->type, buffer->timestamp_us);
+    fflush(stderr);
+    if (buffer->internal_handle) {
+        MiniAV_ReleaseBuffer(buffer->internal_handle);
+    }
   }
+  fflush(stdout); // Ensure immediate output of printf
 }
 
 // Helper to sleep cross-platform
@@ -129,7 +155,7 @@ int main() {
 
   MiniAV_SetLogCallback(test_screen_log_callback, NULL);
   MiniAV_SetLogLevel(
-      MINIAV_LOG_LEVEL_DEBUG); // Set to DEBUG for more verbose output
+      MINIAV_LOG_LEVEL_INFO); // Keep DEBUG for now, can be changed to INFO
 
   MiniAVDeviceInfo *displays = NULL;
   uint32_t display_count = 0;
@@ -140,7 +166,6 @@ int main() {
   if (res != MINIAV_SUCCESS) {
     fprintf(stderr, "Failed to create screen context: %s\n",
             MiniAV_GetErrorString(res));
-    // MiniAV_FreeDeviceList(displays, display_count);
     return 1;
   }
   printf("Screen context created.\n");
@@ -150,11 +175,13 @@ int main() {
   if (res != MINIAV_SUCCESS) {
     fprintf(stderr, "Failed to enumerate displays: %s\n",
             MiniAV_GetErrorString(res));
+    MiniAV_Screen_DestroyContext(screen_ctx); // Clean up context
     return 1;
   }
 
   if (display_count == 0) {
     printf("No displays found.\n");
+    MiniAV_Screen_DestroyContext(screen_ctx); // Clean up context
     return 0;
   }
 
@@ -165,7 +192,6 @@ int main() {
            displays[i].is_default ? "Yes" : "No");
   }
 
-  // Prompt the user to select a display
   uint32_t selected_display_index = 0;
   if (display_count > 1) {
     printf("\nEnter the index of the display to capture (0-%u): ",
@@ -174,6 +200,7 @@ int main() {
         selected_display_index >= display_count) {
       fprintf(stderr, "Invalid display index. Exiting.\n");
       MiniAV_FreeDeviceList(displays, display_count);
+      MiniAV_Screen_DestroyContext(screen_ctx);
       return 1;
     }
   } else {
@@ -185,15 +212,11 @@ int main() {
   printf("\nSelected display for testing: '%s' (ID: '%s')\n",
          selected_display.name, selected_display.device_id);
 
-  // Prepare format for configuration
-  // For screen capture, width, height, and pixel_format are usually determined
-  // by the display itself. We can suggest FPS and output preference.
   MiniAVVideoFormatInfo capture_format;
   memset(&capture_format, 0, sizeof(MiniAVVideoFormatInfo));
   capture_format.output_preference = MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE;
-  capture_format.frame_rate_numerator = 30; // Request 30 FPS
+  capture_format.frame_rate_numerator = 240;
   capture_format.frame_rate_denominator = 1;
-  // capture_format.output_preference = MINIAV_OUTPUT_PREFERENCE_CPU_ONLY;
 
   printf("\nConfiguring screen capture for display '%s'...\n",
          selected_display.device_id);
@@ -205,8 +228,9 @@ int main() {
              ? "GPU_IF_AVAILABLE"
              : "CPU_ONLY");
 
+  // Enable audio capture by passing 'true'
   res = MiniAV_Screen_ConfigureDisplay(screen_ctx, selected_display.device_id,
-                                       &capture_format, NULL);
+                                       &capture_format, true);
   if (res != MINIAV_SUCCESS) {
     fprintf(stderr, "Failed to configure screen capture: %s\n",
             MiniAV_GetErrorString(res));
@@ -215,7 +239,6 @@ int main() {
     return 1;
   }
 
-  // After configuration, the context should have the actual capture parameters
   MiniAVVideoFormatInfo actual_format;
   MiniAV_Screen_GetConfiguredFormat(screen_ctx, &actual_format);
   printf("Screen capture configured successfully.\n");
@@ -234,9 +257,11 @@ int main() {
              ? "CPU_ONLY"
              : "UNKNOWN");
 
-  printf("\nStarting screen capture for %d seconds...\n",
-         SCREEN_CAPTURE_DURATION_SECONDS);
-  g_screen_frame_count = 0;
+  printf("\nStarting screen capture indefinitely...\n");
+  printf("Press Ctrl+C to stop.\n");
+  g_video_frame_count = 0;
+  g_audio_packet_count = 0;
+
   res =
       MiniAV_Screen_StartCapture(screen_ctx, test_screen_buffer_callback, NULL);
   if (res != MINIAV_SUCCESS) {
@@ -246,31 +271,33 @@ int main() {
     MiniAV_FreeDeviceList(displays, display_count);
     return 1;
   }
-  printf("Screen capture started. Waiting for frames...\n");
+  printf("Screen capture started. Monitoring frame/packet deltas...\n");
 
-  for (int i = 0; i < SCREEN_CAPTURE_DURATION_SECONDS; ++i) {
-    printf(
-        "ScreenTest main: Sleeping... (%d/%d s), Frames received so far: %d\n",
-        i + 1, SCREEN_CAPTURE_DURATION_SECONDS, g_screen_frame_count);
-    screen_sleep_ms(1000);
+  // Loop indefinitely to keep the capture running
+  // The callback will print real-time information
+  // Use Ctrl+C to terminate the program
+  while (1) {
+    screen_sleep_ms(1000); // Keep main thread alive, sleep for 1 second
+                           // Actual work happens in the callback thread(s)
   }
 
+  // The following cleanup code will not be reached if Ctrl+C is used to exit.
+  // For a test application, this is often acceptable.
+  // For a production app, signal handling would be needed for graceful shutdown.
   printf("\nStopping screen capture...\n");
   res = MiniAV_Screen_StopCapture(screen_ctx);
   if (res != MINIAV_SUCCESS) {
     fprintf(stderr, "Failed to stop screen capture: %s\n",
             MiniAV_GetErrorString(res));
-    // Continue with cleanup
   }
-  printf("Screen capture stopped. Total frames received: %d\n",
-         g_screen_frame_count);
+  printf("Screen capture stopped. Total video frames: %d, Total audio packets: %d\n",
+         g_video_frame_count, g_audio_packet_count);
 
   printf("\nDestroying screen context...\n");
   res = MiniAV_Screen_DestroyContext(screen_ctx);
   if (res != MINIAV_SUCCESS) {
     fprintf(stderr, "Failed to destroy screen context: %s\n",
             MiniAV_GetErrorString(res));
-    // Continue with cleanup
   }
   printf("Screen context destroyed.\n");
 
@@ -279,5 +306,5 @@ int main() {
   printf("Resources cleaned up.\n");
 
   printf("\nScreen capture test finished.\n");
-  return 0;
+  return 0; // Should not be reached in the while(1) scenario without break
 }

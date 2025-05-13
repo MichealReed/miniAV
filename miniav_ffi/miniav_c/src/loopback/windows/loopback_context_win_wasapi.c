@@ -196,30 +196,35 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
   UINT32 num_frames_available;
   BYTE *data_ptr = NULL;
   DWORD flags;
-  UINT64 device_position;
-  UINT64 qpc_position;
+  UINT64 device_position; // Not used for timestamping in this context
+  UINT64 qpc_position;    // This is the key timestamp from WASAPI
 
-  HANDLE wait_array[2] = {platform_ctx->stop_event_handle, NULL};
-  DWORD wait_count = 1;
+  HANDLE wait_array[2] = {platform_ctx->stop_event_handle,
+                          NULL}; // wait_array[1] was never set
+  DWORD wait_count = 1;          // Only waiting on stop_event or timeout
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WASAPI: Capture thread started.");
 
   while (TRUE) {
-    DWORD wait_result =
-        WaitForMultipleObjects(wait_count, wait_array, FALSE, 100);
+    // Using a fixed timeout for polling, can be adjusted.
+    // Consider using event-driven mode if supported and desired for lower
+    // latency, but polling is simpler for loopback.
+    DWORD wait_result = WaitForSingleObject(platform_ctx->stop_event_handle,
+                                            10); // Poll every 10ms
 
     if (wait_result == WAIT_OBJECT_0) {
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "WASAPI: Capture thread received stop event.");
       break;
     } else if (wait_result == WAIT_TIMEOUT) {
-      // Polling interval expired
+      // Polling interval expired, proceed to check for data
     } else if (wait_result == WAIT_FAILED) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "WASAPI: Capture thread WaitForMultipleObjects failed: %lu",
+                 "WASAPI: Capture thread WaitForSingleObject failed: %lu",
                  GetLastError());
       break;
     }
+    // Removed the WaitForMultipleObjects as only one event was actively used.
 
     hr = platform_ctx->capture_client->lpVtbl->GetNextPacketSize(
         platform_ctx->capture_client, &packet_length);
@@ -227,8 +232,8 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "WASAPI: GetNextPacketSize failed: 0x%lx", hr);
       if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
-        break;
-      Sleep(20);
+        break;   // Device lost, exit thread
+      Sleep(20); // Wait a bit before retrying on other errors
       continue;
     }
 
@@ -241,39 +246,47 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "WASAPI: GetBuffer failed: 0x%lx",
                    hr);
         if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
-          goto cleanup_thread;
-        break;
+          goto cleanup_thread; // Device lost, exit thread
+        break; // Break from inner loop, outer loop will retry GetNextPacketSize
       }
 
       if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-        // For silent packets, data_ptr might be NULL or point to silence.
-        // If data_ptr is NULL and num_frames_available > 0, we might need to
-        // provide our own silent buffer. For now, we assume if
-        // num_frames_available > 0, data_ptr is valid (even if it's silence).
         miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                   "WASAPI: Silent packet received (frames: %u).",
-                   num_frames_available);
+                   "WASAPI: Silent packet received (frames: %u). QPC: %llu",
+                   num_frames_available, qpc_position);
+        // If you need to generate silence, do it here.
+        // For now, if data_ptr is NULL, we might skip, or the app callback
+        // handles it.
       }
 
       if (num_frames_available > 0 && ctx->app_callback) {
         MiniAVBuffer buffer;
         memset(&buffer, 0, sizeof(MiniAVBuffer));
         buffer.type = MINIAV_BUFFER_TYPE_AUDIO;
-        buffer.content_type =
-            MINIAV_BUFFER_CONTENT_TYPE_CPU; // WASAPI gives CPU buffer
-        buffer.timestamp_us = miniav_get_time_us();
+        buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
 
-        buffer.data.audio.data = data_ptr;
+        // Convert QPC position to microseconds
+        if (platform_ctx->qpc_frequency.QuadPart != 0) {
+          buffer.timestamp_us =
+              (qpc_position * 1000000) / platform_ctx->qpc_frequency.QuadPart;
+        } else {
+          buffer.timestamp_us =
+              miniav_get_time_us(); // Fallback, though qpc_frequency should
+                                    // always be valid
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "WASAPI: QPC frequency is zero in capture thread, using "
+                     "fallback timestamp.");
+        }
+
+        buffer.data.audio.data =
+            data_ptr; // Can be NULL if AUDCLNT_BUFFERFLAGS_SILENT and no data
         buffer.data_size_bytes =
             num_frames_available * platform_ctx->capture_format->nBlockAlign;
 
-        // Populate the format information within the audio_buffer part of the
-        // union
-        buffer.data.audio.info = ctx->configured_format; // Copy the base format
-        buffer.data.audio.info.num_frames =
-            num_frames_available; // Update with actual frames
+        buffer.data.audio.info = ctx->configured_format;
+        buffer.data.audio.info.num_frames = num_frames_available;
 
-        ctx->app_callback(ctx, &buffer, ctx->app_callback_user_data);
+        ctx->app_callback(&buffer, ctx->app_callback_user_data);
       }
 
       hr = platform_ctx->capture_client->lpVtbl->ReleaseBuffer(
@@ -282,17 +295,19 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR,
                    "WASAPI: ReleaseBuffer failed: 0x%lx", hr);
         if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
-          goto cleanup_thread;
+          goto cleanup_thread; // Device lost, exit thread
+        // Other errors might be recoverable, but could indicate issues.
       }
 
+      // Get the next packet size for the loop condition
       hr = platform_ctx->capture_client->lpVtbl->GetNextPacketSize(
           platform_ctx->capture_client, &packet_length);
       if (FAILED(hr)) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR,
                    "WASAPI: GetNextPacketSize (in loop) failed: 0x%lx", hr);
         if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
-          goto cleanup_thread;
-        packet_length = 0;
+          goto cleanup_thread; // Device lost, exit thread
+        packet_length = 0;     // Ensure loop terminates on error
       }
     }
   }
@@ -314,25 +329,41 @@ MiniAVResultCode wasapi_init_platform(MiniAVLoopbackContext *ctx) {
   ctx->platform_ctx = platform_ctx;
   platform_ctx->parent_ctx = ctx;
 
+  // Initialize QPC Frequency
+  if (!QueryPerformanceFrequency(&platform_ctx->qpc_frequency)) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "WASAPI: QueryPerformanceFrequency failed: %lu", GetLastError());
+    miniav_free(platform_ctx);
+    ctx->platform_ctx = NULL;
+    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+  }
+  if (platform_ctx->qpc_frequency.QuadPart == 0) { // Should not happen
+    miniav_log(MINIAV_LOG_LEVEL_ERROR, "WASAPI: QPC frequency is zero.");
+    miniav_free(platform_ctx);
+    ctx->platform_ctx = NULL;
+    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+  }
+
+  // Create the stop event
+  platform_ctx->stop_event_handle = CreateEvent(
+      NULL, TRUE, FALSE, NULL); // Manual reset, initially non-signaled
+  if (platform_ctx->stop_event_handle == NULL) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "WASAPI: CreateEvent for stop_event failed: %lu",
+               GetLastError());
+    miniav_free(platform_ctx);
+    ctx->platform_ctx = NULL;
+    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+  }
+
   HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
   if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "WASAPI: CoInitializeEx failed: 0x%lx",
                hr);
-    if (hr != S_FALSE) {
-      miniav_free(platform_ctx);
-      ctx->platform_ctx = NULL;
-      return hresult_to_miniavresult(hr);
-    }
-  }
-
-  platform_ctx->stop_event_handle = CreateEvent(NULL, TRUE, FALSE, NULL);
-  if (platform_ctx->stop_event_handle == NULL) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WASAPI: Failed to create stop event: %lu", GetLastError());
-    CoUninitialize();
+    CloseHandle(platform_ctx->stop_event_handle); // Clean up created event
     miniav_free(platform_ctx);
     ctx->platform_ctx = NULL;
-    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+    return hresult_to_miniavresult(hr);
   }
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WASAPI: Platform context initialized.");

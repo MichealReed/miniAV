@@ -292,7 +292,3 @@ MiniAV_Screen_GetConfiguredFormat(MiniAVScreenContext *ctx,
   *format_out = ctx->configured_format;
   return MINIAV_SUCCESS;
 }
-
-// Note: MiniAV_ReleaseBuffer is a general API function.
-// The screen backend's release_buffer op is called by the common
-// MiniAV_ReleaseBuffer after inspecting the MiniAVNativeBufferInternalPayload.

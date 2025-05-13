@@ -62,8 +62,7 @@ void test_screen_buffer_callback(const MiniAVBuffer *buffer, void *user_data) {
     last_video_timestamp_us = buffer->timestamp_us;
 
     if (buffer->content_type == MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE) {
-      // Minimal print, can be commented out if not needed for speed test
-      // printf("  GPU Buffer: Shared Handle = %p\n", buffer->data.video.native_gpu_shared_handle);
+      printf("  GPU Buffer: Shared Handle = %p\n", buffer->data.video.native_gpu_shared_handle);
     }
 
     if (buffer->internal_handle) {
@@ -155,7 +154,7 @@ int main() {
 
   MiniAV_SetLogCallback(test_screen_log_callback, NULL);
   MiniAV_SetLogLevel(
-      MINIAV_LOG_LEVEL_INFO); // Keep DEBUG for now, can be changed to INFO
+      MINIAV_LOG_LEVEL_DEBUG);
 
   MiniAVDeviceInfo *displays = NULL;
   uint32_t display_count = 0;
@@ -282,8 +281,6 @@ int main() {
   }
 
   // The following cleanup code will not be reached if Ctrl+C is used to exit.
-  // For a test application, this is often acceptable.
-  // For a production app, signal handling would be needed for graceful shutdown.
   printf("\nStopping screen capture...\n");
   res = MiniAV_Screen_StopCapture(screen_ctx);
   if (res != MINIAV_SUCCESS) {

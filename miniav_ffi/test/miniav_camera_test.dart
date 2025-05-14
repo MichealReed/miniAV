@@ -8,12 +8,8 @@ void main() {
   late MiniAV miniAV;
 
   setUpAll(() {
-    // This is a good place to initialize MiniAV or load the library
-    // if it's not handled by the constructor or a global setup.
-    // For now, our MiniAV constructor handles library loading.
     miniAV = MiniAV();
 
-    // Optional: Set a log callback for debugging during tests
     miniAV.setLogCallback((level, messagePtr, userData) {
       final message = messagePtr.cast<Utf8>().toDartString();
       print('[MiniAV Test Log - $level]: $message');
@@ -173,6 +169,4 @@ void main() {
     // TODO: Add tests for cameraStartCapture and cameraStopCapture
     // These will be more involved as they require handling callbacks and buffers.
   });
-
-  // You can add more groups for other parts of the API (Core, Screen, Audio, Loopback)
 }

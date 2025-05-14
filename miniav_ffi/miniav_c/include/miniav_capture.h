@@ -36,7 +36,7 @@ MiniAV_FreeFormatList(void *formats,
 MINIAV_API MiniAVResultCode
 MiniAV_Camera_EnumerateDevices(MiniAVDeviceInfo **devices, uint32_t *count);
 MINIAV_API MiniAVResultCode MiniAV_Camera_GetSupportedFormats(
-    const char *device_id, void **formats,
+    const char *device_id, MiniAVVideoFormatInfo **formats,
     uint32_t *count); // Placeholder for MiniAVVideoFormatInfo
 
 MINIAV_API MiniAVResultCode

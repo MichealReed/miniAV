@@ -1055,7 +1055,7 @@ mf_get_supported_formats(const char *device_id_utf8,
       continue;
     }
 
-    UINT32 width = 0, height = 0;
+    uint32_t width = 0, height = 0;
     UINT64 packed_frame_size = 0;
     hr_attr = IMFMediaType_GetUINT64(media_type, &MF_MT_FRAME_SIZE,
                                      &packed_frame_size);
@@ -1065,10 +1065,10 @@ mf_get_supported_formats(const char *device_id_utf8,
       media_type_index++;
       continue;
     }
-    width = (UINT32)(packed_frame_size >> 32);
-    height = (UINT32)(packed_frame_size & 0xFFFFFFFF);
+    width = (uint32_t)(packed_frame_size >> 32);
+    height = (uint32_t)(packed_frame_size & 0xFFFFFFFF);
 
-    UINT32 fr_num = 0, fr_den = 0;
+    uint32_t fr_num = 0, fr_den = 0;
     UINT64 packed_frame_rate = 0;
     hr_attr = IMFMediaType_GetUINT64(media_type, &MF_MT_FRAME_RATE,
                                      &packed_frame_rate);
@@ -1078,8 +1078,8 @@ mf_get_supported_formats(const char *device_id_utf8,
       media_type_index++;
       continue;
     }
-    fr_num = (UINT32)(packed_frame_rate >> 32);
-    fr_den = (UINT32)(packed_frame_rate & 0xFFFFFFFF);
+    fr_num = (uint32_t)(packed_frame_rate >> 32);
+    fr_den = (uint32_t)(packed_frame_rate & 0xFFFFFFFF);
 
     if (width == 0 || height == 0 || fr_den == 0) {
       IMFMediaType_Release(media_type);
@@ -1109,6 +1109,8 @@ mf_get_supported_formats(const char *device_id_utf8,
     result_formats_list[found_formats].frame_rate_numerator = fr_num;
     result_formats_list[found_formats].frame_rate_denominator = fr_den;
     result_formats_list[found_formats].pixel_format = pixel_format;
+    result_formats_list[found_formats].output_preference =
+        MINIAV_OUTPUT_PREFERENCE_CPU;
     found_formats++;
 
     IMFMediaType_Release(media_type);

@@ -151,17 +151,19 @@ MiniAVResultCode MiniAV_Camera_EnumerateDevices(
     ));
 
 @ffi.Native<
-    ffi.Int Function(ffi.Pointer<ffi.Char>, ffi.Pointer<ffi.Pointer<ffi.Void>>,
+    ffi.Int Function(
+        ffi.Pointer<ffi.Char>,
+        ffi.Pointer<ffi.Pointer<MiniAVVideoFormatInfo>>,
         ffi.Pointer<ffi.Uint32>)>(symbol: 'MiniAV_Camera_GetSupportedFormats')
 external int _MiniAV_Camera_GetSupportedFormats(
   ffi.Pointer<ffi.Char> device_id,
-  ffi.Pointer<ffi.Pointer<ffi.Void>> formats,
+  ffi.Pointer<ffi.Pointer<MiniAVVideoFormatInfo>> formats,
   ffi.Pointer<ffi.Uint32> count,
 );
 
 MiniAVResultCode MiniAV_Camera_GetSupportedFormats(
   ffi.Pointer<ffi.Char> device_id,
-  ffi.Pointer<ffi.Pointer<ffi.Void>> formats,
+  ffi.Pointer<ffi.Pointer<MiniAVVideoFormatInfo>> formats,
   ffi.Pointer<ffi.Uint32> count,
 ) =>
     MiniAVResultCode.fromValue(_MiniAV_Camera_GetSupportedFormats(

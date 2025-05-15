@@ -151,9 +151,6 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
         pSample // Can be NULL if dwStreamFlags has
                 // MF_SOURCE_READERF_ENDOFSTREAM or MF_SOURCE_READERF_STREAMTICK
 ) {
-
-  miniav_log(MINIAV_LOG_LEVEL_ERROR, "MF: OnReadSample - ENTRY POINT REACHED.");
-
   MFPlatformContext *mf_ctx = (MFPlatformContext *)pThis;
   MiniAVCameraContext *parent_ctx = mf_ctx->parent_ctx;
   HRESULT hr = S_OK; // hr for internal operations, hrStatus is from MF
@@ -306,7 +303,8 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                              shared_handle);
                   buffer_ptr->data.video.planes[0] = NULL;
                   buffer_ptr->data.video.native_gpu_texture_ptr = d3d11_texture;
-                  buffer_ptr->data.video.native_gpu_shared_handle = shared_handle;
+                  buffer_ptr->data.video.native_gpu_shared_handle =
+                      shared_handle;
                   buffer_ptr->data.video.stride_bytes[0] = 0;
                   buffer_ptr->data_size_bytes = 0;
                   processed_as_gpu_texture = TRUE;
@@ -668,7 +666,6 @@ static MiniAVResultCode mf_init_platform(MiniAVCameraContext *ctx) {
 
   hr_com_init =
       CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-  // ... (existing COM init logging and error handling) ...
   if (FAILED(hr_com_init) && hr_com_init != RPC_E_CHANGED_MODE) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "MF: CoInitializeEx failed: 0x%X",
                hr_com_init);

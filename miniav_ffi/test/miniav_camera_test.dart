@@ -271,11 +271,7 @@ void main() {
         }
 
         // Pass the Dart callback directly. MiniAV class handles NativeCallable.
-        miniAV.cameraStartCapture(
-          contextHandle,
-          myDartBufferCallback,
-          // Optional: userData: myCustomUserDataPointer,
-        );
+        miniAV.cameraStartCapture(contextHandle, myDartBufferCallback);
         print('Camera capture started. Waiting for frame...');
 
         await frameReceivedCompleter.future.timeout(
@@ -323,6 +319,160 @@ void main() {
         // The NativeCallable is now managed by the MiniAV instance,
         // so no need to close it explicitly here.
         // It will be closed by cameraStopCapture or miniAV.dispose().
+      }
+    });
+  });
+
+  group('MiniAV Camera Latency Test', () {
+    test('Capture frames for 5 seconds and measure latency', () async {
+      miniAV.setLogCallback((level, message, userData) {
+        print('[MiniAV Test Log - $level]: $message');
+      });
+      miniAV.setLogLevel(bindings.MiniAVLogLevel.MINIAV_LOG_LEVEL_DEBUG);
+
+      List<DeviceInfo> devices;
+      try {
+        devices = miniAV.cameraEnumerateDevices();
+      } on MiniAVException catch (e) {
+        markTestSkipped(
+          'Skipping latency test: Failed to enumerate devices - $e',
+        );
+        return;
+      }
+
+      if (devices.isEmpty) {
+        markTestSkipped('Skipping latency test: No camera devices found.');
+        return;
+      }
+      final firstDevice = devices.first;
+
+      List<VideoFormatInfo> formats;
+      try {
+        formats = miniAV.cameraGetSupportedFormats(firstDevice.deviceId);
+      } on MiniAVException catch (e) {
+        markTestSkipped(
+          'Skipping latency test: Failed to get formats for ${firstDevice.deviceId} - $e',
+        );
+        return;
+      }
+
+      if (formats.isEmpty) {
+        markTestSkipped(
+          'Skipping latency test: No formats found for ${firstDevice.deviceId}.',
+        );
+        return;
+      }
+
+      // Try to find a common format, otherwise use the first available
+      final formatToTest = formats.firstWhere(
+        (f) => f.width == 640 && f.height == 480,
+        orElse: () => formats.first,
+      );
+      print(
+        'Selected format for latency test: ${formatToTest.width}x${formatToTest.height} @ ${formatToTest.frameRateNumerator}/${formatToTest.frameRateDenominator}fps, PixelFormat: ${formatToTest.pixelFormat.name}',
+      );
+
+      bindings.MiniAVCameraContextHandle? contextHandle;
+      final frameReceivedCompleter = Completer<void>();
+      int frameCount = 0;
+      final List<int> frameTimestamps = [];
+      final List<int> frameLatencies = [];
+
+      try {
+        contextHandle = miniAV.cameraCreateContext();
+        miniAV.cameraConfigure(
+          contextHandle,
+          firstDevice.deviceId,
+          formatToTest,
+        );
+        print('Camera configured for latency test.');
+
+        // Define the Dart callback that matches MiniAVBufferCallback
+        void myDartBufferCallback(
+          Pointer<bindings.MiniAVBuffer> bufferPtr,
+          Pointer<Void> userData,
+        ) {
+          if (bufferPtr == nullptr) {
+            print('[Test Callback] Received NULL buffer pointer!');
+            return;
+          }
+          final buffer = bufferPtr.ref;
+
+          frameCount++;
+          final timestamp = DateTime.now().microsecondsSinceEpoch;
+          frameTimestamps.add(timestamp);
+
+          if (frameTimestamps.length > 1) {
+            final latency =
+                timestamp - frameTimestamps[frameTimestamps.length - 2];
+            frameLatencies.add(latency);
+          }
+
+          print(
+            '[Test Callback] Frame received! Count: $frameCount, Type: ${buffer.type.name}, TS: ${buffer.timestamp_us}, Size: ${buffer.data_size_bytes}',
+          );
+
+          if (buffer.type ==
+              bindings.MiniAVBufferType.MINIAV_BUFFER_TYPE_VIDEO) {
+            print(
+              '  Video: ${buffer.data.video.width}x${buffer.data.video.height}, PixFmt: ${buffer.data.video.pixel_format.name}, Stride0: ${buffer.data.video.stride_bytes[0]}',
+            );
+          }
+
+          if (buffer.internal_handle != nullptr) {
+            try {
+              miniAV.releaseBuffer(bufferPtr);
+            } on MiniAVException catch (e) {
+              print("[Test Callback] Error releasing buffer: $e");
+            }
+          }
+
+          if (!frameReceivedCompleter.isCompleted && frameCount >= 1) {
+            frameReceivedCompleter.complete();
+          }
+        }
+
+        miniAV.cameraStartCapture(contextHandle, myDartBufferCallback);
+        print('Camera capture started. Capturing for 5 seconds...');
+
+        await Future.delayed(const Duration(seconds: 5));
+
+        miniAV.cameraStopCapture(contextHandle);
+        print('Camera capture stopped.');
+
+        if (frameLatencies.isNotEmpty) {
+          final averageLatency =
+              frameLatencies.reduce((a, b) => a + b) / frameLatencies.length;
+          print('Frame Latencies (microseconds): $frameLatencies');
+          print(
+            'Average Frame Latency: ${(averageLatency / 1000).toStringAsFixed(2)} milliseconds',
+          );
+        } else {
+          print('No frame latencies recorded.');
+        }
+
+        expect(
+          frameCount,
+          greaterThan(0),
+          reason: 'Expected at least one frame to be received.',
+        );
+      } on MiniAVException catch (e) {
+        fail(
+          'Camera latency test failed for device ${firstDevice.deviceId} with format ${formatToTest.toString()}: $e',
+        );
+      } catch (e, s) {
+        print('Stack trace for unexpected error in latency test: $s');
+        fail('Camera latency test failed with unexpected error: $e');
+      } finally {
+        print('Cleaning up latency test resources...');
+        if (contextHandle != null && contextHandle != nullptr) {
+          try {
+            miniAV.cameraDestroyContext(contextHandle);
+            print('Camera context destroyed.');
+          } on MiniAVException catch (e) {
+            print('Error destroying context (during cleanup): $e');
+          }
+        }
       }
     });
   });

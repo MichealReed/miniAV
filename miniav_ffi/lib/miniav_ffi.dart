@@ -1,4 +1,8 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:ffi' as ffi;
+import 'dart:isolate';
+import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 import 'miniav_ffi_bindings.dart' as bindings;
 
@@ -113,9 +117,27 @@ class MiniAVException implements Exception {
   }
 }
 
+typedef UserDartMiniAVLogCallbackFunction =
+    void Function(
+      bindings.MiniAVLogLevel level,
+      String message, // Expects a Dart String
+      ffi.Pointer<ffi.Void> userData,
+    );
+
 class MiniAV {
-  // late final bindings. _bindings; // No longer needed as bindings are top-level
+  // For Log Callback
   ffi.NativeCallable<bindings.MiniAVLogCallbackFunction>? _logCallbackCallable;
+  ReceivePort? _logReceivePort;
+  StreamSubscription<dynamic>? _logStreamSubscription;
+  UserDartMiniAVLogCallbackFunction? _userLogCallback;
+
+  // For Camera Buffer Callback
+  // Corrected type here to match the typedef from bindings.dart
+  ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>?
+  _cameraBufferCallbackCallable;
+  ReceivePort? _cameraReceivePort;
+  StreamSubscription<dynamic>? _cameraStreamSubscription;
+  bindings.DartMiniAVBufferCallbackFunction? _userCameraCallback;
 
   MiniAV() {
     // Initialize the library, if necessary.
@@ -125,9 +147,23 @@ class MiniAV {
   }
 
   void dispose() {
+    // Cleanup log callback resources
+    _logStreamSubscription?.cancel();
+    _logReceivePort?.close();
     _logCallbackCallable?.close();
+    _logStreamSubscription = null;
+    _logReceivePort = null;
     _logCallbackCallable = null;
-    // Any other cleanup for the MiniAV instance
+    _userLogCallback = null;
+
+    // Cleanup camera callback resources
+    _cameraStreamSubscription?.cancel();
+    _cameraReceivePort?.close();
+    _cameraBufferCallbackCallable?.close();
+    _cameraStreamSubscription = null;
+    _cameraReceivePort = null;
+    _cameraBufferCallbackCallable = null;
+    _userCameraCallback = null;
   }
 
   /// Gets the version of the MiniAV library.
@@ -212,50 +248,9 @@ class MiniAV {
 
   /// Sets the log callback function.
   void setLogCallback(
-    bindings.DartMiniAVLogCallbackFunction dartCallback, {
+    UserDartMiniAVLogCallbackFunction dartCallback, {
     ffi.Pointer<ffi.Void>? userData,
-  }) {
-    // Close any existing callable before creating a new one.
-    _logCallbackCallable?.close();
-    _logCallbackCallable = null;
-
-    // Create a NativeCallable. The closure provided to isolateLocal
-    // captures the 'dartCallback' from the setLogCallback parameters.
-    _logCallbackCallable = ffi.NativeCallable<
-      bindings.MiniAVLogCallbackFunction
-    >.isolateLocal(
-      (
-        int nativeLevel,
-        ffi.Pointer<ffi.Char> nativeMessage,
-        ffi.Pointer<ffi.Void> nativeUserData,
-      ) {
-        // nativeUserData is the 'userData' that was passed to bindings.MiniAV_SetLogCallback.
-        // This is the same 'userData' that the user of setLogCallback provided.
-        dartCallback(
-          bindings.MiniAVLogLevel.fromValue(nativeLevel),
-          nativeMessage,
-          nativeUserData, // Pass the userData through to the user's Dart callback
-        );
-      },
-      // For void functions, exceptionalReturn is often not needed unless you want
-      // to propagate an error to C in a specific way, which is advanced.
-    );
-
-    final result = bindings.MiniAV_SetLogCallback(
-      _logCallbackCallable!.nativeFunction,
-      userData ?? ffi.nullptr,
-    );
-
-    if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
-      // If setting the callback failed, we might not need to worry about the nativeCallback's lifecycle
-      // as much, but it's good practice to have a strategy.
-      _logCallbackCallable!.close();
-      _logCallbackCallable = null;
-      throw MiniAVException('Failed to set log callback', result);
-    }
-    // TODO: Manage the lifecycle of nativeCallback if it's stored by the native code.
-    // For example, store it in a member variable if only one callback is active.
-  }
+  }) {}
 
   /// Sets the log level.
   void setLogLevel(bindings.MiniAVLogLevel level) {
@@ -360,7 +355,6 @@ class MiniAV {
       // Free the entire array of structs allocated by C.
       // MiniAV_FreeFormatList expects a void* (which is the MiniAVVideoFormatInfo*) and count.
       _freeFormatList(firstStructPtr.cast<ffi.Void>(), count);
-
       return formatList;
     } finally {
       calloc.free(deviceIdPtr);
@@ -425,6 +419,107 @@ class MiniAV {
     } finally {
       calloc.free(deviceIdPtr);
       calloc.free(nativeFormatPtr);
+    }
+  }
+
+  /// Starts camera capture.
+  ///
+  /// [context] The camera context handle.
+  /// [dartCallback] The Dart function to call when a buffer is received.
+  /// [userData] Optional user data to pass to the callback.
+  void cameraStartCapture(
+    bindings.MiniAVCameraContextHandle context,
+    bindings.DartMiniAVBufferCallbackFunction dartCallback, {
+    ffi.Pointer<ffi.Void>? userData,
+  }) {
+    if (context == ffi.nullptr) {
+      throw ArgumentError.value(context, 'context', 'Context cannot be null.');
+    }
+
+    _cameraStreamSubscription?.cancel();
+    _cameraReceivePort?.close();
+    _cameraBufferCallbackCallable?.close();
+    _userCameraCallback = null;
+
+    _userCameraCallback = dartCallback;
+    _cameraReceivePort = ReceivePort();
+    final sendPort = _cameraReceivePort!.sendPort;
+
+    // This is the function that C will call. It runs in a native thread context.
+    // Its only job is to send a message (containing pointer addresses) to the SendPort.
+    // The signature of this Dart function must match MiniAVBufferCallbackFunction
+    void nativeBufferCallbackEntry(
+      ffi.Pointer<bindings.MiniAVBuffer> nativeBuffer,
+      ffi.Pointer<ffi.Void> cbUserDataFromC,
+    ) {
+      sendPort.send([nativeBuffer.address, cbUserDataFromC.address]);
+    }
+
+    // Use NativeCallable.listener with the correct FFI function signature typedef
+    _cameraBufferCallbackCallable =
+        ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>.listener(
+          nativeBufferCallbackEntry,
+        );
+
+    _cameraStreamSubscription = _cameraReceivePort!.listen((message) {
+      if (_userCameraCallback == null) return;
+
+      final List<dynamic> msgList = message as List<dynamic>;
+      final bufferAddress = msgList[0] as int;
+      final cbUserDataAddress = msgList[1] as int;
+
+      final bufferPtr = ffi.Pointer<bindings.MiniAVBuffer>.fromAddress(
+        bufferAddress,
+      );
+      final cbUserDataPtr = ffi.Pointer<ffi.Void>.fromAddress(
+        cbUserDataAddress,
+      );
+
+      _userCameraCallback!(bufferPtr, cbUserDataPtr);
+    });
+
+    final result = bindings.MiniAV_Camera_StartCapture(
+      context,
+      // Pass the nativeFunction pointer from the NativeCallable
+      _cameraBufferCallbackCallable!.nativeFunction,
+      userData ?? ffi.nullptr,
+    );
+
+    if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+      _cameraStreamSubscription?.cancel();
+      _cameraReceivePort?.close();
+      _cameraBufferCallbackCallable!.close();
+      _cameraStreamSubscription = null;
+      _cameraReceivePort = null;
+      _cameraBufferCallbackCallable = null;
+      _userCameraCallback = null;
+      throw MiniAVException('Failed to start camera capture', result);
+    }
+  }
+
+  /// Stops camera capture.
+  ///
+  /// [context] The camera context handle.
+  void cameraStopCapture(bindings.MiniAVCameraContextHandle context) {
+    if (context == ffi.nullptr) {
+      return;
+    }
+
+    final result = bindings.MiniAV_Camera_StopCapture(context);
+
+    // Clean up resources associated with the callback for this instance
+    _cameraStreamSubscription?.cancel();
+    _cameraReceivePort?.close();
+    _cameraBufferCallbackCallable
+        ?.close(); // Important: close the NativeCallable
+
+    _cameraStreamSubscription = null;
+    _cameraReceivePort = null;
+    _cameraBufferCallbackCallable = null;
+    _userCameraCallback = null;
+
+    if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+      throw MiniAVException('Failed to stop camera capture', result);
     }
   }
 }

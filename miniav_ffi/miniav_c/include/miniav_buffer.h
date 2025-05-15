@@ -23,14 +23,6 @@ typedef enum {
   MINIAV_NATIVE_HANDLE_TYPE_AUDIO
 } MiniAVNativeHandleType;
 
-typedef struct MiniAVNativeBufferInternalPayload {
-  MiniAVNativeHandleType handle_type;
-  void *context_owner;       // e.g., MiniAVCameraContextHandle,
-                             // MiniAVAudioContextHandle
-  void *native_resource_ptr; // e.g., IMFMediaBuffer*, v4l2_buffer*,
-                             // CMSampleBufferRef
-} MiniAVNativeBufferInternalPayload;
-
 typedef enum {
   MINIAV_BUFFER_CONTENT_TYPE_CPU, // CPU-accessible memory. Check
                                   // MiniAVBuffer.type to interpret data.video
@@ -79,6 +71,16 @@ typedef struct {
   void *user_data;
   void *internal_handle;
 } MiniAVBuffer;
+
+typedef struct MiniAVNativeBufferInternalPayload {
+  MiniAVNativeHandleType handle_type;
+  void *context_owner;       // e.g., MiniAVCameraContextHandle,
+                             // MiniAVAudioContextHandle
+  void *native_resource_ptr; // e.g., IMFMediaBuffer*, v4l2_buffer*,
+                             // CMSampleBufferRef
+  MiniAVBuffer
+      *parent_miniav_buffer_ptr; // Pointer to the heap-allocated MiniAVBuffer
+} MiniAVNativeBufferInternalPayload;
 
 #ifdef __cplusplus
 }

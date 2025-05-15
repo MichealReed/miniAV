@@ -2,13 +2,17 @@ name: miniav_platform_interface
 description: A starting point for Dart libraries or applications.
 version: 1.0.0
 # repository: https://github.com/my_org/my_repo
+publish_to: none
 
 environment:
   sdk: ^3.8.0-133.0.dev
 
 # Add regular dependencies here.
 dependencies:
-  # path: ^1.8.0
+  miniav_ffi:
+    path: ../miniav_ffi
+  miniav_web:
+    path: ../miniav_web
 
 dev_dependencies:
   lints: ^5.0.0

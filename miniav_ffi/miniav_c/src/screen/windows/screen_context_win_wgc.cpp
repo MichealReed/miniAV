@@ -205,6 +205,204 @@ static winrt::com_ptr<ID3D11Texture2D> GetTextureFromDirect3DSurface(
 
 // --- Platform Ops Implementation ---
 
+static MiniAVResultCode
+wgc_get_default_formats(const char *device_id_utf8,
+                        MiniAVVideoFormatInfo *video_format_out,
+                        MiniAVAudioInfo *audio_format_out) {
+  if (!device_id_utf8 || !video_format_out) {
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+  memset(video_format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  if (audio_format_out) {
+    memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
+  }
+
+  HMONITOR hmonitor = NULL;
+  HWND hwnd = NULL;
+  WGCCaptureTargetType target_type = WGC_TARGET_NONE;
+
+  if (strncmp(device_id_utf8, "HMONITOR:0x", 11) == 0) {
+    if (sscanf_s(device_id_utf8, "HMONITOR:0x%p", (void **)&hmonitor) != 1 ||
+        !hmonitor) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WGC GetDefaultFormats: Invalid display ID format: %s",
+                 device_id_utf8);
+      return MINIAV_ERROR_INVALID_ARG;
+    }
+    target_type = WGC_TARGET_DISPLAY;
+  } else if (strncmp(device_id_utf8, "HWND:0x", 7) == 0) {
+    if (sscanf_s(device_id_utf8, "HWND:0x%p", (void **)&hwnd) != 1 || !hwnd ||
+        !IsWindow(hwnd)) {
+      miniav_log(
+          MINIAV_LOG_LEVEL_ERROR,
+          "WGC GetDefaultFormats: Invalid window ID format or invalid HWND: %s",
+          device_id_utf8);
+      return MINIAV_ERROR_INVALID_ARG;
+    }
+    target_type = WGC_TARGET_WINDOW;
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "WGC GetDefaultFormats: Unknown device ID format: %s",
+               device_id_utf8);
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+
+  // --- Video Format ---
+  video_format_out->pixel_format = MINIAV_PIXEL_FORMAT_BGRA32; // WGC default
+  video_format_out->frame_rate_numerator = 60;
+  video_format_out->frame_rate_denominator = 1;
+  video_format_out->output_preference =
+      MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE; // Default preference
+
+  if (target_type == WGC_TARGET_DISPLAY) {
+    MONITORINFOEXW mi;
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(hmonitor, &mi)) {
+      video_format_out->width = mi.rcMonitor.right - mi.rcMonitor.left;
+      video_format_out->height = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WGC GetDefaultFormats: GetMonitorInfoW failed for %s",
+                 device_id_utf8);
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+    }
+  } else { // WGC_TARGET_WINDOW
+    RECT rc;
+    if (GetWindowRect(hwnd, &rc)) {
+      video_format_out->width = rc.right - rc.left;
+      video_format_out->height = rc.bottom - rc.top;
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WGC GetDefaultFormats: GetWindowRect failed for %s",
+                 device_id_utf8);
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+    }
+  }
+  if (video_format_out->width == 0 || video_format_out->height == 0) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "WGC GetDefaultFormats: Target %s has zero width or height.",
+               device_id_utf8);
+    // Allow proceeding, but this is unusual. WGC might fail later if item size
+    // is 0.
+  }
+
+  // --- Audio Format (Optional) ---
+  if (audio_format_out) {
+    const char *loopback_target_id_str = NULL;
+    char process_id_string_buffer[64];
+
+    if (target_type == WGC_TARGET_WINDOW && hwnd) {
+      DWORD process_id = 0;
+      GetWindowThreadProcessId(hwnd, &process_id);
+      if (process_id != 0) {
+        snprintf(process_id_string_buffer, sizeof(process_id_string_buffer),
+                 "PID:%lu", process_id);
+        loopback_target_id_str = process_id_string_buffer;
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "WGC GetDefaultFormats: Querying default audio for PID: %lu",
+                   process_id);
+      } else {
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "WGC GetDefaultFormats: Could not get PID for HWND %p. "
+                   "Querying system default audio.",
+                   hwnd);
+        // loopback_target_id_str remains NULL for system default
+      }
+    } else {
+      miniav_log(
+          MINIAV_LOG_LEVEL_DEBUG,
+          "WGC GetDefaultFormats: Querying system default audio format.");
+      // loopback_target_id_str remains NULL for system default
+    }
+
+    MiniAVResultCode audio_res = MiniAV_Loopback_GetDefaultFormat(
+        loopback_target_id_str, audio_format_out);
+    if (audio_res != MINIAV_SUCCESS) {
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "WGC GetDefaultFormats: Failed to get default audio format "
+                 "for target %s (loopback ID %s): %s. Audio format not set.",
+                 device_id_utf8,
+                 loopback_target_id_str ? loopback_target_id_str
+                                        : "(system default)",
+                 MiniAV_GetErrorString(audio_res));
+      // audio_format_out is already zeroed, so no need to do anything else.
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WGC GetDefaultFormats: Default audio format for target %s "
+                 "(loopback ID %s): Format=%d, Ch=%u, Rate=%u",
+                 device_id_utf8,
+                 loopback_target_id_str ? loopback_target_id_str
+                                        : "(system default)",
+                 audio_format_out->format, audio_format_out->channels,
+                 audio_format_out->sample_rate);
+    }
+  }
+
+  miniav_log(MINIAV_LOG_LEVEL_INFO,
+             "WGC GetDefaultFormats: Video: %ux%u @ %u/%u FPS, PixelFormat: "
+             "%d. Audio queried: %s",
+             video_format_out->width, video_format_out->height,
+             video_format_out->frame_rate_numerator,
+             video_format_out->frame_rate_denominator,
+             video_format_out->pixel_format, audio_format_out ? "Yes" : "No");
+
+  return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode
+wgc_get_configured_formats(MiniAVScreenContext *ctx,
+                           MiniAVVideoFormatInfo *video_format_out,
+                           MiniAVAudioInfo *audio_format_out) {
+  if (!ctx || !ctx->platform_ctx || !video_format_out) {
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+  WGCScreenPlatformContext *wgc_ctx =
+      (WGCScreenPlatformContext *)ctx->platform_ctx;
+
+  memset(video_format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  if (audio_format_out) {
+    memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
+  }
+
+  if (!ctx->is_configured) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "WGC GetConfiguredFormats: Context not configured.");
+    return MINIAV_ERROR_NOT_INITIALIZED;
+  }
+
+  // Video format is stored in the parent context's configured_format
+  // which is updated by wgc_configure_capture_item
+  *video_format_out = ctx->configured_format;
+
+  // Audio format
+  if (audio_format_out) {
+    if (wgc_ctx->audio_loopback_enabled_and_configured) {
+      *audio_format_out = wgc_ctx->configured_audio_format;
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WGC GetConfiguredFormats: Audio: Format=%d, Ch=%u, Rate=%u",
+                 audio_format_out->format, audio_format_out->channels,
+                 audio_format_out->sample_rate);
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WGC GetConfiguredFormats: Audio loopback not enabled or not "
+                 "configured. Audio format not set.");
+      // audio_format_out remains zeroed
+    }
+  }
+  miniav_log(
+      MINIAV_LOG_LEVEL_INFO,
+      "WGC GetConfiguredFormats: Video: %ux%u @ %u/%u FPS, PixelFormat: %d. "
+      "Audio configured: %s",
+      video_format_out->width, video_format_out->height,
+      video_format_out->frame_rate_numerator,
+      video_format_out->frame_rate_denominator, video_format_out->pixel_format,
+      (wgc_ctx->audio_loopback_enabled_and_configured && audio_format_out)
+          ? "Yes"
+          : "No/Not Requested");
+
+  return MINIAV_SUCCESS;
+}
+
 static MiniAVResultCode wgc_init_platform(MiniAVScreenContext *ctx) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: Initializing platform context.");
   if (!ctx)
@@ -498,6 +696,7 @@ static MiniAVResultCode wgc_configure_capture_item(
                  item_id_utf8);
       return MINIAV_ERROR_INVALID_ARG;
     }
+    wgc_ctx->parent_ctx->is_configured = TRUE;
     wgc_ctx->selected_hmonitor = hmonitor;
     wgc_ctx->selected_hwnd = NULL;
   } else if (target_type == WGC_TARGET_WINDOW) {
@@ -508,6 +707,7 @@ static MiniAVResultCode wgc_configure_capture_item(
                  item_id_utf8);
       return MINIAV_ERROR_INVALID_ARG;
     }
+    wgc_ctx->parent_ctx->is_configured = TRUE;
     wgc_ctx->selected_hwnd = hwnd;
     wgc_ctx->selected_hmonitor = NULL;
   } else {
@@ -1349,7 +1549,7 @@ static void wgc_on_frame_arrived(
           mapped_rect_cpu.RowPitch * buffer.data.video.height;
 
       texture_for_payload_ref_com = per_frame_staging_texture_com;
-    } else {                                 // GPU Path successful
+    } else { // GPU Path successful
       buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
       buffer.data.video.native_gpu_shared_handle = shared_handle_for_app;
       buffer.data.video.native_gpu_texture_ptr =
@@ -1479,10 +1679,13 @@ static void wgc_on_frame_arrived(
 
 // --- Ops struct and Platform Init ---
 const ScreenContextInternalOps g_screen_ops_win_wgc = {
-    wgc_init_platform,     wgc_destroy_platform,  wgc_enumerate_displays,
-    wgc_enumerate_windows, wgc_configure_display, wgc_configure_window,
+    wgc_init_platform,         wgc_destroy_platform,  wgc_enumerate_displays,
+    wgc_enumerate_windows,     wgc_configure_display, wgc_configure_window,
     wgc_configure_region, // Not supported
-    wgc_start_capture,     wgc_stop_capture,      wgc_release_buffer};
+    wgc_start_capture,         wgc_stop_capture,      wgc_release_buffer,
+    wgc_get_default_formats,
+    wgc_get_configured_formats 
+};
 
 MiniAVResultCode
 miniav_screen_context_platform_init_windows_wgc(MiniAVScreenContext *ctx) {

@@ -32,8 +32,23 @@ typedef struct CameraContextInternalOps {
     // Static-like operations (don't take a full MiniAVCameraContext but might need some platform init)
     MiniAVResultCode (*enumerate_devices)(MiniAVDeviceInfo** devices, uint32_t* count);
     MiniAVResultCode (*get_supported_formats)(const char* device_id, MiniAVVideoFormatInfo** formats, uint32_t* count);
+    MiniAVResultCode (*get_default_format)(const char* device_id, MiniAVVideoFormatInfo* format_out); // New
+
+    // Context-specific operations
+    MiniAVResultCode (*get_configured_format)(MiniAVCameraContext* ctx, MiniAVVideoFormatInfo* format_out); // New
 
 } CameraContextInternalOps;
+
+// --- Camera Backend Entry Structure ---
+// Used in the backend table for dynamic selection.
+typedef struct MiniAVCameraBackend {
+    const char* name;
+    const CameraContextInternalOps* ops; // Direct pointer to the ops table for this backend
+    // Initial, minimal platform init for selection.
+    // This function is responsible for setting ctx->ops and potentially ctx->platform_ctx.
+    MiniAVResultCode (*platform_init_for_selection)(MiniAVCameraContext* ctx);
+} MiniAVCameraBackend;
+
 
 // Main camera context structure
 struct MiniAVCameraContext {
@@ -56,11 +71,16 @@ struct MiniAVCameraContext {
 // Platform-specific initialization functions (to be implemented in platform files)
 // These will set up ctx->ops and call ops->init_platform
 #if defined(_WIN32)
-MiniAVResultCode miniav_camera_context_platform_init_windows(MiniAVCameraContext* ctx);
+// This function will be pointed to by MiniAVCameraBackend's platform_init_for_selection
+// It should set ctx->ops = &g_camera_ops_win_mf (or similar) and do minimal setup.
+extern MiniAVResultCode miniav_camera_context_platform_init_windows_mf(MiniAVCameraContext* ctx); // Renamed for clarity
+extern const CameraContextInternalOps g_camera_ops_win_mf; // Ensure this is declared
 #elif defined(__APPLE__)
-// MiniAVResultCode miniav_camera_context_platform_init_macos(MiniAVCameraContext* ctx);
+// extern MiniAVResultCode miniav_camera_context_platform_init_macos_avf(MiniAVCameraContext* ctx);
+// extern const CameraContextInternalOps g_camera_ops_macos_avf;
 #elif defined(__linux__)
-// MiniAVResultCode miniav_camera_context_platform_init_linux(MiniAVCameraContext* ctx);
+// extern MiniAVResultCode miniav_camera_context_platform_init_linux_v4l2(MiniAVCameraContext* ctx);
+// extern const CameraContextInternalOps g_camera_ops_linux_v4l2;
 #else
 // Potentially a fallback or error
 #endif

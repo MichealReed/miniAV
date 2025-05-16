@@ -430,8 +430,181 @@ dxgi_cleanup_d3d_and_duplication(DXGIScreenPlatformContext *dxgi_ctx) {
 }
 
 static MiniAVResultCode
+dxgi_get_default_formats(const char *device_id_utf8,
+                         MiniAVVideoFormatInfo *video_format_out,
+                         MiniAVAudioInfo *audio_format_out) {
+  if (!device_id_utf8 || !video_format_out) {
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+  memset(video_format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  if (audio_format_out) {
+    memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
+  }
+
+  unsigned int adapter_idx = 0, output_idx = 0;
+  if (sscanf_s(device_id_utf8, "Adapter%u_Output%u", &adapter_idx,
+               &output_idx) != 2) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "DXGI GetDefaultFormats: Invalid display_id format: %s. "
+               "Expected AdapterX_OutputY.",
+               device_id_utf8);
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+
+  // --- Video Format ---
+  video_format_out->pixel_format = MINIAV_PIXEL_FORMAT_BGRA32; // DXGI default
+  video_format_out->frame_rate_numerator = 60;                 // Common default
+  video_format_out->frame_rate_denominator = 1;
+  video_format_out->output_preference =
+      MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE; // Default preference
+
+  // Get display dimensions
+  HRESULT hr;
+  IDXGIFactory1 *factory = NULL;
+  IDXGIAdapter1 *adapter = NULL;
+  IDXGIOutput *output = NULL;
+  BOOL found_output = FALSE;
+
+  hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory);
+  if (FAILED(hr)) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "DXGI GetDefaultFormats: Failed to create DXGIFactory1: 0x%X",
+               hr);
+    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+  }
+
+  if (SUCCEEDED(IDXGIFactory1_EnumAdapters1(factory, adapter_idx, &adapter))) {
+    if (SUCCEEDED(IDXGIAdapter1_EnumOutputs(adapter, output_idx, &output))) {
+      DXGI_OUTPUT_DESC desc;
+      if (SUCCEEDED(IDXGIOutput_GetDesc(output, &desc))) {
+        video_format_out->width =
+            desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
+        video_format_out->height =
+            desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+        found_output = TRUE;
+      } else {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "DXGI GetDefaultFormats: GetDesc failed for %s",
+                   device_id_utf8);
+      }
+      IDXGIOutput_Release(output);
+    } else {
+      miniav_log(
+          MINIAV_LOG_LEVEL_ERROR,
+          "DXGI GetDefaultFormats: Failed to enum output %u for adapter %u",
+          output_idx, adapter_idx);
+    }
+    IDXGIAdapter1_Release(adapter);
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "DXGI GetDefaultFormats: Failed to enum adapter %u",
+               adapter_idx);
+  }
+  IDXGIFactory1_Release(factory);
+
+  if (!found_output) {
+    return MINIAV_ERROR_DEVICE_NOT_FOUND;
+  }
+  if (video_format_out->width == 0 || video_format_out->height == 0) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "DXGI GetDefaultFormats: Target %s has zero width or height.",
+               device_id_utf8);
+    // Allow proceeding, but this is unusual.
+  }
+
+  // --- Audio Format (Optional) ---
+  if (audio_format_out) {
+    // For DXGI, we always query the system default audio output for loopback
+    // as it captures the entire screen.
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "DXGI GetDefaultFormats: Querying system default audio format.");
+    MiniAVResultCode audio_res =
+        MiniAV_Loopback_GetDefaultFormat(NULL, audio_format_out);
+    if (audio_res != MINIAV_SUCCESS) {
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "DXGI GetDefaultFormats: Failed to get default audio format "
+                 "for %s: %s. Audio format not set.",
+                 device_id_utf8, MiniAV_GetErrorString(audio_res));
+      // audio_format_out is already zeroed
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "DXGI GetDefaultFormats: Default audio format for target %s: "
+                 "Format=%d, Ch=%u, Rate=%u",
+                 device_id_utf8, audio_format_out->format,
+                 audio_format_out->channels, audio_format_out->sample_rate);
+    }
+  }
+
+  miniav_log(MINIAV_LOG_LEVEL_INFO,
+             "DXGI GetDefaultFormats: Video: %ux%u @ %u/%u FPS, PixelFormat: "
+             "%d. Audio queried: %s",
+             video_format_out->width, video_format_out->height,
+             video_format_out->frame_rate_numerator,
+             video_format_out->frame_rate_denominator,
+             video_format_out->pixel_format, audio_format_out ? "Yes" : "No");
+
+  return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode
+dxgi_get_configured_formats(MiniAVScreenContext *ctx,
+                            MiniAVVideoFormatInfo *video_format_out,
+                            MiniAVAudioInfo *audio_format_out) {
+  if (!ctx || !ctx->platform_ctx || !video_format_out) {
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+  DXGIScreenPlatformContext *dxgi_ctx =
+      (DXGIScreenPlatformContext *)ctx->platform_ctx;
+
+  memset(video_format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  if (audio_format_out) {
+    memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
+  }
+
+  if (!ctx->is_configured) { // is_configured is set by the main API after
+                             // successful configure_xxx
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "DXGI GetConfiguredFormats: Context not configured.");
+    return MINIAV_ERROR_NOT_INITIALIZED;
+  }
+
+  // Video format is stored in the parent context's configured_format
+  // which is updated by dxgi_configure_display
+  *video_format_out = ctx->configured_format;
+
+  // Audio format
+  if (audio_format_out) {
+    if (dxgi_ctx->audio_loopback_enabled_and_configured) {
+      *audio_format_out = dxgi_ctx->configured_audio_format;
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "DXGI GetConfiguredFormats: Audio: Format=%d, Ch=%u, Rate=%u",
+                 audio_format_out->format, audio_format_out->channels,
+                 audio_format_out->sample_rate);
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "DXGI GetConfiguredFormats: Audio loopback not enabled or not "
+                 "configured. Audio format not set.");
+      // audio_format_out remains zeroed
+    }
+  }
+
+  miniav_log(
+      MINIAV_LOG_LEVEL_INFO,
+      "DXGI GetConfiguredFormats: Video: %ux%u @ %u/%u FPS, PixelFormat: %d. "
+      "Audio configured: %s",
+      video_format_out->width, video_format_out->height,
+      video_format_out->frame_rate_numerator,
+      video_format_out->frame_rate_denominator, video_format_out->pixel_format,
+      (dxgi_ctx->audio_loopback_enabled_and_configured && audio_format_out)
+          ? "Yes"
+          : "No/Not Requested");
+
+  return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode
 dxgi_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
-                       const MiniAVVideoFormatInfo *format) {
+                       const MiniAVVideoFormatInfo *format, bool *audio_enabled) {
   if (!ctx || !ctx->platform_ctx || !display_id_utf8 || !format)
     return MINIAV_ERROR_INVALID_ARG;
   DXGIScreenPlatformContext *dxgi_ctx =
@@ -1136,7 +1309,10 @@ const ScreenContextInternalOps g_screen_ops_win_dxgi = {
     .configure_region = dxgi_configure_region, // Not supported
     .start_capture = dxgi_start_capture,
     .stop_capture = dxgi_stop_capture,
-    .release_buffer = dxgi_release_buffer};
+    .release_buffer = dxgi_release_buffer,
+    .get_default_formats = dxgi_get_default_formats,
+    .get_configured_formats = dxgi_get_configured_formats
+};
 
 MiniAVResultCode
 miniav_screen_context_platform_init_windows_dxgi(MiniAVScreenContext *ctx) {

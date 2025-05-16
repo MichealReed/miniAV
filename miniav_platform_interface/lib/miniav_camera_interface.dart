@@ -8,6 +8,9 @@ abstract class MiniCameraPlatformInterface {
   /// Get supported video formats for a given device.
   Future<List<MiniAVVideoFormatInfo>> getSupportedFormats(String deviceId);
 
+  /// Get supported audio formats for a given device.
+  Future<MiniAVVideoFormatInfo> getDefaultFormat(String deviceId);
+
   /// Create a camera context (for capture/configuration).
   Future<MiniCameraContextPlatformInterface> createContext();
 }
@@ -16,6 +19,8 @@ abstract class MiniCameraPlatformInterface {
 abstract class MiniCameraContextPlatformInterface {
   /// Configure the camera context with a device and format.
   Future<void> configure(String deviceId, MiniAVVideoFormatInfo format);
+
+  Future<MiniAVVideoFormatInfo> getConfiguredFormat();
 
   /// Start camera capture.
   /// [onFrame] is called for each frame received.

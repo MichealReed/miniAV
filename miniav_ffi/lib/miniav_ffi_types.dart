@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:miniav_platform_interface/miniav_platform_types.dart';
 import 'miniav_ffi_bindings.dart' as bindings;
 import 'dart:ffi' as ffi;
@@ -5,14 +7,29 @@ import 'dart:ffi' as ffi;
 import 'dart:typed_data';
 
 // Helper function to convert ffi.Array<ffi.Char> to String
-String _charArrayToString(ffi.Array<ffi.Char> array, int maxLength) {
-  final sb = StringBuffer();
+String _charArrayToUtf8String(ffi.Array<ffi.Char> charArray, int maxLength) {
+  final bytes = <int>[];
   for (int i = 0; i < maxLength; ++i) {
-    final charCode = array[i];
-    if (charCode == 0) break; // Null terminator
-    sb.writeCharCode(charCode);
+    final int charCode = charArray[i]; // Accesses the int value (ffi.Char)
+
+    if (charCode == 0) {
+      break; // Null terminator
+    }
+    // Convert the potentially signed charCode to an unsigned byte (0-255)
+    // by taking the lower 8 bits. This is crucial for UTF-8 decoding.
+    bytes.add(charCode & 0xFF);
   }
-  return sb.toString();
+  try {
+    // Decode the list of UTF-8 bytes into a Dart string.
+    return utf8.decode(bytes, allowMalformed: false);
+  } catch (e) {
+    // Optional: Handle decoding errors, e.g., log and return a placeholder or allow malformed.
+    // print("UTF-8 decoding error: $e. Raw bytes: $bytes");
+    return utf8.decode(
+      bytes,
+      allowMalformed: true,
+    ); // Or return an error string like "[Decoding Error]"
+  }
 }
 
 /// Dart representation of MiniAVDeviceInfo.
@@ -28,12 +45,15 @@ class DeviceInfo {
   });
 
   factory DeviceInfo.fromNative(bindings.MiniAVDeviceInfo nativeInfo) {
+    // Ensure you are calling the corrected helper function.
     return DeviceInfo(
-      deviceId: _charArrayToString(
+      deviceId: _charArrayToUtf8String(
+        // Use the corrected helper
         nativeInfo.device_id,
         bindings.MINIAV_DEVICE_ID_MAX_LEN,
       ),
-      name: _charArrayToString(
+      name: _charArrayToUtf8String(
+        // Use the corrected helper
         nativeInfo.name,
         bindings.MINIAV_DEVICE_NAME_MAX_LEN,
       ),
@@ -332,5 +352,97 @@ extension MiniAVOutputPreferenceX on bindings.MiniAVOutputPreference {
             .MiniAVOutputPreference
             .MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE;
     }
+  }
+}
+
+/// Dart FFI representation of MiniAVAudioInfo.
+class AudioInfo {
+  final bindings.MiniAVAudioFormat format;
+  final int sampleRate;
+  final int channels;
+  final int numFrames; // Optional: if your C struct has it and it's useful
+
+  AudioInfo({
+    required this.format,
+    required this.sampleRate,
+    required this.channels,
+    this.numFrames = 0, // Default if not always present or used
+  });
+
+  factory AudioInfo.fromNative(bindings.MiniAVAudioInfo nativeInfo) {
+    return AudioInfo(
+      format: nativeInfo.format, // Uses the getter from bindings
+      sampleRate: nativeInfo.sample_rate,
+      channels: nativeInfo.channels,
+      numFrames: nativeInfo.num_frames,
+    );
+  }
+
+  @override
+  String toString() =>
+      'AudioInfo(format: ${format.name}, sampleRate: $sampleRate, channels: $channels, numFrames: $numFrames)';
+}
+
+// AudioFormat conversion
+extension MiniAVAudioFormatX on bindings.MiniAVAudioFormat {
+  MiniAVAudioFormat toPlatformType() {
+    switch (this) {
+      case bindings.MiniAVAudioFormat.MINIAV_AUDIO_FORMAT_U8:
+        return MiniAVAudioFormat.u8;
+      case bindings.MiniAVAudioFormat.MINIAV_AUDIO_FORMAT_S16:
+        return MiniAVAudioFormat.s16;
+      case bindings.MiniAVAudioFormat.MINIAV_AUDIO_FORMAT_S32:
+        return MiniAVAudioFormat.s32;
+      case bindings.MiniAVAudioFormat.MINIAV_AUDIO_FORMAT_F32:
+        return MiniAVAudioFormat.f32;
+      default:
+        return MiniAVAudioFormat.unknown;
+    }
+  }
+
+  static bindings.MiniAVAudioFormat fromPlatformType(MiniAVAudioFormat f) {
+    switch (f) {
+      case MiniAVAudioFormat.u8:
+        return bindings.MiniAVAudioFormat.MINIAV_AUDIO_FORMAT_U8;
+      case MiniAVAudioFormat.s16:
+        return bindings.MiniAVAudioFormat.MINIAV_AUDIO_FORMAT_S16;
+      case MiniAVAudioFormat.s32:
+        return bindings.MiniAVAudioFormat.MINIAV_AUDIO_FORMAT_S32;
+      case MiniAVAudioFormat.f32:
+        return bindings.MiniAVAudioFormat.MINIAV_AUDIO_FORMAT_F32;
+      default:
+        return bindings.MiniAVAudioFormat.MINIAV_AUDIO_FORMAT_UNKNOWN;
+    }
+  }
+}
+
+// AudioInfo conversion
+extension AudioInfoFFIToPlatform on AudioInfo {
+  MiniAVAudioInfo toPlatformType() => MiniAVAudioInfo(
+    format: format.toPlatformType(),
+    sampleRate: sampleRate,
+    channels: channels,
+    numFrames: numFrames,
+  );
+
+  static AudioInfo fromNative(bindings.MiniAVAudioInfo nativeInfo) =>
+      AudioInfo.fromNative(nativeInfo);
+
+  static AudioInfo fromPlatformType(MiniAVAudioInfo info) => AudioInfo(
+    format: MiniAVAudioFormatX.fromPlatformType(info.format),
+    sampleRate: info.sampleRate,
+    channels: info.channels,
+    numFrames: info.numFrames,
+  );
+
+  /// Copies a platform type into a native struct (for FFI calls).
+  static void copyToNative(
+    MiniAVAudioInfo info,
+    bindings.MiniAVAudioInfo native,
+  ) {
+    native.formatAsInt = MiniAVAudioFormatX.fromPlatformType(info.format).value;
+    native.sample_rate = info.sampleRate;
+    native.channels = info.channels;
+    native.num_frames = info.numFrames;
   }
 }

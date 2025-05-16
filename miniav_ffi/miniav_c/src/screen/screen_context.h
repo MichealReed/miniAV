@@ -3,7 +3,6 @@
 
 #include "../../include/miniav.h"
 
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -14,42 +13,67 @@ struct MiniAVScreenContext;
 // --- Screen Context Operations ---
 // These are function pointers for platform-specific implementations.
 typedef struct ScreenContextInternalOps {
-    MiniAVResultCode (*init_platform)(struct MiniAVScreenContext *ctx);
-    MiniAVResultCode (*destroy_platform)(struct MiniAVScreenContext *ctx);
+  MiniAVResultCode (*init_platform)(struct MiniAVScreenContext *ctx);
+  MiniAVResultCode (*destroy_platform)(struct MiniAVScreenContext *ctx);
 
-    MiniAVResultCode (*enumerate_displays)(MiniAVDeviceInfo **displays_out, uint32_t *count_out);
-    MiniAVResultCode (*enumerate_windows)(MiniAVDeviceInfo **windows_out, uint32_t *count_out);
-    // MiniAV_FreeDeviceList is used to free the lists from enumerate_displays/windows
+  MiniAVResultCode (*enumerate_displays)(MiniAVDeviceInfo **displays,
+                                         uint32_t *count);
+  MiniAVResultCode (*enumerate_windows)(MiniAVDeviceInfo **windows,
+                                        uint32_t *count);
 
-    MiniAVResultCode (*configure_display)(struct MiniAVScreenContext *ctx, const char *display_id, const MiniAVVideoFormatInfo *format);
-    MiniAVResultCode (*configure_window)(struct MiniAVScreenContext *ctx, const char *window_id, const MiniAVVideoFormatInfo *format); // window_id might be HWND as string or a title
-    MiniAVResultCode (*configure_region)(struct MiniAVScreenContext *ctx, const char *display_id_or_window_id, int x, int y, int width, int height, const MiniAVVideoFormatInfo *format);
+  MiniAVResultCode (*configure_display)(struct MiniAVScreenContext *ctx,
+                                        const char *display_id,
+                                        const MiniAVVideoFormatInfo *format);
+  MiniAVResultCode (*configure_window)(struct MiniAVScreenContext *ctx,
+                                       const char *window_id,
+                                       const MiniAVVideoFormatInfo *format);
+  MiniAVResultCode (*configure_region)(struct MiniAVScreenContext *ctx,
+                                       const char *target_id, int x, int y,
+                                       int width, int height,
+                                       const MiniAVVideoFormatInfo *format);
 
-    MiniAVResultCode (*start_capture)(struct MiniAVScreenContext *ctx, MiniAVBufferCallback callback, void *user_data);
-    MiniAVResultCode (*stop_capture)(struct MiniAVScreenContext *ctx);
+  MiniAVResultCode (*start_capture)(struct MiniAVScreenContext *ctx,
+                                    MiniAVBufferCallback callback,
+                                    void *user_data);
+  MiniAVResultCode (*stop_capture)(struct MiniAVScreenContext *ctx);
+  MiniAVResultCode (*release_buffer)(struct MiniAVScreenContext *ctx,
+                                     void *native_buffer_payload_resource_ptr);
 
-    // Called via the common MiniAV_ReleaseBuffer, which inspects the payload
-    MiniAVResultCode (*release_buffer)(struct MiniAVScreenContext *ctx, void *native_buffer_payload_resource_ptr);
+  MiniAVResultCode (*get_default_formats)(
+      const char *device_id, MiniAVVideoFormatInfo *video_format_out,
+      MiniAVAudioInfo *audio_format_out);
 
+  MiniAVResultCode (*get_configured_formats)(
+      struct MiniAVScreenContext *ctx, MiniAVVideoFormatInfo *video_format_out,
+      MiniAVAudioInfo *audio_format_out);
 } ScreenContextInternalOps;
 
 // --- Screen Context Structure ---
 typedef struct MiniAVScreenContext {
-    void *platform_ctx; // Platform-specific context (e.g., DXGIScreenPlatformContext)
-    const ScreenContextInternalOps *ops;
+  void *platform_ctx; // Platform-specific context (e.g.,
+                      // DXGIScreenPlatformContext)
+  const ScreenContextInternalOps *ops;
 
-    MiniAVBufferCallback app_callback;
-    void *app_callback_user_data;
+  MiniAVBufferCallback app_callback;
+  void *app_callback_user_data;
 
-    bool is_running; // TRUE if capture is active
-    MiniAVVideoFormatInfo configured_format; // The format requested by the user and/or confirmed by the backend
+  bool is_running;                         // TRUE if capture is active
+  bool is_configured;                      // TRUE if the context is configured
+  MiniAVVideoFormatInfo configured_format; // The format requested by the user
+                                           // and/or confirmed by the backend
 
-    // Add any other common state needed across platforms
-    MiniAVCaptureType capture_target_type; // DISPLAY, WINDOW, REGION
+  // Add any other common state needed across platforms
+  MiniAVCaptureType capture_target_type; // DISPLAY, WINDOW, REGION
 
-    bool capture_audio_requested; // Whether the user requested audio capture
+  bool capture_audio_requested; // Whether the user requested audio capture
 
 } MiniAVScreenContext;
+
+typedef struct {
+  const char *name;
+  const ScreenContextInternalOps *ops;
+  MiniAVResultCode (*platform_init)(MiniAVScreenContext *ctx);
+} MiniAVScreenBackend;
 
 #ifdef __cplusplus
 }

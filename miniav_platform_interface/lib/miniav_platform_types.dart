@@ -123,3 +123,6 @@ class MiniAVAudioBuffer {
     required this.data,
   });
 }
+
+typedef ScreenFormatDefaults =
+    (MiniAVVideoFormatInfo videoFormat, MiniAVAudioInfo? audioFormat);

@@ -38,7 +38,10 @@ MiniAV_Camera_EnumerateDevices(MiniAVDeviceInfo **devices, uint32_t *count);
 MINIAV_API MiniAVResultCode MiniAV_Camera_GetSupportedFormats(
     const char *device_id, MiniAVVideoFormatInfo **formats,
     uint32_t *count); // Placeholder for MiniAVVideoFormatInfo
-
+MINIAV_API MiniAVResultCode MiniAV_Camera_GetDefaultFormat(
+    const char *device_id, MiniAVVideoFormatInfo *format_out);
+MINIAV_API MiniAVResultCode MiniAV_Camera_GetConfiguredFormat(
+    MiniAVCameraContextHandle context, MiniAVVideoFormatInfo *format_out);
 MINIAV_API MiniAVResultCode
 MiniAV_Camera_CreateContext(MiniAVCameraContextHandle *context);
 MINIAV_API MiniAVResultCode
@@ -59,20 +62,27 @@ MINIAV_API MiniAVResultCode MiniAV_Screen_EnumerateDisplays(
     MiniAVDeviceInfo **displays_out, uint32_t *count_out);
 MINIAV_API MiniAVResultCode
 MiniAV_Screen_EnumerateWindows(MiniAVDeviceInfo **windows, uint32_t *count);
+MINIAV_API MiniAVResultCode MiniAV_Screen_GetDefaultFormats(
+    const char *display_id, MiniAVVideoFormatInfo *video_format_out,
+    MiniAVAudioInfo *audio_format_out);
 MINIAV_API MiniAVResultCode
 MiniAV_Screen_DestroyContext(MiniAVScreenContextHandle context);
 MINIAV_API MiniAVResultCode MiniAV_Screen_ConfigureDisplay(
     MiniAVScreenContextHandle context, const char *display_id,
-    const void *format,
-    bool capture_audio); // Placeholder for MiniAVVideoFormatInfo
+    const MiniAVVideoFormatInfo *format, // Corrected type
+    bool capture_audio);
 MINIAV_API MiniAVResultCode MiniAV_Screen_ConfigureWindow(
     MiniAVScreenContextHandle context, const char *window_id,
-    const MiniAVAudioInfo *format, bool capture_audio);
+    const MiniAVVideoFormatInfo *format,
+    bool capture_audio);
 MINIAV_API MiniAVResultCode MiniAV_Screen_ConfigureRegion(
     MiniAVScreenContextHandle context, const char *display_id, int x, int y,
-    int width, int height, const MiniAVAudioInfo *format, bool capture_audio);
-MINIAV_API MiniAVResultCode MiniAV_Screen_GetConfiguredFormat(
-    MiniAVScreenContextHandle *ctx, MiniAVVideoFormatInfo *format_out);
+    int width, int height,
+    const MiniAVVideoFormatInfo *format,
+    bool capture_audio);
+MINIAV_API MiniAVResultCode MiniAV_Screen_GetConfiguredFormats(
+    MiniAVScreenContextHandle *ctx, MiniAVVideoFormatInfo *video_format_out,
+    MiniAVAudioInfo *audio_format_out);
 MINIAV_API MiniAVResultCode
 MiniAV_Screen_StartCapture(MiniAVScreenContextHandle context,
                            MiniAVBufferCallback callback, void *user_data);
@@ -82,9 +92,12 @@ MiniAV_Screen_StopCapture(MiniAVScreenContextHandle context);
 // --- Audio Capture API ---
 MINIAV_API MiniAVResultCode
 MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices, uint32_t *count);
-
 MINIAV_API MiniAVResultCode MiniAV_Audio_GetSupportedFormats(
     const char *device_id, MiniAVAudioInfo **formats, uint32_t *count);
+MINIAV_API MiniAVResultCode MiniAV_Audio_GetDefaultFormat(
+    const char *device_id, MiniAVAudioInfo *format_out);
+MINIAV_API MiniAVResultCode MiniAV_Audio_GetConfiguredFormat(
+    MiniAVAudioContextHandle context, MiniAVAudioInfo *format_out);
 MINIAV_API MiniAVResultCode
 MiniAV_Audio_CreateContext(MiniAVAudioContextHandle *context);
 MINIAV_API MiniAVResultCode
@@ -105,6 +118,10 @@ MINIAV_API MiniAVResultCode MiniAV_Loopback_EnumerateTargets(
     MiniAVDeviceInfo **targets_out, // Array of available loopback targets
     uint32_t *count_out             // Number of targets found
 );
+MINIAV_API MiniAVResultCode MiniAV_Loopback_GetDefaultFormat(
+    const char *target_device_id, MiniAVAudioInfo *format_out);
+MINIAV_API MiniAVResultCode MiniAV_Loopback_GetConfiguredFormat(
+    MiniAVLoopbackContextHandle context, MiniAVAudioInfo *format_out);
 MINIAV_API MiniAVResultCode
 MiniAV_Loopback_CreateContext(MiniAVLoopbackContextHandle *context_out);
 MINIAV_API MiniAVResultCode
@@ -120,8 +137,6 @@ MINIAV_API MiniAVResultCode MiniAV_Loopback_Configure(
     // Consider adding MiniAVLoopbackTargetInfo here if more complex targeting
     // is needed beyond device_id const MiniAVLoopbackTargetInfo* target_info
 );
-MINIAV_API MiniAVResultCode MiniAV_Loopback_GetConfiguredFormat(
-    MiniAVLoopbackContextHandle context, MiniAVAudioInfo *format_out);
 MINIAV_API MiniAVResultCode
 MiniAV_Loopback_StartCapture(MiniAVLoopbackContextHandle context,
                              MiniAVBufferCallback callback, void *user_data);

@@ -1796,7 +1796,7 @@ const CameraContextInternalOps g_camera_ops_win_mf = {
     .release_buffer = mf_release_buffer};
 
 MiniAVResultCode
-miniav_camera_context_platform_init_windows(MiniAVCameraContext *ctx) {
+miniav_camera_context_platform_init_windows_mf(MiniAVCameraContext *ctx) {
   if (!ctx)
     return MINIAV_ERROR_INVALID_ARG;
   ctx->ops = &g_camera_ops_win_mf;

@@ -2,6 +2,7 @@ import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart';
 import 'miniav_ffi_bindings.dart' as bindings;
 import 'miniav_ffi_camera.dart';
+import 'miniav_ffi_screen.dart';
 import 'package:miniav_platform_interface/miniav_platform_interface.dart';
 
 // Export camera FFI implementation for external use
@@ -13,14 +14,14 @@ class MiniAVFFIPlatform extends MiniAVPlatformInterface {
   MiniAVFFIPlatform();
 
   final MiniFFICameraPlatform _camera = MiniFFICameraPlatform();
+  final MiniFFIScreenPlatform _screen = MiniFFIScreenPlatform();
   // TODO: Add screen/audio/loopback implementations as you create them
 
   @override
   MiniCameraPlatformInterface get camera => _camera;
 
   @override
-  MiniScreenPlatformInterface get screen =>
-      throw UnimplementedError('Screen capture not implemented for FFI');
+  MiniScreenPlatformInterface get screen => _screen;
 
   @override
   MiniAudioInputPlatformInterface get audioInput =>

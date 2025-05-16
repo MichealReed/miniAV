@@ -11,15 +11,10 @@
 #include <mmdeviceapi.h>                   // For IMMDeviceEnumerator, IMMDevice
 #include <windows.h>
 
-// Forward declaration from loopback_api.c (or a common internal header if
-// preferred) This is to avoid circular dependencies if loopback_api.c includes
-// this for the ops getter. Alternatively, the ops getter could be in a more
-// central place or its declaration moved. For now, assume it's okay to declare
-// it here as it's tightly coupled.
-extern const LoopbackContextInternalOps *miniav_loopback_get_win_ops(void);
-extern MiniAVResultCode miniav_loopback_enumerate_targets_win(
-    MiniAVLoopbackTargetType target_type_filter, MiniAVDeviceInfo **targets,
-    uint32_t *count);
+extern const LoopbackContextInternalOps g_loopback_ops_wasapi;
+
+MiniAVResultCode miniav_loopback_context_platform_init_windows_wasapi(
+    MiniAVLoopbackContext *ctx);
 
 // --- WASAPI Platform-Specific Context ---
 typedef struct LoopbackPlatformContextWinWasapi {

@@ -2,14 +2,14 @@ import 'miniav_platform_types.dart';
 
 /// Abstract interface for screen capture functionality on all platforms.
 abstract class MiniScreenPlatformInterface {
-  /// Enumerate available screens
-  Future<List<MiniAVDeviceInfo>> enumerateScreens();
+  /// Enumerate available displays
+  Future<List<MiniAVDeviceInfo>> enumerateDisplays();
 
   /// Enumerate available windows
   Future<List<MiniAVDeviceInfo>> enumerateWindows();
 
-  /// Get supported video formats for a given screen or window.
-  Future<List<MiniAVVideoFormatInfo>> getSupportedFormats(String screenId);
+  /// Get default formats for display and loopback devices.
+  Future<ScreenFormatDefaults> getDefaultFormats(String displayId);
 
   /// Create a screen capture context (for capture/configuration).
   Future<MiniScreenContextPlatformInterface> createContext();
@@ -17,8 +17,21 @@ abstract class MiniScreenPlatformInterface {
 
 /// Abstract screen context for configuring and capturing from a screen or window.
 abstract class MiniScreenContextPlatformInterface {
-  /// Configure the screen context with a screen/window and format.
-  Future<void> configure(String screenId, MiniAVVideoFormatInfo format);
+  /// Configure the screen context with a display and format.
+  Future<void> configureDisplay(
+    String screenId,
+    MiniAVVideoFormatInfo format, {
+    bool captureAudio = false,
+  });
+
+  /// Configure the screen context with a window and format.
+  Future<void> configureWindow(
+    String windowId,
+    MiniAVVideoFormatInfo format, {
+    bool captureAudio = false,
+  });
+
+  Future<ScreenFormatDefaults> getConfiguredFormats();
 
   /// Start screen capture.
   /// [onFrame] is called for each frame received.

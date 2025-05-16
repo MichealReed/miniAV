@@ -75,6 +75,29 @@ class MiniFFICameraPlatform implements MiniCameraPlatformInterface {
   }
 
   @override
+  Future<MiniAVVideoFormatInfo> getDefaultFormat(String deviceId) async {
+    final deviceIdPtr = deviceId.toNativeUtf8();
+    final formatOutPtr = calloc<bindings.MiniAVVideoFormatInfo>();
+    try {
+      final result = bindings.MiniAV_Camera_GetDefaultFormat(
+        deviceIdPtr.cast(),
+        formatOutPtr,
+      );
+      if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+        throw Exception(
+          'Failed to get default format for device $deviceId: ${result.name}',
+        );
+      }
+      return VideoFormatInfoFFIToPlatform.fromNative(
+        formatOutPtr.ref,
+      ).toPlatformType();
+    } finally {
+      calloc.free(deviceIdPtr);
+      calloc.free(formatOutPtr);
+    }
+  }
+
+  @override
   Future<MiniCameraContextPlatformInterface> createContext() async {
     final contextPtr = calloc<bindings.MiniAVCameraContextHandle>();
     try {
@@ -112,6 +135,27 @@ class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
     } finally {
       calloc.free(deviceIdPtr);
       calloc.free(nativeFormatPtr);
+    }
+  }
+
+  @override
+  Future<MiniAVVideoFormatInfo> getConfiguredFormat() async {
+    final formatOutPtr = calloc<bindings.MiniAVVideoFormatInfo>();
+    try {
+      final result = bindings.MiniAV_Camera_GetConfiguredFormat(
+        _context,
+        formatOutPtr,
+      );
+      if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+        throw Exception(
+          'Failed to get configured camera format: ${result.name}',
+        );
+      }
+      return VideoFormatInfoFFIToPlatform.fromNative(
+        formatOutPtr.ref,
+      ).toPlatformType();
+    } finally {
+      calloc.free(formatOutPtr);
     }
   }
 

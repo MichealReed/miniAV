@@ -1348,7 +1348,7 @@ MiniAVResultCode wasapi_get_configured_format(MiniAVLoopbackContext *ctx,
 }
 
 // --- Ops Table ---
-static const LoopbackContextInternalOps g_wasapi_loopback_ops = {
+const LoopbackContextInternalOps g_loopback_ops_wasapi = {
     .init_platform = wasapi_init_platform,
     .destroy_platform = wasapi_destroy_platform,
     .enumerate_targets_platform = miniav_loopback_enumerate_targets_win,
@@ -1358,8 +1358,15 @@ static const LoopbackContextInternalOps g_wasapi_loopback_ops = {
     .release_buffer_platform = wasapi_release_buffer_platform,
     .get_configured_format = wasapi_get_configured_format};
 
-const LoopbackContextInternalOps *miniav_loopback_get_win_ops(void) {
-  return &g_wasapi_loopback_ops;
+MiniAVResultCode miniav_loopback_context_platform_init_windows_wasapi(
+    MiniAVLoopbackContext *ctx) {
+  if (!ctx)
+    return MINIAV_ERROR_INVALID_ARG;
+  ctx->ops = &g_loopback_ops_wasapi;
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "DXGI: Assigned Windows DXGI screen ops.");
+  // The caller (e.g., MiniAV_Screen_CreateContext) will call
+  // ctx->ops->init_platform()
+  return MINIAV_SUCCESS;
 }
 
 #endif // _WIN32

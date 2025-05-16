@@ -32,7 +32,7 @@ void main() {
         print('No camera devices found to get formats from.');
         return;
       }
-      final firstDevice = devices.first;
+      final firstDevice = devices[1];
       print(
         'Attempting to get formats for device: ${firstDevice.name} (${firstDevice.deviceId})',
       );
@@ -64,7 +64,7 @@ void main() {
           print('No camera devices found.');
           return;
         }
-        final firstDevice = devices.first;
+        final firstDevice = devices[1];
         final formats = await camera.getSupportedFormats(firstDevice.deviceId);
         if (formats.isEmpty) {
           print('No formats found for device ${firstDevice.deviceId}.');
@@ -90,7 +90,7 @@ void main() {
         print('No camera devices found.');
         return;
       }
-      final firstDevice = devices.first;
+      final firstDevice = devices[1];
       final formats = await camera.getSupportedFormats(firstDevice.deviceId);
       if (formats.isEmpty) {
         print('No formats found for device ${firstDevice.deviceId}.');
@@ -151,7 +151,7 @@ void main() {
         print('No camera devices found.');
         return;
       }
-      final firstDevice = devices.first;
+      final firstDevice = devices[1];
       final formats = await camera.getSupportedFormats(firstDevice.deviceId);
       if (formats.isEmpty) {
         print('No formats found for device ${firstDevice.deviceId}.');

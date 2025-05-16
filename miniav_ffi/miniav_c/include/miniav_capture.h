@@ -90,6 +90,8 @@ MiniAV_Screen_StopCapture(MiniAVScreenContextHandle context);
 // --- Audio Capture API ---
 MINIAV_API MiniAVResultCode
 MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices, uint32_t *count);
+MINIAV_API MiniAVResultCode MiniAV_Audio_GetSupportedFormats(
+    const char *device_id, MiniAVAudioInfo **formats_out, uint32_t *count_out);
 MINIAV_API MiniAVResultCode MiniAV_Audio_GetDefaultFormat(
     const char *device_id, MiniAVAudioInfo *format_out);
 MINIAV_API MiniAVResultCode MiniAV_Audio_GetConfiguredFormat(

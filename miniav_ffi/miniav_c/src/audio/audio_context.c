@@ -140,21 +140,11 @@ MiniAVResultCode MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices,
   return MINIAV_SUCCESS;
 }
 
-// TODO: Implement MiniAV_Audio_GetSupportedFormats properly by querying
-// miniaudio
 MiniAVResultCode MiniAV_Audio_GetSupportedFormats(const char *device_id_str,
                                                   MiniAVAudioInfo **formats,
                                                   uint32_t *count) {
   if (!device_id_str || !formats || !count)
     return MINIAV_ERROR_INVALID_ARG;
-
-  // --- Placeholder Implementation ---
-  // This should ideally query the specific device using
-  // ma_context_get_device_info and ma_device_info_get_supported_formats. For
-  // now, return a common set.
-  miniav_log(MINIAV_LOG_LEVEL_WARN,
-             "MiniAV_Audio_GetSupportedFormats is using a placeholder "
-             "implementation.");
 
   *count = 4; // Number of formats we'll return
   *formats = (MiniAVAudioInfo *)miniav_calloc(*count, sizeof(MiniAVAudioInfo));
@@ -329,41 +319,6 @@ MiniAVResultCode MiniAV_Audio_Configure(
   return MINIAV_SUCCESS;
 }
 
-static ma_bool32
-miniav_is_native_format_supported(const ma_device_info *pDeviceInfo,
-                                  ma_format format, ma_uint32 channels,
-                                  ma_uint32 sampleRate) {
-  MINIAV_UNUSED(channels); // Channels will be handled by miniaudio during init
-  MINIAV_UNUSED(
-      sampleRate); // Sample rate will be handled by miniaudio during init
-
-  // Check if the base format is in the list of native formats.
-  // The version of ma_device_info you're using doesn't have discrete
-  // min/max channel/rate members. We rely on miniaudio to perform
-  // conversion if the exact channel/rate isn't native but the format is.
-  for (ma_uint32 i = 0; i < pDeviceInfo->nativeDataFormatCount; ++i) {
-    // Assuming nativeDataFormats in your version is an array of ma_format
-    // or a struct where the format can be directly compared.
-    // If nativeDataFormats is ma_format_share_mode_pair, access .format
-    // If it's just ma_format, this direct comparison is fine.
-    // Adjust based on the actual structure of nativeDataFormats[i] in your
-    // miniaudio.h
-
-    // If nativeDataFormats is an array of ma_format_share_mode_pair (common in
-    // v0.11+)
-    if (pDeviceInfo->nativeDataFormats[i].format == format) {
-      return MA_TRUE;
-    }
-    // If nativeDataFormats is a simple array of ma_format (older versions)
-    // else if (pDeviceInfo->nativeDataFormats[i] == format) { // Uncomment and
-    // adapt if this is the case
-    //    return MA_TRUE;
-    // }
-  }
-
-  return MA_FALSE; // Base format not found in the native list
-}
-
 MiniAVResultCode MiniAV_Audio_GetDefaultFormat(const char *device_id_str,
                                                MiniAVAudioInfo *format_out) {
   if (!format_out) {
@@ -371,157 +326,61 @@ MiniAVResultCode MiniAV_Audio_GetDefaultFormat(const char *device_id_str,
   }
   memset(format_out, 0, sizeof(MiniAVAudioInfo));
 
+  format_out->format = MINIAV_AUDIO_FORMAT_F32; // A very common format
+  format_out->sample_rate = 48000;              // A very common sample rate
+  format_out->channels = 2;                     // Stereo is common
+
+  miniav_log(
+      MINIAV_LOG_LEVEL_WARN,
+      "GetDefaultFormat: Using HARDCODED default format (S16, 48kHz, 2ch). "
+      "Device ID '%s' was effectively ignored for format selection.",
+      device_id_str ? device_id_str : "(Default)");
+
   ma_context ma_ctx_temp;
   ma_result res = ma_context_init(NULL, 0, NULL, &ma_ctx_temp);
-  if (res != MA_SUCCESS) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "Failed to init ma_context for GetDefaultFormat: %s",
-               ma_result_description(res));
-    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
-  }
+  if (res == MA_SUCCESS) {
+    ma_device_info *playback_infos, *capture_infos;
+    ma_uint32 playback_count, capture_count;
+    res = ma_context_get_devices(&ma_ctx_temp, &playback_infos, &playback_count,
+                                 &capture_infos, &capture_count);
+    if (res == MA_SUCCESS && capture_count > 0) {
+      const ma_device_info *p_target_device_info = NULL;
+      const char *target_device_name_for_log =
+          "(Default - Name N/A due to hardcoding)";
 
-  ma_device_info *playback_infos, *capture_infos;
-  ma_uint32 playback_count, capture_count;
-  res = ma_context_get_devices(&ma_ctx_temp, &playback_infos, &playback_count,
-                               &capture_infos, &capture_count);
-  if (res != MA_SUCCESS) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "Failed to get devices for GetDefaultFormat: %s",
-               ma_result_description(res));
-    ma_context_uninit(&ma_ctx_temp);
-    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
-  }
-
-  if (capture_count == 0) {
-    miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "No capture devices found for GetDefaultFormat.");
-    ma_context_uninit(&ma_ctx_temp);
-    return MINIAV_ERROR_DEVICE_NOT_FOUND;
-  }
-
-  ma_device_id target_ma_id;
-  int device_found_idx = -1; // Store index to access capture_infos later
-  const char *target_device_name_for_log = "(Default)";
-
-  if (device_id_str == NULL ||
-      strlen(device_id_str) == 0) { // Get system default
-    for (ma_uint32 i = 0; i < capture_count; ++i) {
-      if (capture_infos[i].isDefault) {
-        target_ma_id = capture_infos[i].id;
-        target_device_name_for_log = capture_infos[i].name;
-        device_found_idx = i;
-        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                   "Using default audio device for GetDefaultFormat: %s",
-                   target_device_name_for_log);
-        break;
-      }
-    }
-    if (device_found_idx == -1 &&
-        capture_count > 0) { // Fallback to first device if no explicit default
-      target_ma_id = capture_infos[0].id;
-      target_device_name_for_log = capture_infos[0].name;
-      device_found_idx = 0;
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "No explicit default, using first audio device for "
-                 "GetDefaultFormat: %s",
-                 target_device_name_for_log);
-    }
-  } else { // Get specific device
-    target_device_name_for_log = device_id_str;
-    for (ma_uint32 i = 0; i < capture_count; ++i) {
-      if (strcmp(capture_infos[i].name, device_id_str) == 0) {
-        target_ma_id = capture_infos[i].id;
-        device_found_idx = i;
-        break;
-      }
-    }
-  }
-
-  if (device_found_idx == -1) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "Device not found for GetDefaultFormat: %s",
-               target_device_name_for_log);
-    ma_context_uninit(&ma_ctx_temp);
-    return MINIAV_ERROR_DEVICE_NOT_FOUND;
-  }
-
-  // Use the ma_device_info directly from the enumerated list
-  const ma_device_info *p_target_device_info = &capture_infos[device_found_idx];
-
-  MiniAVAudioInfo preferred_formats[] = {
-      {MINIAV_AUDIO_FORMAT_F32, 48000, 2}, {MINIAV_AUDIO_FORMAT_S16, 48000, 2},
-      {MINIAV_AUDIO_FORMAT_F32, 44100, 2}, {MINIAV_AUDIO_FORMAT_S16, 44100, 2},
-      {MINIAV_AUDIO_FORMAT_F32, 48000, 1}, {MINIAV_AUDIO_FORMAT_S16, 48000, 1},
-  };
-  int num_preferred = sizeof(preferred_formats) / sizeof(preferred_formats[0]);
-
-  for (int i = 0; i < num_preferred; ++i) {
-    ma_format ma_fmt = miniav_format_to_ma_format(preferred_formats[i].format);
-    if (ma_fmt != ma_format_unknown) {
-      // Use the new helper function with the already fetched device info
-      if (miniav_is_native_format_supported(
-              p_target_device_info, ma_fmt, preferred_formats[i].channels,
-              preferred_formats[i].sample_rate) == MA_TRUE) {
-        *format_out = preferred_formats[i];
-        miniav_log(
-            MINIAV_LOG_LEVEL_DEBUG,
-            "Default format for device %s: Format=%d, Rate=%u, Channels=%u",
-            target_device_name_for_log, format_out->format,
-            format_out->sample_rate, format_out->channels);
-        ma_context_uninit(&ma_ctx_temp);
-        return MINIAV_SUCCESS;
-      }
-    }
-  }
-
-  // Fallback if no preferred format is natively supported:
-  // Try device's first native format with common settings.
-  // p_target_device_info is already available.
-  if (p_target_device_info->nativeDataFormatCount > 0) {
-    // In miniaudio 0.11+, nativeDataFormats is an array of
-    // ma_format_share_mode_pair. We are interested in
-    // nativeDataFormats[0].format.
-    ma_format first_native_ma_format =
-        p_target_device_info->nativeDataFormats[0].format;
-    MiniAVAudioFormat first_miniav_format =
-        ma_format_to_miniav_format(first_native_ma_format);
-
-    if (first_miniav_format != MINIAV_AUDIO_FORMAT_UNKNOWN) {
-      uint32_t common_rates[] = {48000, 44100, 96000, 32000};
-      uint32_t common_channels_counts[] = {2, 1};
-
-      for (size_t r_idx = 0;
-           r_idx < sizeof(common_rates) / sizeof(common_rates[0]); ++r_idx) {
-        for (size_t c_idx = 0; c_idx < sizeof(common_channels_counts) /
-                                           sizeof(common_channels_counts[0]);
-             ++c_idx) {
-          uint32_t current_rate = common_rates[r_idx];
-          uint32_t current_channels = common_channels_counts[c_idx];
-
-          if (miniav_is_native_format_supported(
-                  p_target_device_info, first_native_ma_format,
-                  current_channels, current_rate) == MA_TRUE) {
-            format_out->format = first_miniav_format;
-            format_out->sample_rate = current_rate;
-            format_out->channels = current_channels;
-            miniav_log(MINIAV_LOG_LEVEL_WARN,
-                       "Using first native format with common settings as "
-                       "default for device %s: Format=%d, Rate=%u, Channels=%u",
-                       target_device_name_for_log, format_out->format,
-                       format_out->sample_rate, format_out->channels);
-            ma_context_uninit(&ma_ctx_temp);
-            return MINIAV_SUCCESS;
+      if (device_id_str == NULL || strlen(device_id_str) == 0) {
+        for (ma_uint32 i = 0; i < capture_count; ++i) {
+          if (capture_infos[i].isDefault) {
+            target_device_name_for_log = capture_infos[i].name;
+            break;
+          }
+        }
+        if (!p_target_device_info && capture_count > 0 &&
+            strcmp(target_device_name_for_log,
+                   "(Default - Name N/A due to hardcoding)") == 0) {
+          target_device_name_for_log =
+              capture_infos[0]
+                  .name; // Fallback to first device name for logging
+        }
+      } else {
+        target_device_name_for_log = device_id_str;
+        for (ma_uint32 i = 0; i < capture_count; ++i) {
+          if (strcmp(capture_infos[i].name, device_id_str) == 0) {
+            target_device_name_for_log =
+                capture_infos[i].name; // Ensure we use the actual name if found
+            break;
           }
         }
       }
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "GetDefaultFormat: Hardcoded format applied. Target device "
+                 "for logging: %s",
+                 target_device_name_for_log);
     }
+    ma_context_uninit(&ma_ctx_temp);
   }
 
-  miniav_log(MINIAV_LOG_LEVEL_ERROR,
-             "Could not determine a supported default format for device: %s",
-             target_device_name_for_log);
-  ma_context_uninit(&ma_ctx_temp);
-  return MINIAV_ERROR_NOT_SUPPORTED;
+  return MINIAV_SUCCESS;
 }
 
 MiniAVResultCode

@@ -8,6 +8,9 @@ abstract class MiniAudioInputPlatformInterface {
   /// Get supported audio formats for a given input device.
   Future<List<MiniAVAudioInfo>> getSupportedFormats(String deviceId);
 
+  /// Get default audio format for a given input device.
+  Future<MiniAVAudioInfo> getDefaultFormat(String deviceId);
+
   /// Create an audio input capture context.
   Future<MiniAudioInputContextPlatformInterface> createContext();
 }
@@ -16,6 +19,9 @@ abstract class MiniAudioInputPlatformInterface {
 abstract class MiniAudioInputContextPlatformInterface {
   /// Configure the audio input context with a device and format.
   Future<void> configure(String deviceId, MiniAVAudioInfo format);
+
+  /// Get the configured format.
+  Future<MiniAVAudioInfo> getConfiguredFormat();
 
   /// Start audio input capture.
   /// [onData] is called for each audio buffer received.

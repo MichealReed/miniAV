@@ -98,6 +98,52 @@ MiniAV_Loopback_EnumerateTargets(MiniAVLoopbackTargetType target_type_filter,
   return res;
 }
 
+MiniAVResultCode MiniAV_Loopback_GetSupportedFormats(
+    const char *target_device_id, MiniAVAudioInfo **formats_out,
+    uint32_t *count_out) {
+  if (!formats_out || !count_out) {
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+  *formats_out = NULL;
+  *count_out = 0;
+
+  MiniAVResultCode res = MINIAV_ERROR_NOT_SUPPORTED;
+  for (const MiniAVLoopbackBackend *backend_entry = g_loopback_backends;
+       backend_entry->name != NULL; ++backend_entry) {
+    if (backend_entry->ops && backend_entry->ops->get_supported_formats) {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "Attempting GetSupportedFormats with loopback backend: %s for "
+                 "target: %s",
+                 backend_entry->name,
+                 target_device_id ? target_device_id : "(system default)");
+      res = backend_entry->ops->get_supported_formats(
+          target_device_id, formats_out, count_out);
+      if (res == MINIAV_SUCCESS) {
+        miniav_log(MINIAV_LOG_LEVEL_INFO,
+                   "GetSupportedFormats successful with loopback backend: %s "
+                   "for target: %s",
+                   backend_entry->name,
+                   target_device_id ? target_device_id : "(system default)");
+        return MINIAV_SUCCESS;
+      }
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "GetSupportedFormats with loopback backend %s failed for "
+                 "target %s (code: %d). Trying next.",
+                 backend_entry->name,
+                 target_device_id ? target_device_id : "(system default)", res);
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "Loopback backend %s does not support get_supported_formats.",
+                 backend_entry->name);
+    }
+  }
+  miniav_log(MINIAV_LOG_LEVEL_WARN,
+             "Loopback_GetSupportedFormats: No suitable backend found or all "
+             "failed for target: %s",
+             target_device_id ? target_device_id : "(system default)");
+  return res;
+}
+
 MiniAVResultCode MiniAV_Loopback_GetDefaultFormat(const char *target_device_id,
                                                   MiniAVAudioInfo *format_out) {
   if (!format_out) { // target_device_id can be NULL for system default
@@ -108,14 +154,14 @@ MiniAVResultCode MiniAV_Loopback_GetDefaultFormat(const char *target_device_id,
   MiniAVResultCode res = MINIAV_ERROR_NOT_SUPPORTED;
   for (const MiniAVLoopbackBackend *backend_entry = g_loopback_backends;
        backend_entry->name != NULL; ++backend_entry) {
-    if (backend_entry->ops && backend_entry->ops->get_default_format) {
+    if (backend_entry->ops && backend_entry->ops->get_default_format_platform) {
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "Attempting GetDefaultFormat with loopback backend: %s for "
                  "target: %s",
                  backend_entry->name,
                  target_device_id ? target_device_id : "(system default)");
       res =
-          backend_entry->ops->get_default_format(target_device_id, format_out);
+          backend_entry->ops->get_default_format_platform(target_device_id, format_out);
       if (res == MINIAV_SUCCESS) {
         miniav_log(MINIAV_LOG_LEVEL_INFO,
                    "GetDefaultFormat successful with loopback backend: %s for "
@@ -480,8 +526,6 @@ MiniAV_Loopback_GetConfiguredFormat(MiniAVLoopbackContextHandle context_handle,
     miniav_log(
         MINIAV_LOG_LEVEL_WARN,
         "Loopback not configured. Format information may be incomplete.");
-    // return MINIAV_ERROR_NOT_INITIALIZED; // Or allow fetching potentially
-    // zeroed/default format
   }
 
   if (ctx->ops && ctx->ops->get_configured_format) {

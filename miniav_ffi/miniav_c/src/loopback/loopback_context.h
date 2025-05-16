@@ -21,16 +21,26 @@ typedef struct LoopbackContextInternalOps {
       MiniAVLoopbackTargetType target_type_filter, MiniAVDeviceInfo **targets,
       uint32_t *count);
 
+  // Gets the supported audio formats for a given loopback target.
+  MiniAVResultCode (*get_supported_formats)(
+      const char
+          *target_device_id, // Can be NULL for system default, or specific ID
+      MiniAVAudioInfo **formats_out, // Array of supported audio formats
+      uint32_t *count_out);          // Number of formats found
+
   // Gets the default audio format for a given loopback target.
   MiniAVResultCode (*get_default_format)(
-      const char *target_device_id, // Can be NULL for system default, or specific ID
+      const char
+          *target_device_id, // Can be NULL for system default, or specific ID
       MiniAVAudioInfo *format_out);
-
+  MiniAVResultCode (*get_default_format_platform)(
+      const char
+          *target_device_id_utf8, // Specific device ID, or NULL for default
+      MiniAVAudioInfo *format_out);
   // Configure the loopback capture.
   MiniAVResultCode (*configure_loopback)(
       struct MiniAVLoopbackContext *ctx,
-      const MiniAVLoopbackTargetInfo *target_info, 
-      const char *target_device_id, 
+      const MiniAVLoopbackTargetInfo *target_info, const char *target_device_id,
       const MiniAVAudioInfo *requested_format);
 
   MiniAVResultCode (*start_capture)(struct MiniAVLoopbackContext *ctx,
@@ -56,26 +66,27 @@ typedef void *MiniAVWindowHandle;
 // --- Loopback Backend Entry Structure ---
 // Used in the backend table for dynamic selection.
 typedef struct MiniAVLoopbackBackend {
-    const char* name;
-    const LoopbackContextInternalOps* ops;
-    MiniAVResultCode (*platform_init)(struct MiniAVLoopbackContext* ctx); // Initial, minimal platform init for selection
+  const char *name;
+  const LoopbackContextInternalOps *ops;
+  MiniAVResultCode (*platform_init)(
+      struct MiniAVLoopbackContext
+          *ctx); // Initial, minimal platform init for selection
 } MiniAVLoopbackBackend;
-
 
 // --- Loopback Context Structure ---
 typedef struct MiniAVLoopbackContext {
-  void *platform_ctx; 
+  void *platform_ctx;
   const LoopbackContextInternalOps *ops;
 
   MiniAVBufferCallback app_callback;
   void *app_callback_user_data;
 
-  bool is_configured; 
-  bool is_running;    
+  bool is_configured;
+  bool is_running;
 
-  MiniAVAudioInfo configured_format; 
-  MiniAVLoopbackTargetInfo current_target_info; 
-  char current_target_device_id[MINIAV_DEVICE_ID_MAX_LEN]; 
+  MiniAVAudioInfo configured_format;
+  MiniAVLoopbackTargetInfo current_target_info;
+  char current_target_device_id[MINIAV_DEVICE_ID_MAX_LEN];
 
 } MiniAVLoopbackContext;
 

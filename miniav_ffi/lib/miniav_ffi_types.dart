@@ -98,7 +98,7 @@ class VideoFormatInfo {
 }
 
 extension MiniAVBufferFFI on MiniAVBuffer {
-  /// Converts a Pointer<bindings.MiniAVBuffer> to a platform MiniAVBuffer.
+  /// Converts a bindings.MiniAVBuffer Pointer to a platform MiniAVBuffer.
   static MiniAVBuffer fromPointer(ffi.Pointer<bindings.MiniAVBuffer> ptr) {
     final native = ptr.ref;
 
@@ -129,7 +129,7 @@ extension MiniAVBufferFFI on MiniAVBuffer {
         if (planePtr == ffi.nullptr) return null;
         // You may need to know the plane size; here we use strideBytes[i] * height as a guess
         // If you have plane sizes, use them instead!
-        final width = video.width;
+        // final width = video.width;
         final height = video.height;
         final sizeGuess = strideBytes[i] * height;
         try {

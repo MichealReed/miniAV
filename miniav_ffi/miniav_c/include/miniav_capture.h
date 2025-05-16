@@ -73,12 +73,10 @@ MINIAV_API MiniAVResultCode MiniAV_Screen_ConfigureDisplay(
     bool capture_audio);
 MINIAV_API MiniAVResultCode MiniAV_Screen_ConfigureWindow(
     MiniAVScreenContextHandle context, const char *window_id,
-    const MiniAVVideoFormatInfo *format,
-    bool capture_audio);
+    const MiniAVVideoFormatInfo *format, bool capture_audio);
 MINIAV_API MiniAVResultCode MiniAV_Screen_ConfigureRegion(
     MiniAVScreenContextHandle context, const char *display_id, int x, int y,
-    int width, int height,
-    const MiniAVVideoFormatInfo *format,
+    int width, int height, const MiniAVVideoFormatInfo *format,
     bool capture_audio);
 MINIAV_API MiniAVResultCode MiniAV_Screen_GetConfiguredFormats(
     MiniAVScreenContextHandle *ctx, MiniAVVideoFormatInfo *video_format_out,
@@ -92,8 +90,6 @@ MiniAV_Screen_StopCapture(MiniAVScreenContextHandle context);
 // --- Audio Capture API ---
 MINIAV_API MiniAVResultCode
 MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices, uint32_t *count);
-MINIAV_API MiniAVResultCode MiniAV_Audio_GetSupportedFormats(
-    const char *device_id, MiniAVAudioInfo **formats, uint32_t *count);
 MINIAV_API MiniAVResultCode MiniAV_Audio_GetDefaultFormat(
     const char *device_id, MiniAVAudioInfo *format_out);
 MINIAV_API MiniAVResultCode MiniAV_Audio_GetConfiguredFormat(
@@ -117,6 +113,11 @@ MINIAV_API MiniAVResultCode MiniAV_Loopback_EnumerateTargets(
         target_type_filter,         // e.g., system audio, specific process
     MiniAVDeviceInfo **targets_out, // Array of available loopback targets
     uint32_t *count_out             // Number of targets found
+);
+MINIAV_API MiniAVResultCode MiniAV_Loopback_GetSupportedFormats(
+    const char *target_device_id,
+    MiniAVAudioInfo **formats_out, // Array of supported audio formats
+    uint32_t *count_out            // Number of formats found
 );
 MINIAV_API MiniAVResultCode MiniAV_Loopback_GetDefaultFormat(
     const char *target_device_id, MiniAVAudioInfo *format_out);

@@ -29,7 +29,7 @@ typedef struct LoopbackPlatformContextWinWasapi {
   HANDLE capture_thread_handle;
   HANDLE stop_event_handle;
   BOOL attempt_process_specific_capture;
-  DWORD target_process_id;     // For logging/debugging if process-specific
+  DWORD target_process_id; // For logging/debugging if process-specific
   LARGE_INTEGER qpc_frequency;
 } LoopbackPlatformContextWinWasapi;
 
@@ -38,10 +38,6 @@ typedef struct LoopbackPlatformContextWinWasapi {
 
 MiniAVResultCode wasapi_init_platform(MiniAVLoopbackContext *ctx);
 MiniAVResultCode wasapi_destroy_platform(MiniAVLoopbackContext *ctx);
-
-// Note: wasapi_enumerate_targets_platform is effectively
-// miniav_loopback_enumerate_targets_win which is called directly by the API
-// layer, not through the ops table of an existing context.
 
 MiniAVResultCode wasapi_configure_loopback(
     MiniAVLoopbackContext *ctx, const MiniAVLoopbackTargetInfo *target_info,

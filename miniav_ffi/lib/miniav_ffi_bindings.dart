@@ -534,28 +534,6 @@ MiniAVResultCode MiniAV_Audio_EnumerateDevices(
     ));
 
 @ffi.Native<
-    ffi.Int Function(
-        ffi.Pointer<ffi.Char>,
-        ffi.Pointer<ffi.Pointer<MiniAVAudioInfo>>,
-        ffi.Pointer<ffi.Uint32>)>(symbol: 'MiniAV_Audio_GetSupportedFormats')
-external int _MiniAV_Audio_GetSupportedFormats(
-  ffi.Pointer<ffi.Char> device_id,
-  ffi.Pointer<ffi.Pointer<MiniAVAudioInfo>> formats,
-  ffi.Pointer<ffi.Uint32> count,
-);
-
-MiniAVResultCode MiniAV_Audio_GetSupportedFormats(
-  ffi.Pointer<ffi.Char> device_id,
-  ffi.Pointer<ffi.Pointer<MiniAVAudioInfo>> formats,
-  ffi.Pointer<ffi.Uint32> count,
-) =>
-    MiniAVResultCode.fromValue(_MiniAV_Audio_GetSupportedFormats(
-      device_id,
-      formats,
-      count,
-    ));
-
-@ffi.Native<
         ffi.Int Function(ffi.Pointer<ffi.Char>, ffi.Pointer<MiniAVAudioInfo>)>(
     symbol: 'MiniAV_Audio_GetDefaultFormat')
 external int _MiniAV_Audio_GetDefaultFormat(
@@ -688,6 +666,28 @@ MiniAVResultCode MiniAV_Loopback_EnumerateTargets(
     MiniAVResultCode.fromValue(_MiniAV_Loopback_EnumerateTargets(
       target_type_filter.value,
       targets_out,
+      count_out,
+    ));
+
+@ffi.Native<
+    ffi.Int Function(
+        ffi.Pointer<ffi.Char>,
+        ffi.Pointer<ffi.Pointer<MiniAVAudioInfo>>,
+        ffi.Pointer<ffi.Uint32>)>(symbol: 'MiniAV_Loopback_GetSupportedFormats')
+external int _MiniAV_Loopback_GetSupportedFormats(
+  ffi.Pointer<ffi.Char> target_device_id,
+  ffi.Pointer<ffi.Pointer<MiniAVAudioInfo>> formats_out,
+  ffi.Pointer<ffi.Uint32> count_out,
+);
+
+MiniAVResultCode MiniAV_Loopback_GetSupportedFormats(
+  ffi.Pointer<ffi.Char> target_device_id,
+  ffi.Pointer<ffi.Pointer<MiniAVAudioInfo>> formats_out,
+  ffi.Pointer<ffi.Uint32> count_out,
+) =>
+    MiniAVResultCode.fromValue(_MiniAV_Loopback_GetSupportedFormats(
+      target_device_id,
+      formats_out,
       count_out,
     ));
 

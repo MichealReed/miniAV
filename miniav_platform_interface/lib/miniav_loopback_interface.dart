@@ -6,7 +6,7 @@ abstract class MiniLoopbackPlatformInterface {
   Future<List<MiniAVDeviceInfo>> enumerateDevices();
 
   /// Get supported audio formats for a given loopback device.
-  Future<List<MiniAVAudioInfo>> getSupportedFormats(String deviceId);
+  Future<MiniAVAudioInfo> getDefaultFormat(String deviceId);
 
   /// Create a loopback capture context.
   Future<MiniLoopbackContextPlatformInterface> createContext();
@@ -16,6 +16,9 @@ abstract class MiniLoopbackPlatformInterface {
 abstract class MiniLoopbackContextPlatformInterface {
   /// Configure the loopback context with a device and format.
   Future<void> configure(String deviceId, MiniAVAudioInfo format);
+
+  /// Get the configured format.
+  Future<MiniAVAudioInfo> getConfiguredFormat();
 
   /// Start loopback capture.
   /// [onData] is called for each audio buffer received.

@@ -7,9 +7,6 @@ void main() {
   late MiniScreenPlatformInterface screen;
 
   setUpAll(() {
-    // Initialize and register your FFI platform implementation
-    // This assumes MiniAVFFIPlatform is your main FFI registration class
-    // and it provides a 'screen' getter.
     screen = MiniAVFFIPlatform().screen;
     print('MiniAV FFI Screen Test Setup Complete.');
   });

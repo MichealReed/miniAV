@@ -25,10 +25,7 @@ String _charArrayToUtf8String(ffi.Array<ffi.Char> charArray, int maxLength) {
   } catch (e) {
     // Optional: Handle decoding errors, e.g., log and return a placeholder or allow malformed.
     // print("UTF-8 decoding error: $e. Raw bytes: $bytes");
-    return utf8.decode(
-      bytes,
-      allowMalformed: true,
-    ); // Or return an error string like "[Decoding Error]"
+    return utf8.decode(bytes, allowMalformed: true);
   }
 }
 
@@ -45,15 +42,12 @@ class DeviceInfo {
   });
 
   factory DeviceInfo.fromNative(bindings.MiniAVDeviceInfo nativeInfo) {
-    // Ensure you are calling the corrected helper function.
     return DeviceInfo(
       deviceId: _charArrayToUtf8String(
-        // Use the corrected helper
         nativeInfo.device_id,
         bindings.MINIAV_DEVICE_ID_MAX_LEN,
       ),
       name: _charArrayToUtf8String(
-        // Use the corrected helper
         nativeInfo.name,
         bindings.MINIAV_DEVICE_NAME_MAX_LEN,
       ),

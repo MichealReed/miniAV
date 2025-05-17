@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "camera_context_linux_pipewire.h"
 #include "../../../include/miniav_buffer.h"
 #include "../../common/miniav_logging.h"
@@ -86,14 +87,23 @@ typedef struct PipeWirePlatformContext {
 
 static MiniAVResultCode pw_init_platform(MiniAVCameraContext *ctx);
 static MiniAVResultCode pw_destroy_platform(MiniAVCameraContext *ctx);
-static MiniAVResultCode pw_enumerate_devices(MiniAVDeviceInfo **devices_out, uint32_t *count_out);
-static MiniAVResultCode pw_get_supported_formats(const char *device_id_str, MiniAVVideoFormatInfo **formats_out, uint32_t *count_out);
-static MiniAVResultCode pw_configure(MiniAVCameraContext *ctx, const char *device_id, const MiniAVVideoFormatInfo *format);
+static MiniAVResultCode pw_enumerate_devices(MiniAVDeviceInfo **devices_out,
+                                             uint32_t *count_out);
+static MiniAVResultCode
+pw_get_supported_formats(const char *device_id_str,
+                         MiniAVVideoFormatInfo **formats_out,
+                         uint32_t *count_out);
+static MiniAVResultCode pw_configure(MiniAVCameraContext *ctx,
+                                     const char *device_id,
+                                     const MiniAVVideoFormatInfo *format);
 static MiniAVResultCode pw_start_capture(MiniAVCameraContext *ctx);
-static MiniAVResultCode pw_get_buffer(MiniAVCameraContext *ctx, MiniAVBuffer *buffer, uint32_t timeout_ms);
-static MiniAVResultCode pw_release_buffer(MiniAVCameraContext *ctx, void *buffer);
-static MiniAVResultCode pw_stop_capture(MiniAVCameraContext *ctx); // <--- ADD THIS FORWARD DECLARATION
-
+static MiniAVResultCode pw_get_buffer(MiniAVCameraContext *ctx,
+                                      MiniAVBuffer *buffer,
+                                      uint32_t timeout_ms);
+static MiniAVResultCode pw_release_buffer(MiniAVCameraContext *ctx,
+                                          void *buffer);
+static MiniAVResultCode
+pw_stop_capture(MiniAVCameraContext *ctx); // <--- ADD THIS FORWARD DECLARATION
 
 // --- Helper Functions ---
 
@@ -601,15 +611,19 @@ static const struct pw_registry_events registry_events = {
 };
 
 // --- Core Callbacks for sync ---
-static void on_core_sync_done_enum(void *data, int seq) {
+static void on_core_sync_done_enum(void *data, uint32_t id,
+                                   int seq) { // Added uint32_t id
   PipeWireEnumData *enum_data = (PipeWireEnumData *)data;
+  MINIAV_UNUSED(id); // If id is not used
   if (enum_data->pending_sync == seq) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Core sync done for enumeration.");
     pw_main_loop_quit(enum_data->loop);
   }
 }
-static void on_core_sync_done_format(void *data, int seq) {
+static void on_core_sync_done_format(void *data, uint32_t id,
+                                     int seq) { // Added uint32_t id
   PipeWireFormatEnumData *format_data = (PipeWireFormatEnumData *)data;
+  MINIAV_UNUSED(id); // If id is not used
   if (format_data->pending_sync == seq) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW: Core sync done for format enumeration.");
@@ -891,75 +905,79 @@ enum_cleanup:
 }
 
 static void process_node_params_for_formats(PipeWireFormatEnumData *format_data,
-                                            const struct spa_node_info *info) {
+                                            const struct pw_node_info *info) {
   if (!info)
     return;
 
   for (uint32_t i = 0; i < info->n_params; i++) {
     if (info->params[i].id == SPA_PARAM_EnumFormat) {
-      if (pw_context_get_object(pw_core_get_context(format_data->core),
-                                info->params[i].id) == NULL) {
-        // This is simplified. We need to fetch the actual param values.
-        // This requires using pw_node_enum_params and then parsing the pods.
-        // For now, this is a placeholder for the complex logic.
-        miniav_log(
-            MINIAV_LOG_LEVEL_DEBUG,
-            "PW: Node has SPA_PARAM_EnumFormat. Need to fetch and parse.");
+      // This is simplified. We need to fetch the actual param values.
+      // This requires using pw_node_enum_params and then parsing the pods.
+      // For now, this is a placeholder for the complex logic.
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW: Node has SPA_PARAM_EnumFormat. Need to fetch and parse.");
 
-        // Example of how one might start fetching (very simplified):
-        // This part is highly complex due to async nature and pod parsing.
-        // A real implementation would involve pw_node_enum_params,
-        // handling the result (which is another event), and then parsing the
-        // pods.
+      // Example of how one might start fetching (very simplified):
+      // This part is highly complex due to async nature and pod parsing.
+      // A real implementation would involve pw_node_enum_params,
+      // handling the result (which is another event), and then parsing the
+      // pods.
 
-        // For now, let's add some common hardcoded formats as a placeholder
-        // until proper SPA_PARAM_EnumFormat parsing is implemented.
-        if (*format_data->formats_count < format_data->allocated_formats) {
-          format_data->formats_list[*format_data->formats_count] =
-              (MiniAVVideoFormatInfo){.width = 640,
-                                      .height = 480,
-                                      .pixel_format = MINIAV_PIXEL_FORMAT_YUY2,
-                                      .frame_rate_numerator = 30,
-                                      .frame_rate_denominator = 1,
-                                      .output_preference =
-                                          MINIAV_OUTPUT_PREFERENCE_CPU};
-          (*format_data->formats_count)++;
-        }
-        if (*format_data->formats_count < format_data->allocated_formats) {
-          format_data->formats_list[*format_data->formats_count] =
-              (MiniAVVideoFormatInfo){.width = 1280,
-                                      .height = 720,
-                                      .pixel_format = MINIAV_PIXEL_FORMAT_MJPEG,
-                                      .frame_rate_numerator = 30,
-                                      .frame_rate_denominator = 1,
-                                      .output_preference =
-                                          MINIAV_OUTPUT_PREFERENCE_CPU};
-          (*format_data->formats_count)++;
-        }
+      // For now, let's add some common hardcoded formats as a placeholder
+      // until proper SPA_PARAM_EnumFormat parsing is implemented.
+      if (*format_data->formats_count < format_data->allocated_formats) {
+        format_data->formats_list[*format_data->formats_count] =
+            (MiniAVVideoFormatInfo){.width = 640,
+                                    .height = 480,
+                                    .pixel_format = MINIAV_PIXEL_FORMAT_YUY2,
+                                    .frame_rate_numerator = 30,
+                                    .frame_rate_denominator = 1,
+                                    .output_preference =
+                                        MINIAV_OUTPUT_PREFERENCE_CPU};
+        (*format_data->formats_count)++;
+      }
+      if (*format_data->formats_count < format_data->allocated_formats) {
+        format_data->formats_list[*format_data->formats_count] =
+            (MiniAVVideoFormatInfo){.width = 1280,
+                                    .height = 720,
+                                    .pixel_format = MINIAV_PIXEL_FORMAT_MJPEG,
+                                    .frame_rate_numerator = 30,
+                                    .frame_rate_denominator = 1,
+                                    .output_preference =
+                                        MINIAV_OUTPUT_PREFERENCE_CPU};
+        (*format_data->formats_count)++;
       }
     }
   }
 }
 
-static void on_node_info(void *data, const struct spa_node_info *info) {
+static void
+on_node_info(void *data,
+             const struct pw_node_info *info) { // Changed to pw_node_info
   PipeWireFormatEnumData *format_data = (PipeWireFormatEnumData *)data;
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW: Received node info for format enumeration (node %u).",
              format_data->node_id);
-  process_node_params_for_formats(format_data, info);
-  // After processing info, we'd typically sync or know we are done.
-  // For this simplified version, we assume one info event is enough.
-  format_data->result = MINIAV_SUCCESS; // Mark as success for now
-  // This sync should ideally be tied to pw_node_enum_params completion.
-  // For now, we'll quit the loop after the first info.
+
+  // Access the spa_node_info if needed: const struct spa_node_info *spa_info =
+  // info ? info->info : NULL; However, pw_node_info itself contains the
+  // n_params and params array directly.
+  if (info) { // Check if info is not NULL
+    process_node_params_for_formats(format_data, info); // Pass pw_node_info
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW: on_node_info called with NULL info.");
+  }
+
+  format_data->result = MINIAV_SUCCESS;
   if (format_data->loop) {
     pw_main_loop_quit(format_data->loop);
   }
 }
 
 static const struct pw_node_events node_info_events = {
-    PW_VERSION_NODE_EVENTS,
-    .info = on_node_info,
+    PW_VERSION_NODE_EVENTS, .info = on_node_info,
+    // .param = on_node_param, // You would add this for pw_node_enum_params
 };
 
 static MiniAVResultCode

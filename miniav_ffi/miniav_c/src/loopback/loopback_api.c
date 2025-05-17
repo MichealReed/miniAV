@@ -22,12 +22,11 @@ extern MiniAVResultCode miniav_loopback_context_platform_init_macos_coreaudio(
     MiniAVLoopbackContext *ctx); // Example name
 #endif
 
-// Example for Linux (e.g., in loopback_context_linux_pulse.c)
 #ifdef __linux__
 extern const LoopbackContextInternalOps
-    g_loopback_ops_linux_pulse; // Example name
-extern MiniAVResultCode miniav_loopback_context_platform_init_linux_pulse(
-    MiniAVLoopbackContext *ctx); // Example name
+    g_loopback_ops_linux_pipewire;
+extern MiniAVResultCode miniav_loopback_context_platform_init_linux_pipewire(
+    MiniAVLoopbackContext *ctx);
 // Potentially add PipeWire or others here too
 #endif
 
@@ -43,10 +42,8 @@ static const MiniAVLoopbackBackend g_loopback_backends[] = {
      miniav_loopback_context_platform_init_macos_coreaudio},
 #endif
 #ifdef __linux__
-    {"PulseAudio", &g_loopback_ops_linux_pulse,
-     miniav_loopback_context_platform_init_linux_pulse},
-// {"PipeWire", &g_loopback_ops_linux_pipewire,
-// miniav_loopback_context_platform_init_linux_pipewire},
+    {"PipeWire", &g_loopback_ops_linux_pipewire,
+     miniav_loopback_context_platform_init_linux_pipewire},
 #endif
     {NULL, NULL, NULL} // Sentinel
 };

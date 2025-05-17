@@ -7,9 +7,9 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
 
 # --- Module Enable Options ---
 option(MINIAV_ENABLE_AUDIO "Enable Audio Module (miniaudio)" OFF)
-option(MINIAV_ENABLE_CAMERA "Enable Camera Capture Module" ON)
+option(MINIAV_ENABLE_CAMERA "Enable Camera Capture Module" OFF)
 option(MINIAV_ENABLE_SCREEN "Enable Screen Capture Module" OFF)
-option(MINIAV_ENABLE_LOOPBACK "Enable Audio Loopback Module" OFF)
+option(MINIAV_ENABLE_LOOPBACK "Enable Audio Loopback Module" ON)
 
 # --- Backend Options ---
 # Windows Screen Capture Backends
@@ -130,17 +130,6 @@ if(MINIAV_ENABLE_CAMERA)
         list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_MACOS_AVF_CAMERA_ENABLED")
     elseif(UNIX AND NOT APPLE)
         set(LINUX_CAMERA_BACKEND_FOUND FALSE)
-        if(MINIAV_BACKEND_LINUX_V4L2_CAMERA)
-            message(STATUS "Linux: Enabling V4L2 for camera.")
-            list(APPEND ALL_SOURCES "src/camera/linux/camera_context_linux_v4l2.c")
-            list(APPEND ALL_HEADERS "src/camera/linux/camera_context_linux_v4l2.h")
-            pkg_check_modules(V4L2 REQUIRED libv4l2)
-            list(APPEND ALL_LINK_LIBS ${V4L2_LIBRARIES})
-            list(APPEND ALL_PRIVATE_INCLUDE_DIRS ${V4L2_INCLUDE_DIRS})
-            list(APPEND ALL_DEFINITIONS ${V4L2_CFLAGS_OTHER})
-            list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_LINUX_V4L2_CAMERA_ENABLED")
-            set(LINUX_CAMERA_BACKEND_FOUND TRUE)
-        endif()
         if(MINIAV_BACKEND_LINUX_PIPEWIRE_CAMERA)
             message(STATUS "Linux: Enabling PipeWire for camera.")
             list(APPEND ALL_SOURCES "src/camera/linux/camera_context_linux_pipewire.c") # Uncomment when implemented
@@ -248,13 +237,14 @@ if(MINIAV_ENABLE_LOOPBACK)
         # list(APPEND ALL_LINK_LIBS "-framework AudioToolbox") # Example
         # list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_MACOS_COREAUDIO_LOOPBACK_ENABLED")
     elseif(UNIX AND NOT APPLE)
-        message(WARNING "Linux: Loopback audio capture not yet implemented.")
-        # list(APPEND ALL_SOURCES "src/loopback/linux/loopback_context_linux_pulse.c") # Example for PulseAudio
-        # list(APPEND ALL_HEADERS "src/loopback/linux/loopback_context_linux_pulse.h")
-        # pkg_check_modules(PULSEAUDIO REQUIRED libpulse)
-        # list(APPEND ALL_LINK_LIBS ${PULSEAUDIO_LIBRARIES})
-        # list(APPEND ALL_PRIVATE_INCLUDE_DIRS ${PULSEAUDIO_INCLUDE_DIRS})
-        # list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_LINUX_PULSE_LOOPBACK_ENABLED")
+        message(STATUS "Linux: Enabling PipeWire for loopback audio.")
+        list(APPEND ALL_SOURCES "src/loopback/linux/loopback_context_linux_pipewire.c")
+        list(APPEND ALL_HEADERS "src/loopback/linux/loopback_context_linux_pipewire.h")
+        pkg_check_modules(PIPEWIRE_LOOPBACK REQUIRED libpipewire-0.3)
+        list(APPEND ALL_LINK_LIBS ${PIPEWIRE_LOOPBACK_LIBRARIES})
+        list(APPEND ALL_PRIVATE_INCLUDE_DIRS ${PIPEWIRE_LOOPBACK_INCLUDE_DIRS})
+        list(APPEND ALL_DEFINITIONS ${PIPEWIRE_LOOPBACK_CFLAGS_OTHER}) # Add CFLAGS from pkg-config
+        list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_LINUX_PIPEWIRE_LOOPBACK_ENABLED") # Corrected
     endif()
 else()
     message(STATUS "Loopback audio module disabled")

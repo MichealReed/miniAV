@@ -505,7 +505,7 @@ pw_loopback_start_capture(struct MiniAVLoopbackContext *ctx,
 
   // Start the loop thread
   if (pthread_create(&pw_ctx->loop_thread, NULL, pipewire_loopback_thread_func,
-                     pw_ctx) != 0) {
+                     ctx) != 0) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "PW Loopback: Failed to create PipeWire loop thread.");
     pw_stream_destroy(pw_ctx->stream);
@@ -804,9 +804,8 @@ static void on_registry_global_remove(void *data, uint32_t id) {
 static void on_stream_state_changed(void *data, enum pw_stream_state old,
                                     enum pw_stream_state state,
                                     const char *error) {
-  struct MiniAVLoopbackContext *ctx = (struct MiniAVLoopbackContext *)data;
   PipeWireLoopbackPlatformContext *pw_ctx =
-      (PipeWireLoopbackPlatformContext *)ctx->platform_ctx;
+      (PipeWireLoopbackPlatformContext *)data; // Corrected cast
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Loopback: Stream state changed from %s to %s.",
@@ -818,17 +817,13 @@ static void on_stream_state_changed(void *data, enum pw_stream_state old,
                error ? error : "Unknown error");
     pw_ctx->is_streaming = false;
     if (pw_ctx->loop_running && pw_ctx->loop && pw_ctx->wakeup_pipe[1] != -1) {
-      write(pw_ctx->wakeup_pipe[1], "q", 1); // Signal loop to quit on error
+      write(pw_ctx->wakeup_pipe[1], "q", 1);
     }
     break;
   case PW_STREAM_STATE_UNCONNECTED:
     pw_ctx->is_streaming = false;
-    // If we were trying to connect and failed, or disconnected.
-    // If loop is running for this stream, might need to quit it.
     if (pw_ctx->loop_running && pw_ctx->loop && pw_ctx->wakeup_pipe[1] != -1 &&
         old != PW_STREAM_STATE_CONNECTING) {
-      // Only quit if it wasn't just a failed connection attempt that might be
-      // retried or handled. Or if it's an unexpected unconnect.
     }
     break;
   case PW_STREAM_STATE_CONNECTING:
@@ -848,7 +843,11 @@ static void on_stream_state_changed(void *data, enum pw_stream_state old,
 
 static void on_stream_param_changed(void *data, uint32_t id,
                                     const struct spa_pod *param) {
-  // ...
+  PipeWireLoopbackPlatformContext *pw_ctx =
+      (PipeWireLoopbackPlatformContext *)data; // Corrected cast
+  MINIAV_UNUSED(pw_ctx); // If pw_ctx is not used after this, to avoid unused
+                         // variable warning. Or use it as intended.
+
   if (!param || id != SPA_PARAM_Format) {
     return;
   }
@@ -863,8 +862,6 @@ static void on_stream_param_changed(void *data, uint32_t id,
     return;
   }
 
-  // Update configured_format if it changed from what we requested.
-  // This is important if PipeWire selected a different compatible format.
   MiniAVAudioInfo negotiated_format;
   negotiated_format.format = spa_audio_format_to_miniav(info.format);
   negotiated_format.channels = info.channels;
@@ -875,9 +872,9 @@ static void on_stream_param_changed(void *data, uint32_t id,
                "PW Loopback: Negotiated format: %s, %uHz, %uch.",
                spa_debug_type_find_name(spa_type_audio_format, info.format),
                info.rate, info.channels);
-    // pw_ctx->configured_format = negotiated_format; // Update our context's
-    // idea of the format Potentially notify app if format changed significantly
-    // from requested.
+    // if (pw_ctx) { // Check if pw_ctx is valid before using
+    //   pw_ctx->configured_format = negotiated_format;
+    // }
   } else {
     miniav_log(
         MINIAV_LOG_LEVEL_WARN,
@@ -887,12 +884,11 @@ static void on_stream_param_changed(void *data, uint32_t id,
 }
 
 static void on_stream_process(void *data) {
-  struct MiniAVLoopbackContext *ctx = (struct MiniAVLoopbackContext *)data;
   PipeWireLoopbackPlatformContext *pw_ctx =
-      (PipeWireLoopbackPlatformContext *)ctx->platform_ctx;
+      (PipeWireLoopbackPlatformContext *)data; // Corrected cast
   struct pw_buffer *pw_buf;
 
-  if (!pw_ctx->app_callback)
+  if (!pw_ctx || !pw_ctx->app_callback) // Added null check for pw_ctx
     return;
 
   while ((pw_buf = pw_stream_dequeue_buffer(pw_ctx->stream)) != NULL) {

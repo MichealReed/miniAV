@@ -271,9 +271,9 @@ MiniAV_Camera_DestroyContext(MiniAVCameraContextHandle context_handle) {
 MiniAVResultCode
 MiniAV_Camera_Configure(MiniAVCameraContextHandle context_handle,
                         const char *device_id,
-                        const MiniAVVideoFormatInfo *format) {
+                        const void *format_void_ptr) {
   MiniAVCameraContext *ctx = (MiniAVCameraContext *)context_handle;
-  if (!ctx || !format ) { // device_id can be NULL for default, but format must exist
+  if (!ctx || !format_void_ptr ) { // device_id can be NULL for default, but format must exist
     return MINIAV_ERROR_INVALID_ARG;
   }
   if (!ctx->ops || !ctx->ops->configure) {
@@ -284,6 +284,9 @@ MiniAV_Camera_Configure(MiniAVCameraContextHandle context_handle,
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "Cannot configure camera while capture is running.");
     return MINIAV_ERROR_ALREADY_RUNNING;
   }
+
+    const MiniAVVideoFormatInfo *format = (const MiniAVVideoFormatInfo *)format_void_ptr; // Cast here
+
 
   MiniAVResultCode res = ctx->ops->configure(ctx, device_id, format);
   if (res == MINIAV_SUCCESS) {

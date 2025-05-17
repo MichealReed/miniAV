@@ -170,7 +170,7 @@ MiniAVResultCode MiniAV_FreeDeviceList(MiniAVDeviceInfo *devices,
 }
 
 // Helper to free the list allocated by GetSupportedFormats
-MiniAVResultCode MiniAV_FreeFormatList(MiniAVAudioInfo *formats,
+MiniAVResultCode MiniAV_FreeFormatList(void *formats,
                                        uint32_t count) {
   MINIAV_UNUSED(count); // count might be useful if allocation was complex
   if (formats) {

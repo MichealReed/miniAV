@@ -48,7 +48,7 @@ MINIAV_API MiniAVResultCode
 MiniAV_Camera_DestroyContext(MiniAVCameraContextHandle context);
 MINIAV_API MiniAVResultCode MiniAV_Camera_Configure(
     MiniAVCameraContextHandle context, const char *device_id,
-    const void *format); // Placeholder for MiniAVVideoFormatInfo
+    const void *format);
 MINIAV_API MiniAVResultCode
 MiniAV_Camera_StartCapture(MiniAVCameraContextHandle context,
                            MiniAVBufferCallback callback, void *user_data);

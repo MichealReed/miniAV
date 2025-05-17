@@ -64,8 +64,6 @@ struct MiniAVCameraContext {
 
     MiniAVVideoFormatInfo configured_format; // Store the currently configured format
     char selected_device_id[MINIAV_DEVICE_ID_MAX_LEN]; // Store the ID of the selected device
-
-    // Any other common state for camera contexts
 };
 
 // Platform-specific initialization functions (to be implemented in platform files)

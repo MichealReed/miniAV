@@ -15,12 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Use miniaudio as the backend
-#define MINIAUDIO_IMPLEMENTATION
-#define MA_NO_DECODING
-#define MA_NO_ENCODING
-#include "../third_party/miniaudio/miniaudio.h"
-
 // --- Helper Functions ---
 
 // Convert MiniAVSampleFormat to ma_format

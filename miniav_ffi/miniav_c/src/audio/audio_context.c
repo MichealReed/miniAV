@@ -9,6 +9,7 @@
 #include "../common/miniav_context_base.h"
 #include "../common/miniav_logging.h"
 #include "../common/miniav_utils.h"
+#include "../common/miniav_time.h"
 #include "audio_context.h" // Specific internal header for this file (if any)
 
 // Standard library headers

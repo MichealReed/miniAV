@@ -82,6 +82,19 @@ typedef struct PipeWirePlatformContext {
 
 } PipeWirePlatformContext;
 
+// Forward declarations for static functions
+
+static MiniAVResultCode pw_init_platform(MiniAVCameraContext *ctx);
+static MiniAVResultCode pw_destroy_platform(MiniAVCameraContext *ctx);
+static MiniAVResultCode pw_enumerate_devices(MiniAVDeviceInfo **devices_out, uint32_t *count_out);
+static MiniAVResultCode pw_get_supported_formats(const char *device_id_str, MiniAVVideoFormatInfo **formats_out, uint32_t *count_out);
+static MiniAVResultCode pw_configure(MiniAVCameraContext *ctx, const char *device_id, const MiniAVVideoFormatInfo *format);
+static MiniAVResultCode pw_start_capture(MiniAVCameraContext *ctx);
+static MiniAVResultCode pw_get_buffer(MiniAVCameraContext *ctx, MiniAVBuffer *buffer, uint32_t timeout_ms);
+static MiniAVResultCode pw_release_buffer(MiniAVCameraContext *ctx, void *buffer);
+static MiniAVResultCode pw_stop_capture(MiniAVCameraContext *ctx); // <--- ADD THIS FORWARD DECLARATION
+
+
 // --- Helper Functions ---
 
 static MiniAVPixelFormat

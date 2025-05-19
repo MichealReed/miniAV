@@ -326,12 +326,13 @@ MiniAVResultCode MiniAV_Screen_ConfigureDisplay(MiniAVScreenContext *ctx,
 
   MiniAVResultCode res = ctx->ops->configure_display(ctx, display_id, format);
   if (res == MINIAV_SUCCESS) {
-    memcpy(&ctx->configured_video_format, format, sizeof(MiniAVVideoInfo));
     miniav_log(MINIAV_LOG_LEVEL_INFO,
                "Screen display configured successfully (API layer).");
   } else {
-    memset(&ctx->configured_video_format, 0,
-           sizeof(MiniAVVideoInfo)); // Clear on failure
+    // On failure, clear the configured format in the main context.
+    memset(&ctx->configured_video_format, 0, sizeof(MiniAVVideoInfo));
+    memset(&ctx->configured_audio_format, 0,
+           sizeof(MiniAVAudioInfo)); // Also clear audio format
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "Failed to configure screen display (API layer), code: %d", res);
   }
@@ -357,12 +358,11 @@ MiniAVResultCode MiniAV_Screen_ConfigureWindow(MiniAVScreenContext *ctx,
 
   MiniAVResultCode res = ctx->ops->configure_window(ctx, window_id, format);
   if (res == MINIAV_SUCCESS) {
-    memcpy(&ctx->configured_video_format, format, sizeof(MiniAVVideoInfo));
     miniav_log(MINIAV_LOG_LEVEL_INFO,
                "Screen window configured successfully (API layer).");
   } else {
-    memset(&ctx->configured_video_format, 0,
-           sizeof(MiniAVVideoInfo)); // Clear on failure
+    memset(&ctx->configured_video_format, 0, sizeof(MiniAVVideoInfo));
+    memset(&ctx->configured_audio_format, 0, sizeof(MiniAVAudioInfo));
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "Failed to configure screen window (API layer), code: %d", res);
   }
@@ -390,12 +390,11 @@ MiniAVResultCode MiniAV_Screen_ConfigureRegion(MiniAVScreenContext *ctx,
   MiniAVResultCode res =
       ctx->ops->configure_region(ctx, target_id, x, y, width, height, format);
   if (res == MINIAV_SUCCESS) {
-    memcpy(&ctx->configured_video_format, format, sizeof(MiniAVVideoInfo));
     miniav_log(MINIAV_LOG_LEVEL_INFO,
                "Screen region configured successfully (API layer).");
   } else {
-    memset(&ctx->configured_video_format, 0,
-           sizeof(MiniAVVideoInfo)); // Clear on failure
+    memset(&ctx->configured_video_format, 0, sizeof(MiniAVVideoInfo));
+    memset(&ctx->configured_audio_format, 0, sizeof(MiniAVAudioInfo));
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "Failed to configure screen region (API layer), code: %d", res);
   }

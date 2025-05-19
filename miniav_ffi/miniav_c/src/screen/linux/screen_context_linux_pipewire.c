@@ -53,21 +53,18 @@ miniav_video_format_to_spa(MiniAVPixelFormat pixel_fmt) {
   }
 }
 
-// Remove the conflicting definition of spa_video_format_to_miniav that returns
-// MiniAVVideoInfo
-
-static MiniAVPixelFormat // Corrected return type
+static MiniAVPixelFormat
 spa_video_format_to_miniav(enum spa_video_format spa_fmt) {
   switch (spa_fmt) {
   case SPA_VIDEO_FORMAT_BGRA:
-    return MINIAV_PIXEL_FORMAT_BGRA32; // Corrected enum
+    return MINIAV_PIXEL_FORMAT_BGRA32;
   case SPA_VIDEO_FORMAT_RGBA:
-    return MINIAV_PIXEL_FORMAT_RGBA32; // Corrected enum
+    return MINIAV_PIXEL_FORMAT_RGBA32;
   case SPA_VIDEO_FORMAT_I420:
-    return MINIAV_PIXEL_FORMAT_I420; // Corrected enum
+    return MINIAV_PIXEL_FORMAT_I420;
   // Add more mappings
   default:
-    return MINIAV_PIXEL_FORMAT_UNKNOWN; // Corrected enum
+    return MINIAV_PIXEL_FORMAT_UNKNOWN;
   }
 }
 
@@ -135,20 +132,34 @@ static uint32_t get_miniav_pixel_format_planes(MiniAVPixelFormat pixel_fmt) {
 
 static const char *screen_pixel_format_to_string(MiniAVPixelFormat format) {
   switch (format) {
-  case MINIAV_PIXEL_FORMAT_UNKNOWN: return "UNKNOWN";
-  case MINIAV_PIXEL_FORMAT_I420:    return "I420";
-  case MINIAV_PIXEL_FORMAT_NV12:    return "NV12";
-  case MINIAV_PIXEL_FORMAT_NV21:    return "NV21";
-  case MINIAV_PIXEL_FORMAT_YUY2:    return "YUY2";
-  case MINIAV_PIXEL_FORMAT_UYVY:    return "UYVY";
-  case MINIAV_PIXEL_FORMAT_RGB24:   return "RGB24";
-  case MINIAV_PIXEL_FORMAT_BGR24:   return "BGR24";
-  case MINIAV_PIXEL_FORMAT_RGBA32:  return "RGBA32";
-  case MINIAV_PIXEL_FORMAT_BGRA32:  return "BGRA32";
-  case MINIAV_PIXEL_FORMAT_ARGB32:  return "ARGB32";
-  case MINIAV_PIXEL_FORMAT_ABGR32:  return "ABGR32";
-  case MINIAV_PIXEL_FORMAT_MJPEG:   return "MJPEG";
-  default: return "InvalidFormat";
+  case MINIAV_PIXEL_FORMAT_UNKNOWN:
+    return "UNKNOWN";
+  case MINIAV_PIXEL_FORMAT_I420:
+    return "I420";
+  case MINIAV_PIXEL_FORMAT_NV12:
+    return "NV12";
+  case MINIAV_PIXEL_FORMAT_NV21:
+    return "NV21";
+  case MINIAV_PIXEL_FORMAT_YUY2:
+    return "YUY2";
+  case MINIAV_PIXEL_FORMAT_UYVY:
+    return "UYVY";
+  case MINIAV_PIXEL_FORMAT_RGB24:
+    return "RGB24";
+  case MINIAV_PIXEL_FORMAT_BGR24:
+    return "BGR24";
+  case MINIAV_PIXEL_FORMAT_RGBA32:
+    return "RGBA32";
+  case MINIAV_PIXEL_FORMAT_BGRA32:
+    return "BGRA32";
+  case MINIAV_PIXEL_FORMAT_ARGB32:
+    return "ARGB32";
+  case MINIAV_PIXEL_FORMAT_ABGR32:
+    return "ABGR32";
+  case MINIAV_PIXEL_FORMAT_MJPEG:
+    return "MJPEG";
+  default:
+    return "InvalidFormat";
   }
 }
 
@@ -422,10 +433,10 @@ pw_screen_get_default_formats(const char *device_id,
 
   if (video_format_out) {
     video_format_out->pixel_format =
-        MINIAV_PIXEL_FORMAT_BGRA32; // Common, good quality
-    video_format_out->width = 1920;
-    video_format_out->height = 1080;
-    video_format_out->frame_rate_numerator = 30;
+        MINIAV_PIXEL_FORMAT_BGRA32; // Common, good quality default
+    video_format_out->width = 0;  // Request native/negotiated width
+    video_format_out->height = 0; // Request native/negotiated height
+    video_format_out->frame_rate_numerator = 30; // Common default FPS
     video_format_out->frame_rate_denominator = 1;
     video_format_out->output_preference =
         MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE;
@@ -437,9 +448,10 @@ pw_screen_get_default_formats(const char *device_id,
     audio_format_out->sample_rate = 48000;
     audio_format_out->channels = 2;
   }
-  miniav_log(MINIAV_LOG_LEVEL_WARN,
+  miniav_log(MINIAV_LOG_LEVEL_INFO, // Changed to INFO as this is important behavior
              "PW Screen: GetDefaultFormats provides common placeholders. "
-             "Actual formats depend on source negotiation.");
+             "Resolution 0x0 requests native/negotiated size. "
+             "Actual formats depend on source negotiation after StartCapture.");
   return MINIAV_SUCCESS;
 }
 
@@ -618,7 +630,7 @@ pw_screen_configure_display(struct MiniAVScreenContext *ctx,
 static MiniAVResultCode
 pw_screen_configure_window(struct MiniAVScreenContext *ctx,
                            const char *window_id,
-                           const MiniAVVideoInfo *format) {
+                           const MiniAVVideoInfo *video_format) {
   PipeWireScreenPlatformContext *pctx =
       (PipeWireScreenPlatformContext *)ctx->platform_ctx;
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: ConfigureWindow for ID: %s",
@@ -630,22 +642,70 @@ pw_screen_configure_window(struct MiniAVScreenContext *ctx,
     strncpy(pctx->target_id_str, "portal_selected_window",
             sizeof(pctx->target_id_str) - 1);
   }
-  pctx->requested_video_format = *format;
+
+  pw_screen_get_default_formats(
+      window_id, &pctx->requested_video_format,
+      (ctx->capture_audio_requested ? &pctx->requested_audio_format : NULL));
+
+  if (video_format) {
+    if (video_format->width > 0 && video_format->height > 0) {
+      pctx->requested_video_format.width = video_format->width;
+      pctx->requested_video_format.height = video_format->height;
+    }
+    if (video_format->pixel_format != MINIAV_PIXEL_FORMAT_UNKNOWN) {
+      pctx->requested_video_format.pixel_format = video_format->pixel_format;
+    }
+    if (video_format->frame_rate_numerator > 0 &&
+        video_format->frame_rate_denominator > 0) {
+      pctx->requested_video_format.frame_rate_numerator =
+          video_format->frame_rate_numerator;
+      pctx->requested_video_format.frame_rate_denominator =
+          video_format->frame_rate_denominator;
+    } else if (video_format->frame_rate_numerator > 0 &&
+               pctx->requested_video_format.frame_rate_denominator == 0) {
+      pctx->requested_video_format.frame_rate_numerator =
+          video_format->frame_rate_numerator;
+      pctx->requested_video_format.frame_rate_denominator = 1;
+    }
+    pctx->requested_video_format.output_preference =
+        video_format->output_preference;
+  }
+
+  miniav_log(
+      MINIAV_LOG_LEVEL_DEBUG,
+      "PW Screen: ConfigureWindow - Effective requested video format: %ux%u, "
+      "%s (%d), %u/%u FPS, Pref: %d",
+      pctx->requested_video_format.width, pctx->requested_video_format.height,
+      screen_pixel_format_to_string(pctx->requested_video_format.pixel_format),
+      pctx->requested_video_format.pixel_format,
+      pctx->requested_video_format.frame_rate_numerator,
+      pctx->requested_video_format.frame_rate_denominator,
+      pctx->requested_video_format.output_preference);
+
   pctx->capture_type = MINIAV_CAPTURE_TYPE_WINDOW;
   pctx->audio_requested_by_user = ctx->capture_audio_requested;
-  if (ctx->capture_audio_requested) {
-    pctx->requested_audio_format = ctx->configured_audio_format;
+
+  if (pctx->audio_requested_by_user) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW Screen: ConfigureWindow - Effective requested audio format: "
+               "%u Hz, %u Ch, Format %d",
+               pctx->requested_audio_format.sample_rate,
+               pctx->requested_audio_format.channels,
+               pctx->requested_audio_format.format);
   }
 
   ctx->is_configured = true;
-  ctx->configured_video_format = *format;
+  ctx->configured_video_format = pctx->requested_video_format;
+  if (ctx->capture_audio_requested) {
+    ctx->configured_audio_format = pctx->requested_audio_format;
+  }
   return MINIAV_SUCCESS;
 }
 
 static MiniAVResultCode
 pw_screen_configure_region(struct MiniAVScreenContext *ctx,
                            const char *target_id, int x, int y, int width,
-                           int height, const MiniAVVideoInfo *format) {
+                           int height, const MiniAVVideoInfo *video_format) {
   PipeWireScreenPlatformContext *pctx =
       (PipeWireScreenPlatformContext *)ctx->platform_ctx;
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
@@ -659,25 +719,83 @@ pw_screen_configure_region(struct MiniAVScreenContext *ctx,
     strncpy(pctx->target_id_str, "portal_selected_region_base",
             sizeof(pctx->target_id_str) - 1);
   }
-  pctx->requested_video_format = *format;
-  pctx->capture_type =
-      MINIAV_CAPTURE_TYPE_REGION; // Portal might not support region directly;
-                                  // client-side crop may be needed.
-  pctx->audio_requested_by_user = ctx->capture_audio_requested;
-  if (ctx->capture_audio_requested) {
-    pctx->requested_audio_format = ctx->configured_audio_format;
+
+  pw_screen_get_default_formats(
+      target_id, &pctx->requested_video_format,
+      (ctx->capture_audio_requested ? &pctx->requested_audio_format : NULL));
+
+  // For region, the width/height from parameters are primary
+  if (width > 0 && height > 0) {
+    pctx->requested_video_format.width = width;
+    pctx->requested_video_format.height = height;
   }
+  // Then overlay other specifics from user's video_format
+  if (video_format) {
+    // If user also specified width/height in video_format, and they are valid,
+    // let them override (though region parameters x,y,width,height are usually
+    // the source of truth for dimensions)
+    if (video_format->width > 0 && video_format->height > 0) {
+      // This might be redundant if width/height params are always used, but
+      // good for safety
+      pctx->requested_video_format.width = video_format->width;
+      pctx->requested_video_format.height = video_format->height;
+    }
+    if (video_format->pixel_format != MINIAV_PIXEL_FORMAT_UNKNOWN) {
+      pctx->requested_video_format.pixel_format = video_format->pixel_format;
+    }
+    if (video_format->frame_rate_numerator > 0 &&
+        video_format->frame_rate_denominator > 0) {
+      pctx->requested_video_format.frame_rate_numerator =
+          video_format->frame_rate_numerator;
+      pctx->requested_video_format.frame_rate_denominator =
+          video_format->frame_rate_denominator;
+    } else if (video_format->frame_rate_numerator > 0 &&
+               pctx->requested_video_format.frame_rate_denominator == 0) {
+      pctx->requested_video_format.frame_rate_numerator =
+          video_format->frame_rate_numerator;
+      pctx->requested_video_format.frame_rate_denominator = 1;
+    }
+    pctx->requested_video_format.output_preference =
+        video_format->output_preference;
+  }
+
+  miniav_log(
+      MINIAV_LOG_LEVEL_DEBUG,
+      "PW Screen: ConfigureRegion - Effective requested video format: %ux%u, "
+      "%s (%d), %u/%u FPS, Pref: %d",
+      pctx->requested_video_format.width, pctx->requested_video_format.height,
+      screen_pixel_format_to_string(pctx->requested_video_format.pixel_format),
+      pctx->requested_video_format.pixel_format,
+      pctx->requested_video_format.frame_rate_numerator,
+      pctx->requested_video_format.frame_rate_denominator,
+      pctx->requested_video_format.output_preference);
+
+  pctx->capture_type = MINIAV_CAPTURE_TYPE_REGION;
+  pctx->audio_requested_by_user = ctx->capture_audio_requested;
   pctx->region_x = x;
   pctx->region_y = y;
-  pctx->region_width = width;
-  pctx->region_height = height;
+  // pctx->region_width and pctx->region_height are effectively set via
+  // pctx->requested_video_format.width/height
+
+  if (pctx->audio_requested_by_user) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW Screen: ConfigureRegion - Effective requested audio format: "
+               "%u Hz, %u Ch, Format %d",
+               pctx->requested_audio_format.sample_rate,
+               pctx->requested_audio_format.channels,
+               pctx->requested_audio_format.format);
+  }
 
   miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Region capture support depends "
                                     "on portal/source capabilities. "
-                                    "Client-side cropping might be necessary.");
+                                    "Client-side cropping might be necessary "
+                                    "if portal provides full source.");
 
   ctx->is_configured = true;
-  ctx->configured_video_format = *format;
+  ctx->configured_video_format = pctx->requested_video_format;
+  if (ctx->capture_audio_requested) {
+    ctx->configured_audio_format = pctx->requested_audio_format;
+  }
   return MINIAV_SUCCESS;
 }
 

@@ -47,7 +47,7 @@ typedef struct {
   bool is_default; // True if this is the default device
 } MiniAVDeviceInfo;
 
-// --- Pixel Formats (Moved Here) ---
+// --- Pixel Formats
 typedef enum {
   MINIAV_PIXEL_FORMAT_UNKNOWN = 0,
   MINIAV_PIXEL_FORMAT_I420,   // Planar YUV 4:2:0

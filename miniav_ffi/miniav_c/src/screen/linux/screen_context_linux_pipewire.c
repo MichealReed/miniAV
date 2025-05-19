@@ -133,6 +133,25 @@ static uint32_t get_miniav_pixel_format_planes(MiniAVPixelFormat pixel_fmt) {
   }
 }
 
+static const char *screen_pixel_format_to_string(MiniAVPixelFormat format) {
+  switch (format) {
+  case MINIAV_PIXEL_FORMAT_UNKNOWN: return "UNKNOWN";
+  case MINIAV_PIXEL_FORMAT_I420:    return "I420";
+  case MINIAV_PIXEL_FORMAT_NV12:    return "NV12";
+  case MINIAV_PIXEL_FORMAT_NV21:    return "NV21";
+  case MINIAV_PIXEL_FORMAT_YUY2:    return "YUY2";
+  case MINIAV_PIXEL_FORMAT_UYVY:    return "UYVY";
+  case MINIAV_PIXEL_FORMAT_RGB24:   return "RGB24";
+  case MINIAV_PIXEL_FORMAT_BGR24:   return "BGR24";
+  case MINIAV_PIXEL_FORMAT_RGBA32:  return "RGBA32";
+  case MINIAV_PIXEL_FORMAT_BGRA32:  return "BGRA32";
+  case MINIAV_PIXEL_FORMAT_ARGB32:  return "ARGB32";
+  case MINIAV_PIXEL_FORMAT_ABGR32:  return "ABGR32";
+  case MINIAV_PIXEL_FORMAT_MJPEG:   return "MJPEG";
+  default: return "InvalidFormat";
+  }
+}
+
 // --- Forward Declarations for Static Functions ---
 static void *pw_screen_loop_thread_func(void *arg);
 
@@ -393,6 +412,82 @@ pw_screen_destroy_platform(struct MiniAVScreenContext *ctx) {
 }
 
 static MiniAVResultCode
+pw_screen_get_default_formats(const char *device_id,
+                              MiniAVVideoInfo *video_format_out,
+                              MiniAVAudioInfo *audio_format_out) {
+  MINIAV_UNUSED(device_id);
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: GetDefaultFormats for device: %s",
+             device_id ? device_id : "Any (Portal)");
+
+  if (video_format_out) {
+    video_format_out->pixel_format =
+        MINIAV_PIXEL_FORMAT_BGRA32; // Common, good quality
+    video_format_out->width = 1920;
+    video_format_out->height = 1080;
+    video_format_out->frame_rate_numerator = 30;
+    video_format_out->frame_rate_denominator = 1;
+    video_format_out->output_preference =
+        MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE;
+    // num_planes, strides, dmabuf_plane_offsets are not part of
+    // MiniAVVideoInfo
+  }
+  if (audio_format_out) {
+    audio_format_out->format = MINIAV_AUDIO_FORMAT_F32;
+    audio_format_out->sample_rate = 48000;
+    audio_format_out->channels = 2;
+  }
+  miniav_log(MINIAV_LOG_LEVEL_WARN,
+             "PW Screen: GetDefaultFormats provides common placeholders. "
+             "Actual formats depend on source negotiation.");
+  return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode
+pw_screen_get_configured_video_formats(struct MiniAVScreenContext *ctx,
+                                       MiniAVVideoInfo *video_format_out,
+                                       MiniAVAudioInfo *audio_format_out) {
+  PipeWireScreenPlatformContext *pctx =
+      (PipeWireScreenPlatformContext *)ctx->platform_ctx;
+
+  if (video_format_out) {
+    // Prefer actually negotiated and valid format stored in the parent context
+    if (ctx->configured_video_format.pixel_format !=
+            MINIAV_PIXEL_FORMAT_UNKNOWN &&
+        ctx->configured_video_format.width > 0 &&
+        ctx->configured_video_format.height > 0) {
+      *video_format_out = ctx->configured_video_format;
+      // Ensure output_preference from the original request is preserved,
+      // as it's not part of PipeWire's video format negotiation in this
+      // context.
+      video_format_out->output_preference =
+          pctx->requested_video_format.output_preference;
+    } else if (ctx->is_configured) { // Fallback to what was initially
+                                     // requested/configured
+      *video_format_out = pctx->requested_video_format;
+    } else { // Not configured at all
+      memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
+      video_format_out->pixel_format = MINIAV_PIXEL_FORMAT_UNKNOWN;
+    }
+  }
+
+  if (audio_format_out) {
+    // Prefer actually negotiated audio format stored in the parent context
+    if (ctx->configured_audio_format.format != MINIAV_AUDIO_FORMAT_UNKNOWN &&
+        ctx->configured_audio_format.sample_rate > 0) {
+      *audio_format_out = ctx->configured_audio_format;
+    } else if (ctx->is_configured &&
+               pctx->audio_requested_by_user) { // Fallback to requested
+      *audio_format_out = pctx->requested_audio_format;
+    } else { // Not configured or audio not requested
+      memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
+      audio_format_out->format = MINIAV_AUDIO_FORMAT_UNKNOWN;
+    }
+  }
+  return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode
 pw_screen_enumerate_displays(MiniAVDeviceInfo **displays_out,
                              uint32_t *count_out) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: EnumerateDisplays called.");
@@ -447,24 +542,76 @@ pw_screen_configure_display(struct MiniAVScreenContext *ctx,
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: ConfigureDisplay for ID: %s",
              display_id ? display_id : "any_portal_selected");
 
-  // display_id is not directly used with portal's SelectSources dialog,
-  // but could be used if we had a way to pre-select.
-  // For now, target_id_str is mostly for logging or internal state.
   if (display_id) {
     strncpy(pctx->target_id_str, display_id, sizeof(pctx->target_id_str) - 1);
   } else {
     strncpy(pctx->target_id_str, "portal_selected_display",
             sizeof(pctx->target_id_str) - 1);
   }
-  pctx->requested_video_format = *video_format;
+
+  // Start with defaults for both video and audio (if requested)
+  pw_screen_get_default_formats(
+      display_id, &pctx->requested_video_format,
+      (ctx->capture_audio_requested ? &pctx->requested_audio_format : NULL));
+
+  // Overlay user-provided video format specifics if they are valid
+  if (video_format) {
+    if (video_format->width > 0 && video_format->height > 0) {
+      pctx->requested_video_format.width = video_format->width;
+      pctx->requested_video_format.height = video_format->height;
+    }
+    if (video_format->pixel_format != MINIAV_PIXEL_FORMAT_UNKNOWN) {
+      pctx->requested_video_format.pixel_format = video_format->pixel_format;
+    }
+    if (video_format->frame_rate_numerator > 0 &&
+        video_format->frame_rate_denominator > 0) {
+      pctx->requested_video_format.frame_rate_numerator =
+          video_format->frame_rate_numerator;
+      pctx->requested_video_format.frame_rate_denominator =
+          video_format->frame_rate_denominator;
+    } else if (video_format->frame_rate_numerator > 0 &&
+               pctx->requested_video_format.frame_rate_denominator == 0) {
+      // User provided numerator but not denominator, assume /1
+      pctx->requested_video_format.frame_rate_numerator =
+          video_format->frame_rate_numerator;
+      pctx->requested_video_format.frame_rate_denominator = 1;
+    }
+    // output_preference is always taken from user input
+    pctx->requested_video_format.output_preference =
+        video_format->output_preference;
+  }
+
+  miniav_log(
+      MINIAV_LOG_LEVEL_DEBUG,
+      "PW Screen: ConfigureDisplay - Effective requested video format: %ux%u, "
+      "%s (%d), %u/%u FPS, Pref: %d",
+      pctx->requested_video_format.width, pctx->requested_video_format.height,
+      screen_pixel_format_to_string(pctx->requested_video_format.pixel_format),
+      pctx->requested_video_format.pixel_format,
+      pctx->requested_video_format.frame_rate_numerator,
+      pctx->requested_video_format.frame_rate_denominator,
+      pctx->requested_video_format.output_preference);
+
   pctx->capture_type = MINIAV_CAPTURE_TYPE_DISPLAY;
   pctx->audio_requested_by_user = ctx->capture_audio_requested;
-  if (ctx->capture_audio_requested) {
-    pctx->requested_audio_format = ctx->configured_audio_format;
+  // pctx->requested_audio_format is already populated by
+  // pw_screen_get_default_formats if audio was requested
+
+  if (pctx->audio_requested_by_user) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW Screen: ConfigureDisplay - Effective requested audio "
+               "format: %u Hz, %u Ch, Format %d",
+               pctx->requested_audio_format.sample_rate,
+               pctx->requested_audio_format.channels,
+               pctx->requested_audio_format.format);
   }
 
   ctx->is_configured = true;
-  ctx->configured_video_format = *video_format;
+  ctx->configured_video_format = pctx->requested_video_format;
+  if (ctx->capture_audio_requested) {
+    ctx->configured_audio_format = pctx->requested_audio_format;
+  }
+
   return MINIAV_SUCCESS;
 }
 
@@ -1335,81 +1482,6 @@ pw_screen_release_buffer(struct MiniAVScreenContext *ctx,
   return MINIAV_SUCCESS;
 }
 
-static MiniAVResultCode
-pw_screen_get_default_formats(const char *device_id,
-                              MiniAVVideoInfo *video_format_out,
-                              MiniAVAudioInfo *audio_format_out) {
-  MINIAV_UNUSED(device_id);
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "PW Screen: GetDefaultFormats for device: %s",
-             device_id ? device_id : "Any (Portal)");
-
-  if (video_format_out) {
-    video_format_out->pixel_format =
-        MINIAV_PIXEL_FORMAT_BGRA32; // Common, good quality
-    video_format_out->width = 1920;
-    video_format_out->height = 1080;
-    video_format_out->frame_rate_numerator = 30;
-    video_format_out->frame_rate_denominator = 1;
-    video_format_out->output_preference =
-        MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE;
-    // num_planes, strides, dmabuf_plane_offsets are not part of
-    // MiniAVVideoInfo
-  }
-  if (audio_format_out) {
-    audio_format_out->format = MINIAV_AUDIO_FORMAT_F32;
-    audio_format_out->sample_rate = 48000;
-    audio_format_out->channels = 2;
-  }
-  miniav_log(MINIAV_LOG_LEVEL_WARN,
-             "PW Screen: GetDefaultFormats provides common placeholders. "
-             "Actual formats depend on source negotiation.");
-  return MINIAV_SUCCESS;
-}
-
-static MiniAVResultCode
-pw_screen_get_configured_video_formats(struct MiniAVScreenContext *ctx,
-                                       MiniAVVideoInfo *video_format_out,
-                                       MiniAVAudioInfo *audio_format_out) {
-  PipeWireScreenPlatformContext *pctx =
-      (PipeWireScreenPlatformContext *)ctx->platform_ctx;
-
-  if (video_format_out) {
-    // Prefer actually negotiated and valid format stored in the parent context
-    if (ctx->configured_video_format.pixel_format !=
-            MINIAV_PIXEL_FORMAT_UNKNOWN &&
-        ctx->configured_video_format.width > 0 &&
-        ctx->configured_video_format.height > 0) {
-      *video_format_out = ctx->configured_video_format;
-      // Ensure output_preference from the original request is preserved,
-      // as it's not part of PipeWire's video format negotiation in this
-      // context.
-      video_format_out->output_preference =
-          pctx->requested_video_format.output_preference;
-    } else if (ctx->is_configured) { // Fallback to what was initially
-                                     // requested/configured
-      *video_format_out = pctx->requested_video_format;
-    } else { // Not configured at all
-      memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
-      video_format_out->pixel_format = MINIAV_PIXEL_FORMAT_UNKNOWN;
-    }
-  }
-
-  if (audio_format_out) {
-    // Prefer actually negotiated audio format stored in the parent context
-    if (ctx->configured_audio_format.format != MINIAV_AUDIO_FORMAT_UNKNOWN &&
-        ctx->configured_audio_format.sample_rate > 0) {
-      *audio_format_out = ctx->configured_audio_format;
-    } else if (ctx->is_configured &&
-               pctx->audio_requested_by_user) { // Fallback to requested
-      *audio_format_out = pctx->requested_audio_format;
-    } else { // Not configured or audio not requested
-      memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
-      audio_format_out->format = MINIAV_AUDIO_FORMAT_UNKNOWN;
-    }
-  }
-  return MINIAV_SUCCESS;
-}
 // --- PipeWire Thread and Event Handlers ---
 
 static void *pw_screen_loop_thread_func(void *arg) {

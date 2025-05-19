@@ -239,7 +239,8 @@ int main() {
   }
 
   MiniAVVideoInfo actual_format;
-  MiniAV_Screen_GetConfiguredFormats(screen_ctx, &actual_format, NULL);
+  MiniAVAudioInfo actual_audio_format;
+  MiniAV_Screen_GetConfiguredFormats(screen_ctx, &actual_format, &actual_audio_format);
   printf("Screen capture configured successfully.\n");
   printf("  Actual Capture Resolution: %ux%u\n", actual_format.width,
          actual_format.height);

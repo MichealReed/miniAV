@@ -1373,53 +1373,37 @@ pw_screen_get_configured_video_formats(struct MiniAVScreenContext *ctx,
                                        MiniAVAudioInfo *audio_format_out) {
   PipeWireScreenPlatformContext *pctx =
       (PipeWireScreenPlatformContext *)ctx->platform_ctx;
-  if (!ctx->is_configured && !ctx->is_running)
-    return MINIAV_ERROR_NOT_INITIALIZED;
 
   if (video_format_out) {
-    if ((pctx->video_stream_active || ctx->is_running) &&
-        pctx->current_video_format_details.spa_format.format !=
-            SPA_VIDEO_FORMAT_UNKNOWN) {
-      video_format_out->pixel_format = spa_video_format_to_miniav(
-          pctx->current_video_format_details.spa_format.format);
-      video_format_out->width =
-          pctx->current_video_format_details.spa_format.size.width;
-      video_format_out->height =
-          pctx->current_video_format_details.spa_format.size.height;
-      video_format_out->frame_rate_numerator =
-          pctx->current_video_format_details.spa_format.framerate.num;
-      video_format_out->frame_rate_denominator =
-          pctx->current_video_format_details.spa_format.framerate.denom;
+    // Prefer actually negotiated and valid format stored in the parent context
+    if (ctx->configured_video_format.pixel_format !=
+            MINIAV_PIXEL_FORMAT_UNKNOWN &&
+        ctx->configured_video_format.width > 0 &&
+        ctx->configured_video_format.height > 0) {
+      *video_format_out = ctx->configured_video_format;
+      // Ensure output_preference from the original request is preserved,
+      // as it's not part of PipeWire's video format negotiation in this
+      // context.
       video_format_out->output_preference =
           pctx->requested_video_format.output_preference;
-    } else if (ctx->is_configured) {
+    } else if (ctx->is_configured) { // Fallback to what was initially
+                                     // requested/configured
       *video_format_out = pctx->requested_video_format;
-    } else {
+    } else { // Not configured at all
       memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
       video_format_out->pixel_format = MINIAV_PIXEL_FORMAT_UNKNOWN;
     }
   }
 
   if (audio_format_out) {
-    // Use parent_ctx->configured_video_format if available and negotiated
-    // Or fallback to pctx->requested_audio_format
-    if ((pctx->audio_stream_active ||
-         (ctx->is_running && pctx->audio_requested_by_user)) &&
-        pctx->current_audio_format.format != SPA_AUDIO_FORMAT_UNKNOWN) {
-      // Assuming MiniAVScreenContext has 'configured_video_format'
-      if (ctx->configured_video_format.pixel_format !=
-          MINIAV_AUDIO_FORMAT_UNKNOWN) {
-        *audio_format_out = ctx->configured_audio_format;
-      } else { // Fallback to constructing from current_audio_format if parent
-               // not updated yet
-        audio_format_out->format =
-            spa_audio_format_to_miniav_audio(pctx->current_audio_format.format);
-        audio_format_out->channels = pctx->current_audio_format.channels;
-        audio_format_out->sample_rate = pctx->current_audio_format.rate;
-      }
-    } else if (ctx->is_configured && pctx->audio_requested_by_user) {
+    // Prefer actually negotiated audio format stored in the parent context
+    if (ctx->configured_audio_format.format != MINIAV_AUDIO_FORMAT_UNKNOWN &&
+        ctx->configured_audio_format.sample_rate > 0) {
+      *audio_format_out = ctx->configured_audio_format;
+    } else if (ctx->is_configured &&
+               pctx->audio_requested_by_user) { // Fallback to requested
       *audio_format_out = pctx->requested_audio_format;
-    } else {
+    } else { // Not configured or audio not requested
       memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
       audio_format_out->format = MINIAV_AUDIO_FORMAT_UNKNOWN;
     }
@@ -1821,11 +1805,12 @@ static void on_video_stream_process(void *data) {
     } else if (spa_buf->datas[0].type == SPA_DATA_MemPtr) {
       miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
 
-      uint32_t num_miniav_planes =
-          get_miniav_pixel_format_planes(miniav_buffer.data.video.info.pixel_format);
+      uint32_t num_miniav_planes = get_miniav_pixel_format_planes(
+          miniav_buffer.data.video.info.pixel_format);
 
-      if (num_miniav_planes == 0 && miniav_buffer.data.video.info.pixel_format !=
-                                        MINIAV_PIXEL_FORMAT_UNKNOWN) {
+      if (num_miniav_planes == 0 &&
+          miniav_buffer.data.video.info.pixel_format !=
+              MINIAV_PIXEL_FORMAT_UNKNOWN) {
         miniav_log(MINIAV_LOG_LEVEL_WARN,
                    "PW Screen: CPU Video format %d resolved to 0 planes. Check "
                    "get_miniav_pixel_format_planes.",
@@ -1992,6 +1977,13 @@ static void on_audio_stream_param_changed(void *data, uint32_t id,
   if (spa_format_audio_raw_parse(param, &pctx->current_audio_format) < 0) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "PW Screen: Failed to parse audio SPA_PARAM_Format.");
+    // Mark parent context's audio format as unknown
+    if (pctx->parent_ctx) {
+      pctx->parent_ctx->configured_audio_format.format =
+          MINIAV_AUDIO_FORMAT_UNKNOWN;
+      pctx->parent_ctx->configured_audio_format.channels = 0;
+      pctx->parent_ctx->configured_audio_format.sample_rate = 0;
+    }
     return;
   }
   miniav_log(MINIAV_LOG_LEVEL_INFO,
@@ -2001,13 +1993,11 @@ static void on_audio_stream_param_changed(void *data, uint32_t id,
              pctx->current_audio_format.channels,
              pctx->current_audio_format.rate);
 
-  // Update parent context's DEDICATED audio format member
-  // Assuming MiniAVScreenContext has 'configured_video_format' of type
-  // MiniAVAudioInfo
   if (pctx->parent_ctx) {
-    pctx->parent_ctx->configured_video_format.pixel_format =
+    pctx->parent_ctx->configured_audio_format.format =
         spa_audio_format_to_miniav_audio(pctx->current_audio_format.format);
-    pctx->parent_ctx->configured_video_format = pctx->requested_video_format;
+    pctx->parent_ctx->configured_audio_format.channels =
+        pctx->current_audio_format.channels;
     pctx->parent_ctx->configured_audio_format.sample_rate =
         pctx->current_audio_format.rate;
   }

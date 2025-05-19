@@ -378,9 +378,9 @@ MiniAV_Loopback_Configure(MiniAVLoopbackContextHandle context_handle,
 
   if (res == MINIAV_SUCCESS) {
     ctx->is_configured = true;
-    ctx->configured_format =
+    ctx->configured_video_format =
         *format; // Cache the requested format, backend might adjust and update
-                 // via get_configured_format
+                 // via get_configured_video_format
     if (target_info_to_pass) {
       ctx->current_target_info = *target_info_to_pass;
       memset(ctx->current_target_device_id, 0, MINIAV_DEVICE_ID_MAX_LEN);
@@ -431,7 +431,7 @@ MiniAVResultCode MiniAV_Loopback_ConfigureWithTargetInfo(
       ctx, target_info, NULL, format); // device_id is NULL
   if (res == MINIAV_SUCCESS) {
     ctx->is_configured = true;
-    ctx->configured_format = *format; // Cache requested
+    ctx->configured_video_format = *format; // Cache requested
     ctx->current_target_info = *target_info;
     memset(ctx->current_target_device_id, 0, MINIAV_DEVICE_ID_MAX_LEN);
     miniav_log(MINIAV_LOG_LEVEL_INFO,
@@ -525,15 +525,15 @@ MiniAV_Loopback_GetConfiguredFormat(MiniAVLoopbackContextHandle context_handle,
         "Loopback not configured. Format information may be incomplete.");
   }
 
-  if (ctx->ops && ctx->ops->get_configured_format) {
-    return ctx->ops->get_configured_format(ctx, format_out);
+  if (ctx->ops && ctx->ops->get_configured_video_format) {
+    return ctx->ops->get_configured_video_format(ctx, format_out);
   } else {
-    miniav_log(MINIAV_LOG_LEVEL_WARN, "get_configured_format op not available. "
+    miniav_log(MINIAV_LOG_LEVEL_WARN, "get_configured_video_format op not available. "
                                       "Using cached format if configured.");
     // Fallback to the cached format if the op is missing (should ideally not
     // happen for a valid context)
     if (ctx->is_configured) {
-      *format_out = ctx->configured_format;
+      *format_out = ctx->configured_video_format;
       return MINIAV_SUCCESS;
     }
   }

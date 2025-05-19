@@ -57,7 +57,7 @@ typedef struct DXGIScreenPlatformContext {
   HANDLE stop_event_handle;
   CRITICAL_SECTION critical_section; // For thread-safe access to shared members
 
-  MiniAVVideoFormatInfo configured_format; // Store user's requested format
+  MiniAVVideoInfo configured_video_format; // Store user's requested format
                                            // (FPS, output_preference)
   UINT target_fps;
   UINT frame_width;               // Actual width from DXGI
@@ -431,12 +431,12 @@ dxgi_cleanup_d3d_and_duplication(DXGIScreenPlatformContext *dxgi_ctx) {
 
 static MiniAVResultCode
 dxgi_get_default_formats(const char *device_id_utf8,
-                         MiniAVVideoFormatInfo *video_format_out,
+                         MiniAVVideoInfo *video_format_out,
                          MiniAVAudioInfo *audio_format_out) {
   if (!device_id_utf8 || !video_format_out) {
     return MINIAV_ERROR_INVALID_ARG;
   }
-  memset(video_format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
   if (audio_format_out) {
     memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
   }
@@ -547,8 +547,8 @@ dxgi_get_default_formats(const char *device_id_utf8,
 }
 
 static MiniAVResultCode
-dxgi_get_configured_formats(MiniAVScreenContext *ctx,
-                            MiniAVVideoFormatInfo *video_format_out,
+dxgi_get_configured_video_formats(MiniAVScreenContext *ctx,
+                            MiniAVVideoInfo *video_format_out,
                             MiniAVAudioInfo *audio_format_out) {
   if (!ctx || !ctx->platform_ctx || !video_format_out) {
     return MINIAV_ERROR_INVALID_ARG;
@@ -556,7 +556,7 @@ dxgi_get_configured_formats(MiniAVScreenContext *ctx,
   DXGIScreenPlatformContext *dxgi_ctx =
       (DXGIScreenPlatformContext *)ctx->platform_ctx;
 
-  memset(video_format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
   if (audio_format_out) {
     memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
   }
@@ -568,9 +568,9 @@ dxgi_get_configured_formats(MiniAVScreenContext *ctx,
     return MINIAV_ERROR_NOT_INITIALIZED;
   }
 
-  // Video format is stored in the parent context's configured_format
+  // Video format is stored in the parent context's configured_video_format
   // which is updated by dxgi_configure_display
-  *video_format_out = ctx->configured_format;
+  *video_format_out = ctx->configured_video_format;
 
   // Audio format
   if (audio_format_out) {
@@ -604,7 +604,7 @@ dxgi_get_configured_formats(MiniAVScreenContext *ctx,
 
 static MiniAVResultCode
 dxgi_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
-                       const MiniAVVideoFormatInfo *format, bool *audio_enabled) {
+                       const MiniAVVideoInfo *format, bool *audio_enabled) {
   if (!ctx || !ctx->platform_ctx || !display_id_utf8 || !format)
     return MINIAV_ERROR_INVALID_ARG;
   DXGIScreenPlatformContext *dxgi_ctx =
@@ -654,7 +654,7 @@ dxgi_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
   strncpy_s(dxgi_ctx->selected_device_id, MINIAV_DEVICE_ID_MAX_LEN,
             display_id_utf8, _TRUNCATE);
 
-  dxgi_ctx->configured_format =
+  dxgi_ctx->configured_video_format =
       *format; // Store the requested format including output_preference
   if (format->frame_rate_denominator > 0 && format->frame_rate_numerator > 0) {
     dxgi_ctx->target_fps =
@@ -670,14 +670,14 @@ dxgi_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
 
   // Actual width, height, and pixel format are determined by DXGI, stored
   // during init_d3d_and_duplication
-  ctx->configured_format.width = dxgi_ctx->frame_width;
-  ctx->configured_format.height = dxgi_ctx->frame_height;
-  ctx->configured_format.pixel_format =
+  ctx->configured_video_format.width = dxgi_ctx->frame_width;
+  ctx->configured_video_format.height = dxgi_ctx->frame_height;
+  ctx->configured_video_format.pixel_format =
       dxgi_ctx->pixel_format; // Should be BGRA32
-  ctx->configured_format.frame_rate_numerator = dxgi_ctx->target_fps;
-  ctx->configured_format.frame_rate_denominator = 1;
-  ctx->configured_format.output_preference =
-      dxgi_ctx->configured_format
+  ctx->configured_video_format.frame_rate_numerator = dxgi_ctx->target_fps;
+  ctx->configured_video_format.frame_rate_denominator = 1;
+  ctx->configured_video_format.output_preference =
+      dxgi_ctx->configured_video_format
           .output_preference; // Ensure parent context also has it
 
   // --- Configure Audio Loopback ---
@@ -750,7 +750,7 @@ dxgi_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
 
 static MiniAVResultCode
 dxgi_configure_window(MiniAVScreenContext *ctx, const char *window_id_utf8,
-                      const MiniAVVideoFormatInfo *format) {
+                      const MiniAVVideoInfo *format) {
   MINIAV_UNUSED(ctx);
   MINIAV_UNUSED(window_id_utf8);
   MINIAV_UNUSED(format);
@@ -762,7 +762,7 @@ dxgi_configure_window(MiniAVScreenContext *ctx, const char *window_id_utf8,
 static MiniAVResultCode
 dxgi_configure_region(MiniAVScreenContext *ctx, const char *display_id_utf8,
                       int x, int y, int width, int height,
-                      const MiniAVVideoFormatInfo *format) {
+                      const MiniAVVideoInfo *format) {
   MINIAV_UNUSED(ctx);
   MINIAV_UNUSED(display_id_utf8);
   MINIAV_UNUSED(x);
@@ -980,7 +980,7 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
     frame_timeout_ms = 16;
 
   MiniAVOutputPreference desired_output_pref =
-      dxgi_ctx->configured_format.output_preference;
+      dxgi_ctx->configured_video_format.output_preference;
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "DXGI: Capture thread started. Target FPS: %u, Frame Timeout: %u "
@@ -1311,7 +1311,7 @@ const ScreenContextInternalOps g_screen_ops_win_dxgi = {
     .stop_capture = dxgi_stop_capture,
     .release_buffer = dxgi_release_buffer,
     .get_default_formats = dxgi_get_default_formats,
-    .get_configured_formats = dxgi_get_configured_formats
+    .get_configured_video_formats = dxgi_get_configured_video_formats
 };
 
 MiniAVResultCode

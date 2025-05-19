@@ -137,8 +137,8 @@ typedef struct WGCScreenPlatformContext {
   CRITICAL_SECTION critical_section; // To protect shared members like callback
                                      // and streaming state
 
-  MiniAVVideoFormatInfo
-      configured_format; // User's request (FPS, output_preference)
+  MiniAVVideoInfo
+      configured_video_format; // User's request (FPS, output_preference)
   UINT target_fps;
   UINT frame_width;
   UINT frame_height;
@@ -207,12 +207,12 @@ static winrt::com_ptr<ID3D11Texture2D> GetTextureFromDirect3DSurface(
 
 static MiniAVResultCode
 wgc_get_default_formats(const char *device_id_utf8,
-                        MiniAVVideoFormatInfo *video_format_out,
+                        MiniAVVideoInfo *video_format_out,
                         MiniAVAudioInfo *audio_format_out) {
   if (!device_id_utf8 || !video_format_out) {
     return MINIAV_ERROR_INVALID_ARG;
   }
-  memset(video_format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
   if (audio_format_out) {
     memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
   }
@@ -350,8 +350,8 @@ wgc_get_default_formats(const char *device_id_utf8,
 }
 
 static MiniAVResultCode
-wgc_get_configured_formats(MiniAVScreenContext *ctx,
-                           MiniAVVideoFormatInfo *video_format_out,
+wgc_get_configured_video_formats(MiniAVScreenContext *ctx,
+                           MiniAVVideoInfo *video_format_out,
                            MiniAVAudioInfo *audio_format_out) {
   if (!ctx || !ctx->platform_ctx || !video_format_out) {
     return MINIAV_ERROR_INVALID_ARG;
@@ -359,7 +359,7 @@ wgc_get_configured_formats(MiniAVScreenContext *ctx,
   WGCScreenPlatformContext *wgc_ctx =
       (WGCScreenPlatformContext *)ctx->platform_ctx;
 
-  memset(video_format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
   if (audio_format_out) {
     memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
   }
@@ -370,9 +370,9 @@ wgc_get_configured_formats(MiniAVScreenContext *ctx,
     return MINIAV_ERROR_NOT_INITIALIZED;
   }
 
-  // Video format is stored in the parent context's configured_format
+  // Video format is stored in the parent context's configured_video_format
   // which is updated by wgc_configure_capture_item
-  *video_format_out = ctx->configured_format;
+  *video_format_out = ctx->configured_video_format;
 
   // Audio format
   if (audio_format_out) {
@@ -669,7 +669,7 @@ static MiniAVResultCode wgc_enumerate_windows(MiniAVDeviceInfo **windows_out,
 
 static MiniAVResultCode wgc_configure_capture_item(
     WGCScreenPlatformContext *wgc_ctx, const char *item_id_utf8,
-    WGCCaptureTargetType target_type, const MiniAVVideoFormatInfo *format) {
+    WGCCaptureTargetType target_type, const MiniAVVideoInfo *format) {
   if (wgc_ctx->is_streaming) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "WGC: Cannot configure while streaming.");
@@ -741,7 +741,7 @@ static MiniAVResultCode wgc_configure_capture_item(
     }
 
     // Store configuration
-    wgc_ctx->configured_format = *format;
+    wgc_ctx->configured_video_format = *format;
     if (format->frame_rate_denominator > 0 &&
         format->frame_rate_numerator > 0) {
       wgc_ctx->target_fps =
@@ -757,13 +757,13 @@ static MiniAVResultCode wgc_configure_capture_item(
     wgc_ctx->frame_height = static_cast<UINT>(item_size.Height);
 
     // Update parent context's configured format
-    wgc_ctx->parent_ctx->configured_format.width = wgc_ctx->frame_width;
-    wgc_ctx->parent_ctx->configured_format.height = wgc_ctx->frame_height;
-    wgc_ctx->parent_ctx->configured_format.pixel_format = wgc_ctx->pixel_format;
-    wgc_ctx->parent_ctx->configured_format.frame_rate_numerator =
+    wgc_ctx->parent_ctx->configured_video_format.width = wgc_ctx->frame_width;
+    wgc_ctx->parent_ctx->configured_video_format.height = wgc_ctx->frame_height;
+    wgc_ctx->parent_ctx->configured_video_format.pixel_format = wgc_ctx->pixel_format;
+    wgc_ctx->parent_ctx->configured_video_format.frame_rate_numerator =
         wgc_ctx->target_fps;
-    wgc_ctx->parent_ctx->configured_format.frame_rate_denominator = 1;
-    wgc_ctx->parent_ctx->configured_format.output_preference =
+    wgc_ctx->parent_ctx->configured_video_format.frame_rate_denominator = 1;
+    wgc_ctx->parent_ctx->configured_video_format.output_preference =
         format->output_preference;
 
     wgc_ctx->current_target_type = target_type;
@@ -878,7 +878,7 @@ static MiniAVResultCode wgc_configure_capture_item(
 
 static MiniAVResultCode
 wgc_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
-                      const MiniAVVideoFormatInfo *format) {
+                      const MiniAVVideoInfo *format) {
   if (!ctx || !ctx->platform_ctx || !display_id_utf8 || !format)
     return MINIAV_ERROR_INVALID_ARG;
   WGCScreenPlatformContext *wgc_ctx =
@@ -891,7 +891,7 @@ wgc_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
 
 static MiniAVResultCode
 wgc_configure_window(MiniAVScreenContext *ctx, const char *window_id_utf8,
-                     const MiniAVVideoFormatInfo *format) {
+                     const MiniAVVideoInfo *format) {
   if (!ctx || !ctx->platform_ctx || !window_id_utf8 || !format)
     return MINIAV_ERROR_INVALID_ARG;
   WGCScreenPlatformContext *wgc_ctx =
@@ -905,7 +905,7 @@ wgc_configure_window(MiniAVScreenContext *ctx, const char *window_id_utf8,
 static MiniAVResultCode
 wgc_configure_region(MiniAVScreenContext *ctx, const char *display_id_utf8,
                      int x, int y, int width, int height,
-                     const MiniAVVideoFormatInfo *format) {
+                     const MiniAVVideoInfo *format) {
   MINIAV_UNUSED(ctx);
   MINIAV_UNUSED(display_id_utf8);
   MINIAV_UNUSED(x);
@@ -1412,7 +1412,7 @@ static void wgc_on_frame_arrived(
     buffer.user_data = wgc_ctx->app_callback_user_data_internal;
 
     MiniAVOutputPreference desired_output_pref =
-        wgc_ctx->configured_format.output_preference;
+        wgc_ctx->configured_video_format.output_preference;
 
     // --- GPU Path Attempt ---
     if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE &&
@@ -1684,7 +1684,7 @@ const ScreenContextInternalOps g_screen_ops_win_wgc = {
     wgc_configure_region, // Not supported
     wgc_start_capture,         wgc_stop_capture,      wgc_release_buffer,
     wgc_get_default_formats,
-    wgc_get_configured_formats 
+    wgc_get_configured_video_formats 
 };
 
 MiniAVResultCode

@@ -29,11 +29,16 @@ typedef enum {
   MINIAV_ERROR_INVALID_OPERATION = -16,
   MINIAV_ERROR_NOT_IMPLEMENTED = -17,
   MINIAV_ERROR_NOT_CONFIGURED = -18,
+  MINIAV_ERROR_PORTAL_FAILED = -19,
+  MINIAV_ERROR_STREAM_FAILED = -20,
+  MINIAV_ERROR_PORTAL_CLOSED = -21,
+  MINIAV_ERROR_USER_CANCELLED = -22,
 } MiniAVResultCode;
 
 // --- Device Info ---
 #define MINIAV_DEVICE_ID_MAX_LEN 256
 #define MINIAV_DEVICE_NAME_MAX_LEN 256
+#define MINIAV_VIDEO_FORMAT_MAX_PLANES 4
 
 typedef struct {
   char device_id[MINIAV_DEVICE_ID_MAX_LEN]; // Platform-specific unique
@@ -88,7 +93,7 @@ typedef struct {
   uint32_t frame_rate_numerator;
   uint32_t frame_rate_denominator;
   MiniAVOutputPreference output_preference;
-} MiniAVVideoFormatInfo;
+} MiniAVVideoInfo;
 
 typedef struct {
   MiniAVAudioFormat format;

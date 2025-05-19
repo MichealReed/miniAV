@@ -38,11 +38,11 @@ class MiniFFICameraPlatform implements MiniCameraPlatformInterface {
   }
 
   @override
-  Future<List<MiniAVVideoFormatInfo>> getSupportedFormats(
+  Future<List<MiniAVVideoInfo>> getSupportedFormats(
     String deviceId,
   ) async {
     final deviceIdPtr = deviceId.toNativeUtf8();
-    final formatsPtrPtr = calloc<ffi.Pointer<bindings.MiniAVVideoFormatInfo>>();
+    final formatsPtrPtr = calloc<ffi.Pointer<bindings.MiniAVVideoInfo>>();
     final countPtr = calloc<ffi.Uint32>();
     try {
       final result = bindings.MiniAV_Camera_GetSupportedFormats(
@@ -56,9 +56,9 @@ class MiniFFICameraPlatform implements MiniCameraPlatformInterface {
       final formatsArrayPtr = formatsPtrPtr.value;
       final count = countPtr.value;
       if (formatsArrayPtr == ffi.nullptr || count == 0) {
-        return <MiniAVVideoFormatInfo>[];
+        return <MiniAVVideoInfo>[];
       }
-      final formatList = <MiniAVVideoFormatInfo>[];
+      final formatList = <MiniAVVideoInfo>[];
       for (int i = 0; i < count; i++) {
         final ffiFormat = (formatsArrayPtr + i).ref;
         formatList.add(
@@ -75,9 +75,9 @@ class MiniFFICameraPlatform implements MiniCameraPlatformInterface {
   }
 
   @override
-  Future<MiniAVVideoFormatInfo> getDefaultFormat(String deviceId) async {
+  Future<MiniAVVideoInfo> getDefaultFormat(String deviceId) async {
     final deviceIdPtr = deviceId.toNativeUtf8();
-    final formatOutPtr = calloc<bindings.MiniAVVideoFormatInfo>();
+    final formatOutPtr = calloc<bindings.MiniAVVideoInfo>();
     try {
       final result = bindings.MiniAV_Camera_GetDefaultFormat(
         deviceIdPtr.cast(),
@@ -119,9 +119,9 @@ class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
   MiniFFICameraContext(this._context);
 
   @override
-  Future<void> configure(String deviceId, MiniAVVideoFormatInfo format) async {
+  Future<void> configure(String deviceId, MiniAVVideoInfo format) async {
     final deviceIdPtr = deviceId.toNativeUtf8();
-    final nativeFormatPtr = calloc<bindings.MiniAVVideoFormatInfo>();
+    final nativeFormatPtr = calloc<bindings.MiniAVVideoInfo>();
     try {
       VideoFormatInfoFFIToPlatform.copyToNative(format, nativeFormatPtr.ref);
       final result = bindings.MiniAV_Camera_Configure(
@@ -139,8 +139,8 @@ class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
   }
 
   @override
-  Future<MiniAVVideoFormatInfo> getConfiguredFormat() async {
-    final formatOutPtr = calloc<bindings.MiniAVVideoFormatInfo>();
+  Future<MiniAVVideoInfo> getConfiguredFormat() async {
+    final formatOutPtr = calloc<bindings.MiniAVVideoInfo>();
     try {
       final result = bindings.MiniAV_Camera_GetConfiguredFormat(
         _context,

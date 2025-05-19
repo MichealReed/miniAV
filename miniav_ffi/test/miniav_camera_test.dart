@@ -37,7 +37,7 @@ void main() {
         'Attempting to get formats for device: ${firstDevice.name} (${firstDevice.deviceId})',
       );
       final formats = await camera.getSupportedFormats(firstDevice.deviceId);
-      expect(formats, isA<List<MiniAVVideoFormatInfo>>());
+      expect(formats, isA<List<MiniAVVideoInfo>>());
       print('Found ${formats.length} formats for ${firstDevice.name}:');
       for (final format in formats) {
         print(

@@ -20,7 +20,7 @@ typedef struct CameraContextInternalOps {
     // Destroys platform-specific parts of the context.
     MiniAVResultCode (*destroy_platform)(MiniAVCameraContext* ctx);
     // Configures the camera device and format.
-    MiniAVResultCode (*configure)(MiniAVCameraContext* ctx, const char* device_id, const MiniAVVideoFormatInfo* format);
+    MiniAVResultCode (*configure)(MiniAVCameraContext* ctx, const char* device_id, const MiniAVVideoInfo* format);
     // Starts the capture stream.
     MiniAVResultCode (*start_capture)(MiniAVCameraContext* ctx);
     // Stops the capture stream.
@@ -31,11 +31,11 @@ typedef struct CameraContextInternalOps {
 
     // Static-like operations (don't take a full MiniAVCameraContext but might need some platform init)
     MiniAVResultCode (*enumerate_devices)(MiniAVDeviceInfo** devices, uint32_t* count);
-    MiniAVResultCode (*get_supported_formats)(const char* device_id, MiniAVVideoFormatInfo** formats, uint32_t* count);
-    MiniAVResultCode (*get_default_format)(const char* device_id, MiniAVVideoFormatInfo* format_out); // New
+    MiniAVResultCode (*get_supported_formats)(const char* device_id, MiniAVVideoInfo** formats, uint32_t* count);
+    MiniAVResultCode (*get_default_format)(const char* device_id, MiniAVVideoInfo* format_out); // New
 
     // Context-specific operations
-    MiniAVResultCode (*get_configured_format)(MiniAVCameraContext* ctx, MiniAVVideoFormatInfo* format_out); // New
+    MiniAVResultCode (*get_configured_video_format)(MiniAVCameraContext* ctx, MiniAVVideoInfo* format_out); // New
 
 } CameraContextInternalOps;
 
@@ -62,7 +62,7 @@ struct MiniAVCameraContext {
     int is_configured;
     int is_running;
 
-    MiniAVVideoFormatInfo configured_format; // Store the currently configured format
+    MiniAVVideoInfo configured_video_format; // Store the currently configured format
     char selected_device_id[MINIAV_DEVICE_ID_MAX_LEN]; // Store the ID of the selected device
 };
 

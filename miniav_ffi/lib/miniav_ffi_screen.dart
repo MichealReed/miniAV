@@ -72,7 +72,7 @@ class MiniFFIScreenPlatform implements MiniScreenPlatformInterface {
   @override
   Future<ScreenFormatDefaults> getDefaultFormats(String displayId) async {
     final displayIdPtr = displayId.toNativeUtf8();
-    final videoFormatOutPtr = calloc<bindings.MiniAVVideoFormatInfo>();
+    final videoFormatOutPtr = calloc<bindings.MiniAVVideoInfo>();
     final audioFormatOutPtr = calloc<bindings.MiniAVAudioInfo>();
 
     try {
@@ -136,11 +136,11 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
   @override
   Future<void> configureDisplay(
     String displayId,
-    MiniAVVideoFormatInfo format, {
+    MiniAVVideoInfo format, {
     bool captureAudio = false,
   }) async {
     final displayIdPtr = displayId.toNativeUtf8();
-    final nativeFormatPtr = calloc<bindings.MiniAVVideoFormatInfo>();
+    final nativeFormatPtr = calloc<bindings.MiniAVVideoInfo>();
     try {
       VideoFormatInfoFFIToPlatform.copyToNative(format, nativeFormatPtr.ref);
       final result = bindings.MiniAV_Screen_ConfigureDisplay(
@@ -161,12 +161,12 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
   @override
   Future<void> configureWindow(
     String windowId,
-    MiniAVVideoFormatInfo format, { // This should be MiniAVVideoFormatInfo
+    MiniAVVideoInfo format, { // This should be MiniAVVideoInfo
     bool captureAudio = false,
   }) async {
     final windowIdPtr = windowId.toNativeUtf8();
     final nativeFormatPtr =
-        calloc<bindings.MiniAVVideoFormatInfo>(); // Correct type
+        calloc<bindings.MiniAVVideoInfo>(); // Correct type
     try {
       VideoFormatInfoFFIToPlatform.copyToNative(
         format,
@@ -189,7 +189,7 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
 
   @override
   Future<ScreenFormatDefaults> getConfiguredFormats() async {
-    final videoFormatOutPtr = calloc<bindings.MiniAVVideoFormatInfo>();
+    final videoFormatOutPtr = calloc<bindings.MiniAVVideoInfo>();
     final audioFormatOutPtr = calloc<bindings.MiniAVAudioInfo>();
     try {
       final result = bindings.MiniAV_Screen_GetConfiguredFormats(

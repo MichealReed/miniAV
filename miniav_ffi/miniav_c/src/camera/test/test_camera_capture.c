@@ -156,7 +156,7 @@ int main() {
   MiniAVDeviceInfo selected_device = devices[selected_device_index];
   printf("\nSelected device for testing: '%s'\n", selected_device.name);
 
-  MiniAVVideoFormatInfo *formats = NULL;
+  MiniAVVideoInfo *formats = NULL;
   uint32_t format_count = 0;
 
   printf("\nGetting supported formats for device '%s'...\n",
@@ -192,7 +192,7 @@ int main() {
   }
 
   // Select the first format for testing
-  MiniAVVideoFormatInfo selected_format = formats[0];
+  MiniAVVideoInfo selected_format = formats[0];
   printf("\nSelected format for testing: %ux%u @ %u/%u FPS, %s\n",
          selected_format.width, selected_format.height,
          selected_format.frame_rate_numerator,

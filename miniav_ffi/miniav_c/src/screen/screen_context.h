@@ -1,5 +1,5 @@
-#ifndef MINIAV_SCREEN_CONTEXT_H
-#define MINIAV_SCREEN_CONTEXT_H
+#ifndef SCREEN_CONTEXT_H
+#define SCREEN_CONTEXT_H
 
 #include "../../include/miniav.h"
 
@@ -23,14 +23,14 @@ typedef struct ScreenContextInternalOps {
 
   MiniAVResultCode (*configure_display)(struct MiniAVScreenContext *ctx,
                                         const char *display_id,
-                                        const MiniAVVideoFormatInfo *format);
+                                        const MiniAVVideoInfo *format);
   MiniAVResultCode (*configure_window)(struct MiniAVScreenContext *ctx,
                                        const char *window_id,
-                                       const MiniAVVideoFormatInfo *format);
+                                       const MiniAVVideoInfo *format);
   MiniAVResultCode (*configure_region)(struct MiniAVScreenContext *ctx,
                                        const char *target_id, int x, int y,
                                        int width, int height,
-                                       const MiniAVVideoFormatInfo *format);
+                                       const MiniAVVideoInfo *format);
 
   MiniAVResultCode (*start_capture)(struct MiniAVScreenContext *ctx,
                                     MiniAVBufferCallback callback,
@@ -40,11 +40,11 @@ typedef struct ScreenContextInternalOps {
                                      void *native_buffer_payload_resource_ptr);
 
   MiniAVResultCode (*get_default_formats)(
-      const char *device_id, MiniAVVideoFormatInfo *video_format_out,
+      const char *device_id, MiniAVVideoInfo *video_format_out,
       MiniAVAudioInfo *audio_format_out);
 
-  MiniAVResultCode (*get_configured_formats)(
-      struct MiniAVScreenContext *ctx, MiniAVVideoFormatInfo *video_format_out,
+  MiniAVResultCode (*get_configured_video_formats)(
+      struct MiniAVScreenContext *ctx, MiniAVVideoInfo *video_format_out,
       MiniAVAudioInfo *audio_format_out);
 } ScreenContextInternalOps;
 
@@ -57,10 +57,12 @@ typedef struct MiniAVScreenContext {
   MiniAVBufferCallback app_callback;
   void *app_callback_user_data;
 
-  bool is_running;                         // TRUE if capture is active
-  bool is_configured;                      // TRUE if the context is configured
-  MiniAVVideoFormatInfo configured_format; // The format requested by the user
-                                           // and/or confirmed by the backend
+  bool is_running;    // TRUE if capture is active
+  bool is_configured; // TRUE if the context is configured
+  MiniAVVideoInfo
+      configured_video_format; // The format requested by the user
+                               // and/or confirmed by the backend
+  MiniAVAudioInfo configured_audio_format;
 
   // Add any other common state needed across platforms
   MiniAVCaptureType capture_target_type; // DISPLAY, WINDOW, REGION
@@ -72,7 +74,7 @@ typedef struct MiniAVScreenContext {
 typedef struct {
   const char *name;
   const ScreenContextInternalOps *ops;
-  MiniAVResultCode (*platform_init)(MiniAVScreenContext *ctx);
+  MiniAVResultCode (*platform_init_for_selection)(MiniAVScreenContext *ctx);
 } MiniAVScreenBackend;
 
 #ifdef __cplusplus

@@ -41,7 +41,7 @@ typedef struct PipeWireLoopbackPlatformContext {
 
   // Configuration
   uint32_t target_node_id; // PipeWire node ID to capture from
-  MiniAVAudioInfo configured_format;
+  MiniAVAudioInfo configured_video_format;
   bool is_configured;
   bool is_streaming;
 

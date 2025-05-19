@@ -1,6 +1,6 @@
 // Core type definitions first
 #include "../../include/miniav_buffer.h" // Defines MiniAVBuffer, MiniAVBufferType, MiniAVPixelFormat, MiniAVSampleFormat
-#include "../../include/miniav_types.h" // Defines MiniAVResultCode, handles, MiniAVDeviceInfo, MiniAVAudioInfo, MiniAVVideoFormatInfo, etc.
+#include "../../include/miniav_types.h" // Defines MiniAVResultCode, handles, MiniAVDeviceInfo, MiniAVAudioInfo, MiniAVVideoInfo, etc.
 
 // API header using the types
 #include "../../include/miniav_capture.h" // Defines MiniAVBufferCallback and the capture functions

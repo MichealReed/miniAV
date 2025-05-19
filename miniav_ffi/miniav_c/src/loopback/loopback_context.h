@@ -52,7 +52,7 @@ typedef struct LoopbackContextInternalOps {
       struct MiniAVLoopbackContext *ctx,
       void *native_buffer_payload_resource_ptr);
 
-  MiniAVResultCode (*get_configured_format)(struct MiniAVLoopbackContext *ctx,
+  MiniAVResultCode (*get_configured_video_format)(struct MiniAVLoopbackContext *ctx,
                                             MiniAVAudioInfo *format_out);
 
 } LoopbackContextInternalOps;
@@ -84,7 +84,7 @@ typedef struct MiniAVLoopbackContext {
   bool is_configured;
   bool is_running;
 
-  MiniAVAudioInfo configured_format;
+  MiniAVAudioInfo configured_video_format;
   MiniAVLoopbackTargetInfo current_target_info;
   char current_target_device_id[MINIAV_DEVICE_ID_MAX_LEN];
 

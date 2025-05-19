@@ -153,17 +153,17 @@ MiniAVResultCode MiniAV_Camera_EnumerateDevices(
 @ffi.Native<
     ffi.Int Function(
         ffi.Pointer<ffi.Char>,
-        ffi.Pointer<ffi.Pointer<MiniAVVideoFormatInfo>>,
+        ffi.Pointer<ffi.Pointer<MiniAVVideoInfo>>,
         ffi.Pointer<ffi.Uint32>)>(symbol: 'MiniAV_Camera_GetSupportedFormats')
 external int _MiniAV_Camera_GetSupportedFormats(
   ffi.Pointer<ffi.Char> device_id,
-  ffi.Pointer<ffi.Pointer<MiniAVVideoFormatInfo>> formats,
+  ffi.Pointer<ffi.Pointer<MiniAVVideoInfo>> formats,
   ffi.Pointer<ffi.Uint32> count,
 );
 
 MiniAVResultCode MiniAV_Camera_GetSupportedFormats(
   ffi.Pointer<ffi.Char> device_id,
-  ffi.Pointer<ffi.Pointer<MiniAVVideoFormatInfo>> formats,
+  ffi.Pointer<ffi.Pointer<MiniAVVideoInfo>> formats,
   ffi.Pointer<ffi.Uint32> count,
 ) =>
     MiniAVResultCode.fromValue(_MiniAV_Camera_GetSupportedFormats(
@@ -174,16 +174,16 @@ MiniAVResultCode MiniAV_Camera_GetSupportedFormats(
 
 @ffi.Native<
         ffi.Int Function(
-            ffi.Pointer<ffi.Char>, ffi.Pointer<MiniAVVideoFormatInfo>)>(
+            ffi.Pointer<ffi.Char>, ffi.Pointer<MiniAVVideoInfo>)>(
     symbol: 'MiniAV_Camera_GetDefaultFormat')
 external int _MiniAV_Camera_GetDefaultFormat(
   ffi.Pointer<ffi.Char> device_id,
-  ffi.Pointer<MiniAVVideoFormatInfo> format_out,
+  ffi.Pointer<MiniAVVideoInfo> format_out,
 );
 
 MiniAVResultCode MiniAV_Camera_GetDefaultFormat(
   ffi.Pointer<ffi.Char> device_id,
-  ffi.Pointer<MiniAVVideoFormatInfo> format_out,
+  ffi.Pointer<MiniAVVideoInfo> format_out,
 ) =>
     MiniAVResultCode.fromValue(_MiniAV_Camera_GetDefaultFormat(
       device_id,
@@ -192,16 +192,16 @@ MiniAVResultCode MiniAV_Camera_GetDefaultFormat(
 
 @ffi.Native<
         ffi.Int Function(
-            MiniAVCameraContextHandle, ffi.Pointer<MiniAVVideoFormatInfo>)>(
+            MiniAVCameraContextHandle, ffi.Pointer<MiniAVVideoInfo>)>(
     symbol: 'MiniAV_Camera_GetConfiguredFormat')
 external int _MiniAV_Camera_GetConfiguredFormat(
   MiniAVCameraContextHandle context,
-  ffi.Pointer<MiniAVVideoFormatInfo> format_out,
+  ffi.Pointer<MiniAVVideoInfo> format_out,
 );
 
 MiniAVResultCode MiniAV_Camera_GetConfiguredFormat(
   MiniAVCameraContextHandle context,
-  ffi.Pointer<MiniAVVideoFormatInfo> format_out,
+  ffi.Pointer<MiniAVVideoInfo> format_out,
 ) =>
     MiniAVResultCode.fromValue(_MiniAV_Camera_GetConfiguredFormat(
       context,
@@ -336,17 +336,17 @@ MiniAVResultCode MiniAV_Screen_EnumerateWindows(
 
 @ffi.Native<
         ffi.Int Function(ffi.Pointer<ffi.Char>,
-            ffi.Pointer<MiniAVVideoFormatInfo>, ffi.Pointer<MiniAVAudioInfo>)>(
+            ffi.Pointer<MiniAVVideoInfo>, ffi.Pointer<MiniAVAudioInfo>)>(
     symbol: 'MiniAV_Screen_GetDefaultFormats')
 external int _MiniAV_Screen_GetDefaultFormats(
   ffi.Pointer<ffi.Char> display_id,
-  ffi.Pointer<MiniAVVideoFormatInfo> video_format_out,
+  ffi.Pointer<MiniAVVideoInfo> video_format_out,
   ffi.Pointer<MiniAVAudioInfo> audio_format_out,
 );
 
 MiniAVResultCode MiniAV_Screen_GetDefaultFormats(
   ffi.Pointer<ffi.Char> display_id,
-  ffi.Pointer<MiniAVVideoFormatInfo> video_format_out,
+  ffi.Pointer<MiniAVVideoInfo> video_format_out,
   ffi.Pointer<MiniAVAudioInfo> audio_format_out,
 ) =>
     MiniAVResultCode.fromValue(_MiniAV_Screen_GetDefaultFormats(
@@ -372,19 +372,19 @@ MiniAVResultCode MiniAV_Screen_DestroyContext(
     ffi.Int Function(
         MiniAVScreenContextHandle,
         ffi.Pointer<ffi.Char>,
-        ffi.Pointer<MiniAVVideoFormatInfo>,
+        ffi.Pointer<MiniAVVideoInfo>,
         ffi.Bool)>(symbol: 'MiniAV_Screen_ConfigureDisplay')
 external int _MiniAV_Screen_ConfigureDisplay(
   MiniAVScreenContextHandle context,
   ffi.Pointer<ffi.Char> display_id,
-  ffi.Pointer<MiniAVVideoFormatInfo> format,
+  ffi.Pointer<MiniAVVideoInfo> format,
   bool capture_audio,
 );
 
 MiniAVResultCode MiniAV_Screen_ConfigureDisplay(
   MiniAVScreenContextHandle context,
   ffi.Pointer<ffi.Char> display_id,
-  ffi.Pointer<MiniAVVideoFormatInfo> format,
+  ffi.Pointer<MiniAVVideoInfo> format,
   bool capture_audio,
 ) =>
     MiniAVResultCode.fromValue(_MiniAV_Screen_ConfigureDisplay(
@@ -398,19 +398,19 @@ MiniAVResultCode MiniAV_Screen_ConfigureDisplay(
     ffi.Int Function(
         MiniAVScreenContextHandle,
         ffi.Pointer<ffi.Char>,
-        ffi.Pointer<MiniAVVideoFormatInfo>,
+        ffi.Pointer<MiniAVVideoInfo>,
         ffi.Bool)>(symbol: 'MiniAV_Screen_ConfigureWindow')
 external int _MiniAV_Screen_ConfigureWindow(
   MiniAVScreenContextHandle context,
   ffi.Pointer<ffi.Char> window_id,
-  ffi.Pointer<MiniAVVideoFormatInfo> format,
+  ffi.Pointer<MiniAVVideoInfo> format,
   bool capture_audio,
 );
 
 MiniAVResultCode MiniAV_Screen_ConfigureWindow(
   MiniAVScreenContextHandle context,
   ffi.Pointer<ffi.Char> window_id,
-  ffi.Pointer<MiniAVVideoFormatInfo> format,
+  ffi.Pointer<MiniAVVideoInfo> format,
   bool capture_audio,
 ) =>
     MiniAVResultCode.fromValue(_MiniAV_Screen_ConfigureWindow(
@@ -428,7 +428,7 @@ MiniAVResultCode MiniAV_Screen_ConfigureWindow(
         ffi.Int,
         ffi.Int,
         ffi.Int,
-        ffi.Pointer<MiniAVVideoFormatInfo>,
+        ffi.Pointer<MiniAVVideoInfo>,
         ffi.Bool)>(symbol: 'MiniAV_Screen_ConfigureRegion')
 external int _MiniAV_Screen_ConfigureRegion(
   MiniAVScreenContextHandle context,
@@ -437,7 +437,7 @@ external int _MiniAV_Screen_ConfigureRegion(
   int y,
   int width,
   int height,
-  ffi.Pointer<MiniAVVideoFormatInfo> format,
+  ffi.Pointer<MiniAVVideoInfo> format,
   bool capture_audio,
 );
 
@@ -448,7 +448,7 @@ MiniAVResultCode MiniAV_Screen_ConfigureRegion(
   int y,
   int width,
   int height,
-  ffi.Pointer<MiniAVVideoFormatInfo> format,
+  ffi.Pointer<MiniAVVideoInfo> format,
   bool capture_audio,
 ) =>
     MiniAVResultCode.fromValue(_MiniAV_Screen_ConfigureRegion(
@@ -464,17 +464,17 @@ MiniAVResultCode MiniAV_Screen_ConfigureRegion(
 
 @ffi.Native<
         ffi.Int Function(ffi.Pointer<MiniAVScreenContextHandle>,
-            ffi.Pointer<MiniAVVideoFormatInfo>, ffi.Pointer<MiniAVAudioInfo>)>(
+            ffi.Pointer<MiniAVVideoInfo>, ffi.Pointer<MiniAVAudioInfo>)>(
     symbol: 'MiniAV_Screen_GetConfiguredFormats')
 external int _MiniAV_Screen_GetConfiguredFormats(
   ffi.Pointer<MiniAVScreenContextHandle> ctx,
-  ffi.Pointer<MiniAVVideoFormatInfo> video_format_out,
+  ffi.Pointer<MiniAVVideoInfo> video_format_out,
   ffi.Pointer<MiniAVAudioInfo> audio_format_out,
 );
 
 MiniAVResultCode MiniAV_Screen_GetConfiguredFormats(
   ffi.Pointer<MiniAVScreenContextHandle> ctx,
-  ffi.Pointer<MiniAVVideoFormatInfo> video_format_out,
+  ffi.Pointer<MiniAVVideoInfo> video_format_out,
   ffi.Pointer<MiniAVAudioInfo> audio_format_out,
 ) =>
     MiniAVResultCode.fromValue(_MiniAV_Screen_GetConfiguredFormats(
@@ -971,7 +971,7 @@ enum MiniAVOutputPreference {
       };
 }
 
-final class MiniAVVideoFormatInfo extends ffi.Struct {
+final class MiniAVVideoInfo extends ffi.Struct {
   @ffi.Uint32()
   external int width;
 

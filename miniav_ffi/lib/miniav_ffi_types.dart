@@ -60,7 +60,7 @@ class DeviceInfo {
       'DeviceInfo(deviceId: $deviceId, name: $name, isDefault: $isDefault)';
 }
 
-/// Dart representation of MiniAVVideoFormatInfo.
+/// Dart representation of MiniAVVideoInfo.
 class VideoFormatInfo {
   final int width;
   final int height;
@@ -79,7 +79,7 @@ class VideoFormatInfo {
   });
 
   factory VideoFormatInfo.fromNative(
-    bindings.MiniAVVideoFormatInfo nativeInfo,
+    bindings.MiniAVVideoInfo nativeInfo,
   ) {
     return VideoFormatInfo(
       width: nativeInfo.width,
@@ -216,7 +216,7 @@ extension DeviceInfoFFIToPlatform on DeviceInfo {
 
 // VideoFormatInfo conversion
 extension VideoFormatInfoFFIToPlatform on VideoFormatInfo {
-  MiniAVVideoFormatInfo toPlatformType() => MiniAVVideoFormatInfo(
+  MiniAVVideoInfo toPlatformType() => MiniAVVideoInfo(
     width: width,
     height: height,
     pixelFormat: pixelFormat.toPlatformType(),
@@ -226,10 +226,10 @@ extension VideoFormatInfoFFIToPlatform on VideoFormatInfo {
   );
 
   static VideoFormatInfo fromNative(
-    bindings.MiniAVVideoFormatInfo nativeInfo,
+    bindings.MiniAVVideoInfo nativeInfo,
   ) => VideoFormatInfo.fromNative(nativeInfo);
 
-  static VideoFormatInfo fromPlatformType(MiniAVVideoFormatInfo info) =>
+  static VideoFormatInfo fromPlatformType(MiniAVVideoInfo info) =>
       VideoFormatInfo(
         width: info.width,
         height: info.height,
@@ -243,8 +243,8 @@ extension VideoFormatInfoFFIToPlatform on VideoFormatInfo {
 
   /// Copies a platform type into a native struct (for FFI calls).
   static void copyToNative(
-    MiniAVVideoFormatInfo info,
-    bindings.MiniAVVideoFormatInfo native,
+    MiniAVVideoInfo info,
+    bindings.MiniAVVideoInfo native,
   ) {
     native.width = info.width;
     native.height = info.height;

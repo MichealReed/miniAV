@@ -82,7 +82,7 @@ MiniAVResultCode MiniAV_Camera_EnumerateDevices(MiniAVDeviceInfo **devices,
 }
 
 MiniAVResultCode MiniAV_Camera_GetSupportedFormats(
-    const char *device_id, MiniAVVideoFormatInfo **formats, uint32_t *count) {
+    const char *device_id, MiniAVVideoInfo **formats, uint32_t *count) {
   if (!device_id || !formats || !count) {
     return MINIAV_ERROR_INVALID_ARG;
   }
@@ -125,11 +125,11 @@ MiniAVResultCode MiniAV_Camera_GetSupportedFormats(
 
 MiniAVResultCode
 MiniAV_Camera_GetDefaultFormat(const char *device_id,
-                               MiniAVVideoFormatInfo *format_out) {
+                               MiniAVVideoInfo *format_out) {
   if (!device_id || !format_out) {
     return MINIAV_ERROR_INVALID_ARG;
   }
-  memset(format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  memset(format_out, 0, sizeof(MiniAVVideoInfo));
 
   MiniAVResultCode res = MINIAV_ERROR_NOT_SUPPORTED;
   for (const MiniAVCameraBackend *backend_entry = g_camera_backends;
@@ -319,13 +319,13 @@ MiniAV_Camera_Configure(MiniAVCameraContextHandle context_handle,
     return MINIAV_ERROR_ALREADY_RUNNING;
   }
 
-  const MiniAVVideoFormatInfo *format =
-      (const MiniAVVideoFormatInfo *)format_void_ptr; // Cast here
+  const MiniAVVideoInfo *format =
+      (const MiniAVVideoInfo *)format_void_ptr; // Cast here
 
   MiniAVResultCode res = ctx->ops->configure(ctx, device_id, format);
   if (res == MINIAV_SUCCESS) {
     ctx->is_configured = 1;
-    ctx->configured_format = *format; // Cache the requested format
+    ctx->configured_video_format = *format; // Cache the requested format
     if (device_id) {
       miniav_strlcpy(ctx->selected_device_id, device_id,
                      sizeof(ctx->selected_device_id));
@@ -345,7 +345,7 @@ MiniAV_Camera_Configure(MiniAVCameraContextHandle context_handle,
         format->frame_rate_denominator, fps_approx, format->pixel_format);
   } else {
     ctx->is_configured = 0;
-    memset(&ctx->configured_format, 0, sizeof(MiniAVVideoFormatInfo));
+    memset(&ctx->configured_video_format, 0, sizeof(MiniAVVideoInfo));
     memset(ctx->selected_device_id, 0, sizeof(ctx->selected_device_id));
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "Camera configuration failed with code: %d", res);
@@ -355,12 +355,12 @@ MiniAV_Camera_Configure(MiniAVCameraContextHandle context_handle,
 
 MiniAVResultCode
 MiniAV_Camera_GetConfiguredFormat(MiniAVCameraContextHandle context_handle,
-                                  MiniAVVideoFormatInfo *format_out) {
+                                  MiniAVVideoInfo *format_out) {
   MiniAVCameraContext *ctx = (MiniAVCameraContext *)context_handle;
   if (!ctx || !format_out) {
     return MINIAV_ERROR_INVALID_ARG;
   }
-  memset(format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  memset(format_out, 0, sizeof(MiniAVVideoInfo));
 
   if (!ctx->is_configured) {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
@@ -370,14 +370,14 @@ MiniAV_Camera_GetConfiguredFormat(MiniAVCameraContextHandle context_handle,
     // (possibly zeroed) format
   }
 
-  if (ctx->ops && ctx->ops->get_configured_format) {
-    return ctx->ops->get_configured_format(ctx, format_out);
+  if (ctx->ops && ctx->ops->get_configured_video_format) {
+    return ctx->ops->get_configured_video_format(ctx, format_out);
   } else {
     // Fallback to the cached format if the op is missing
-    miniav_log(MINIAV_LOG_LEVEL_WARN, "get_configured_format op not available. "
+    miniav_log(MINIAV_LOG_LEVEL_WARN, "get_configured_video_format op not available. "
                                       "Using cached format if configured.");
     if (ctx->is_configured) {
-      *format_out = ctx->configured_format;
+      *format_out = ctx->configured_video_format;
       return MINIAV_SUCCESS;
     }
   }

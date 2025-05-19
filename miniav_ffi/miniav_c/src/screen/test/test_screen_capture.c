@@ -211,8 +211,8 @@ int main() {
   printf("\nSelected display for testing: '%s' (ID: '%s')\n",
          selected_display.name, selected_display.device_id);
 
-  MiniAVVideoFormatInfo capture_format;
-  memset(&capture_format, 0, sizeof(MiniAVVideoFormatInfo));
+  MiniAVVideoInfo capture_format;
+  memset(&capture_format, 0, sizeof(MiniAVVideoInfo));
   capture_format.output_preference = MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE;
   capture_format.frame_rate_numerator = 240;
   capture_format.frame_rate_denominator = 1;
@@ -238,7 +238,7 @@ int main() {
     return 1;
   }
 
-  MiniAVVideoFormatInfo actual_format;
+  MiniAVVideoInfo actual_format;
   MiniAV_Screen_GetConfiguredFormats(screen_ctx, &actual_format, NULL);
   printf("Screen capture configured successfully.\n");
   printf("  Actual Capture Resolution: %ux%u\n", actual_format.width,

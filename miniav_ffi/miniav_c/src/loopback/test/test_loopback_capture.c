@@ -250,13 +250,13 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  MiniAVAudioInfo configured_format;
-  res = MiniAV_Loopback_GetConfiguredFormat(loopback_ctx, &configured_format);
+  MiniAVAudioInfo configured_video_format;
+  res = MiniAV_Loopback_GetConfiguredFormat(loopback_ctx, &configured_video_format);
   if (res == MINIAV_SUCCESS) {
     printf("Loopback capture configured successfully.\n");
     printf("  Actual Configured Format - Channels: %u, Rate: %u, Format: %d\n",
-           configured_format.channels, configured_format.sample_rate,
-           configured_format.format);
+           configured_video_format.channels, configured_video_format.sample_rate,
+           configured_video_format.format);
   } else {
     fprintf(stderr, "Warning: Failed to get configured format: %s\n",
             MiniAV_GetErrorString(res));

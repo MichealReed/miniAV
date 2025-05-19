@@ -50,7 +50,7 @@ MiniAVResultCode wasapi_stop_capture(MiniAVLoopbackContext *ctx);
 MiniAVResultCode
 wasapi_release_buffer_platform(MiniAVLoopbackContext *ctx,
                                void *native_buffer_payload_resource_ptr);
-MiniAVResultCode wasapi_get_configured_format(MiniAVLoopbackContext *ctx,
+MiniAVResultCode wasapi_get_configured_video_format(MiniAVLoopbackContext *ctx,
                                               MiniAVAudioInfo *format_out);
 
 #endif // _WIN32

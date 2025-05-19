@@ -417,7 +417,7 @@ static MiniAVResultCode pw_loopback_configure_loopback(
     return MINIAV_ERROR_INVALID_ARG;
   }
 
-  pw_ctx->configured_format = *requested_format;
+  pw_ctx->configured_video_format = *requested_format;
   pw_ctx->is_configured = true;
 
   miniav_log(
@@ -471,11 +471,11 @@ pw_loopback_start_capture(struct MiniAVLoopbackContext *ctx,
   const struct spa_pod *params[1];
 
   enum spa_audio_format spa_fmt =
-      miniav_audio_format_to_spa(pw_ctx->configured_format.format);
+      miniav_audio_format_to_spa(pw_ctx->configured_video_format.format);
   if (spa_fmt == SPA_AUDIO_FORMAT_UNKNOWN) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "PW Loopback: Unknown Miniaudio format for SPA: %d",
-               pw_ctx->configured_format.format);
+               pw_ctx->configured_video_format.format);
     pw_stream_destroy(pw_ctx->stream);
     pw_ctx->stream = NULL;
     return MINIAV_ERROR_INVALID_ARG;
@@ -484,8 +484,8 @@ pw_loopback_start_capture(struct MiniAVLoopbackContext *ctx,
   params[0] = spa_format_audio_raw_build(
       &b, SPA_PARAM_EnumFormat,
       &SPA_AUDIO_INFO_RAW_INIT(.format = spa_fmt,
-                               .channels = pw_ctx->configured_format.channels,
-                               .rate = pw_ctx->configured_format.sample_rate));
+                               .channels = pw_ctx->configured_video_format.channels,
+                               .rate = pw_ctx->configured_video_format.sample_rate));
 
   if (pw_stream_connect(
           pw_ctx->stream,
@@ -578,13 +578,13 @@ pw_loopback_release_buffer_platform(struct MiniAVLoopbackContext *ctx,
 }
 
 static MiniAVResultCode
-pw_loopback_get_configured_format(struct MiniAVLoopbackContext *ctx,
+pw_loopback_get_configured_video_format(struct MiniAVLoopbackContext *ctx,
                                   MiniAVAudioInfo *format_out) {
   PipeWireLoopbackPlatformContext *pw_ctx =
       (PipeWireLoopbackPlatformContext *)ctx->platform_ctx;
   if (!pw_ctx->is_configured)
     return MINIAV_ERROR_NOT_INITIALIZED;
-  *format_out = pw_ctx->configured_format;
+  *format_out = pw_ctx->configured_video_format;
   return MINIAV_SUCCESS;
 }
 
@@ -873,7 +873,7 @@ static void on_stream_param_changed(void *data, uint32_t id,
                spa_debug_type_find_name(spa_type_audio_format, info.format),
                info.rate, info.channels);
     // if (pw_ctx) { // Check if pw_ctx is valid before using
-    //   pw_ctx->configured_format = negotiated_format;
+    //   pw_ctx->configured_video_format = negotiated_format;
     // }
   } else {
     miniav_log(
@@ -906,9 +906,9 @@ static void on_stream_process(void *data) {
       // The format info should ideally come from the negotiated format stored
       // in pw_ctx
       miniav_buffer.data.audio.info =
-          pw_ctx->configured_format; // Use the format known at configure/start
+          pw_ctx->configured_video_format; // Use the format known at configure/start
 
-      // If SPA_PARAM_Format changed and updated pw_ctx->configured_format, this
+      // If SPA_PARAM_Format changed and updated pw_ctx->configured_video_format, this
       // will be the negotiated one. Otherwise, it's what we requested.
 
       miniav_buffer.data.audio.data = spa_d->data + spa_d->chunk->offset;
@@ -932,7 +932,7 @@ const LoopbackContextInternalOps g_loopback_ops_linux_pipewire = {
     .start_capture = pw_loopback_start_capture,
     .stop_capture = pw_loopback_stop_capture,
     .release_buffer_platform = pw_loopback_release_buffer_platform,
-    .get_configured_format = pw_loopback_get_configured_format,
+    .get_configured_video_format = pw_loopback_get_configured_video_format,
 };
 
 // --- Platform Init Function (called by loopback_api.c) ---

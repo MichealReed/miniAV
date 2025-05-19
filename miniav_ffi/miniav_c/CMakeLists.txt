@@ -8,8 +8,8 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
 # --- Module Enable Options ---
 option(MINIAV_ENABLE_AUDIO "Enable Audio Module (miniaudio)" OFF)
 option(MINIAV_ENABLE_CAMERA "Enable Camera Capture Module" OFF)
-option(MINIAV_ENABLE_SCREEN "Enable Screen Capture Module" OFF)
-option(MINIAV_ENABLE_LOOPBACK "Enable Audio Loopback Module" ON)
+option(MINIAV_ENABLE_SCREEN "Enable Screen Capture Module" ON)
+option(MINIAV_ENABLE_LOOPBACK "Enable Audio Loopback Module" OFF)
 
 # --- Backend Options ---
 # Windows Screen Capture Backends
@@ -39,6 +39,7 @@ set(ALL_HEADERS "") # For files that are both source and header, or just headers
 set(ALL_PRIVATE_INCLUDE_DIRS "")
 set(ALL_LINK_LIBS "")
 set(ALL_DEFINITIONS "")
+set(ALL_COMPILE_OPTIONS "")
 
 # --- Common Sources & Public Headers (Always Included) ---
 file(GLOB COMMON_SOURCES "src/common/*.c" "src/common/*.h")
@@ -137,7 +138,8 @@ if(MINIAV_ENABLE_CAMERA)
             pkg_check_modules(PIPEWIRE_CAMERA REQUIRED libpipewire-0.3) # Uncomment when implemented
             list(APPEND ALL_LINK_LIBS ${PIPEWIRE_CAMERA_LIBRARIES}) # Uncomment when implemented
             list(APPEND ALL_PRIVATE_INCLUDE_DIRS ${PIPEWIRE_CAMERA_INCLUDE_DIRS}) # Uncomment when implemented
-            list(APPEND ALL_DEFINITIONS ${PIPEWIRE_CAMERA_CFLAGS_OTHER}) # Uncomment when implemented
+            list(APPEND ALL_DEFINITIONS ${PIPEWIRE_CAMERA_DEFINITIONS}) # Changed from _CFLAGS_OTHER
+            list(APPEND ALL_COMPILE_OPTIONS ${PIPEWIRE_CAMERA_COMPILE_OPTIONS}) # Added
             list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_LINUX_PIPEWIRE_CAMERA_ENABLED")
             set(LINUX_CAMERA_BACKEND_FOUND TRUE) # Uncomment when implemented
             message(WARNING "Linux: PipeWire camera backend is selected but not fully implemented in CMake script.")
@@ -194,7 +196,8 @@ if(MINIAV_ENABLE_SCREEN)
             pkg_check_modules(PIPEWIRE_SCREEN REQUIRED libpipewire-0.3 gio-unix-2.0) # Gio needed for portal
             list(APPEND ALL_LINK_LIBS ${PIPEWIRE_SCREEN_LIBRARIES})
             list(APPEND ALL_PRIVATE_INCLUDE_DIRS ${PIPEWIRE_SCREEN_INCLUDE_DIRS})
-            list(APPEND ALL_DEFINITIONS ${PIPEWIRE_SCREEN_CFLAGS_OTHER})
+            list(APPEND ALL_DEFINITIONS ${PIPEWIRE_SCREEN_DEFINITIONS}) # Changed from _CFLAGS_OTHER
+            list(APPEND ALL_COMPILE_OPTIONS ${PIPEWIRE_SCREEN_COMPILE_OPTIONS}) # Added
             list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_LINUX_PIPEWIRE_SCREEN_ENABLED")
             set(LINUX_SCREEN_BACKEND_FOUND TRUE)
         endif()
@@ -243,7 +246,8 @@ if(MINIAV_ENABLE_LOOPBACK)
         pkg_check_modules(PIPEWIRE_LOOPBACK REQUIRED libpipewire-0.3)
         list(APPEND ALL_LINK_LIBS ${PIPEWIRE_LOOPBACK_LIBRARIES})
         list(APPEND ALL_PRIVATE_INCLUDE_DIRS ${PIPEWIRE_LOOPBACK_INCLUDE_DIRS})
-        list(APPEND ALL_DEFINITIONS ${PIPEWIRE_LOOPBACK_CFLAGS_OTHER}) # Add CFLAGS from pkg-config
+        list(APPEND ALL_DEFINITIONS ${PIPEWIRE_LOOPBACK_DEFINITIONS}) # Changed from _CFLAGS_OTHER
+        list(APPEND ALL_COMPILE_OPTIONS ${PIPEWIRE_LOOPBACK_COMPILE_OPTIONS}) # Added
         list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_LINUX_PIPEWIRE_LOOPBACK_ENABLED") # Corrected
     endif()
 else()
@@ -254,6 +258,7 @@ endif()
 target_sources(miniav_c PRIVATE ${ALL_SOURCES} ${ALL_HEADERS})
 target_include_directories(miniav_c PRIVATE ${ALL_PRIVATE_INCLUDE_DIRS})
 target_compile_definitions(miniav_c PRIVATE ${ALL_DEFINITIONS})
+target_compile_options(miniav_c PRIVATE ${ALL_COMPILE_OPTIONS}) # Add this line
 target_link_libraries(miniav_c PRIVATE ${ALL_LINK_LIBS})
 
 # --- Installation ---

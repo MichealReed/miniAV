@@ -19,9 +19,12 @@ extern MiniAVResultCode
 miniav_screen_context_platform_init_windows_dxgi(MiniAVScreenContext *ctx);
 #endif
 #endif
-// #ifdef __linux__
-// ...
-// #endif
+#ifdef __linux__
+#include "linux/screen_context_linux_pipewire.h" // Ensure this header declares the ops and init function
+extern const ScreenContextInternalOps g_screen_ops_linux_pipewire;
+extern MiniAVResultCode
+miniav_screen_context_platform_init_linux_pipewire(MiniAVScreenContext *ctx);
+#endif
 // #ifdef __APPLE__
 // ...
 // #endif
@@ -33,17 +36,23 @@ static const MiniAVScreenBackend g_screen_backends[] = {
 #ifdef _WIN32
 #ifdef USE_WGC
     {"Windows Graphics Capture", &g_screen_ops_win_wgc,
-     miniav_screen_context_platform_init_windows_wgc},
+     miniav_screen_context_platform_init_windows_wgc}, // This function now acts
+                                                       // as
+                                                       // platform_init_for_selection
 #endif
 #ifdef USE_DXGI
     {"DXGI", &g_screen_ops_win_dxgi,
-     miniav_screen_context_platform_init_windows_dxgi},
+     miniav_screen_context_platform_init_windows_dxgi}, // This function now
+                                                        // acts as
+                                                        // platform_init_for_selection
 #endif
 #endif
-    // #ifdef __linux__
-    //    {"X11", &g_screen_ops_linux_x11,
-    //    miniav_screen_context_platform_init_linux_x11},
-    // #endif
+#ifdef __linux__
+    {"Pipewire", &g_screen_ops_linux_pipewire,
+     miniav_screen_context_platform_init_linux_pipewire}, // This function now
+                                                          // acts as
+                                                          // platform_init_for_selection
+#endif
     // #ifdef __APPLE__
     //    {"CoreGraphics", &g_screen_ops_macos_cg,
     //    miniav_screen_context_platform_init_macos_cg},
@@ -73,24 +82,35 @@ MiniAVResultCode MiniAV_Screen_CreateContext(MiniAVScreenContext **ctx_out) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "Attempting to initialize screen backend for context: %s",
                backend_entry->name);
-    res = backend_entry->platform_init(
-        ctx); // This sets ctx->ops and ctx->platform_ctx
-    if (res == MINIAV_SUCCESS) {
-      selected_backend_entry = backend_entry;
-      miniav_log(MINIAV_LOG_LEVEL_INFO,
-                 "Successfully selected screen backend for context: %s",
-                 selected_backend_entry->name);
-      break;
-    } else {
-      miniav_log(
-          MINIAV_LOG_LEVEL_DEBUG,
-          "Backend %s init failed for context with code %d. Trying next.",
-          backend_entry->name, res);
-      if (ctx->platform_ctx) { // Clean up if platform_init allocated but failed
-        miniav_free(ctx->platform_ctx);
-        ctx->platform_ctx = NULL;
+    // Assuming MiniAVScreenBackend struct's 3rd member is now
+    // platform_init_for_selection
+    if (backend_entry->platform_init_for_selection) {
+      res = backend_entry->platform_init_for_selection(
+          ctx); // This sets ctx->ops and ctx->platform_ctx
+      if (res == MINIAV_SUCCESS) {
+        selected_backend_entry = backend_entry;
+        miniav_log(MINIAV_LOG_LEVEL_INFO,
+                   "Successfully selected screen backend for context: %s",
+                   selected_backend_entry->name);
+        break;
+      } else {
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "Backend %s platform_init_for_selection failed for context "
+                   "with code %d. Trying next.",
+                   backend_entry->name, res);
+        if (ctx->platform_ctx) { // Clean up if platform_init_for_selection
+                                 // allocated but failed
+          miniav_free(ctx->platform_ctx);
+          ctx->platform_ctx = NULL;
+        }
+        ctx->ops =
+            NULL; // Ensure ops is cleared if platform_init_for_selection failed
       }
-      ctx->ops = NULL; // Ensure ops is cleared if platform_init failed
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "Backend %s has no platform_init_for_selection function.",
+                 backend_entry->name);
+      res = MINIAV_ERROR_NOT_IMPLEMENTED; // Or keep previous res
     }
   }
 
@@ -98,7 +118,9 @@ MiniAVResultCode MiniAV_Screen_CreateContext(MiniAVScreenContext **ctx_out) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "No suitable screen backend found or "
                                        "all failed to initialize for context.");
     miniav_free(ctx);
-    return (res == MINIAV_SUCCESS) ? MINIAV_ERROR_NOT_SUPPORTED : res;
+    return (res == MINIAV_SUCCESS && !selected_backend_entry)
+               ? MINIAV_ERROR_NOT_SUPPORTED
+               : res;
   }
 
   if (!ctx->ops || !ctx->ops->init_platform) {
@@ -241,13 +263,13 @@ MiniAVResultCode MiniAV_Screen_EnumerateWindows(MiniAVDeviceInfo **windows_out,
 
 MiniAVResultCode
 MiniAV_Screen_GetDefaultFormats(const char *device_id,
-                                MiniAVVideoFormatInfo *video_format_out,
+                                MiniAVVideoInfo *video_format_out,
                                 MiniAVAudioInfo *audio_format_out) {
 
   if (!device_id || !video_format_out) {
     return MINIAV_ERROR_INVALID_ARG;
   }
-  memset(video_format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
   if (audio_format_out) {
     memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
   }
@@ -285,10 +307,10 @@ MiniAV_Screen_GetDefaultFormats(const char *device_id,
   return res;
 }
 
-MiniAVResultCode
-MiniAV_Screen_ConfigureDisplay(MiniAVScreenContext *ctx, const char *display_id,
-                               const MiniAVVideoFormatInfo *format,
-                               bool capture_audio) {
+MiniAVResultCode MiniAV_Screen_ConfigureDisplay(MiniAVScreenContext *ctx,
+                                                const char *display_id,
+                                                const MiniAVVideoInfo *format,
+                                                bool capture_audio) {
 
   if (!ctx || !ctx->ops || !ctx->ops->configure_display || !display_id ||
       !format) {
@@ -304,10 +326,10 @@ MiniAV_Screen_ConfigureDisplay(MiniAVScreenContext *ctx, const char *display_id,
   return ctx->ops->configure_display(ctx, display_id, format);
 }
 
-MiniAVResultCode
-MiniAV_Screen_ConfigureWindow(MiniAVScreenContext *ctx, const char *window_id,
-                              const MiniAVVideoFormatInfo *format,
-                              bool capture_audio) {
+MiniAVResultCode MiniAV_Screen_ConfigureWindow(MiniAVScreenContext *ctx,
+                                               const char *window_id,
+                                               const MiniAVVideoInfo *format,
+                                               bool capture_audio) {
 
   if (!ctx || !ctx->ops || !ctx->ops->configure_window || !window_id ||
       !format) {
@@ -323,9 +345,11 @@ MiniAV_Screen_ConfigureWindow(MiniAVScreenContext *ctx, const char *window_id,
   return ctx->ops->configure_window(ctx, window_id, format);
 }
 
-MiniAVResultCode MiniAV_Screen_ConfigureRegion(
-    MiniAVScreenContext *ctx, const char *target_id, int x, int y, int width,
-    int height, const MiniAVVideoFormatInfo *format, bool capture_audio) {
+MiniAVResultCode MiniAV_Screen_ConfigureRegion(MiniAVScreenContext *ctx,
+                                               const char *target_id, int x,
+                                               int y, int width, int height,
+                                               const MiniAVVideoInfo *format,
+                                               bool capture_audio) {
 
   if (!ctx || !ctx->ops || !ctx->ops->configure_region || !target_id ||
       !format || width <= 0 || height <= 0) {
@@ -344,28 +368,30 @@ MiniAVResultCode MiniAV_Screen_ConfigureRegion(
 
 MiniAVResultCode
 MiniAV_Screen_GetConfiguredFormats(MiniAVScreenContext *ctx,
-                                   MiniAVVideoFormatInfo *video_format_out,
+                                   MiniAVVideoInfo *video_format_out,
                                    MiniAVAudioInfo *audio_format_out) {
 
   if (!ctx || !video_format_out) {
     return MINIAV_ERROR_INVALID_ARG;
   }
 
-  memset(video_format_out, 0, sizeof(MiniAVVideoFormatInfo));
+  memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
   if (audio_format_out) {
     memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
   }
 
-  if (ctx->ops && ctx->ops->get_configured_formats) {
-    return ctx->ops->get_configured_formats(ctx, video_format_out,
-                                            audio_format_out);
+  if (ctx->ops && ctx->ops->get_configured_video_formats) {
+    return ctx->ops->get_configured_video_formats(ctx, video_format_out,
+                                                  audio_format_out);
   }
-  miniav_log(MINIAV_LOG_LEVEL_WARN,
-             "get_configured_formats op not available for the current context. "
-             "Using generic context video format if set.");
-  if (ctx->configured_format.width > 0 && ctx->configured_format.height > 0) {
-    memcpy(video_format_out, &ctx->configured_format,
-           sizeof(MiniAVVideoFormatInfo));
+  miniav_log(
+      MINIAV_LOG_LEVEL_WARN,
+      "get_configured_video_formats op not available for the current context. "
+      "Using generic context video format if set.");
+  if (ctx->configured_video_format.width > 0 &&
+      ctx->configured_video_format.height > 0) {
+    memcpy(video_format_out, &ctx->configured_video_format,
+           sizeof(MiniAVVideoInfo));
     if (audio_format_out) {
       miniav_log(
           MINIAV_LOG_LEVEL_WARN,
@@ -374,7 +400,7 @@ MiniAV_Screen_GetConfiguredFormats(MiniAVScreenContext *ctx,
     return MINIAV_SUCCESS;
   }
   miniav_log(MINIAV_LOG_LEVEL_WARN,
-             "Screen context not configured or get_configured_formats op "
+             "Screen context not configured or get_configured_video_formats op "
              "failed/unavailable.");
   return MINIAV_ERROR_NOT_INITIALIZED;
 }
@@ -391,7 +417,8 @@ MiniAVResultCode MiniAV_Screen_StartCapture(MiniAVScreenContext *ctx,
     return MINIAV_ERROR_ALREADY_RUNNING;
   }
 
-  if (ctx->configured_format.width == 0 || ctx->configured_format.height == 0) {
+  if (ctx->configured_video_format.width == 0 ||
+      ctx->configured_video_format.height == 0) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "Screen capture not configured (generic check). Call a "
                "configure function first.");

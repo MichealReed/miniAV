@@ -30,18 +30,18 @@ MINIAV_API MiniAVResultCode MiniAV_FreeDeviceList(MiniAVDeviceInfo *devices,
                                                   uint32_t count);
 MINIAV_API MiniAVResultCode
 MiniAV_FreeFormatList(void *formats,
-                      uint32_t count); // Placeholder for MiniAVVideoFormatInfo
+                      uint32_t count);
 
 // --- Camera Capture API ---
 MINIAV_API MiniAVResultCode
 MiniAV_Camera_EnumerateDevices(MiniAVDeviceInfo **devices, uint32_t *count);
 MINIAV_API MiniAVResultCode MiniAV_Camera_GetSupportedFormats(
-    const char *device_id, MiniAVVideoFormatInfo **formats,
-    uint32_t *count); // Placeholder for MiniAVVideoFormatInfo
+    const char *device_id, MiniAVVideoInfo **formats,
+    uint32_t *count); // Placeholder for MiniAVVideoInfo
 MINIAV_API MiniAVResultCode MiniAV_Camera_GetDefaultFormat(
-    const char *device_id, MiniAVVideoFormatInfo *format_out);
+    const char *device_id, MiniAVVideoInfo *format_out);
 MINIAV_API MiniAVResultCode MiniAV_Camera_GetConfiguredFormat(
-    MiniAVCameraContextHandle context, MiniAVVideoFormatInfo *format_out);
+    MiniAVCameraContextHandle context, MiniAVVideoInfo *format_out);
 MINIAV_API MiniAVResultCode
 MiniAV_Camera_CreateContext(MiniAVCameraContextHandle *context);
 MINIAV_API MiniAVResultCode
@@ -63,23 +63,23 @@ MINIAV_API MiniAVResultCode MiniAV_Screen_EnumerateDisplays(
 MINIAV_API MiniAVResultCode
 MiniAV_Screen_EnumerateWindows(MiniAVDeviceInfo **windows, uint32_t *count);
 MINIAV_API MiniAVResultCode MiniAV_Screen_GetDefaultFormats(
-    const char *display_id, MiniAVVideoFormatInfo *video_format_out,
+    const char *display_id, MiniAVVideoInfo *video_format_out,
     MiniAVAudioInfo *audio_format_out);
 MINIAV_API MiniAVResultCode
 MiniAV_Screen_DestroyContext(MiniAVScreenContextHandle context);
 MINIAV_API MiniAVResultCode MiniAV_Screen_ConfigureDisplay(
     MiniAVScreenContextHandle context, const char *display_id,
-    const MiniAVVideoFormatInfo *format, // Corrected type
+    const MiniAVVideoInfo *format, // Corrected type
     bool capture_audio);
 MINIAV_API MiniAVResultCode MiniAV_Screen_ConfigureWindow(
     MiniAVScreenContextHandle context, const char *window_id,
-    const MiniAVVideoFormatInfo *format, bool capture_audio);
+    const MiniAVVideoInfo *format, bool capture_audio);
 MINIAV_API MiniAVResultCode MiniAV_Screen_ConfigureRegion(
     MiniAVScreenContextHandle context, const char *display_id, int x, int y,
-    int width, int height, const MiniAVVideoFormatInfo *format,
+    int width, int height, const MiniAVVideoInfo *format,
     bool capture_audio);
 MINIAV_API MiniAVResultCode MiniAV_Screen_GetConfiguredFormats(
-    MiniAVScreenContextHandle *ctx, MiniAVVideoFormatInfo *video_format_out,
+    MiniAVScreenContextHandle context, MiniAVVideoInfo *video_format_out,
     MiniAVAudioInfo *audio_format_out);
 MINIAV_API MiniAVResultCode
 MiniAV_Screen_StartCapture(MiniAVScreenContextHandle context,

@@ -283,7 +283,7 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
         buffer.data_size_bytes =
             num_frames_available * platform_ctx->capture_format->nBlockAlign;
 
-        buffer.data.audio.info = ctx->configured_format;
+        buffer.data.audio.info = ctx->configured_video_format;
         buffer.data.audio.info.num_frames = num_frames_available;
 
         ctx->app_callback(&buffer, ctx->app_callback_user_data);
@@ -1249,7 +1249,7 @@ MiniAVResultCode wasapi_configure_loopback(
   }
 
   waveformat_to_miniav_audio_format(platform_ctx->capture_format,
-                                    &ctx->configured_format);
+                                    &ctx->configured_video_format);
 
   hr = platform_ctx->audio_client->lpVtbl->GetBufferSize(
       platform_ctx->audio_client, &platform_ctx->buffer_frame_count);
@@ -1510,12 +1510,12 @@ cleanup:
   return mres;
 }
 
-MiniAVResultCode wasapi_get_configured_format(MiniAVLoopbackContext *ctx,
+MiniAVResultCode wasapi_get_configured_video_format(MiniAVLoopbackContext *ctx,
                                               MiniAVAudioInfo *format_out) {
   if (!ctx->is_configured || !ctx->platform_ctx) {
     return MINIAV_ERROR_NOT_INITIALIZED;
   }
-  *format_out = ctx->configured_format;
+  *format_out = ctx->configured_video_format;
   return MINIAV_SUCCESS;
 }
 
@@ -1529,7 +1529,7 @@ const LoopbackContextInternalOps g_loopback_ops_wasapi = {
     .start_capture = wasapi_start_capture,
     .stop_capture = wasapi_stop_capture,
     .release_buffer_platform = wasapi_release_buffer_platform,
-    .get_configured_format = wasapi_get_configured_format};
+    .get_configured_video_format = wasapi_get_configured_video_format};
 
 MiniAVResultCode miniav_loopback_context_platform_init_windows_wasapi(
     MiniAVLoopbackContext *ctx) {

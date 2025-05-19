@@ -90,7 +90,7 @@ void main() {
       late MiniScreenContextPlatformInterface context;
       late List<MiniAVDeviceInfo> displays;
       late List<MiniAVDeviceInfo> windows;
-      MiniAVVideoFormatInfo? defaultVideoFormat;
+      MiniAVVideoInfo? defaultVideoFormat;
 
       setUp(() async {
         context = await screen.createContext();

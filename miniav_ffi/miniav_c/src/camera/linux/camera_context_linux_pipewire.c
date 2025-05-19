@@ -41,7 +41,7 @@ typedef struct PipeWireEnumData {
 
 typedef struct PipeWireFormatEnumData {
   struct pw_main_loop *loop;
-  MiniAVVideoFormatInfo *formats_list;
+  MiniAVVideoInfo *formats_list;
   uint32_t *formats_count;
   uint32_t allocated_formats;
   MiniAVResultCode result;
@@ -68,7 +68,7 @@ typedef struct PipeWirePlatformContext {
 
   // Configuration
   uint32_t target_node_id;
-  MiniAVVideoFormatInfo configured_format;
+  MiniAVVideoInfo configured_video_format;
   bool is_configured;
   bool is_streaming;
 
@@ -76,7 +76,7 @@ typedef struct PipeWirePlatformContext {
   PipeWireDeviceTempInfo temp_devices[PW_MAX_REPORTED_DEVICES];
   uint32_t num_temp_devices;
 
-  MiniAVVideoFormatInfo temp_formats[PW_MAX_REPORTED_FORMATS];
+  MiniAVVideoInfo temp_formats[PW_MAX_REPORTED_FORMATS];
   uint32_t num_temp_formats;
 
   int pending_sync_ops; // For sync operations during init/enum
@@ -91,11 +91,11 @@ static MiniAVResultCode pw_enumerate_devices(MiniAVDeviceInfo **devices_out,
                                              uint32_t *count_out);
 static MiniAVResultCode
 pw_get_supported_formats(const char *device_id_str,
-                         MiniAVVideoFormatInfo **formats_out,
+                         MiniAVVideoInfo **formats_out,
                          uint32_t *count_out);
 static MiniAVResultCode pw_configure(MiniAVCameraContext *ctx,
                                      const char *device_id,
-                                     const MiniAVVideoFormatInfo *format);
+                                     const MiniAVVideoInfo *format);
 static MiniAVResultCode pw_start_capture(MiniAVCameraContext *ctx);
 static MiniAVResultCode pw_get_buffer(MiniAVCameraContext *ctx,
                                       MiniAVBuffer *buffer,
@@ -262,7 +262,7 @@ const char *miniav_pixel_format_to_string_short(MiniAVPixelFormat format) {
 }
 
 static void parse_spa_format(const struct spa_pod *format_pod,
-                             MiniAVVideoFormatInfo *info,
+                             MiniAVVideoInfo *info,
                              PipeWirePlatformContext *pw_ctx) {
   // First, try to parse as spa_video_info_raw for common properties like size
   // and framerate
@@ -381,9 +381,9 @@ static void on_stream_process(void *userdata) {
   struct spa_data *d =
       &spa_buf->datas[0]; // Assuming single plane for simplicity first
 
-  miniav_buf->data.video.width = pw_ctx->configured_format.width;
-  miniav_buf->data.video.height = pw_ctx->configured_format.height;
-  miniav_buf->data.video.pixel_format = pw_ctx->configured_format.pixel_format;
+  miniav_buf->data.video.width = pw_ctx->configured_video_format.width;
+  miniav_buf->data.video.height = pw_ctx->configured_video_format.height;
+  miniav_buf->data.video.pixel_format = pw_ctx->configured_video_format.pixel_format;
 
   // TODO: Handle multi-planar formats (NV12, I420) correctly by inspecting
   // spa_buf->n_datas and spa_video_info for plane strides and offsets. For now,
@@ -473,17 +473,17 @@ static void on_stream_state_changed(void *userdata, enum pw_stream_state old,
       struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
       const struct spa_pod *params[1];
       uint32_t spa_format =
-          miniav_pixel_format_to_spa(pw_ctx->configured_format.pixel_format);
+          miniav_pixel_format_to_spa(pw_ctx->configured_video_format.pixel_format);
 
       params[0] = spa_format_video_raw_build(
           &b, SPA_PARAM_EnumFormat,
           &SPA_VIDEO_INFO_RAW_INIT(
                   .format = spa_format,
-                  .size = SPA_RECTANGLE(pw_ctx->configured_format.width,
-                                        pw_ctx->configured_format.height),
+                  .size = SPA_RECTANGLE(pw_ctx->configured_video_format.width,
+                                        pw_ctx->configured_video_format.height),
                   .framerate = SPA_FRACTION(
-                      pw_ctx->configured_format.frame_rate_numerator,
-                      pw_ctx->configured_format.frame_rate_denominator)));
+                      pw_ctx->configured_video_format.frame_rate_numerator,
+                      pw_ctx->configured_video_format.frame_rate_denominator)));
 
       if (pw_stream_update_params(pw_ctx->stream, params, 1) < 0) {
         miniav_log(
@@ -493,10 +493,10 @@ static void on_stream_state_changed(void *userdata, enum pw_stream_state old,
         miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                    "PW: Requested stream format %s, %ux%u @ %u/%u.",
                    spa_debug_type_find_name(spa_type_video_format, spa_format),
-                   pw_ctx->configured_format.width,
-                   pw_ctx->configured_format.height,
-                   pw_ctx->configured_format.frame_rate_numerator,
-                   pw_ctx->configured_format.frame_rate_denominator);
+                   pw_ctx->configured_video_format.width,
+                   pw_ctx->configured_video_format.height,
+                   pw_ctx->configured_video_format.frame_rate_numerator,
+                   pw_ctx->configured_video_format.frame_rate_denominator);
       }
     }
     break;
@@ -517,7 +517,7 @@ static void on_stream_param_changed(void *userdata, uint32_t id,
   }
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Stream SPA_PARAM_Format changed.");
 
-  MiniAVVideoFormatInfo current_stream_format = {0};
+  MiniAVVideoInfo current_stream_format = {0};
   parse_spa_format(param, &current_stream_format, pw_ctx);
 
   miniav_log(MINIAV_LOG_LEVEL_INFO,
@@ -530,7 +530,7 @@ static void on_stream_param_changed(void *userdata, uint32_t id,
              current_stream_format.frame_rate_denominator);
 
   // Here you might want to verify if current_stream_format matches
-  // configured_format and potentially update pw_ctx->configured_format if the
+  // configured_video_format and potentially update pw_ctx->configured_video_format if the
   // device chose a compatible alternative. For now, we assume the device
   // accepted our request or something close.
 
@@ -927,7 +927,7 @@ static void process_node_params_for_formats(PipeWireFormatEnumData *format_data,
       // until proper SPA_PARAM_EnumFormat parsing is implemented.
       if (*format_data->formats_count < format_data->allocated_formats) {
         format_data->formats_list[*format_data->formats_count] =
-            (MiniAVVideoFormatInfo){.width = 640,
+            (MiniAVVideoInfo){.width = 640,
                                     .height = 480,
                                     .pixel_format = MINIAV_PIXEL_FORMAT_YUY2,
                                     .frame_rate_numerator = 30,
@@ -938,7 +938,7 @@ static void process_node_params_for_formats(PipeWireFormatEnumData *format_data,
       }
       if (*format_data->formats_count < format_data->allocated_formats) {
         format_data->formats_list[*format_data->formats_count] =
-            (MiniAVVideoFormatInfo){.width = 1280,
+            (MiniAVVideoInfo){.width = 1280,
                                     .height = 720,
                                     .pixel_format = MINIAV_PIXEL_FORMAT_MJPEG,
                                     .frame_rate_numerator = 30,
@@ -982,7 +982,7 @@ static const struct pw_node_events node_info_events = {
 
 static MiniAVResultCode
 pw_get_supported_formats(const char *device_id_str,
-                         MiniAVVideoFormatInfo **formats_out,
+                         MiniAVVideoInfo **formats_out,
                          uint32_t *count_out) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW: Getting supported formats for device ID %s.", device_id_str);
@@ -1024,8 +1024,8 @@ pw_get_supported_formats(const char *device_id_str,
 
   PipeWireFormatEnumData format_data = {0};
   format_data.loop = loop;
-  format_data.formats_list = (MiniAVVideoFormatInfo *)miniav_calloc(
-      PW_MAX_REPORTED_FORMATS, sizeof(MiniAVVideoFormatInfo));
+  format_data.formats_list = (MiniAVVideoInfo *)miniav_calloc(
+      PW_MAX_REPORTED_FORMATS, sizeof(MiniAVVideoInfo));
   if (!format_data.formats_list) {
     overall_res = MINIAV_ERROR_OUT_OF_MEMORY;
     goto format_enum_cleanup;
@@ -1072,8 +1072,8 @@ pw_get_supported_formats(const char *device_id_str,
   if (format_data.result == MINIAV_SUCCESS) {
     if (*count_out > 0) {
       *formats_out = format_data.formats_list;
-      MiniAVVideoFormatInfo *final_list = miniav_realloc(
-          *formats_out, (*count_out) * sizeof(MiniAVVideoFormatInfo));
+      MiniAVVideoInfo *final_list = miniav_realloc(
+          *formats_out, (*count_out) * sizeof(MiniAVVideoInfo));
       if (final_list)
         *formats_out = final_list;
     } else {
@@ -1106,7 +1106,7 @@ format_enum_cleanup:
 
 static MiniAVResultCode pw_configure(MiniAVCameraContext *ctx,
                                      const char *device_id_str,
-                                     const MiniAVVideoFormatInfo *format) {
+                                     const MiniAVVideoInfo *format) {
   if (!ctx || !ctx->platform_ctx || !device_id_str || !format)
     return MINIAV_ERROR_INVALID_ARG;
   PipeWirePlatformContext *pw_ctx =
@@ -1125,7 +1125,7 @@ static MiniAVResultCode pw_configure(MiniAVCameraContext *ctx,
   }
 
   pw_ctx->target_node_id = node_id;
-  pw_ctx->configured_format = *format; // Store a copy
+  pw_ctx->configured_video_format = *format; // Store a copy
   pw_ctx->is_configured = true;
 
   miniav_log(MINIAV_LOG_LEVEL_INFO,

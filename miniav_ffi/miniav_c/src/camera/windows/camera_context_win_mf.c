@@ -206,15 +206,15 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   }
   buffer_ptr->type = MINIAV_BUFFER_TYPE_VIDEO;
   buffer_ptr->timestamp_us = llTimestamp;
-  buffer_ptr->data.video.width = parent_ctx->configured_format.width;
-  buffer_ptr->data.video.height = parent_ctx->configured_format.height;
+  buffer_ptr->data.video.width = parent_ctx->configured_video_format.width;
+  buffer_ptr->data.video.height = parent_ctx->configured_video_format.height;
   buffer_ptr->data.video.pixel_format =
-      parent_ctx->configured_format.pixel_format;
+      parent_ctx->configured_video_format.pixel_format;
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "MF: OnReadSample - parent_ctx->configured_format.pixel_format is "
+             "MF: OnReadSample - parent_ctx->configured_video_format.pixel_format is "
              "%d (0x%X)",
-             parent_ctx->configured_format.pixel_format,
-             parent_ctx->configured_format.pixel_format);
+             parent_ctx->configured_video_format.pixel_format,
+             parent_ctx->configured_video_format.pixel_format);
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "MF: OnReadSample - buffer.data.video.pixel_format is %d (0x%X) "
              "before callback",
@@ -228,7 +228,7 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   buffer_ptr->data.video.native_gpu_texture_ptr = NULL;
 
   MiniAVOutputPreference desired_output_pref =
-      parent_ctx->configured_format.output_preference;
+      parent_ctx->configured_video_format.output_preference;
 
   // Attempt GPU shared texture path if D3D manager exists and GPU preference is
   // set
@@ -445,11 +445,11 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
     UINT32 stride = 0;
 
     GUID mf_subtype = MiniAVPixelFormatToMfSubType(
-        parent_ctx->configured_format.pixel_format);
+        parent_ctx->configured_video_format.pixel_format);
 
     if (!IsEqualGUID(&mf_subtype, &GUID_NULL)) {
       HRESULT hr_stride = MFGetStrideForBitmapInfoHeader(
-          mf_subtype.Data1, parent_ctx->configured_format.width,
+          mf_subtype.Data1, parent_ctx->configured_video_format.width,
           &temp_stride_signed);
 
       if (SUCCEEDED(hr_stride) && temp_stride_signed != 0) {
@@ -464,14 +464,14 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                    "returned 0 stride for format %lu (MiniAV format %d), width "
                    "%u. Falling back to manual calculation.",
                    hr_stride, mf_subtype.Data1,
-                   parent_ctx->configured_format.pixel_format,
-                   parent_ctx->configured_format.width);
+                   parent_ctx->configured_video_format.pixel_format,
+                   parent_ctx->configured_video_format.width);
       }
     } else {
       miniav_log(MINIAV_LOG_LEVEL_WARN,
                  "MF: Could not map MiniAVPixelFormat %d to MF subtype for "
                  "stride calculation. Falling back to manual calculation.",
-                 parent_ctx->configured_format.pixel_format);
+                 parent_ctx->configured_video_format.pixel_format);
     }
 
     if (stride == 0) {
@@ -924,7 +924,7 @@ cleanup_and_exit:
 
 static MiniAVResultCode
 mf_get_supported_formats(const char *device_id_utf8,
-                         MiniAVVideoFormatInfo **formats_out,
+                         MiniAVVideoInfo **formats_out,
                          uint32_t *count_out) {
   miniav_log(
       MINIAV_LOG_LEVEL_DEBUG,
@@ -938,7 +938,7 @@ mf_get_supported_formats(const char *device_id_utf8,
   IMFActivate *device_activate = NULL;
   IMFMediaSource *media_source = NULL;
   IMFSourceReader *source_reader = NULL;
-  MiniAVVideoFormatInfo *result_formats_list = NULL;
+  MiniAVVideoInfo *result_formats_list = NULL;
   uint32_t allocated_formats = 0;
   uint32_t found_formats = 0;
   IMFAttributes *enum_attributes = NULL;
@@ -1118,9 +1118,9 @@ mf_get_supported_formats(const char *device_id_utf8,
 
     if (found_formats >= allocated_formats) {
       allocated_formats = (allocated_formats == 0) ? 8 : allocated_formats * 2;
-      MiniAVVideoFormatInfo *new_list = (MiniAVVideoFormatInfo *)miniav_realloc(
+      MiniAVVideoInfo *new_list = (MiniAVVideoInfo *)miniav_realloc(
           result_formats_list,
-          allocated_formats * sizeof(MiniAVVideoFormatInfo));
+          allocated_formats * sizeof(MiniAVVideoInfo));
       if (!new_list) {
         miniav_free(result_formats_list);
         result_formats_list = NULL;
@@ -1213,7 +1213,7 @@ static MiniAVResultCode mf_configure(
     MiniAVCameraContext *ctx,
     const char
         *device_id_utf8, // This is the symbolic link from initial enumeration
-    const MiniAVVideoFormatInfo *format) {
+    const MiniAVVideoInfo *format) {
   MFPlatformContext *mf_ctx = (MFPlatformContext *)ctx->platform_ctx;
   HRESULT hr = S_OK;
   HRESULT hr_loop_check;
@@ -1240,7 +1240,7 @@ static MiniAVResultCode mf_configure(
              format->output_preference);
 
   // set ctx format
-  mf_ctx->parent_ctx->configured_format = *format;
+  mf_ctx->parent_ctx->configured_video_format = *format;
 
   if (!device_id_utf8) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
@@ -1603,12 +1603,12 @@ static MiniAVResultCode mf_configure(
   // Configuration successful
   mf_ctx->app_callback_internal = ctx->app_callback;
   mf_ctx->app_callback_user_data_internal = ctx->app_callback_user_data;
-  ctx->configured_format = *format;
-  mf_ctx->parent_ctx->configured_format = *format;
+  ctx->configured_video_format = *format;
+  mf_ctx->parent_ctx->configured_video_format = *format;
   miniav_log(
       MINIAV_LOG_LEVEL_DEBUG,
-      "MF: mf_configure - ctx->configured_format.pixel_format set to %d (0x%X)",
-      ctx->configured_format.pixel_format, ctx->configured_format.pixel_format);
+      "MF: mf_configure - ctx->configured_video_format.pixel_format set to %d (0x%X)",
+      ctx->configured_video_format.pixel_format, ctx->configured_video_format.pixel_format);
 
   miniav_log(MINIAV_LOG_LEVEL_INFO,
              "MF: Configured device %ls successfully (real).",
@@ -1723,7 +1723,7 @@ static MiniAVResultCode mf_start_capture(MiniAVCameraContext *ctx) {
   // reconfigured without restart)
   mf_ctx->app_callback_internal = ctx->app_callback;
   mf_ctx->app_callback_user_data_internal = ctx->app_callback_user_data;
-  mf_ctx->parent_ctx->configured_format = ctx->configured_format;
+  mf_ctx->parent_ctx->configured_video_format = ctx->configured_video_format;
   LeaveCriticalSection(&mf_ctx->critical_section);
 
   // Initial call to ReadSample. Subsequent calls are made from OnReadSample.

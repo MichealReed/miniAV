@@ -323,7 +323,19 @@ MiniAVResultCode MiniAV_Screen_ConfigureDisplay(MiniAVScreenContext *ctx,
   }
   ctx->capture_target_type = MINIAV_CAPTURE_TYPE_DISPLAY;
   ctx->capture_audio_requested = capture_audio;
-  return ctx->ops->configure_display(ctx, display_id, format);
+
+  MiniAVResultCode res = ctx->ops->configure_display(ctx, display_id, format);
+  if (res == MINIAV_SUCCESS) {
+    memcpy(&ctx->configured_video_format, format, sizeof(MiniAVVideoInfo));
+    miniav_log(MINIAV_LOG_LEVEL_INFO,
+               "Screen display configured successfully (API layer).");
+  } else {
+    memset(&ctx->configured_video_format, 0,
+           sizeof(MiniAVVideoInfo)); // Clear on failure
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "Failed to configure screen display (API layer), code: %d", res);
+  }
+  return res;
 }
 
 MiniAVResultCode MiniAV_Screen_ConfigureWindow(MiniAVScreenContext *ctx,
@@ -342,7 +354,19 @@ MiniAVResultCode MiniAV_Screen_ConfigureWindow(MiniAVScreenContext *ctx,
   }
   ctx->capture_target_type = MINIAV_CAPTURE_TYPE_WINDOW;
   ctx->capture_audio_requested = capture_audio;
-  return ctx->ops->configure_window(ctx, window_id, format);
+
+  MiniAVResultCode res = ctx->ops->configure_window(ctx, window_id, format);
+  if (res == MINIAV_SUCCESS) {
+    memcpy(&ctx->configured_video_format, format, sizeof(MiniAVVideoInfo));
+    miniav_log(MINIAV_LOG_LEVEL_INFO,
+               "Screen window configured successfully (API layer).");
+  } else {
+    memset(&ctx->configured_video_format, 0,
+           sizeof(MiniAVVideoInfo)); // Clear on failure
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "Failed to configure screen window (API layer), code: %d", res);
+  }
+  return res;
 }
 
 MiniAVResultCode MiniAV_Screen_ConfigureRegion(MiniAVScreenContext *ctx,
@@ -362,8 +386,20 @@ MiniAVResultCode MiniAV_Screen_ConfigureRegion(MiniAVScreenContext *ctx,
   }
   ctx->capture_target_type = MINIAV_CAPTURE_TYPE_REGION;
   ctx->capture_audio_requested = capture_audio;
-  return ctx->ops->configure_region(ctx, target_id, x, y, width, height,
-                                    format);
+
+  MiniAVResultCode res =
+      ctx->ops->configure_region(ctx, target_id, x, y, width, height, format);
+  if (res == MINIAV_SUCCESS) {
+    memcpy(&ctx->configured_video_format, format, sizeof(MiniAVVideoInfo));
+    miniav_log(MINIAV_LOG_LEVEL_INFO,
+               "Screen region configured successfully (API layer).");
+  } else {
+    memset(&ctx->configured_video_format, 0,
+           sizeof(MiniAVVideoInfo)); // Clear on failure
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "Failed to configure screen region (API layer), code: %d", res);
+  }
+  return res;
 }
 
 MiniAVResultCode
@@ -448,12 +484,17 @@ MiniAVResultCode MiniAV_Screen_StopCapture(MiniAVScreenContext *ctx) {
   if (!ctx->is_running) {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
                "Screen capture not running or already stopped.");
-    return MINIAV_SUCCESS;
+    return MINIAV_SUCCESS; // Already stopped, consider it success.
   }
 
   miniav_log(MINIAV_LOG_LEVEL_INFO, "Stopping screen capture...");
   MiniAVResultCode res = ctx->ops->stop_capture(ctx);
+
+  // These should be cleared regardless of platform op success, as we are
+  // stopping.
   ctx->is_running = false;
+  ctx->app_callback = NULL;
+  ctx->app_callback_user_data = NULL;
 
   if (res == MINIAV_SUCCESS) {
     miniav_log(MINIAV_LOG_LEVEL_INFO, "Screen capture stopped successfully.");

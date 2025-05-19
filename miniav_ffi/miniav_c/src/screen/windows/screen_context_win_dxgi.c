@@ -1059,9 +1059,9 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
     buffer.type = MINIAV_BUFFER_TYPE_VIDEO;
     buffer.timestamp_us = miniav_qpc_to_microseconds(frame_info.LastPresentTime,
                                                      dxgi_ctx->qpc_frequency);
-    buffer.data.video.width = dxgi_ctx->frame_width;
-    buffer.data.video.height = dxgi_ctx->frame_height;
-    buffer.data.video.pixel_format = dxgi_ctx->pixel_format;
+    buffer.data.video.info.width = dxgi_ctx->frame_width;
+    buffer.data.video.info.height = dxgi_ctx->frame_height;
+    buffer.data.video.info.pixel_format = dxgi_ctx->pixel_format;
     buffer.user_data = dxgi_ctx->app_callback_user_data_internal;
 
     BOOL processed_as_gpu = FALSE;

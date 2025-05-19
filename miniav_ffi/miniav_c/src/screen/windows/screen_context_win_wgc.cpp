@@ -1405,9 +1405,9 @@ static void wgc_on_frame_arrived(
                                                 10); // Convert 100ns to us
 
     auto frame_content_size = frame.ContentSize();
-    buffer.data.video.width = static_cast<uint32_t>(frame_content_size.Width);
-    buffer.data.video.height = static_cast<uint32_t>(frame_content_size.Height);
-    buffer.data.video.pixel_format = wgc_ctx->pixel_format; // BGRA32
+    buffer.data.video.info.width = static_cast<uint32_t>(frame_content_size.Width);
+    buffer.data.video.info.height = static_cast<uint32_t>(frame_content_size.Height);
+    buffer.data.video.info.pixel_format = wgc_ctx->pixel_format; // BGRA32
     buffer.type = MINIAV_BUFFER_TYPE_VIDEO;
     buffer.user_data = wgc_ctx->app_callback_user_data_internal;
 
@@ -1546,7 +1546,7 @@ static void wgc_on_frame_arrived(
       buffer.data.video.planes[0] = (uint8_t *)mapped_rect_cpu.pData;
       buffer.data.video.stride_bytes[0] = mapped_rect_cpu.RowPitch;
       buffer.data_size_bytes =
-          mapped_rect_cpu.RowPitch * buffer.data.video.height;
+          mapped_rect_cpu.RowPitch * buffer.data.video.info.height;
 
       texture_for_payload_ref_com = per_frame_staging_texture_com;
     } else { // GPU Path successful

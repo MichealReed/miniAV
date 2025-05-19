@@ -48,8 +48,8 @@ void test_camera_buffer_callback(const MiniAVBuffer *buffer, void *user_data) {
     printf(
         "TestCallback: Received Video Buffer: Timestamp=%" PRIu64
         "us, %ux%u, Format=%d, Size=%zu bytes, Plane0 Stride=%u, Frame #%d\n",
-        buffer->timestamp_us, buffer->data.video.width,
-        buffer->data.video.height, buffer->data.video.pixel_format,
+        buffer->timestamp_us, buffer->data.video.info.width,
+        buffer->data.video.info.height, buffer->data.video.info.pixel_format,
         buffer->data_size_bytes, buffer->data.video.stride_bytes[0],
         g_frame_count);
 

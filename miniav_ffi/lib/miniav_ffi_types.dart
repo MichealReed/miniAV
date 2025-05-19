@@ -129,8 +129,8 @@ extension MiniAVBufferFFI on MiniAVBuffer {
         if (planePtr == ffi.nullptr) return null;
         // You may need to know the plane size; here we use strideBytes[i] * height as a guess
         // If you have plane sizes, use them instead!
-        // final width = video.width;
-        final height = video.height;
+        // final width = video.info.width;
+        final height = video.info.height;
         final sizeGuess = strideBytes[i] * height;
         try {
           return planePtr.cast<ffi.Uint8>().asTypedList(sizeGuess);
@@ -140,8 +140,8 @@ extension MiniAVBufferFFI on MiniAVBuffer {
       });
 
       videoBuffer = MiniAVVideoBuffer(
-        width: video.width,
-        height: video.height,
+        width: video.info.width,
+        height: video.info.height,
         pixelFormat: MiniAVPixelFormat.values[pixelFormat.value],
         strideBytes: strideBytes,
         planes: planes,

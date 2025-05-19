@@ -46,9 +46,7 @@ typedef struct {
 
   union {
     struct {
-      uint32_t width;
-      uint32_t height;
-      MiniAVPixelFormat pixel_format;
+      MiniAVVideoInfo info;
 
       // CPU data
       uint32_t stride_bytes[4];

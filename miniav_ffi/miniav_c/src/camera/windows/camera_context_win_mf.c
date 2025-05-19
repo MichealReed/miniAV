@@ -206,9 +206,9 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   }
   buffer_ptr->type = MINIAV_BUFFER_TYPE_VIDEO;
   buffer_ptr->timestamp_us = llTimestamp;
-  buffer_ptr->data.video.width = parent_ctx->configured_video_format.width;
-  buffer_ptr->data.video.height = parent_ctx->configured_video_format.height;
-  buffer_ptr->data.video.pixel_format =
+  buffer_ptr->data.video.info.width = parent_ctx->configured_video_format.width;
+  buffer_ptr->data.video.info.height = parent_ctx->configured_video_format.height;
+  buffer_ptr->data.video.info.pixel_format =
       parent_ctx->configured_video_format.pixel_format;
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "MF: OnReadSample - parent_ctx->configured_video_format.pixel_format is "
@@ -216,10 +216,10 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
              parent_ctx->configured_video_format.pixel_format,
              parent_ctx->configured_video_format.pixel_format);
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "MF: OnReadSample - buffer.data.video.pixel_format is %d (0x%X) "
+             "MF: OnReadSample - buffer.data.video.info.pixel_format is %d (0x%X) "
              "before callback",
-             buffer_ptr->data.video.pixel_format,
-             buffer_ptr->data.video.pixel_format);
+             buffer_ptr->data.video.info.pixel_format,
+             buffer_ptr->data.video.info.pixel_format);
   // Assuming MiniAVBuffer has these fields (actual_output_preference_achieved,
   // shared_texture_handle, native_gpu_texture_ptr)
   // buffer.data.video.actual_output_preference_achieved =
@@ -477,53 +477,53 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
     if (stride == 0) {
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "MF: Using fallback stride calculation for pixel format %d.",
-                 buffer_ptr->data.video.pixel_format);
-      if (buffer_ptr->data.video.pixel_format == MINIAV_PIXEL_FORMAT_YUY2 ||
-          buffer_ptr->data.video.pixel_format == MINIAV_PIXEL_FORMAT_UYVY)
-        stride = buffer_ptr->data.video.width * 2;
-      else if (buffer_ptr->data.video.pixel_format ==
+                 buffer_ptr->data.video.info.pixel_format);
+      if (buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_YUY2 ||
+          buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_UYVY)
+        stride = buffer_ptr->data.video.info.width * 2;
+      else if (buffer_ptr->data.video.info.pixel_format ==
                    MINIAV_PIXEL_FORMAT_RGB24 ||
-               buffer_ptr->data.video.pixel_format == MINIAV_PIXEL_FORMAT_BGR24)
-        stride = buffer_ptr->data.video.width * 3;
-      else if (buffer_ptr->data.video.pixel_format ==
+               buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_BGR24)
+        stride = buffer_ptr->data.video.info.width * 3;
+      else if (buffer_ptr->data.video.info.pixel_format ==
                    MINIAV_PIXEL_FORMAT_RGBA32 ||
-               buffer_ptr->data.video.pixel_format ==
+               buffer_ptr->data.video.info.pixel_format ==
                    MINIAV_PIXEL_FORMAT_BGRA32 ||
-               buffer_ptr->data.video.pixel_format ==
+               buffer_ptr->data.video.info.pixel_format ==
                    MINIAV_PIXEL_FORMAT_ARGB32 ||
-               buffer_ptr->data.video.pixel_format ==
+               buffer_ptr->data.video.info.pixel_format ==
                    MINIAV_PIXEL_FORMAT_ABGR32)
-        stride = buffer_ptr->data.video.width * 4;
-      else if (buffer_ptr->data.video.pixel_format ==
+        stride = buffer_ptr->data.video.info.width * 4;
+      else if (buffer_ptr->data.video.info.pixel_format ==
                    MINIAV_PIXEL_FORMAT_NV12 ||
-               buffer_ptr->data.video.pixel_format == MINIAV_PIXEL_FORMAT_NV21)
-        stride = buffer_ptr->data.video.width;
-      else if (buffer_ptr->data.video.pixel_format == MINIAV_PIXEL_FORMAT_I420)
-        stride = buffer_ptr->data.video.width;
+               buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_NV21)
+        stride = buffer_ptr->data.video.info.width;
+      else if (buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_I420)
+        stride = buffer_ptr->data.video.info.width;
       else {
         miniav_log(
             MINIAV_LOG_LEVEL_WARN,
             "MF: Unknown pixel format for fallback stride calculation: %d. "
             "Defaulting stride to width * 4.",
-            buffer_ptr->data.video.pixel_format);
-        stride = buffer_ptr->data.video.width * 4;
+            buffer_ptr->data.video.info.pixel_format);
+        stride = buffer_ptr->data.video.info.width * 4;
       }
     }
     buffer_ptr->data.video.stride_bytes[0] = stride;
 
-    if (buffer_ptr->data.video.pixel_format == MINIAV_PIXEL_FORMAT_NV12 ||
-        buffer_ptr->data.video.pixel_format == MINIAV_PIXEL_FORMAT_NV21) {
+    if (buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_NV12 ||
+        buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_NV21) {
       buffer_ptr->data.video.planes[1] =
-          raw_buffer_data + (stride * buffer_ptr->data.video.height);
+          raw_buffer_data + (stride * buffer_ptr->data.video.info.height);
       buffer_ptr->data.video.stride_bytes[1] = stride;
-    } else if (buffer_ptr->data.video.pixel_format ==
+    } else if (buffer_ptr->data.video.info.pixel_format ==
                MINIAV_PIXEL_FORMAT_I420) {
       buffer_ptr->data.video.planes[1] =
-          raw_buffer_data + (stride * buffer_ptr->data.video.height);
+          raw_buffer_data + (stride * buffer_ptr->data.video.info.height);
       buffer_ptr->data.video.stride_bytes[1] = stride / 2;
       buffer_ptr->data.video.planes[2] =
-          raw_buffer_data + (stride * buffer_ptr->data.video.height) +
-          (stride / 2 * buffer_ptr->data.video.height / 2);
+          raw_buffer_data + (stride * buffer_ptr->data.video.info.height) +
+          (stride / 2 * buffer_ptr->data.video.info.height / 2);
       buffer_ptr->data.video.stride_bytes[2] = stride / 2;
     }
     buffer_ptr->data_size_bytes = current_length;

@@ -381,9 +381,9 @@ static void on_stream_process(void *userdata) {
   struct spa_data *d =
       &spa_buf->datas[0]; // Assuming single plane for simplicity first
 
-  miniav_buf->data.video.width = pw_ctx->configured_video_format.width;
-  miniav_buf->data.video.height = pw_ctx->configured_video_format.height;
-  miniav_buf->data.video.pixel_format = pw_ctx->configured_video_format.pixel_format;
+  miniav_buf->data.video.info.width = pw_ctx->configured_video_format.width;
+  miniav_buf->data.video.info.height = pw_ctx->configured_video_format.height;
+  miniav_buf->data.video.info.pixel_format = pw_ctx->configured_video_format.pixel_format;
 
   // TODO: Handle multi-planar formats (NV12, I420) correctly by inspecting
   // spa_buf->n_datas and spa_video_info for plane strides and offsets. For now,

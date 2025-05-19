@@ -54,10 +54,10 @@ void test_screen_buffer_callback(const MiniAVBuffer *buffer, void *user_data) {
     if (last_video_timestamp_us != 0 && buffer->timestamp_us > last_video_timestamp_us) {
       delta_ms = (double)(buffer->timestamp_us - last_video_timestamp_us) / 1000.0;
       printf("Video: +%.3f ms (Frame #%d, %ux%u, TS: %" PRIu64 "us)\n",
-             delta_ms, g_video_frame_count, buffer->data.video.width, buffer->data.video.height, buffer->timestamp_us);
+             delta_ms, g_video_frame_count, buffer->data.video.info.width, buffer->data.video.info.height, buffer->timestamp_us);
     } else {
       printf("Video: First frame (Frame #%d, %ux%u, TS: %" PRIu64 "us)\n",
-             g_video_frame_count, buffer->data.video.width, buffer->data.video.height, buffer->timestamp_us);
+             g_video_frame_count, buffer->data.video.info.width, buffer->data.video.info.height, buffer->timestamp_us);
     }
     last_video_timestamp_us = buffer->timestamp_us;
 

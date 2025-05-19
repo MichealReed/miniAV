@@ -1564,32 +1564,33 @@ static void on_video_stream_param_changed(void *data, uint32_t id,
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Screen: Video stream SPA_PARAM_Format received.");
 
-  enum spa_media_type parsed_media_type; // Local variable for media type
-  enum spa_media_subtype
-      parsed_media_subtype; // Local variable for media subtype
+  enum spa_media_type parsed_media_type;
+  enum spa_media_subtype parsed_media_subtype;
 
-  // Get the general media type and subtype first
   if (spa_format_parse(param, &parsed_media_type, &parsed_media_subtype) < 0) {
     miniav_log(
         MINIAV_LOG_LEVEL_ERROR,
         "PW Screen: Failed to parse media type/subtype for video format.");
+    // Ensure current format is marked as unknown to prevent using stale/invalid
+    // data
+    pctx->current_video_format_details.spa_format.format =
+        SPA_VIDEO_FORMAT_UNKNOWN;
+    pctx->current_video_format_details.derived_num_planes = 0;
+    pctx->parent_ctx->configured_video_format.pixel_format =
+        MINIAV_PIXEL_FORMAT_UNKNOWN;
+    pctx->parent_ctx->configured_video_format.width = 0;
+    pctx->parent_ctx->configured_video_format.height = 0;
     return;
   }
 
-  // Check if it's raw video
   if (parsed_media_type != SPA_MEDIA_TYPE_video ||
       parsed_media_subtype != SPA_MEDIA_SUBTYPE_raw) {
-    // Handle non-raw video (e.g., DSP format) or log as unexpected
     struct spa_video_info_dsp format_info_dsp = {0};
     if (spa_format_video_dsp_parse(param, &format_info_dsp) == 0) {
       miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "PW Screen: Parsed as DSP video format "
-                 "(unexpected for raw screen capture). Format: %u",
+                 "PW Screen: Parsed as DSP video format (unexpected for raw "
+                 "screen capture). Format: %u",
                  format_info_dsp.format);
-      // Mark our internal raw format as unknown since we didn't get raw
-      pctx->current_video_format_details.spa_format.format =
-          SPA_VIDEO_FORMAT_UNKNOWN;
-      pctx->current_video_format_details.derived_num_planes = 0;
     } else {
       miniav_log(
           MINIAV_LOG_LEVEL_ERROR,
@@ -1598,50 +1599,69 @@ static void on_video_stream_param_changed(void *data, uint32_t id,
           spa_debug_type_find_name(spa_type_media_type, parsed_media_type),
           spa_debug_type_find_name(spa_type_media_subtype,
                                    parsed_media_subtype));
-      pctx->current_video_format_details.spa_format.format =
-          SPA_VIDEO_FORMAT_UNKNOWN;
-      pctx->current_video_format_details.derived_num_planes = 0;
-      return;
     }
-  } else {
-    // It's raw video, parse the detailed parameters into our spa_video_info_raw
-    // struct
-    if (spa_format_video_raw_parse(
-            param, &pctx->current_video_format_details.spa_format) < 0) {
-      miniav_log(
-          MINIAV_LOG_LEVEL_ERROR,
-          "PW Screen: Failed to parse spa_video_info_raw for raw video.");
-      // Mark format as unknown if parsing failed
-      pctx->current_video_format_details.spa_format.format =
-          SPA_VIDEO_FORMAT_UNKNOWN;
-      pctx->current_video_format_details.derived_num_planes = 0;
-      return; // Critical error if we expected raw but couldn't parse details
-    }
+    pctx->current_video_format_details.spa_format.format =
+        SPA_VIDEO_FORMAT_UNKNOWN;
+    pctx->current_video_format_details.derived_num_planes = 0;
+    pctx->parent_ctx->configured_video_format.pixel_format =
+        MINIAV_PIXEL_FORMAT_UNKNOWN;
+    pctx->parent_ctx->configured_video_format.width = 0;
+    pctx->parent_ctx->configured_video_format.height = 0;
+    return;
   }
 
-  // Proceed only if we have a successfully parsed raw video format
+  // It's raw video, parse the detailed parameters
+  if (spa_format_video_raw_parse(
+          param, &pctx->current_video_format_details.spa_format) < 0) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: Failed to parse spa_video_info_raw for raw video.");
+    pctx->current_video_format_details.spa_format.format =
+        SPA_VIDEO_FORMAT_UNKNOWN;
+    pctx->current_video_format_details.derived_num_planes = 0;
+    pctx->parent_ctx->configured_video_format.pixel_format =
+        MINIAV_PIXEL_FORMAT_UNKNOWN;
+    pctx->parent_ctx->configured_video_format.width = 0;
+    pctx->parent_ctx->configured_video_format.height = 0;
+    return;
+  }
+
+  // Validate parsed dimensions
+  if (pctx->current_video_format_details.spa_format.size.width == 0 ||
+      pctx->current_video_format_details.spa_format.size.height == 0) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: Parsed video format has zero dimensions (%ux%u). "
+               "Treating as invalid.",
+               pctx->current_video_format_details.spa_format.size.width,
+               pctx->current_video_format_details.spa_format.size.height);
+    pctx->current_video_format_details.spa_format.format =
+        SPA_VIDEO_FORMAT_UNKNOWN; // Mark as invalid
+    pctx->current_video_format_details.derived_num_planes = 0;
+    pctx->parent_ctx->configured_video_format.pixel_format =
+        MINIAV_PIXEL_FORMAT_UNKNOWN;
+    pctx->parent_ctx->configured_video_format.width = 0;
+    pctx->parent_ctx->configured_video_format.height = 0;
+    return;
+  }
+
+  // Proceed only if we have a successfully parsed and validated raw video
+  // format
   if (pctx->current_video_format_details.spa_format.format !=
       SPA_VIDEO_FORMAT_UNKNOWN) {
     pctx->current_video_format_details.negotiated_modifier =
         pctx->current_video_format_details.spa_format.modifier;
 
-    // Derive number of planes based on the MiniAV pixel format
     MiniAVPixelFormat miniav_fmt = spa_video_format_to_miniav(
         pctx->current_video_format_details.spa_format.format);
     pctx->current_video_format_details.derived_num_planes =
         get_miniav_pixel_format_planes(miniav_fmt);
 
     miniav_log(MINIAV_LOG_LEVEL_INFO,
-               "PW Screen: Negotiated video format: %s (overall type: %s/%s), "
-               "%ux%u @ %u/%u fps, "
-               "derived_planes: %u, modifier: %" PRIu64,
-               spa_debug_type_find_name( // Specific raw format
+               "PW Screen: Negotiated video format: %s (MiniAV: %d), %ux%u @ "
+               "%u/%u fps, derived_planes: %u, modifier: %" PRIu64,
+               spa_debug_type_find_name(
                    spa_type_video_format,
                    pctx->current_video_format_details.spa_format.format),
-               spa_debug_type_find_name( // Overall media type
-                   spa_type_media_type, parsed_media_type),
-               spa_debug_type_find_name( // Overall media subtype
-                   spa_type_media_subtype, parsed_media_subtype),
+               miniav_fmt,
                pctx->current_video_format_details.spa_format.size.width,
                pctx->current_video_format_details.spa_format.size.height,
                pctx->current_video_format_details.spa_format.framerate.num,
@@ -1659,14 +1679,17 @@ static void on_video_stream_param_changed(void *data, uint32_t id,
         pctx->current_video_format_details.spa_format.framerate.num;
     pctx->parent_ctx->configured_video_format.frame_rate_denominator =
         pctx->current_video_format_details.spa_format.framerate.denom;
-  } else {
+    // output_preference is set by configure_x, not negotiated by PipeWire for
+    // video. It remains as requested by the user.
+  } else { // This case should ideally be caught by earlier checks if parse
+           // failed or dimensions were zero
     miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Video format is unknown or "
                                       "not usable after param changed.");
-    // Ensure parent context reflects this
     pctx->parent_ctx->configured_video_format.pixel_format =
         MINIAV_PIXEL_FORMAT_UNKNOWN;
+    pctx->parent_ctx->configured_video_format.width = 0;
+    pctx->parent_ctx->configured_video_format.height = 0;
     pctx->current_video_format_details.derived_num_planes = 0;
-    // Optionally clear other fields in configured_video_format
   }
 }
 
@@ -1755,14 +1778,9 @@ static void on_video_stream_process(void *data) {
     }
 
     // Populate MiniAVBuffer.data.video directly
-    miniav_buffer.data.video.pixel_format = spa_video_format_to_miniav(
-        pctx->current_video_format_details.spa_format.format);
-    miniav_buffer.data.video.width =
-        pctx->current_video_format_details.spa_format.size.width;
-    miniav_buffer.data.video.height =
-        pctx->current_video_format_details.spa_format.size.height;
-    // Strides for MiniAVBuffer are set below for CPU path. For DMABUF, they are
-    // implicit.
+    // Use the already updated parent_ctx->configured_video_format which
+    // reflects negotiated params
+    miniav_buffer.data.video.info = pctx->parent_ctx->configured_video_format;
 
     if (pctx->current_video_format_details.is_dmabuf &&
         (spa_buf->datas[0].type == SPA_DATA_DmaBuf ||
@@ -1804,14 +1822,14 @@ static void on_video_stream_process(void *data) {
       miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
 
       uint32_t num_miniav_planes =
-          get_miniav_pixel_format_planes(miniav_buffer.data.video.pixel_format);
+          get_miniav_pixel_format_planes(miniav_buffer.data.video.info.pixel_format);
 
-      if (num_miniav_planes == 0 && miniav_buffer.data.video.pixel_format !=
+      if (num_miniav_planes == 0 && miniav_buffer.data.video.info.pixel_format !=
                                         MINIAV_PIXEL_FORMAT_UNKNOWN) {
         miniav_log(MINIAV_LOG_LEVEL_WARN,
                    "PW Screen: CPU Video format %d resolved to 0 planes. Check "
                    "get_miniav_pixel_format_planes.",
-                   miniav_buffer.data.video.pixel_format);
+                   miniav_buffer.data.video.info.pixel_format);
         goto queue_and_continue_video;
       }
 
@@ -1834,33 +1852,33 @@ static void on_video_stream_process(void *data) {
               (uint8_t *)d_plane->data + d_plane->chunk->offset;
           miniav_buffer.data.video.stride_bytes[i] = d_plane->chunk->stride;
           if (d_plane->chunk->stride == 0 &&
-              miniav_buffer.data.video.pixel_format !=
+              miniav_buffer.data.video.info.pixel_format !=
                   MINIAV_PIXEL_FORMAT_MJPEG) {
             // For packed formats like BGRA, stride might be width * bpp if not
             // explicitly set. For MJPEG, stride is often 0 as it's a compressed
             // blob. This is a simplistic fallback, real stride calculation can
             // be complex.
-            if (miniav_buffer.data.video.pixel_format ==
+            if (miniav_buffer.data.video.info.pixel_format ==
                     MINIAV_PIXEL_FORMAT_BGRA32 ||
-                miniav_buffer.data.video.pixel_format ==
+                miniav_buffer.data.video.info.pixel_format ==
                     MINIAV_PIXEL_FORMAT_RGBA32 ||
-                miniav_buffer.data.video.pixel_format ==
+                miniav_buffer.data.video.info.pixel_format ==
                     MINIAV_PIXEL_FORMAT_ARGB32 ||
-                miniav_buffer.data.video.pixel_format ==
+                miniav_buffer.data.video.info.pixel_format ==
                     MINIAV_PIXEL_FORMAT_ABGR32) {
               miniav_buffer.data.video.stride_bytes[i] =
-                  miniav_buffer.data.video.width * 4;
-            } else if (miniav_buffer.data.video.pixel_format ==
+                  miniav_buffer.data.video.info.width * 4;
+            } else if (miniav_buffer.data.video.info.pixel_format ==
                            MINIAV_PIXEL_FORMAT_RGB24 ||
-                       miniav_buffer.data.video.pixel_format ==
+                       miniav_buffer.data.video.info.pixel_format ==
                            MINIAV_PIXEL_FORMAT_BGR24) {
               miniav_buffer.data.video.stride_bytes[i] =
-                  miniav_buffer.data.video.width * 3;
+                  miniav_buffer.data.video.info.width * 3;
             } else {
               miniav_log(MINIAV_LOG_LEVEL_WARN,
                          "PW Screen: CPU Video buffer plane %u has stride 0 "
                          "from chunk for format %d. Data might be incorrect.",
-                         i, miniav_buffer.data.video.pixel_format);
+                         i, miniav_buffer.data.video.info.pixel_format);
             }
           }
           total_size += d_plane->chunk->size; // Sum actual chunk sizes from PW
@@ -1907,13 +1925,10 @@ static void on_video_stream_process(void *data) {
     payload_alloc = NULL; // Callback now owns the payload via internal_handle
 
   queue_and_continue_video:
-    if (payload_alloc) { // If we allocated but didn't send to callback (e.g.
-                         // goto)
+    if (payload_alloc) {
       miniav_free(payload_alloc);
     }
     pw_stream_queue_buffer(pctx->video_stream, pw_buf);
-    pctx->parent_ctx->configured_audio_format.sample_rate =
-        pctx->current_audio_format.rate;
   }
 }
 

@@ -40,6 +40,7 @@ typedef struct PipeWireScreenPlatformContext {
   GCancellable *cancellable;       // Add this
   char *portal_session_handle_str; // Add this
   char *portal_request_handle_str; // Add this
+  guint current_request_subscription_id;
 
   MiniAVBufferCallback app_callback_pending; // Add this
   void *app_callback_user_data_pending;      // Add this

@@ -434,8 +434,8 @@ pw_screen_get_default_formats(const char *device_id,
   if (video_format_out) {
     video_format_out->pixel_format =
         MINIAV_PIXEL_FORMAT_BGRA32; // Common, good quality default
-    video_format_out->width = 0;  // Request native/negotiated width
-    video_format_out->height = 0; // Request native/negotiated height
+    video_format_out->width = 0;    // Request native/negotiated width
+    video_format_out->height = 0;   // Request native/negotiated height
     video_format_out->frame_rate_numerator = 30; // Common default FPS
     video_format_out->frame_rate_denominator = 1;
     video_format_out->output_preference =
@@ -448,10 +448,11 @@ pw_screen_get_default_formats(const char *device_id,
     audio_format_out->sample_rate = 48000;
     audio_format_out->channels = 2;
   }
-  miniav_log(MINIAV_LOG_LEVEL_INFO, // Changed to INFO as this is important behavior
-             "PW Screen: GetDefaultFormats provides common placeholders. "
-             "Resolution 0x0 requests native/negotiated size. "
-             "Actual formats depend on source negotiation after StartCapture.");
+  miniav_log(
+      MINIAV_LOG_LEVEL_INFO, // Changed to INFO as this is important behavior
+      "PW Screen: GetDefaultFormats provides common placeholders. "
+      "Resolution 0x0 requests native/negotiated size. "
+      "Actual formats depend on source negotiation after StartCapture.");
   return MINIAV_SUCCESS;
 }
 
@@ -799,115 +800,67 @@ pw_screen_configure_region(struct MiniAVScreenContext *ctx,
   return MINIAV_SUCCESS;
 }
 
-static void on_portal_start_response(PipeWireScreenPlatformContext *pctx,
-                                     GVariant *results) {
-  if (!results) {
+static void on_portal_request_response(GObject *source_object,
+                                       GAsyncResult *res, gpointer user_data) {
+  PipeWireScreenPlatformContext *pctx =
+      (PipeWireScreenPlatformContext *)user_data;
+  GError *error = NULL;
+  GVariant *result_variant = g_dbus_connection_call_finish(
+      G_DBUS_CONNECTION(source_object), res, &error);
+
+  if (error) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: Portal Start method failed (no results variant).");
+               "PW Screen: D-Bus request call failed: %s", error->message);
     pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
-    return;
-  }
-
-  GVariant *streams_array_variant = NULL;
-
-  // The 'results' GVariant is a dictionary. We need to find the 'streams' key.
-  // Corrected g_variant_lookup format string
-  if (!g_variant_lookup(results, "streams",
-                        "a(ua{sv})", // Removed '@' which is for maybe types
-                        &streams_array_variant)) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: 'streams' key (type a(ua{sv})) not found in portal "
-               "Start response dict.");
-    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
-    if (streams_array_variant)
-      g_variant_unref(streams_array_variant);
-    return;
-  }
-
-  if (!streams_array_variant) { // Should not happen if lookup succeeded, but
-                                // defensive
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: 'streams' variant is NULL after lookup in portal "
-               "Start response.");
-    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
-    return;
-  }
-
-  GVariantIter stream_iter;
-  guint32 stream_node_id_temp;
-  GVariant *stream_props_dict_variant;
-
-  g_variant_iter_init(&stream_iter, streams_array_variant);
-  bool video_node_found = false;
-  // bool audio_node_found = false; // If expecting separate audio stream
-
-  // Iterate through the streams array
-  while (g_variant_iter_next(&stream_iter, "(u@a{sv})", &stream_node_id_temp,
-                             &stream_props_dict_variant)) {
-    // For simplicity, assume the first stream is video.
-    // A robust implementation would check properties in
-    // stream_props_dict_variant (e.g., for a "purpose" or "type" key).
-    if (!video_node_found) {
-      pctx->video_node_id = stream_node_id_temp;
-      miniav_log(MINIAV_LOG_LEVEL_INFO,
-                 "PW Screen: Portal provided video stream node ID: %u",
-                 pctx->video_node_id);
-      video_node_found = true;
+    g_error_free(error);
+    if (result_variant)
+      g_variant_unref(result_variant);
+    // Potentially wake up the loop or signal failure if blocking
+    if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
+      write(pctx->wakeup_pipe[1], "f", 1); // Indicate failure
     }
-    // Example: Check for audio stream if portal provides it separately
-    // const char* purpose = NULL;
-    // if (g_variant_lookup(stream_props_dict_variant, "purpose", "s",
-    // &purpose)) {
-    //    if (strcmp(purpose, "audio") == 0 && !audio_node_found) {
-    //        pctx->audio_node_id = stream_node_id_temp;
-    //        audio_node_found = true;
-    //        miniav_log(MINIAV_LOG_LEVEL_INFO, "PW Screen: Portal provided
-    //        audio stream node ID: %u", pctx->audio_node_id);
-    //    }
-    //    g_free((void*)purpose);
-    // }
-    g_variant_unref(
-        stream_props_dict_variant); // Unref the dict for this stream entry
-  }
-  g_variant_unref(streams_array_variant); // Unref the main streams array
-
-  if (!video_node_found) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: No video stream node ID found in portal response.");
-    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
     return;
   }
 
-  if (pctx->audio_requested_by_user &&
-      pctx->video_node_id != PW_ID_ANY /*&& !audio_node_found*/) {
-    // If portal doesn't explicitly give a separate audio stream,
-    // it might be muxed with video or available from the same node.
-    // Or, a common pattern is to use a specific well-known node for desktop
-    // audio (e.g. @DEFAULT_AUDIO_SINK@.monitor). For now, we'll try to connect
-    // to the video node for audio if requested and no separate audio node was
-    // found. This is a simplification and might not always work.
-    // pctx->audio_node_id = pctx->video_node_id; // Simplification
-    miniav_log(
-        MINIAV_LOG_LEVEL_WARN,
-        "PW Screen: Audio requested. Portal did not explicitly provide a "
-        "separate audio stream node. "
-        "Audio capture from a specific node is not yet fully implemented here. "
-        "Attempting to use a placeholder or relying on PipeWire to pick a "
-        "default if audio_node_id remains PW_ID_ANY.");
-    // If you know the portal provides audio on the *same* node as video:
-    // pctx->audio_node_id = pctx->video_node_id;
-    // Or if you need to find a generic desktop audio source:
-    // pctx->audio_node_id = find_desktop_audio_node_id(pctx->core); //
-    // Hypothetical function For now, if audio_node_id is still PW_ID_ANY,
-    // PipeWire might pick a default if stream is connected to PW_ID_ANY.
-    // However, screen capture portals usually provide specific nodes.
-    // Let's assume for now the portal *should* have provided an audio node if
-    // audio was part of the selection. If not, we might have to skip audio or
-    // use a fallback. For this example, we'll proceed and let audio stream
-    // connection fail if audio_node_id is not valid.
+  char *request_handle_path_temp;
+  g_variant_get(result_variant, "(o)", &request_handle_path_temp);
+  // It's crucial to dup before unreffing result_variant if
+  // request_handle_path_temp points into it
+  char *request_handle_path = g_strdup(request_handle_path_temp);
+  g_variant_unref(result_variant); // Unref the variant from call_finish
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: D-Bus request initiated, handle: %s. Waiting for "
+             "Response signal.",
+             request_handle_path);
+
+  // Unsubscribe any previous request signal before subscribing to a new one
+  if (pctx->current_request_subscription_id > 0) {
+    g_dbus_connection_signal_unsubscribe(pctx->dbus_conn,
+                                         pctx->current_request_subscription_id);
+    pctx->current_request_subscription_id = 0;
   }
 
-  pw_screen_setup_pipewire_streams(pctx);
+  pctx->current_request_subscription_id = g_dbus_connection_signal_subscribe(
+      pctx->dbus_conn, XDP_BUS_NAME, XDP_IFACE_REQUEST, "Response",
+      request_handle_path,      // Object path of the request
+      NULL,                     // arg0 filter
+      G_DBUS_SIGNAL_FLAGS_NONE, // CORRECTED FLAG
+      (GDBusSignalCallback)on_portal_request_signal_response,
+      pctx, // Pass pctx as user_data
+      NULL);
+
+  if (pctx->current_request_subscription_id == 0) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: Failed to subscribe to Response signal for %s",
+               request_handle_path);
+    // Handle error: subscription failed
+    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
+    if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
+      write(pctx->wakeup_pipe[1], "f", 1);
+    }
+  }
+  g_free(request_handle_path); // Free the duplicated path
 }
 
 static void
@@ -1012,53 +965,82 @@ on_portal_create_session_response(PipeWireScreenPlatformContext *pctx,
       (GAsyncReadyCallback)on_portal_request_response, pctx);
 }
 
-static void on_portal_request_response(GObject *source_object,
-                                       GAsyncResult *res, gpointer user_data) {
+static void on_portal_request_signal_response(
+    GDBusConnection *connection, const gchar *sender_name,
+    const gchar *object_path, // Path of the Request object
+    const gchar *interface_name, const gchar *signal_name,
+    GVariant *parameters, // (uint response_code, dict results)
+    gpointer user_data) {
   PipeWireScreenPlatformContext *pctx =
       (PipeWireScreenPlatformContext *)user_data;
-  GError *error = NULL;
-  GVariant *result_variant = g_dbus_connection_call_finish(
-      G_DBUS_CONNECTION(source_object), res, &error);
 
-  if (error) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: D-Bus request call failed: %s", error->message);
-    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
-    g_error_free(error);
-    if (result_variant)
-      g_variant_unref(result_variant);
+  // Unsubscribe now that we've received the signal
+  if (pctx->current_request_subscription_id > 0) {
+    g_dbus_connection_signal_unsubscribe(connection,
+                                         pctx->current_request_subscription_id);
+    pctx->current_request_subscription_id = 0; // Clear it
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW Screen: Received Response signal for %s but no valid "
+               "subscription ID was stored.",
+               object_path);
+  }
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: Received Response signal for request object %s",
+             object_path);
+
+  guint response_code;
+  GVariant *results_dict = NULL;
+  // The @a{sv} means results_dict can be NULL if not present in the signal
+  g_variant_get(parameters, "(u@a{sv})", &response_code, &results_dict);
+
+  if (response_code != 0) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW Screen: Portal request %s failed/cancelled with code %u.",
+               object_path, response_code);
+    pctx->last_error = (response_code == 1) ? MINIAV_ERROR_USER_CANCELLED
+                                            : MINIAV_ERROR_PORTAL_FAILED;
+    if (results_dict) {
+      g_variant_unref(results_dict);
+    }
+    // Wake up the loop or signal failure if blocking
+    if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
+      write(pctx->wakeup_pipe[1], "f", 1); // Indicate failure
+    }
     return;
   }
 
-  char *request_handle_path_temp;
-  g_variant_get(result_variant, "(o)", &request_handle_path_temp);
-  g_variant_unref(result_variant); // Unref the variant from call_finish
+  // Determine which step this response corresponds to
+  // Ensure pctx->portal_request_handle_str is not NULL before g_str_has_prefix
+  if (pctx->portal_request_handle_str &&
+      g_str_has_prefix(pctx->portal_request_handle_str, "miniav_select_req")) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW Screen: Processing SelectSources response via signal.");
+    on_portal_select_sources_response(pctx, results_dict);
+  } else if (pctx->portal_request_handle_str &&
+             g_str_has_prefix(pctx->portal_request_handle_str,
+                              "miniav_start_req")) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW Screen: Processing Start response via signal.");
+    on_portal_start_response(pctx, results_dict);
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW Screen: Unknown portal request response for token %s (or "
+               "token is NULL)",
+               pctx->portal_request_handle_str ? pctx->portal_request_handle_str
+                                               : "(null)");
+    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
+    if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
+      write(pctx->wakeup_pipe[1], "f", 1);
+    }
+  }
 
-  char *request_handle_path =
-      g_strdup(request_handle_path_temp); // Dup for signal subscription
-  // request_handle_path_temp is now invalid as result_variant is unreffed.
-
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "PW Screen: D-Bus request initiated, handle: %s. Waiting for "
-             "Response signal.",
-             request_handle_path);
-
-  g_dbus_connection_signal_subscribe(
-      pctx->dbus_conn, XDP_BUS_NAME, XDP_IFACE_REQUEST, "Response",
-      request_handle_path, // Object path of the request
-      NULL,                // arg0 filter
-
-      (GDBusSignalFlags)(G_DBUS_SIGNAL_FLAGS_NO_MATCH_RULE), // Potentially add
-                                                             // G_DBUS_SIGNAL_FLAGS_ONE_SHOT
-                                                             // if GLib is new
-                                                             // enough and it
-                                                             // works
-      (GDBusSignalCallback)on_portal_request_signal_response,
-      pctx,  // Pass pctx as user_data
-      NULL); // No GDestroyNotify needed for pctx if it lives long enough
-  g_free(request_handle_path);
+  if (results_dict) { // results_dict was new ref from g_variant_get if @a{sv}
+                      // was present
+    g_variant_unref(results_dict);
+  }
 }
-
 static void on_portal_request_signal_response(
     GDBusConnection *connection, const gchar *sender_name,
     const gchar *object_path, // Path of the Request object
@@ -1116,6 +1098,111 @@ static void on_portal_request_signal_response(
 
   if (results_dict)
     g_variant_unref(results_dict);
+}
+
+static void on_portal_start_response(
+    PipeWireScreenPlatformContext *pctx,
+    GVariant *results) { // 'results' here is the a{sv} from the Response signal
+  if (!pctx) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: Portal Start response called with NULL pctx.");
+    if (results)
+      g_variant_unref(
+          results); // Should be unreffed by caller if it's a new ref
+    return;
+  }
+
+  if (!results) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: Portal Start method response processing called with "
+               "NULL results dict.");
+    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
+    if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
+      write(pctx->wakeup_pipe[1], "f", 1); // Indicate failure
+    }
+    return;
+  }
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: Processing portal Start response.");
+
+  GVariant *streams_array_variant = NULL;
+  gboolean video_node_found = FALSE;
+  gboolean audio_node_found = FALSE;
+
+  // The "streams" key contains an array of (uint32 node_id, dict properties)
+  // The portal spec says:
+  // "The PipeWire stream node ID for the video stream is the first element in
+  // the streams array.
+  //  If audio is also captured, the PipeWire stream node ID for the audio
+  //  stream is the second element in the streams array."
+  if (g_variant_lookup(results, "streams", "a(ua{sv})",
+                       &streams_array_variant) &&
+      streams_array_variant) {
+    GVariantIter stream_iter;
+    g_variant_iter_init(&stream_iter, streams_array_variant);
+
+    guint32 stream_node_id_temp;
+    GVariant *stream_props_dict_variant; // a{sv}
+
+    // Get the first stream (video)
+    if (g_variant_iter_next(&stream_iter, "(ua{sv})", &stream_node_id_temp,
+                            &stream_props_dict_variant)) {
+      pctx->video_node_id = stream_node_id_temp;
+      video_node_found = TRUE;
+      miniav_log(MINIAV_LOG_LEVEL_INFO,
+                 "PW Screen: Found video stream node ID: %u",
+                 pctx->video_node_id);
+      if (stream_props_dict_variant) { // It's a new ref from iter_next
+        // You could inspect stream_props_dict_variant if needed, e.g., for
+        // "media.type" For now, we assume the first is video.
+        g_variant_unref(stream_props_dict_variant);
+      }
+
+      // Get the second stream (audio, if present and requested)
+      if (pctx->audio_requested_by_user) {
+        if (g_variant_iter_next(&stream_iter, "(ua{sv})", &stream_node_id_temp,
+                                &stream_props_dict_variant)) {
+          pctx->audio_node_id = stream_node_id_temp;
+          audio_node_found = TRUE;
+          miniav_log(MINIAV_LOG_LEVEL_INFO,
+                     "PW Screen: Found audio stream node ID: %u",
+                     pctx->audio_node_id);
+          if (stream_props_dict_variant) {
+            g_variant_unref(stream_props_dict_variant);
+          }
+        } else {
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "PW Screen: Audio was requested, but only one stream "
+                     "(video) provided by portal.");
+          pctx->audio_node_id =
+              PW_ID_ANY; // Ensure it's marked as not available
+        }
+      }
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "PW Screen: No streams found in portal Start response.");
+    }
+    g_variant_unref(
+        streams_array_variant); // streams_array_variant was new ref from lookup
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: 'streams' key (type a(ua{sv})) not found or NULL in "
+               "portal Start response dict.");
+  }
+
+  if (!video_node_found) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: Did not find a video node ID from portal.");
+    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
+    if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
+      write(pctx->wakeup_pipe[1], "f", 1);
+    }
+    return;
+  }
+
+  // If we got at least a video node, proceed to set up PipeWire
+  pw_screen_setup_pipewire_streams(pctx);
 }
 
 static void

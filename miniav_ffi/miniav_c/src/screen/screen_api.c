@@ -452,14 +452,6 @@ MiniAVResultCode MiniAV_Screen_StartCapture(MiniAVScreenContext *ctx,
     return MINIAV_ERROR_ALREADY_RUNNING;
   }
 
-  if (ctx->configured_video_format.width == 0 ||
-      ctx->configured_video_format.height == 0) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "Screen capture not configured (generic check). Call a "
-               "configure function first.");
-    return MINIAV_ERROR_NOT_INITIALIZED;
-  }
-
   ctx->app_callback = callback;
   ctx->app_callback_user_data = user_data;
 

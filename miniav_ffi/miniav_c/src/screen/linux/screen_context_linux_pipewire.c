@@ -931,7 +931,11 @@ on_portal_create_session_response(PipeWireScreenPlatformContext *pctx,
     return;
   }
 
-  g_variant_get(results_variant, "(o)", &pctx->portal_session_handle_str);
+  char *session_handle_tmp = NULL;
+  g_variant_get(results_variant, "(o)", &session_handle_tmp);
+  g_free(pctx->portal_session_handle_str); // Free old if set
+  pctx->portal_session_handle_str = g_strdup(session_handle_tmp);
+  g_free(session_handle_tmp); // Free the temporary string
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: Portal session created: %s",
              pctx->portal_session_handle_str);
 

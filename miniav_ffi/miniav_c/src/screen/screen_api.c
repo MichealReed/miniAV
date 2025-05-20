@@ -5,19 +5,14 @@
 
 // Platform-specific includes and external declarations for backend table
 #ifdef _WIN32
-#ifdef USE_WGC // WGC is preferred, so its include might come first if it
-               // matters for declarations
 #include "windows/screen_context_win_wgc.h"
 extern const ScreenContextInternalOps g_screen_ops_win_wgc;
 extern MiniAVResultCode
 miniav_screen_context_platform_init_windows_wgc(MiniAVScreenContext *ctx);
-#endif
-#ifdef USE_DXGI
 #include "windows/screen_context_win_dxgi.h"
 extern const ScreenContextInternalOps g_screen_ops_win_dxgi;
 extern MiniAVResultCode
 miniav_screen_context_platform_init_windows_dxgi(MiniAVScreenContext *ctx);
-#endif
 #endif
 #ifdef __linux__
 #include "linux/screen_context_linux_pipewire.h" // Ensure this header declares the ops and init function
@@ -34,18 +29,10 @@ miniav_screen_context_platform_init_linux_pipewire(MiniAVScreenContext *ctx);
 // For Windows, WGC is listed first to make it the default.
 static const MiniAVScreenBackend g_screen_backends[] = {
 #ifdef _WIN32
-#ifdef USE_WGC
     {"Windows Graphics Capture", &g_screen_ops_win_wgc,
-     miniav_screen_context_platform_init_windows_wgc}, // This function now acts
-                                                       // as
-                                                       // platform_init_for_selection
-#endif
-#ifdef USE_DXGI
+     miniav_screen_context_platform_init_windows_wgc}, 
     {"DXGI", &g_screen_ops_win_dxgi,
-     miniav_screen_context_platform_init_windows_dxgi}, // This function now
-                                                        // acts as
-                                                        // platform_init_for_selection
-#endif
+     miniav_screen_context_platform_init_windows_dxgi}, 
 #endif
 #ifdef __linux__
     {"Pipewire", &g_screen_ops_linux_pipewire,

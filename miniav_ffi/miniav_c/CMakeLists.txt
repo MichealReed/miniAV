@@ -6,10 +6,10 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
 
 # --- Module Enable Options ---
-option(MINIAV_ENABLE_AUDIO "Enable Audio Module (miniaudio)" OFF)
-option(MINIAV_ENABLE_CAMERA "Enable Camera Capture Module" OFF)
+option(MINIAV_ENABLE_AUDIO "Enable Audio Module (miniaudio)" ON)
+option(MINIAV_ENABLE_CAMERA "Enable Camera Capture Module" ON)
 option(MINIAV_ENABLE_SCREEN "Enable Screen Capture Module" ON)
-option(MINIAV_ENABLE_LOOPBACK "Enable Audio Loopback Module" OFF)
+option(MINIAV_ENABLE_LOOPBACK "Enable Audio Loopback Module" ON)
 
 # --- Backend Options ---
 # Windows Screen Capture Backends

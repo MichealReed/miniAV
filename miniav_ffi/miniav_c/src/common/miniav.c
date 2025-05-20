@@ -1,9 +1,9 @@
 #include "../include/miniav.h"
 #include "../camera/camera_context.h" // For MiniAVCameraContext and ops (for camera case)
 #include "../include/miniav_buffer.h" // For MiniAVNativeBufferInternalPayload
+#include "../screen/screen_context.h" // Add when screen capture is
 #include "miniav_logging.h"
 #include "miniav_utils.h"
-#include "../screen/screen_context.h" // Add when screen capture is
 // implemented #include "../audio/audio_context.h"   // Add if audio needs
 // explicit buffer release
 
@@ -110,32 +110,23 @@ MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
     MiniAVScreenContext *screen_ctx =
         (MiniAVScreenContext *)payload->context_owner;
     if (screen_ctx && screen_ctx->ops && screen_ctx->ops->release_buffer) {
-      res = screen_ctx->ops->release_buffer(screen_ctx,
-                                            payload->native_resource_ptr);
+      res = screen_ctx->ops->release_buffer(screen_ctx, payload);
     } else {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "Invalid screen context or release_buffer op for payload %p.",
                  payload);
       res = MINIAV_ERROR_INVALID_HANDLE;
     }
-  } else {
+  } else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_AUDIO) {
+    miniav_free(payload->native_resource_ptr);
+    res = MINIAV_SUCCESS;
+  }
+   else {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "Unsupported payload handle_type: %d for payload %p.",
                payload->handle_type, payload);
     res = MINIAV_ERROR_INVALID_HANDLE; // Or a more specific error
   }
-
-  // The actual miniav_free of the 'payload' (MiniAVNativeBufferInternalPayload)
-  // itself should happen in the platform-specific release_buffer implementation
-  // if that platform allocated it (e.g. dxgi_release_buffer frees the
-  // DXGIFrameReleasePayload and then the MiniAVNativeBufferInternalPayload).
-  // OR, if MiniAV_ReleaseBuffer is always responsible for freeing the 'payload'
-  // wrapper, it should be done here *after* the platform-specific release.
-  // Based on current dxgi_capture_thread_proc, the
-  // MiniAVNativeBufferInternalPayload and the DXGIFrameReleasePayload are
-  // allocated there and passed up. dxgi_release_buffer frees
-  // DXGIFrameReleasePayload. It seems MiniAV_ReleaseBuffer should be
-  // responsible for freeing the MiniAVNativeBufferInternalPayload.
 
   if (res == MINIAV_SUCCESS) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
@@ -170,8 +161,7 @@ MiniAVResultCode MiniAV_FreeDeviceList(MiniAVDeviceInfo *devices,
 }
 
 // Helper to free the list allocated by GetSupportedFormats
-MiniAVResultCode MiniAV_FreeFormatList(void *formats,
-                                       uint32_t count) {
+MiniAVResultCode MiniAV_FreeFormatList(void *formats, uint32_t count) {
   MINIAV_UNUSED(count); // count might be useful if allocation was complex
   if (formats) {
     miniav_free(formats);

@@ -26,6 +26,7 @@
 #include <gio/gio.h>  // For D-Bus (GDBus)
 #include <glib.h>     // For GVariant, GError, etc.
 #include <inttypes.h> // For PRIu64
+#include <pthread.h>
 #include <string.h>   // For memset, strcmp
 #include <sys/mman.h> // For shm, if using DMABUF or similar
 #include <unistd.h>   // For pipe, read, write, close, getpid
@@ -37,6 +38,14 @@
 #define XDP_IFACE_REQUEST "org.freedesktop.portal.Request"
 #define XDP_IFACE_SESSION "org.freedesktop.portal.Session"
 
+static GMainLoop *gloop = NULL;
+static pthread_t gloop_thread;
+
+static void *glib_main_loop_thread(void *arg) {
+  g_main_loop_run(gloop);
+  return NULL;
+}
+
 // --- Helper to convert formats (Simplified) ---
 static enum spa_video_format
 miniav_video_format_to_spa(MiniAVPixelFormat pixel_fmt) {
@@ -47,6 +56,8 @@ miniav_video_format_to_spa(MiniAVPixelFormat pixel_fmt) {
     return SPA_VIDEO_FORMAT_RGBA;
   case MINIAV_PIXEL_FORMAT_I420:
     return SPA_VIDEO_FORMAT_I420;
+      case MINIAV_PIXEL_FORMAT_BGRX32: // Add this if you have it
+    return SPA_VIDEO_FORMAT_BGRx;
   // Add more mappings
   default:
     return SPA_VIDEO_FORMAT_UNKNOWN;
@@ -62,6 +73,8 @@ spa_video_format_to_miniav(enum spa_video_format spa_fmt) {
     return MINIAV_PIXEL_FORMAT_RGBA32;
   case SPA_VIDEO_FORMAT_I420:
     return MINIAV_PIXEL_FORMAT_I420;
+      case SPA_VIDEO_FORMAT_BGRx:
+    return MINIAV_PIXEL_FORMAT_BGRX32;
   // Add more mappings
   default:
     return MINIAV_PIXEL_FORMAT_UNKNOWN;
@@ -118,8 +131,8 @@ static uint32_t get_miniav_pixel_format_planes(MiniAVPixelFormat pixel_fmt) {
   case MINIAV_PIXEL_FORMAT_BGRA32:
   case MINIAV_PIXEL_FORMAT_ARGB32:
   case MINIAV_PIXEL_FORMAT_ABGR32:
-  case MINIAV_PIXEL_FORMAT_MJPEG: // MJPEG is single buffer/plane in this
-                                  // context
+  case MINIAV_PIXEL_FORMAT_MJPEG:
+  case MINIAV_PIXEL_FORMAT_BGRX32:
     return 1;
   case MINIAV_PIXEL_FORMAT_UNKNOWN:
   default:
@@ -259,6 +272,13 @@ pw_screen_init_platform(struct MiniAVScreenContext *ctx) {
   }
 
   pctx->context = pw_context_new(pw_main_loop_get_loop(pctx->loop), NULL, 0);
+  // Create and run a GLib main loop to process asynchronous D-Bus calls.
+  gloop = g_main_loop_new(NULL, FALSE);
+  if (pthread_create(&gloop_thread, NULL, glib_main_loop_thread, NULL) != 0) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: Failed to create GLib main loop thread.");
+    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+  }
   if (!pctx->context) {
     pw_main_loop_destroy(pctx->loop);
     g_object_unref(pctx->dbus_conn);
@@ -819,28 +839,40 @@ static void on_portal_request_response(GObject *source_object,
       (PipeWireScreenPlatformContext *)user_data;
   GError *error = NULL;
   GVariant *result_variant = g_dbus_connection_call_finish(
-      G_DBUS_CONNECTION(source_object), res, &error);
+    G_DBUS_CONNECTION(source_object), res, &error);
 
-  if (error) {
+if (error) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "PW Screen: D-Bus request call failed: %s", error->message);
     pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
     g_error_free(error);
     if (result_variant)
-      g_variant_unref(result_variant);
-    // Potentially wake up the loop or signal failure if blocking
+        g_variant_unref(result_variant);
     if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
-      write(pctx->wakeup_pipe[1], "f", 1); // Indicate failure
+        write(pctx->wakeup_pipe[1], "f", 1);
     }
     return;
-  }
+}
 
-  char *request_handle_path_temp;
-  g_variant_get(result_variant, "(o)", &request_handle_path_temp);
-  // It's crucial to dup before unreffing result_variant if
-  // request_handle_path_temp points into it
-  char *request_handle_path = g_strdup(request_handle_path_temp);
-  g_variant_unref(result_variant); // Unref the variant from call_finish
+const gchar *variant_type = g_variant_get_type_string(result_variant);
+if (g_strcmp0(variant_type, "(o)") != 0) {
+    gchar *dbg_str = g_variant_print(result_variant, TRUE);
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+        "PW Screen: Unexpected D-Bus reply type: %s, value: %s",
+        variant_type, dbg_str);
+    g_free(dbg_str);
+    g_variant_unref(result_variant);
+    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
+    if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
+        write(pctx->wakeup_pipe[1], "f", 1);
+    }
+    return;
+}
+
+char *request_handle_path_temp;
+g_variant_get(result_variant, "(o)", &request_handle_path_temp);
+char *request_handle_path = g_strdup(request_handle_path_temp);
+g_variant_unref(result_variant);
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Screen: D-Bus request initiated, handle: %s. Waiting for "
@@ -849,19 +881,20 @@ static void on_portal_request_response(GObject *source_object,
 
   // Unsubscribe any previous request signal before subscribing to a new one
   if (pctx->current_request_signal_subscription_id > 0) {
-    g_dbus_connection_signal_unsubscribe(pctx->dbus_conn,
-                                         pctx->current_request_signal_subscription_id);
+    g_dbus_connection_signal_unsubscribe(
+        pctx->dbus_conn, pctx->current_request_signal_subscription_id);
     pctx->current_request_signal_subscription_id = 0;
   }
 
-  pctx->current_request_signal_subscription_id = g_dbus_connection_signal_subscribe(
-      pctx->dbus_conn, XDP_BUS_NAME, XDP_IFACE_REQUEST, "Response",
-      request_handle_path,      // Object path of the request
-      NULL,                     // arg0 filter
-      G_DBUS_SIGNAL_FLAGS_NONE, // CORRECTED FLAG
-      (GDBusSignalCallback)on_portal_request_signal_response,
-      pctx, // Pass pctx as user_data
-      NULL);
+  pctx->current_request_signal_subscription_id =
+      g_dbus_connection_signal_subscribe(
+          pctx->dbus_conn, XDP_BUS_NAME, XDP_IFACE_REQUEST, "Response",
+          request_handle_path,      // Object path of the request
+          NULL,                     // arg0 filter
+          G_DBUS_SIGNAL_FLAGS_NONE, // CORRECTED FLAG
+          (GDBusSignalCallback)on_portal_request_signal_response,
+          pctx, // Pass pctx as user_data
+          NULL);
 
   if (pctx->current_request_signal_subscription_id == 0) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
@@ -1012,8 +1045,6 @@ static void on_portal_request_signal_response(
                response_code);
     pctx->last_error = (response_code == 1) ? MINIAV_ERROR_USER_CANCELLED
                                             : MINIAV_ERROR_PORTAL_FAILED;
-    if (results_dict)
-      g_variant_unref(results_dict);
 
     // TODO: Notify application of failure, clean up state
     pctx->current_portal_op_state = PORTAL_OP_STATE_NONE;
@@ -1034,12 +1065,23 @@ static void on_portal_request_signal_response(
                pctx->current_portal_request_token_str
                    ? pctx->current_portal_request_token_str
                    : "N/A");
-    char *session_handle_temp = NULL;
-    if (g_variant_lookup(results_dict, "session_handle", "o",
-                         &session_handle_temp)) {
+    const char *session_handle_temp = NULL; // MODIFIED: char* to const char*
+    gboolean found_handle = FALSE;
+
+    // Try to look up as object path first (standard)
+    if (g_variant_lookup(results_dict, "session_handle", "o", &session_handle_temp)) {
+        found_handle = TRUE;
+    }
+    // If not found as object path, try as string (for robustness)
+    else if (g_variant_lookup(results_dict, "session_handle", "s", &session_handle_temp)) {
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW Screen: 'session_handle' found as type 's' (string), though 'o' (object path) was expected.");
+        found_handle = TRUE;
+    }
+
+    if (found_handle && session_handle_temp != NULL) {
       g_free(pctx->portal_session_handle_str);
       pctx->portal_session_handle_str = g_strdup(session_handle_temp);
-      // session_handle_temp is owned by results_dict, g_strdup copies.
       miniav_log(MINIAV_LOG_LEVEL_INFO, "PW Screen: Portal session created: %s",
                  pctx->portal_session_handle_str);
 
@@ -1064,8 +1106,20 @@ static void on_portal_request_signal_response(
       portal_initiate_select_sources(pctx); // Proceed to next step
     } else {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "PW Screen: 'session_handle' (type 'o') not found in "
+                 "PW Screen: 'session_handle' (type 'o' or 's') not found or is NULL in "
                  "CreateSession response dict.");
+      // Optional: Log the actual type for detailed debugging if the key exists
+      if (results_dict && g_variant_is_container(results_dict)) {
+          GVariant *value = g_variant_lookup_value(results_dict, "session_handle", NULL);
+          if (value) {
+              const char* type_str = g_variant_get_type_string(value);
+              miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: 'session_handle' exists, actual GVariant type is '%s'.", type_str);
+              // If it's a string-like type, you could try to print its value too, e.g. with g_variant_get_string(value, NULL)
+              g_variant_unref(value);
+          } else {
+              miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: 'session_handle' key truly does not exist in results_dict.");
+          }
+      }
       pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
       // TODO: Cleanup
     }
@@ -1090,57 +1144,59 @@ static void on_portal_request_signal_response(
                    ? pctx->current_portal_request_token_str
                    : "N/A");
 
-    GVariant *streams_array_variant = NULL;
+    if (results_dict) {
+      gchar *results_str = g_variant_print(results_dict, TRUE);
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW Screen: Full Start response results_dict: %s", results_str);
+      g_free(results_str);
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "PW Screen: Start response results_dict is NULL, but response_code was success.");
+    }
+
+           GVariant *streams_variant = g_variant_lookup_value(results_dict, "streams", NULL);
     gboolean video_node_found = FALSE;
-    // gboolean audio_node_found = FALSE; // Keep for future use
+    if (streams_variant) {
+      // Unwrap if it's a variant
+      if (g_variant_is_of_type(streams_variant, G_VARIANT_TYPE_VARIANT)) {
+        GVariant *unwrapped = g_variant_get_variant(streams_variant);
+        g_variant_unref(streams_variant);
+        streams_variant = unwrapped;
+      }
+      if (g_variant_is_of_type(streams_variant, G_VARIANT_TYPE_ARRAY)) {
+        gsize n_streams = g_variant_n_children(streams_variant);
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: streams array has %zu children", n_streams);
+        for (gsize i = 0; i < n_streams; ++i) {
+          GVariant *stream_tuple = g_variant_get_child_value(streams_variant, i);
+          guint32 stream_node_id_temp = 0;
+          GVariant *stream_props_dict_variant = NULL;
+          g_variant_get(stream_tuple, "(ua{sv})", &stream_node_id_temp, &stream_props_dict_variant);
 
-    if (g_variant_lookup(results_dict, "streams", "a(ua{sv})",
-                         &streams_array_variant) &&
-        streams_array_variant) {
-      GVariantIter stream_iter;
-      g_variant_iter_init(&stream_iter, streams_array_variant);
-      guint32 stream_node_id_temp;
-      GVariant *stream_props_dict_variant;
-
-      if (g_variant_iter_next(&stream_iter, "(ua{sv})", &stream_node_id_temp,
-                              &stream_props_dict_variant)) {
-        pctx->video_node_id = stream_node_id_temp;
-        video_node_found = TRUE;
-        miniav_log(MINIAV_LOG_LEVEL_INFO,
-                   "PW Screen: Found video stream node ID: %u",
-                   pctx->video_node_id);
-        if (stream_props_dict_variant)
-          g_variant_unref(stream_props_dict_variant);
-
-        if (pctx->audio_requested_by_user) {
-          if (g_variant_iter_next(&stream_iter, "(ua{sv})",
-                                  &stream_node_id_temp,
-                                  &stream_props_dict_variant)) {
+          if (!video_node_found) {
+            pctx->video_node_id = stream_node_id_temp;
+            video_node_found = TRUE;
+            miniav_log(MINIAV_LOG_LEVEL_INFO,
+                       "PW Screen: Found video stream node ID: %u",
+                       pctx->video_node_id);
+          } else if (pctx->audio_requested_by_user && pctx->audio_node_id == PW_ID_ANY) {
             pctx->audio_node_id = stream_node_id_temp;
-            // audio_node_found = TRUE;
             miniav_log(MINIAV_LOG_LEVEL_INFO,
                        "PW Screen: Found audio stream node ID: %u",
                        pctx->audio_node_id);
-            if (stream_props_dict_variant)
-              g_variant_unref(stream_props_dict_variant);
-          } else {
-            miniav_log(MINIAV_LOG_LEVEL_WARN,
-                       "PW Screen: Audio requested, but only one stream "
-                       "(video) provided.");
-            pctx->audio_node_id = PW_ID_ANY;
           }
+
+          if (stream_props_dict_variant)
+            g_variant_unref(stream_props_dict_variant);
+          g_variant_unref(stream_tuple);
         }
       } else {
-        miniav_log(
-            MINIAV_LOG_LEVEL_ERROR,
-            "PW Screen: No streams found in portal Start response array.");
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: streams is not an array!");
       }
-      g_variant_unref(streams_array_variant);
+      g_variant_unref(streams_variant);
     } else {
-      miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: 'streams' key (a(ua{sv})) "
-                                         "not found in Start response dict.");
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "PW Screen: 'streams' key (a(ua{sv})) not found in Start response dict.");
     }
-
     if (!video_node_found) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "PW Screen: Did not find a video node ID from portal Start.");
@@ -1148,8 +1204,7 @@ static void on_portal_request_signal_response(
       // TODO: Cleanup
     } else {
       miniav_log(MINIAV_LOG_LEVEL_INFO,
-                 "Screen capture started successfully."); // User-facing message
-                                                          // from original log
+                 "Screen capture started successfully.");
       pw_screen_setup_pipewire_streams(pctx);
     }
     break;
@@ -1182,10 +1237,22 @@ on_portal_session_closed(GDBusConnection *connection, const gchar *sender_name,
   PipeWireScreenPlatformContext *pctx =
       (PipeWireScreenPlatformContext *)user_data;
   guint reason;
-  g_variant_get(parameters, "(u)", &reason);
+    const gchar *ptype = g_variant_get_type_string(parameters);
+  
+  if (g_strcmp0(ptype, "(u)") == 0) {
+    g_variant_get(parameters, "(u)", &reason);
+  } else if (g_strcmp0(ptype, "(a{sv})") == 0) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW Screen: Received Session Closed parameters as (a{sv}), assuming reason 0.");
+    reason = 0;
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW Screen: Unexpected parameters type %s in Session Closed signal.", ptype);
+  }
+  
   miniav_log(MINIAV_LOG_LEVEL_INFO,
-             "PW Screen: Portal session %s closed, reason: %u", object_path,
-             reason);
+             "PW Screen: Portal session %s closed, reason: %u",
+             object_path, reason);
 
   if (pctx->portal_session_handle_str &&
       strcmp(pctx->portal_session_handle_str, object_path) == 0) {
@@ -1216,163 +1283,83 @@ on_portal_session_closed(GDBusConnection *connection, const gchar *sender_name,
 static MiniAVResultCode pw_screen_start_capture(struct MiniAVScreenContext *ctx,
                                                 MiniAVBufferCallback callback,
                                                 void *user_data) {
-  PipeWireScreenPlatformContext *pctx =
-      (PipeWireScreenPlatformContext *)ctx->platform_ctx;
-  if (!ctx->is_configured) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: Not configured before StartCapture.");
-    return MINIAV_ERROR_NOT_INITIALIZED;
-  }
-  if (pctx->parent_ctx->is_running || pctx->loop_running ||
-      pctx->current_portal_op_state != PORTAL_OP_STATE_NONE) {
-    miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "PW Screen: Start capture called but already running or portal "
-               "operation pending (state %d).",
-               pctx->current_portal_op_state);
-    return MINIAV_ERROR_ALREADY_RUNNING;
-  }
+    PipeWireScreenPlatformContext *pctx = (PipeWireScreenPlatformContext *)ctx->platform_ctx;
+    if (!ctx->is_configured) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "PW Screen: Not configured before StartCapture.");
+        return MINIAV_ERROR_NOT_INITIALIZED;
+    }
+    if (pctx->parent_ctx->is_running || pctx->loop_running ||
+        pctx->current_portal_op_state != PORTAL_OP_STATE_NONE) {
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "PW Screen: Start capture called but already running or portal "
+                   "operation pending (state %d).",
+                   pctx->current_portal_op_state);
+        return MINIAV_ERROR_ALREADY_RUNNING;
+    }
 
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "PW Screen: Starting capture via xdg-desktop-portal (async)...");
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW Screen: Starting capture via xdg-desktop-portal (async)...");
 
-  pctx->app_callback_pending = callback;
-  pctx->app_callback_user_data_pending = user_data;
-  pctx->last_error = MINIAV_SUCCESS; // Reset last error
+    pctx->app_callback_pending = callback;
+    pctx->app_callback_user_data_pending = user_data;
+    pctx->last_error = MINIAV_SUCCESS; // Reset last error
 
-  if (!pctx->dbus_conn) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: D-Bus connection not available for portal.");
-    return MINIAV_ERROR_NOT_INITIALIZED;
-  }
-  if (g_cancellable_is_cancelled(pctx->cancellable)) {
-    g_object_unref(pctx->cancellable);
-    pctx->cancellable = g_cancellable_new();
-  }
+    if (!pctx->dbus_conn) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "PW Screen: D-Bus connection not available for portal.");
+        return MINIAV_ERROR_NOT_INITIALIZED;
+    }
+    if (g_cancellable_is_cancelled(pctx->cancellable)) {
+        g_object_unref(pctx->cancellable);
+        pctx->cancellable = g_cancellable_new();
+    }
 
-  // --- 1. CreateSession ---
-  pctx->current_portal_op_state = PORTAL_OP_STATE_CREATING_SESSION;
+    // --- If a valid portal session already exists, reuse it ---
+    if (pctx->portal_session_handle_str != NULL) {
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW Screen: Reusing existing portal session: %s",
+                   pctx->portal_session_handle_str);
+        pctx->current_portal_op_state = PORTAL_OP_STATE_SELECTING_SOURCES;
+        portal_initiate_select_sources(pctx);
+        return MINIAV_SUCCESS;
+    }
 
-  g_free(pctx->current_portal_request_token_str); // Free previous if any
-  pctx->current_portal_request_token_str =
-      generate_token("miniav_session_req"); // For CreateSession options
+    // --- Otherwise, create a new session ---
+    pctx->current_portal_op_state = PORTAL_OP_STATE_CREATING_SESSION;
 
-  char *session_handle_token_for_options =
-      generate_token("miniav_session_handle_opt"); // For CreateSession options
+    g_free(pctx->current_portal_request_token_str); // Free previous if any
+    pctx->current_portal_request_token_str =
+        generate_token("miniav_session_req"); // For CreateSession options
 
-  GVariantBuilder options_builder;
-  g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
-  g_variant_builder_add(
-      &options_builder, "{sv}", "handle_token",
-      g_variant_new_string(pctx->current_portal_request_token_str));
-  g_variant_builder_add(&options_builder, "{sv}", "session_handle_token",
-                        g_variant_new_string(session_handle_token_for_options));
-  GVariant *options_variant = g_variant_builder_end(&options_builder);
-  g_free(session_handle_token_for_options);
+    char *session_handle_token_for_options =
+        generate_token("miniav_session_handle_opt"); // For CreateSession options
 
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "PW Screen: Calling CreateSession with token %s",
-             pctx->current_portal_request_token_str);
+    GVariantBuilder options_builder;
+    g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
+    g_variant_builder_add(
+        &options_builder, "{sv}", "handle_token",
+        g_variant_new_string(pctx->current_portal_request_token_str));
+    g_variant_builder_add(&options_builder, "{sv}", "session_handle_token",
+                          g_variant_new_string(session_handle_token_for_options));
+    GVariant *options_variant = g_variant_builder_end(&options_builder);
+    g_free(session_handle_token_for_options);
 
-  g_dbus_connection_call(
-      pctx->dbus_conn, XDP_BUS_NAME, XDP_OBJECT_PATH, XDP_IFACE_SCREENCAST,
-      "CreateSession",
-      g_variant_new_tuple(&options_variant,
-                          1), // Parameters as a tuple: (a{sv})
-      G_VARIANT_TYPE("(o)"),  // Expected reply type: (handle request_handle)
-      G_DBUS_CALL_FLAGS_NONE,
-      -1, // Default timeout
-      pctx->cancellable, (GAsyncReadyCallback)on_dbus_method_call_completed_cb,
-      pctx // user_data
-  );
-  // options_variant is consumed by g_variant_new_tuple and does not need
-  // separate unref if tuple takes ownership. However, g_variant_new_tuple
-  // documentation says "The new GVariant holds a reference to each of the
-  // items." So, if options_variant was created with g_variant_builder_end, it
-  // should be unreffed after the tuple is created. Let's be safe: GVariant
-  // *params_tuple = g_variant_new_tuple(&options_variant, 1);
-  // ... call (params_tuple, ...)
-  // g_variant_unref(params_tuple);
-  // g_variant_unref(options_variant); -> This is not needed as builder_end
-  // gives a floating ref. The issue is that g_variant_new_tuple takes GVariant*
-  // const*, so options_variant itself is not directly passed. The example in
-  // GLib docs for g_dbus_connection_call uses g_variant_new("(s)", "string")
-  // For a{sv}, it should be g_variant_new("(a{sv})", &options_builder) or
-  // options_variant directly if it's already a{sv}. The portal spec for
-  // CreateSession is `CreateSession (IN Dict options) -> (OUT ObjectPath
-  // request_handle)` The options dict itself is the parameter, not wrapped in
-  // another tuple. So, it should be: `options_variant` directly, not
-  // `g_variant_new_tuple(&options_variant, 1)` Let's re-check
-  // g_dbus_connection_call parameters. It takes a GVariant *parameters. If the
-  // method takes one dict `a{sv}`, then `options_variant` is correct. If the
-  // method takes arguments `(arg1, arg2)`, then `g_variant_new("(type1type2)",
-  // arg1, arg2)` CreateSession takes `options (a{sv})`. So `options_variant` is
-  // the GVariant parameter.
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW Screen: Calling CreateSession with token %s",
+               pctx->current_portal_request_token_str);
 
-  // Corrected call:
-  // g_dbus_connection_call(..., options_variant, ...);
-  // And options_variant should be unreffed after the call if it's not floating.
-  // g_variant_builder_end returns a floating reference. g_dbus_connection_call
-  // will sink it.
-
-  // The previous sync call was: g_variant_new("(a{sv})", &options_builder)
-  // This creates a tuple containing the dict. This is likely correct.
-  // Let's stick to that pattern for the parameters argument.
-
-  // Re-evaluating parameter for CreateSession:
-  // Method signature: CreateSession (IN Dict options)
-  // Dict options is a{sv}.
-  // So, the GVariant *parameters for g_dbus_connection_call should be the a{sv}
-  // dict itself. `options_variant` from
-  // `g_variant_builder_end(&options_builder)` is already of type `a{sv}`. So,
-  // the call should be: g_dbus_connection_call(..., options_variant, ...); And
-  // `options_variant` is floating, so it's fine.
-
-  // Let's re-verify the sync call:
-  // g_dbus_connection_call_sync(..., "CreateSession", g_variant_new("(a{sv})",
-  // &options_builder), ...); `g_variant_new("(a{sv})", &options_builder)`
-  // creates a GVariant of type `(a{sv})` (a tuple containing a dict). This
-  // implies the D-Bus method expects its arguments wrapped in a tuple. If
-  // CreateSession has signature `CreateSession (IN Dict options)`, then
-  // `options` is the first argument. If it was `CreateSession (IN String arg1,
-  // IN Dict options)`, then it would be `g_variant_new("(sa{sv})", ...)`. The
-  // XDP spec for ScreenCast.CreateSession is `a{sv} options`. So the parameter
-  // to g_dbus_connection_call should be the `a{sv}` variant directly. The
-  // `g_variant_new("(a{sv})", &options_builder)` in the sync call was likely to
-  // ensure the builder content is correctly formed into a single GVariant
-  // parameter for the call. `g_variant_builder_end` already gives a GVariant of
-  // type `a{sv}`.
-
-  // Final decision for CreateSession parameters:
-  // `options_variant` (which is `a{sv}`) is the correct parameter.
-  // The `g_variant_new("(a{sv})", &options_builder)` was for the *builder*, not
-  // the variant. No, `g_variant_new` takes a format string.
-  // `g_variant_new("(a{sv})", &options_builder)` means "create a tuple, whose
-  // single element is a dict, and populate that dict using the builder". This
-  // is the standard way to pass multiple arguments or a single complex
-  // argument. The portal methods usually take their arguments as a tuple.
-  // CreateSession (options::a{sv}) -> request_handle::o
-  // The parameters GVariant should be a tuple containing the 'options' dict.
-  // So, `g_variant_new("(a{sv})", options_variant_ptr)` where
-  // `options_variant_ptr` points to the `a{sv}`. Or, more directly,
-  // `g_variant_new("(a{sv})", &options_builder)` if the builder is still live.
-  // Since `options_variant` is already the `a{sv}`:
-  GVariant *params_for_create_session =
-      g_variant_new_tuple(&options_variant, 1);
-
-  g_dbus_connection_call(
-      pctx->dbus_conn, XDP_BUS_NAME, XDP_OBJECT_PATH, XDP_IFACE_SCREENCAST,
-      "CreateSession",
-      params_for_create_session, // This is now a tuple (a{sv})
-      G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, -1, pctx->cancellable,
-      (GAsyncReadyCallback)on_dbus_method_call_completed_cb, pctx);
-  // params_for_create_session is floating and will be sunk by the call.
-  // options_variant was sunk by g_variant_new_tuple.
-
-  // The original log message "Screen capture started successfully." was
-  // premature. It should only be logged after the Start call is successful and
-  // streams are being set up. The function should return MINIAV_SUCCESS if the
-  // async process has started. Errors will be handled asynchronously.
-  return MINIAV_SUCCESS;
+    g_dbus_connection_call(
+        pctx->dbus_conn, XDP_BUS_NAME, XDP_OBJECT_PATH, XDP_IFACE_SCREENCAST,
+        "CreateSession",
+        g_variant_new_tuple(&options_variant, 1), // Parameters as a tuple: (a{sv})
+        G_VARIANT_TYPE("(o)"),  // Expected reply type: (o)
+        G_DBUS_CALL_FLAGS_NONE,
+        -1, // Default timeout
+        pctx->cancellable, (GAsyncReadyCallback)on_dbus_method_call_completed_cb,
+        pctx // user_data
+    );
+    return MINIAV_SUCCESS;
 }
 
 static void
@@ -1399,25 +1386,8 @@ portal_initiate_select_sources(PipeWireScreenPlatformContext *pctx) {
   g_variant_builder_add(&options_builder, "{sv}", "types",
                         g_variant_new_uint32(source_types));
 
-  GVariant *options_dict_variant =
-      g_variant_builder_end(&options_builder); // This is a{sv}
-
-  // SelectSources (IN ObjectPath session_handle, IN Dict options) -> (OUT
-  // ObjectPath request_handle) Parameters GVariant should be a tuple: (oa{sv})
   GVariant *params_for_select_sources = g_variant_new(
-      "(oa{sv})", pctx->portal_session_handle_str, options_dict_variant);
-  // options_dict_variant is floating, g_variant_new sinks one ref.
-  // If g_variant_new takes a GVariant** for dicts, then it would be
-  // &options_dict_variant. Let's check g_variant_new with a{sv} For
-  // g_variant_new("(oa{sv})", session_path, dict_variant_itself); is correct if
-  // dict_variant_itself is a GVariant*. Yes, g_variant_new("(oa{sv})", const
-  // gchar *obj_path, GVariant *dict_options) So, this is correct: GVariant
-  // *params_for_select_sources = g_variant_new("(oa{sv})",
-  //                                                    pctx->portal_session_handle_str,
-  //                                                    options_dict_variant);
-  // And options_dict_variant will be unreffed by
-  // g_variant_unref(params_for_select_sources) later if not sunk. Since
-  // options_dict_variant is floating, g_variant_new will take ownership.
+      "(oa{sv})", pctx->portal_session_handle_str, &options_builder);
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Screen: Calling SelectSources for session %s with token %s",
@@ -1440,22 +1410,16 @@ static void portal_initiate_start_stream(PipeWireScreenPlatformContext *pctx) {
   pctx->current_portal_request_token_str = generate_token("miniav_start_req");
 
   GVariantBuilder options_builder;
-  g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
-  g_variant_builder_add(
-      &options_builder, "{sv}", "handle_token",
-      g_variant_new_string(pctx->current_portal_request_token_str));
-  GVariant *start_options_dict =
-      g_variant_builder_end(&options_builder); // a{sv}
-
-  const char *parent_window_handle = ""; // Typically empty
-
-  // Start (IN String parent_window, IN Dict options) -> (OUT ObjectPath
-  // request_handle) This is on the Session interface, so object_path is
-  // pctx->portal_session_handle_str Parameters GVariant should be a tuple:
-  // (sa{sv})
-  GVariant *params_for_start =
-      g_variant_new("(sa{sv})", parent_window_handle, start_options_dict);
-  // start_options_dict is floating, sunk by g_variant_new.
+g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
+g_variant_builder_add(
+    &options_builder, "{sv}", "handle_token",
+    g_variant_new_string(pctx->current_portal_request_token_str));
+// Do not call g_variant_builder_end; pass the builder pointer directly.
+const char *parent_window_handle = "";
+GVariant *params_for_start = g_variant_new("(osa{sv})",
+                                                pctx->portal_session_handle_str,
+                                                parent_window_handle,
+                                                &options_builder);
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Screen: Calling Start for session %s with token %s",
@@ -1464,8 +1428,8 @@ static void portal_initiate_start_stream(PipeWireScreenPlatformContext *pctx) {
 
   g_dbus_connection_call(
       pctx->dbus_conn, XDP_BUS_NAME,
-      pctx->portal_session_handle_str, // Object path is the session handle
-      XDP_IFACE_SESSION,               // Interface is Session
+      XDP_OBJECT_PATH, // Object path is the session handle
+      XDP_IFACE_SCREENCAST,               // Interface is Session
       "Start",
       params_for_start, // This is (sa{sv})
       G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, -1, pctx->cancellable,
@@ -1531,15 +1495,17 @@ pw_screen_setup_pipewire_streams(PipeWireScreenPlatformContext *pctx) {
     if (spa_fmt_req == SPA_VIDEO_FORMAT_UNKNOWN)
       spa_fmt_req = SPA_VIDEO_FORMAT_BGRA;
 
-    params[n_params++] = spa_format_video_raw_build(
-        &b, SPA_PARAM_EnumFormat,
-        &SPA_VIDEO_INFO_RAW_INIT(
-                .format = spa_fmt_req,
-                .size = SPA_RECTANGLE(pctx->requested_video_format.width,
-                                      pctx->requested_video_format.height),
-                .framerate = SPA_FRACTION(
-                    pctx->requested_video_format.frame_rate_numerator,
-                    pctx->requested_video_format.frame_rate_denominator)));
+    {
+    struct spa_pod_frame frame;
+    uint32_t buffer_types = (1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
+    spa_pod_builder_push_object(&b, &frame, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers);
+    spa_pod_builder_add(&b,
+        SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(PW_SCREEN_MAX_BUFFERS, 1, PW_SCREEN_MAX_BUFFERS),
+        SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
+        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(buffer_types),
+        0);
+    params[n_params++] = spa_pod_builder_pop(&b, &frame);
+}
 
     uint32_t buffer_types =
         (1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
@@ -1573,7 +1539,7 @@ pw_screen_setup_pipewire_streams(PipeWireScreenPlatformContext *pctx) {
   }
 
   // --- Create Audio Stream ---
-  if (pctx->audio_requested_by_user && pctx->audio_node_id != PW_ID_ANY) {
+  if (pctx->audio_requested_by_user) {
     pctx->audio_stream = pw_stream_new(
         pctx->core, "miniav-screen-audio",
         pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY,
@@ -1627,10 +1593,6 @@ pw_screen_setup_pipewire_streams(PipeWireScreenPlatformContext *pctx) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW Screen: Audio stream connecting to node %u...",
                pctx->audio_node_id);
-  } else if (pctx->audio_requested_by_user) {
-    miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "PW Screen: Audio requested, but no valid audio_node_id from "
-               "portal. Audio capture skipped.");
   }
 
   // --- Start PipeWire Loop Thread ---
@@ -1789,8 +1751,11 @@ pw_screen_stop_capture(struct MiniAVScreenContext *ctx) {
 
 static MiniAVResultCode
 pw_screen_release_buffer(struct MiniAVScreenContext *ctx,
-                         void *internal_handle_ptr) { // Renamed for clarity
+                         void *internal_handle_ptr) {
   MINIAV_UNUSED(ctx);
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: release_buffer called with internal_handle_ptr=%p", internal_handle_ptr);
 
   if (!internal_handle_ptr) {
     miniav_log(
@@ -1801,6 +1766,10 @@ pw_screen_release_buffer(struct MiniAVScreenContext *ctx,
 
   MiniAVNativeBufferInternalPayload *payload =
       (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: payload ptr=%p, handle_type=%d, native_resource_ptr=%p",
+             payload, payload->handle_type, payload->native_resource_ptr);
 
   if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN) {
     intptr_t fd_ptr_val = (intptr_t)payload->native_resource_ptr;
@@ -1814,7 +1783,6 @@ pw_screen_release_buffer(struct MiniAVScreenContext *ctx,
         miniav_log(MINIAV_LOG_LEVEL_WARN,
                    "PW Screen: Failed to close DMABUF FD %d: %s", fd_to_close,
                    strerror(errno));
-        // Consider if this should return an error. For now, it doesn't.
       }
     } else {
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
@@ -1832,7 +1800,6 @@ pw_screen_release_buffer(struct MiniAVScreenContext *ctx,
                payload->handle_type);
   }
 
-  miniav_free(payload); // Free the payload struct itself
   return MINIAV_SUCCESS;
 }
 
@@ -1845,26 +1812,10 @@ static void *pw_screen_loop_thread_func(void *arg) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Screen: PipeWire loop thread started.");
   pctx->loop_running = true;
-  ctx->is_running = true; // Mark as running now that loop is starting
-
-  // struct pw_loop *loop_ptr = pw_main_loop_get_loop(pctx->loop);
-  // struct spa_source *wakeup_source = NULL;
-
-  // Wakeup pipe is primarily for pw_main_loop_quit from another thread.
-  // The loop itself doesn't need to handle reads from it if pw_main_loop_quit
-  // is used. if (pctx->wakeup_pipe[0] != -1) {
-  //   wakeup_source = pw_loop_add_io(loop_ptr, pctx->wakeup_pipe[0], SPA_IO_IN,
-  //   false, NULL, pctx);
-  // }
+  ctx->is_running = true; 
 
   pw_main_loop_run(pctx->loop); // Blocks here
 
-  // if (wakeup_source) {
-  //   pw_loop_remove_source(loop_ptr, wakeup_source);
-  // }
-
-  // loop_running and is_running are set to false by stop_capture before join,
-  // or in destroy.
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Screen: PipeWire loop thread finished.");
   return NULL;
@@ -2178,14 +2129,7 @@ static void on_video_stream_process(void *data) {
 
     // pw_buf->time is uint64_t nsec. SPA_ID_INVALID is the correct invalid
     // marker.
-    if ((h = spa_buffer_find_meta_data(spa_buf, SPA_META_Header, sizeof(*h))) &&
-        h->pts != SPA_ID_INVALID) {
-      miniav_buffer.timestamp_us = h->pts / 1000; // pts is usually nsec
-    } else if (pw_buf->time != SPA_ID_INVALID) {
-      miniav_buffer.timestamp_us = pw_buf->time / 1000; // Convert nsec to usec
-    } else {
-      miniav_buffer.timestamp_us = miniav_get_time_us();
-    }
+    miniav_buffer.timestamp_us = miniav_get_time_us();
 
     // Populate MiniAVBuffer.data.video directly
     // Use the already updated parent_ctx->configured_video_format which
@@ -2265,10 +2209,6 @@ static void on_video_stream_process(void *data) {
           if (d_plane->chunk->stride == 0 &&
               miniav_buffer.data.video.info.pixel_format !=
                   MINIAV_PIXEL_FORMAT_MJPEG) {
-            // For packed formats like BGRA, stride might be width * bpp if not
-            // explicitly set. For MJPEG, stride is often 0 as it's a compressed
-            // blob. This is a simplistic fallback, real stride calculation can
-            // be complex.
             if (miniav_buffer.data.video.info.pixel_format ==
                     MINIAV_PIXEL_FORMAT_BGRA32 ||
                 miniav_buffer.data.video.info.pixel_format ==
@@ -2276,7 +2216,8 @@ static void on_video_stream_process(void *data) {
                 miniav_buffer.data.video.info.pixel_format ==
                     MINIAV_PIXEL_FORMAT_ARGB32 ||
                 miniav_buffer.data.video.info.pixel_format ==
-                    MINIAV_PIXEL_FORMAT_ABGR32) {
+                    MINIAV_PIXEL_FORMAT_ABGR32 || miniav_buffer.data.video.info.pixel_format ==
+        MINIAV_PIXEL_FORMAT_BGRX32) {
               miniav_buffer.data.video.stride_bytes[i] =
                   miniav_buffer.data.video.info.width * 4;
             } else if (miniav_buffer.data.video.info.pixel_format ==
@@ -2330,15 +2271,13 @@ static void on_video_stream_process(void *data) {
           spa_debug_type_find_name(spa_type_data_type, spa_buf->datas[0].type));
       goto queue_and_continue_video;
     }
-
+miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+    "PW Screen: About to call app_callback: payload_alloc=%p, internal_handle=%p, dup_fd=%d",
+    payload_alloc, miniav_buffer.internal_handle, miniav_buffer.data.video.native_gpu_dmabuf_fd);
     pctx->parent_ctx->app_callback(&miniav_buffer,
                                    pctx->parent_ctx->app_callback_user_data);
-    payload_alloc = NULL; // Callback now owns the payload via internal_handle
 
   queue_and_continue_video:
-    if (payload_alloc) {
-      miniav_free(payload_alloc);
-    }
     pw_stream_queue_buffer(pctx->video_stream, pw_buf);
   }
 }
@@ -2464,10 +2403,9 @@ static void on_audio_stream_process(void *data) {
     miniav_buffer.content_type =
         MINIAV_BUFFER_CONTENT_TYPE_CPU; // Audio is always CPU for now
 
-    // Use parent_ctx->configured_video_format
     if (pctx->parent_ctx) {
       miniav_buffer.data.audio.info = pctx->parent_ctx->configured_audio_format;
-    } else { // Should not happen
+    } else { 
       memset(&miniav_buffer.data.audio.info, 0, sizeof(MiniAVAudioInfo));
       miniav_buffer.data.audio.info.format = MINIAV_AUDIO_FORMAT_UNKNOWN;
     }
@@ -2559,12 +2497,7 @@ miniav_screen_context_platform_init_linux_pipewire(MiniAVScreenContext *ctx) {
       MINIAV_LOG_LEVEL_DEBUG,
       "PW Screen: Initializing PipeWire platform backend for screen context.");
 
-  // Initialize PipeWire library. Should be called once per application.
-  // If multiple contexts are created, this might be called multiple times.
-  // pw_init is refcounted, so it's safe.
   pw_init(NULL, NULL);
-  // g_type_init(); // Generally not needed for modern GLib unless using GObject
-  // features directly.
 
   PipeWireScreenPlatformContext *pctx =
       (PipeWireScreenPlatformContext *)miniav_calloc(

@@ -1000,22 +1000,8 @@ static MiniAVResultCode wgc_start_capture(MiniAVScreenContext *ctx,
       return MINIAV_ERROR_SYSTEM_CALL_FAILED;
     }
 
-    // Optional: Configure session settings
-    // wgc_ctx->session.IsCursorCaptureEnabled(true);
-    // wgc_ctx->session.IsBorderRequired(false); // If you don't want the yellow
-    // border
-
-    // Register frame arrived event handler
-    // Pass 'wgc_ctx' to the lambda by capturing it.
-    // Ensure 'wgc_ctx' remains valid for the lifetime of the event
-    // registration. The lambda captures 'wgc_ctx' by value, which is a pointer.
-    // This is safe as long as unregistration happens before 'wgc_ctx' is freed.
     wgc_ctx->frame_arrived_token = wgc_ctx->frame_pool.FrameArrived(
         [wgc_ctx_capture = wgc_ctx](auto &&sender, auto &&args) {
-          // Check if streaming is still active before processing
-          // This check needs to be thread-safe if is_streaming can be modified
-          // concurrently For simplicity, assuming wgc_on_frame_arrived handles
-          // this.
           wgc_on_frame_arrived(wgc_ctx_capture, sender, args);
         });
 
@@ -1097,21 +1083,11 @@ static MiniAVResultCode wgc_stop_capture(MiniAVScreenContext *ctx) {
   }
 
   LeaveCriticalSection(&wgc_ctx->critical_section);
-
-  // Note: WGC capture is event-driven. There isn't a capture thread owned by
-  // this module in the same way as DXGI. The FrameArrived events are called on
-  // threads managed by WinRT/WGC. Setting is_streaming to FALSE and closing
-  // the session should stop new frames from being processed by
-  // wgc_on_frame_arrived.
-
   // --- Stop Audio Loopback Capture ---
   // Check if audio was successfully configured and we *think* it might have
   // started
   if (wgc_ctx->loopback_audio_ctx &&
       wgc_ctx->audio_loopback_enabled_and_configured && was_streaming_video) {
-    // We check was_streaming_video because if video never started, audio start
-    // might have been skipped or failed. A more precise check would be an
-    // 'is_audio_running' flag set by MiniAV_Loopback_StartCapture's success.
     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: Stopping audio loopback capture.");
     MiniAVResultCode audio_stop_res =
         MiniAV_Loopback_StopCapture(wgc_ctx->loopback_audio_ctx);
@@ -1132,18 +1108,21 @@ static MiniAVResultCode wgc_stop_capture(MiniAVScreenContext *ctx) {
 
 static MiniAVResultCode
 wgc_release_buffer(MiniAVScreenContext *ctx,
-                   void *native_buffer_payload_resource_ptr) {
+                   void *internal_handle_ptr) {
   MINIAV_UNUSED(
       ctx); // ctx might be useful for logging or D3D context if not in payload
-  if (!native_buffer_payload_resource_ptr) {
+  if (!internal_handle_ptr) {
     miniav_log(
         MINIAV_LOG_LEVEL_ERROR,
         "WGC: native_buffer_payload_resource_ptr is NULL in release_buffer.");
     return MINIAV_ERROR_INVALID_ARG;
   }
 
+  MiniAVNativeBufferInternalPayload *payload =
+      (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
+
   WGCFrameReleasePayload *frame_payload =
-      (WGCFrameReleasePayload *)native_buffer_payload_resource_ptr;
+      (WGCFrameReleasePayload *)payload->native_resource_ptr;
 
   if (frame_payload->original_output_preference ==
           MINIAV_OUTPUT_PREFERENCE_CPU ||

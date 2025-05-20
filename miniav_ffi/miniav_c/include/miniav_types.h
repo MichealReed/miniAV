@@ -61,7 +61,8 @@ typedef enum {
   MINIAV_PIXEL_FORMAT_BGRA32, // Packed BGRA
   MINIAV_PIXEL_FORMAT_ARGB32, // Packed ARGB
   MINIAV_PIXEL_FORMAT_ABGR32, // Packed ABGR
-  MINIAV_PIXEL_FORMAT_MJPEG   // Motion JPEG (compressed)
+  MINIAV_PIXEL_FORMAT_MJPEG,   // Motion JPEG (compressed)
+  MINIAV_PIXEL_FORMAT_BGRX32, // 
 } MiniAVPixelFormat;
 
 // --- Audio Formats (Moved Here) ---

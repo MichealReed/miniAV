@@ -582,9 +582,6 @@ static void registry_event_global(void *data, uint32_t id, uint32_t permissions,
           snprintf(dev_info->name, MINIAV_DEVICE_NAME_MAX_LEN,
                    "PipeWire Node %u", id);
         }
-        // TODO: Determine if it's the default device. PipeWire doesn't have a
-        // direct "isDefault" flag like miniaudio. This might require heuristics
-        // or checking specific properties. For now, mark none as default.
         dev_info->is_default = false;
 
         miniav_log(MINIAV_LOG_LEVEL_DEBUG,

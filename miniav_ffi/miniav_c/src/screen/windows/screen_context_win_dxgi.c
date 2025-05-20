@@ -548,8 +548,8 @@ dxgi_get_default_formats(const char *device_id_utf8,
 
 static MiniAVResultCode
 dxgi_get_configured_video_formats(MiniAVScreenContext *ctx,
-                            MiniAVVideoInfo *video_format_out,
-                            MiniAVAudioInfo *audio_format_out) {
+                                  MiniAVVideoInfo *video_format_out,
+                                  MiniAVAudioInfo *audio_format_out) {
   if (!ctx || !ctx->platform_ctx || !video_format_out) {
     return MINIAV_ERROR_INVALID_ARG;
   }
@@ -602,9 +602,10 @@ dxgi_get_configured_video_formats(MiniAVScreenContext *ctx,
   return MINIAV_SUCCESS;
 }
 
-static MiniAVResultCode
-dxgi_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
-                       const MiniAVVideoInfo *format, bool *audio_enabled) {
+static MiniAVResultCode dxgi_configure_display(MiniAVScreenContext *ctx,
+                                               const char *display_id_utf8,
+                                               const MiniAVVideoInfo *format,
+                                               bool *audio_enabled) {
   if (!ctx || !ctx->platform_ctx || !display_id_utf8 || !format)
     return MINIAV_ERROR_INVALID_ARG;
   DXGIScreenPlatformContext *dxgi_ctx =
@@ -748,9 +749,9 @@ dxgi_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
                          // can still work
 }
 
-static MiniAVResultCode
-dxgi_configure_window(MiniAVScreenContext *ctx, const char *window_id_utf8,
-                      const MiniAVVideoInfo *format) {
+static MiniAVResultCode dxgi_configure_window(MiniAVScreenContext *ctx,
+                                              const char *window_id_utf8,
+                                              const MiniAVVideoInfo *format) {
   MINIAV_UNUSED(ctx);
   MINIAV_UNUSED(window_id_utf8);
   MINIAV_UNUSED(format);
@@ -759,10 +760,11 @@ dxgi_configure_window(MiniAVScreenContext *ctx, const char *window_id_utf8,
   return MINIAV_ERROR_NOT_SUPPORTED;
 }
 
-static MiniAVResultCode
-dxgi_configure_region(MiniAVScreenContext *ctx, const char *display_id_utf8,
-                      int x, int y, int width, int height,
-                      const MiniAVVideoInfo *format) {
+static MiniAVResultCode dxgi_configure_region(MiniAVScreenContext *ctx,
+                                              const char *display_id_utf8,
+                                              int x, int y, int width,
+                                              int height,
+                                              const MiniAVVideoInfo *format) {
   MINIAV_UNUSED(ctx);
   MINIAV_UNUSED(display_id_utf8);
   MINIAV_UNUSED(x);
@@ -911,19 +913,21 @@ static MiniAVResultCode dxgi_stop_capture(MiniAVScreenContext *ctx) {
   return MINIAV_SUCCESS;
 }
 
-static MiniAVResultCode
-dxgi_release_buffer(MiniAVScreenContext *ctx,
-                    void *native_buffer_payload_resource_ptr) {
+static MiniAVResultCode dxgi_release_buffer(MiniAVScreenContext *ctx,
+                                            void *internal_handle_ptr) {
   MINIAV_UNUSED(ctx);
-  if (!native_buffer_payload_resource_ptr) {
+  if (!internal_handle_ptr) {
     miniav_log(
         MINIAV_LOG_LEVEL_ERROR,
         "DXGI: native_buffer_payload_resource_ptr is NULL in release_buffer.");
     return MINIAV_ERROR_INVALID_ARG;
   }
 
+  MiniAVNativeBufferInternalPayload *payload =
+      (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
+
   DXGIFrameReleasePayload *frame_payload =
-      (DXGIFrameReleasePayload *)native_buffer_payload_resource_ptr;
+      (DXGIFrameReleasePayload *)payload->native_resource_ptr;
 
   if (frame_payload->type == DXGI_PAYLOAD_TYPE_CPU) {
     if (frame_payload->cpu.d3d_context_for_unmap &&
@@ -1311,8 +1315,7 @@ const ScreenContextInternalOps g_screen_ops_win_dxgi = {
     .stop_capture = dxgi_stop_capture,
     .release_buffer = dxgi_release_buffer,
     .get_default_formats = dxgi_get_default_formats,
-    .get_configured_video_formats = dxgi_get_configured_video_formats
-};
+    .get_configured_video_formats = dxgi_get_configured_video_formats};
 
 MiniAVResultCode
 miniav_screen_context_platform_init_windows_dxgi(MiniAVScreenContext *ctx) {

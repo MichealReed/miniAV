@@ -18,6 +18,13 @@
 // struct OrgFreedesktopPortalRequest;
 // struct OrgFreedesktopPortalScreenCast;
 
+typedef enum {
+  PORTAL_OP_STATE_NONE,
+  PORTAL_OP_STATE_CREATING_SESSION,
+  PORTAL_OP_STATE_SELECTING_SOURCES,
+  PORTAL_OP_STATE_STARTING_STREAM
+} PortalOperationState;
+
 typedef struct {
   struct spa_video_info_raw
       spa_format; // Holds format, size, framerate, modifier
@@ -36,14 +43,25 @@ typedef struct PipeWireScreenPlatformContext {
   bool core_connected;
   int core_sync_seq;
 
-  GDBusConnection *dbus_conn;      // Add this
-  GCancellable *cancellable;       // Add this
-  char *portal_session_handle_str; // Add this
-  char *portal_request_handle_str; // Add this
-  guint current_request_subscription_id;
+  GDBusConnection *dbus_conn;
+  GCancellable *cancellable; // Used for all async portal calls
 
-  MiniAVBufferCallback app_callback_pending; // Add this
-  void *app_callback_user_data_pending;      // Add this
+  char *portal_session_handle_str; // Actual D-Bus object path of the session
+  // char *portal_request_handle_str; // This will be split and renamed
+  char *current_portal_request_token_str; // The "handle_token" we send for the
+                                          // current portal request
+  char *current_portal_request_object_path_str; // D-Bus object path of the
+                                                // current Request object
+
+  PortalOperationState
+      current_portal_op_state; // Tracks the current portal operation
+  guint current_request_signal_subscription_id; // Subscription ID for the
+                                                // Request "Response" signal
+  guint session_closed_signal_subscription_id;  // Subscription ID for the
+                                                // Session "Closed" signal
+
+  MiniAVBufferCallback app_callback_pending;
+  void *app_callback_user_data_pending;
 
   struct pw_stream *video_stream;
   struct spa_hook video_stream_listener;

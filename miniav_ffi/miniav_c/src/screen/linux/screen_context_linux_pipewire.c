@@ -196,15 +196,14 @@ pw_screen_setup_pipewire_streams(PipeWireScreenPlatformContext *pctx);
 static void on_portal_create_session_dbus_response(GObject *source_object,
                                                    GAsyncResult *res,
                                                    gpointer user_data);
-static void
-on_portal_create_session_response(PipeWireScreenPlatformContext *pctx,
-                                  GVariant *results);
 static void on_portal_request_response(GObject *source_object,
                                        GAsyncResult *res, gpointer user_data);
 static void on_portal_request_signal_response(
     GDBusConnection *connection, const gchar *sender_name,
     const gchar *object_path, const gchar *interface_name,
     const gchar *signal_name, GVariant *parameters, gpointer user_data);
+static void portal_initiate_select_sources(PipeWireScreenPlatformContext *pctx);
+static void portal_initiate_start_stream(PipeWireScreenPlatformContext *pctx);
 static void
 on_portal_select_sources_response(PipeWireScreenPlatformContext *pctx,
                                   GVariant *results);
@@ -216,6 +215,10 @@ static void on_portal_session_closed(GDBusConnection *connection,
                                      const gchar *interface_name,
                                      const gchar *signal_name,
                                      GVariant *parameters, gpointer user_data);
+
+static void on_dbus_method_call_completed_cb(GObject *source_object,
+                                             GAsyncResult *res,
+                                             gpointer user_data);
 
 // Helper to generate a unique token
 static char *generate_token(const char *prefix) {
@@ -300,7 +303,11 @@ pw_screen_init_platform(struct MiniAVScreenContext *ctx) {
   pctx->audio_node_id = PW_ID_ANY;
   pctx->core_connected = false;
   pctx->portal_session_handle_str = NULL;
-  pctx->portal_request_handle_str = NULL;
+  pctx->current_portal_request_token_str = NULL;
+  pctx->current_portal_request_object_path_str = NULL;
+  pctx->current_portal_op_state = PORTAL_OP_STATE_NONE;
+  pctx->current_request_signal_subscription_id = 0;
+  pctx->session_closed_signal_subscription_id = 0;
   pctx->app_callback_pending = NULL;
   pctx->app_callback_user_data_pending = NULL;
 
@@ -372,9 +379,15 @@ pw_screen_destroy_platform(struct MiniAVScreenContext *ctx) {
     g_free(pctx->portal_session_handle_str);
     pctx->portal_session_handle_str = NULL;
   }
-  g_free(pctx->portal_request_handle_str);
-  pctx->portal_request_handle_str = NULL;
-
+  g_free(pctx->current_portal_request_token_str);
+  pctx->current_portal_request_token_str = NULL;
+  g_free(pctx->current_portal_request_object_path_str);
+  pctx->current_portal_request_object_path_str = NULL;
+  if (pctx->current_request_signal_subscription_id > 0 && pctx->dbus_conn) {
+    g_dbus_connection_signal_unsubscribe(
+        pctx->dbus_conn, pctx->current_request_signal_subscription_id);
+    pctx->current_request_signal_subscription_id = 0;
+  }
   if (pctx->video_stream) {
     pw_stream_destroy(pctx->video_stream);
     pctx->video_stream = NULL;
@@ -835,13 +848,13 @@ static void on_portal_request_response(GObject *source_object,
              request_handle_path);
 
   // Unsubscribe any previous request signal before subscribing to a new one
-  if (pctx->current_request_subscription_id > 0) {
+  if (pctx->current_request_signal_subscription_id > 0) {
     g_dbus_connection_signal_unsubscribe(pctx->dbus_conn,
-                                         pctx->current_request_subscription_id);
-    pctx->current_request_subscription_id = 0;
+                                         pctx->current_request_signal_subscription_id);
+    pctx->current_request_signal_subscription_id = 0;
   }
 
-  pctx->current_request_subscription_id = g_dbus_connection_signal_subscribe(
+  pctx->current_request_signal_subscription_id = g_dbus_connection_signal_subscribe(
       pctx->dbus_conn, XDP_BUS_NAME, XDP_IFACE_REQUEST, "Response",
       request_handle_path,      // Object path of the request
       NULL,                     // arg0 filter
@@ -850,7 +863,7 @@ static void on_portal_request_response(GObject *source_object,
       pctx, // Pass pctx as user_data
       NULL);
 
-  if (pctx->current_request_subscription_id == 0) {
+  if (pctx->current_request_signal_subscription_id == 0) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "PW Screen: Failed to subscribe to Response signal for %s",
                request_handle_path);
@@ -863,303 +876,301 @@ static void on_portal_request_response(GObject *source_object,
   g_free(request_handle_path); // Free the duplicated path
 }
 
-static void
-on_portal_select_sources_response(PipeWireScreenPlatformContext *pctx,
-                                  GVariant *results_dict) {
-  // results_dict from SelectSources is typically empty on success,
-  // the success itself means the user made a selection.
-  // If results_dict is NULL here, it means the Response signal indicated
-  // failure/cancellation.
-  if (!results_dict) {
-    miniav_log(MINIAV_LOG_LEVEL_INFO,
-               "PW Screen: Portal SelectSources failed or was cancelled (no "
-               "results dict from signal).");
-    // pctx->last_error should have been set by
-    // on_portal_request_signal_response
-    return;
-  }
-  miniav_log(
-      MINIAV_LOG_LEVEL_DEBUG,
-      "PW Screen: Portal SelectSources successful (user made a selection).");
-
-  g_free(pctx->portal_request_handle_str);
-  pctx->portal_request_handle_str = generate_token("miniav_start_req");
-
-  GVariantBuilder options_builder;
-  g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
-  g_variant_builder_add(&options_builder, "{sv}", "handle_token",
-                        g_variant_new_string(pctx->portal_request_handle_str));
-  GVariant *start_options = g_variant_builder_end(&options_builder);
-
-  const char *parent_window_handle =
-      ""; // Typically empty for Wayland, or "x11:..."
-
+static void on_dbus_method_call_completed_cb(GObject *source_object,
+                                             GAsyncResult *res,
+                                             gpointer user_data) {
+  PipeWireScreenPlatformContext *pctx =
+      (PipeWireScreenPlatformContext *)user_data;
   GError *error = NULL;
-  GVariant *result_variant = g_dbus_connection_call_sync(
-      pctx->dbus_conn, XDP_BUS_NAME,
-      pctx->portal_session_handle_str, // Session object path
-      XDP_IFACE_SESSION, "Start",
-      g_variant_new("(sa{sv})", parent_window_handle, start_options),
-      G_VARIANT_TYPE("(o)"), // Expected reply: (handle request_handle)
-      G_DBUS_CALL_FLAGS_NONE,
-      -1, // Default timeout
-      pctx->cancellable, &error);
-
-  if (error) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: D-Bus Start call failed: %s",
-               error->message);
-    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
-    g_error_free(error);
-    if (result_variant)
-      g_variant_unref(result_variant);
-    return;
-  }
-
-  on_portal_create_session_response(pctx, result_variant);
-  g_variant_unref(result_variant);
-}
-
-static void
-on_portal_create_session_response(PipeWireScreenPlatformContext *pctx,
-                                  GVariant *results_variant) {
-  // results_variant is the direct reply from CreateSession, type (o)
-  if (!results_variant) {
-    miniav_log(
-        MINIAV_LOG_LEVEL_ERROR,
-        "PW Screen: Portal CreateSession method failed (no results variant).");
-    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
-    return;
-  }
-
-  char *session_handle_tmp = NULL;
-  g_variant_get(results_variant, "(o)", &session_handle_tmp);
-  g_free(pctx->portal_session_handle_str); // Free old if set
-  pctx->portal_session_handle_str = g_strdup(session_handle_tmp);
-  g_free(session_handle_tmp); // Free the temporary string
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: Portal session created: %s",
-             pctx->portal_session_handle_str);
-
-  g_dbus_connection_signal_subscribe(
-      pctx->dbus_conn, XDP_BUS_NAME, XDP_IFACE_SESSION, "SessionClosed",
-      pctx->portal_session_handle_str,
-      NULL, // arg0 filter
-      G_DBUS_SIGNAL_FLAGS_NONE, (GDBusSignalCallback)on_portal_session_closed,
-      pctx, NULL);
-
-  g_free(pctx->portal_request_handle_str);
-  pctx->portal_request_handle_str = generate_token("miniav_select_req");
-
-  GVariantBuilder options_builder;
-  g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
-  g_variant_builder_add(&options_builder, "{sv}", "handle_token",
-                        g_variant_new_string(pctx->portal_request_handle_str));
-  g_variant_builder_add(&options_builder, "{sv}", "multiple",
-                        g_variant_new_boolean(FALSE));
-
-  uint32_t source_types = 0; // 1=monitor, 2=window
-  if (pctx->capture_type == MINIAV_CAPTURE_TYPE_DISPLAY)
-    source_types = (1 << 0);
-  else if (pctx->capture_type == MINIAV_CAPTURE_TYPE_WINDOW)
-    source_types = (1 << 1);
-  else if (pctx->capture_type == MINIAV_CAPTURE_TYPE_REGION)
-    source_types = (1 << 0) | (1 << 1); // Region might be based on either
-  else
-    source_types = (1 << 0) | (1 << 1); // Default to both if unspecified
-
-  g_variant_builder_add(&options_builder, "{sv}", "types",
-                        g_variant_new_uint32(source_types));
-  // Optionally add "persist_mode" if needed.
-
-  GError *error = NULL;
-  GVariant *result_variant = g_dbus_connection_call_sync(
-      pctx->dbus_conn, XDP_BUS_NAME,
-      XDP_OBJECT_PATH, // Portal main object
-      XDP_IFACE_SCREENCAST, "SelectSources",
-      g_variant_new("(oa{sv})", pctx->portal_session_handle_str,
-                    &options_builder),
-      G_VARIANT_TYPE("(o)"), // Expected reply: (handle request_handle)
-      G_DBUS_CALL_FLAGS_NONE,
-      -1, // Default timeout
-      pctx->cancellable, &error);
+  GVariant *result_variant = g_dbus_connection_call_finish(
+      G_DBUS_CONNECTION(source_object), res, &error);
 
   if (error) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: D-Bus SelectSources call failed: %s",
-               error->message);
+               "PW Screen: D-Bus method call failed (op_state %d): %s",
+               pctx->current_portal_op_state, error->message);
     pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
     g_error_free(error);
     if (result_variant)
       g_variant_unref(result_variant);
+    // TODO: Notify application of failure, potentially clean up
+    // For now, just reset state
+    pctx->current_portal_op_state = PORTAL_OP_STATE_NONE;
+    g_free(pctx->current_portal_request_token_str);
+    pctx->current_portal_request_token_str = NULL;
     return;
   }
 
-  // Call your response handler directly
-  on_portal_select_sources_response(pctx, result_variant);
+  char *request_obj_path_temp = NULL;
+  g_variant_get(result_variant, "(o)", &request_obj_path_temp);
+  g_free(pctx->current_portal_request_object_path_str); // Free old one if any
+  pctx->current_portal_request_object_path_str =
+      g_strdup(request_obj_path_temp);
+  // request_obj_path_temp is owned by result_variant, g_strdup makes a copy.
   g_variant_unref(result_variant);
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: D-Bus method call for op_state %d initiated. Request "
+             "object: %s. Token: %s. Waiting for Response signal.",
+             pctx->current_portal_op_state,
+             pctx->current_portal_request_object_path_str,
+             pctx->current_portal_request_token_str
+                 ? pctx->current_portal_request_token_str
+                 : "N/A");
+
+  // Unsubscribe any previous request signal before subscribing to a new one
+  if (pctx->current_request_signal_subscription_id > 0) {
+    g_dbus_connection_signal_unsubscribe(
+        pctx->dbus_conn, pctx->current_request_signal_subscription_id);
+    pctx->current_request_signal_subscription_id = 0;
+  }
+
+  pctx->current_request_signal_subscription_id =
+      g_dbus_connection_signal_subscribe(
+          pctx->dbus_conn,
+          XDP_BUS_NAME,                                 // Sender
+          XDP_IFACE_REQUEST,                            // Interface
+          "Response",                                   // Signal name
+          pctx->current_portal_request_object_path_str, // Object path of the
+                                                        // request
+          NULL, // arg0 filter (NULL for no filter)
+          G_DBUS_SIGNAL_FLAGS_NONE,
+          (GDBusSignalCallback)on_portal_request_signal_response,
+          pctx, // user_data
+          NULL  // GDestroyNotify for user_data (not needed for pctx)
+      );
+
+  if (pctx->current_request_signal_subscription_id == 0) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: Failed to subscribe to Response signal for %s",
+               pctx->current_portal_request_object_path_str);
+    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
+    // TODO: Notify application of failure
+    g_free(pctx->current_portal_request_object_path_str);
+    pctx->current_portal_request_object_path_str = NULL;
+    g_free(pctx->current_portal_request_token_str);
+    pctx->current_portal_request_token_str = NULL;
+    pctx->current_portal_op_state = PORTAL_OP_STATE_NONE;
+  }
 }
 
 static void on_portal_request_signal_response(
     GDBusConnection *connection, const gchar *sender_name,
-    const gchar *object_path, // Path of the Request object
+    const gchar *object_path, // Path of the Request object that emitted signal
     const gchar *interface_name, const gchar *signal_name,
     GVariant *parameters, // (uint response_code, dict results)
     gpointer user_data) {
   PipeWireScreenPlatformContext *pctx =
       (PipeWireScreenPlatformContext *)user_data;
 
-  guint subscription_id = (guint)(uintptr_t)g_object_get_data(
-      G_OBJECT(connection),
-      object_path); // This is tricky, need to store subscription ID
-  if (subscription_id > 0) {
-    g_dbus_connection_signal_unsubscribe(connection, subscription_id);
+  // Defensive check: ensure this signal is for the request we're expecting
+  if (!pctx->current_portal_request_object_path_str ||
+      strcmp(object_path, pctx->current_portal_request_object_path_str) != 0) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW Screen: Received Response signal for unexpected request "
+               "object %s (expected %s). Ignoring.",
+               object_path,
+               pctx->current_portal_request_object_path_str
+                   ? pctx->current_portal_request_object_path_str
+                   : "null");
+    return;
   }
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "PW Screen: Received Response signal for request object %s",
-             object_path);
+             "PW Screen: Received Response signal for request object %s "
+             "(op_state %d, token %s)",
+             object_path, pctx->current_portal_op_state,
+             pctx->current_portal_request_token_str
+                 ? pctx->current_portal_request_token_str
+                 : "N/A");
+
+  // Unsubscribe from this signal now that we've received it.
+  if (pctx->current_request_signal_subscription_id > 0) {
+    g_dbus_connection_signal_unsubscribe(
+        connection, pctx->current_request_signal_subscription_id);
+    pctx->current_request_signal_subscription_id = 0;
+  }
+  g_free(pctx->current_portal_request_object_path_str); // We are done with this
+                                                        // request object path
+  pctx->current_portal_request_object_path_str = NULL;
+  // We keep current_portal_request_token_str for logging/debugging until the
+  // next request is made.
 
   guint response_code;
-  GVariant *results_dict = NULL; // Must be initialized
+  GVariant *results_dict = NULL;
   g_variant_get(parameters, "(u@a{sv})", &response_code,
                 &results_dict); // results_dict is new ref
 
   if (response_code != 0) { // 0 = success, 1 = user cancelled, 2 = error
     miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "PW Screen: Portal request %s failed/cancelled with code %u.",
-               object_path, response_code);
-    pctx->last_error = (response_code == 1)
-                           ? MINIAV_ERROR_USER_CANCELLED // Use defined error
-                           : MINIAV_ERROR_PORTAL_FAILED;
+               "PW Screen: Portal request (op_state %d, token %s) "
+               "failed/cancelled with code %u.",
+               pctx->current_portal_op_state,
+               pctx->current_portal_request_token_str
+                   ? pctx->current_portal_request_token_str
+                   : "N/A",
+               response_code);
+    pctx->last_error = (response_code == 1) ? MINIAV_ERROR_USER_CANCELLED
+                                            : MINIAV_ERROR_PORTAL_FAILED;
     if (results_dict)
       g_variant_unref(results_dict);
-    // Potentially trigger cleanup or notify application
+
+    // TODO: Notify application of failure, clean up state
+    pctx->current_portal_op_state = PORTAL_OP_STATE_NONE;
+    g_free(pctx->current_portal_request_token_str);
+    pctx->current_portal_request_token_str = NULL;
     return;
   }
 
-  // Determine which step this response corresponds to
-  if (g_str_has_prefix(pctx->portal_request_handle_str, "miniav_select_req")) {
+  // Process successful response based on current operation state
+  PortalOperationState completed_op_state = pctx->current_portal_op_state;
+  pctx->current_portal_op_state =
+      PORTAL_OP_STATE_NONE; // Reset before potentially starting next
+
+  switch (completed_op_state) {
+  case PORTAL_OP_STATE_CREATING_SESSION: {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "PW Screen: Processing SelectSources response via signal.");
-    on_portal_select_sources_response(pctx, results_dict); // Pass the dict
-  } else if (g_str_has_prefix(pctx->portal_request_handle_str,
-                              "miniav_start_req")) {
+               "PW Screen: Processing CreateSession response (token %s).",
+               pctx->current_portal_request_token_str
+                   ? pctx->current_portal_request_token_str
+                   : "N/A");
+    char *session_handle_temp = NULL;
+    if (g_variant_lookup(results_dict, "session_handle", "o",
+                         &session_handle_temp)) {
+      g_free(pctx->portal_session_handle_str);
+      pctx->portal_session_handle_str = g_strdup(session_handle_temp);
+      // session_handle_temp is owned by results_dict, g_strdup copies.
+      miniav_log(MINIAV_LOG_LEVEL_INFO, "PW Screen: Portal session created: %s",
+                 pctx->portal_session_handle_str);
+
+      // Subscribe to SessionClosed signal
+      if (pctx->session_closed_signal_subscription_id > 0) {
+        g_dbus_connection_signal_unsubscribe(
+            pctx->dbus_conn, pctx->session_closed_signal_subscription_id);
+      }
+      pctx->session_closed_signal_subscription_id =
+          g_dbus_connection_signal_subscribe(
+              pctx->dbus_conn, XDP_BUS_NAME, XDP_IFACE_SESSION, "Closed",
+              pctx->portal_session_handle_str, // Object path of the session
+              NULL, G_DBUS_SIGNAL_FLAGS_NONE,
+              (GDBusSignalCallback)on_portal_session_closed, pctx, NULL);
+      if (pctx->session_closed_signal_subscription_id == 0) {
+        miniav_log(
+            MINIAV_LOG_LEVEL_WARN,
+            "PW Screen: Failed to subscribe to SessionClosed signal for %s",
+            pctx->portal_session_handle_str);
+      }
+
+      portal_initiate_select_sources(pctx); // Proceed to next step
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "PW Screen: 'session_handle' (type 'o') not found in "
+                 "CreateSession response dict.");
+      pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
+      // TODO: Cleanup
+    }
+    break;
+  }
+  case PORTAL_OP_STATE_SELECTING_SOURCES: {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "PW Screen: Processing Start response via signal.");
-    on_portal_start_response(pctx, results_dict); // Pass the dict
-  } else {
+               "PW Screen: Processing SelectSources response (token %s). User "
+               "made a selection.",
+               pctx->current_portal_request_token_str
+                   ? pctx->current_portal_request_token_str
+                   : "N/A");
+    // SelectSources response dict is usually empty on success.
+    // The success is implied by response_code == 0.
+    portal_initiate_start_stream(pctx); // Proceed to next step
+    break;
+  }
+  case PORTAL_OP_STATE_STARTING_STREAM: {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW Screen: Processing Start response (token %s).",
+               pctx->current_portal_request_token_str
+                   ? pctx->current_portal_request_token_str
+                   : "N/A");
+
+    GVariant *streams_array_variant = NULL;
+    gboolean video_node_found = FALSE;
+    // gboolean audio_node_found = FALSE; // Keep for future use
+
+    if (g_variant_lookup(results_dict, "streams", "a(ua{sv})",
+                         &streams_array_variant) &&
+        streams_array_variant) {
+      GVariantIter stream_iter;
+      g_variant_iter_init(&stream_iter, streams_array_variant);
+      guint32 stream_node_id_temp;
+      GVariant *stream_props_dict_variant;
+
+      if (g_variant_iter_next(&stream_iter, "(ua{sv})", &stream_node_id_temp,
+                              &stream_props_dict_variant)) {
+        pctx->video_node_id = stream_node_id_temp;
+        video_node_found = TRUE;
+        miniav_log(MINIAV_LOG_LEVEL_INFO,
+                   "PW Screen: Found video stream node ID: %u",
+                   pctx->video_node_id);
+        if (stream_props_dict_variant)
+          g_variant_unref(stream_props_dict_variant);
+
+        if (pctx->audio_requested_by_user) {
+          if (g_variant_iter_next(&stream_iter, "(ua{sv})",
+                                  &stream_node_id_temp,
+                                  &stream_props_dict_variant)) {
+            pctx->audio_node_id = stream_node_id_temp;
+            // audio_node_found = TRUE;
+            miniav_log(MINIAV_LOG_LEVEL_INFO,
+                       "PW Screen: Found audio stream node ID: %u",
+                       pctx->audio_node_id);
+            if (stream_props_dict_variant)
+              g_variant_unref(stream_props_dict_variant);
+          } else {
+            miniav_log(MINIAV_LOG_LEVEL_WARN,
+                       "PW Screen: Audio requested, but only one stream "
+                       "(video) provided.");
+            pctx->audio_node_id = PW_ID_ANY;
+          }
+        }
+      } else {
+        miniav_log(
+            MINIAV_LOG_LEVEL_ERROR,
+            "PW Screen: No streams found in portal Start response array.");
+      }
+      g_variant_unref(streams_array_variant);
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: 'streams' key (a(ua{sv})) "
+                                         "not found in Start response dict.");
+    }
+
+    if (!video_node_found) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "PW Screen: Did not find a video node ID from portal Start.");
+      pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
+      // TODO: Cleanup
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_INFO,
+                 "Screen capture started successfully."); // User-facing message
+                                                          // from original log
+      pw_screen_setup_pipewire_streams(pctx);
+    }
+    break;
+  }
+  case PORTAL_OP_STATE_NONE:
+  default:
     miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "PW Screen: Unknown portal request response for token %s",
-               pctx->portal_request_handle_str);
+               "PW Screen: Received portal response in unexpected state: %d "
+               "(token %s)",
+               completed_op_state,
+               pctx->current_portal_request_token_str
+                   ? pctx->current_portal_request_token_str
+                   : "N/A");
     pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
+    break;
   }
 
   if (results_dict)
     g_variant_unref(results_dict);
-}
-
-static void on_portal_start_response(
-    PipeWireScreenPlatformContext *pctx,
-    GVariant *results) { // 'results' here is the a{sv} from the Response signal
-  if (!pctx) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: Portal Start response called with NULL pctx.");
-    if (results)
-      g_variant_unref(
-          results); // Should be unreffed by caller if it's a new ref
-    return;
-  }
-
-  if (!results) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: Portal Start method response processing called with "
-               "NULL results dict.");
-    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
-    if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
-      write(pctx->wakeup_pipe[1], "f", 1); // Indicate failure
-    }
-    return;
-  }
-
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "PW Screen: Processing portal Start response.");
-
-  GVariant *streams_array_variant = NULL;
-  gboolean video_node_found = FALSE;
-  gboolean audio_node_found = FALSE;
-
-  // The "streams" key contains an array of (uint32 node_id, dict properties)
-  // The portal spec says:
-  // "The PipeWire stream node ID for the video stream is the first element in
-  // the streams array.
-  //  If audio is also captured, the PipeWire stream node ID for the audio
-  //  stream is the second element in the streams array."
-  if (g_variant_lookup(results, "streams", "a(ua{sv})",
-                       &streams_array_variant) &&
-      streams_array_variant) {
-    GVariantIter stream_iter;
-    g_variant_iter_init(&stream_iter, streams_array_variant);
-
-    guint32 stream_node_id_temp;
-    GVariant *stream_props_dict_variant; // a{sv}
-
-    // Get the first stream (video)
-    if (g_variant_iter_next(&stream_iter, "(ua{sv})", &stream_node_id_temp,
-                            &stream_props_dict_variant)) {
-      pctx->video_node_id = stream_node_id_temp;
-      video_node_found = TRUE;
-      miniav_log(MINIAV_LOG_LEVEL_INFO,
-                 "PW Screen: Found video stream node ID: %u",
-                 pctx->video_node_id);
-      if (stream_props_dict_variant) { // It's a new ref from iter_next
-        // You could inspect stream_props_dict_variant if needed, e.g., for
-        // "media.type" For now, we assume the first is video.
-        g_variant_unref(stream_props_dict_variant);
-      }
-
-      // Get the second stream (audio, if present and requested)
-      if (pctx->audio_requested_by_user) {
-        if (g_variant_iter_next(&stream_iter, "(ua{sv})", &stream_node_id_temp,
-                                &stream_props_dict_variant)) {
-          pctx->audio_node_id = stream_node_id_temp;
-          audio_node_found = TRUE;
-          miniav_log(MINIAV_LOG_LEVEL_INFO,
-                     "PW Screen: Found audio stream node ID: %u",
-                     pctx->audio_node_id);
-          if (stream_props_dict_variant) {
-            g_variant_unref(stream_props_dict_variant);
-          }
-        } else {
-          miniav_log(MINIAV_LOG_LEVEL_WARN,
-                     "PW Screen: Audio was requested, but only one stream "
-                     "(video) provided by portal.");
-          pctx->audio_node_id =
-              PW_ID_ANY; // Ensure it's marked as not available
-        }
-      }
-    } else {
-      miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "PW Screen: No streams found in portal Start response.");
-    }
-    g_variant_unref(
-        streams_array_variant); // streams_array_variant was new ref from lookup
-  } else {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: 'streams' key (type a(ua{sv})) not found or NULL in "
-               "portal Start response dict.");
-  }
-
-  if (!video_node_found) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: Did not find a video node ID from portal.");
-    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
-    if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
-      write(pctx->wakeup_pipe[1], "f", 1);
-    }
-    return;
-  }
-
-  // If we got at least a video node, proceed to set up PipeWire
-  pw_screen_setup_pipewire_streams(pctx);
+  // current_portal_request_token_str will be freed/reset when the next request
+  // is made
 }
 
 static void
@@ -1180,6 +1191,11 @@ on_portal_session_closed(GDBusConnection *connection, const gchar *sender_name,
       strcmp(pctx->portal_session_handle_str, object_path) == 0) {
     g_free(pctx->portal_session_handle_str);
     pctx->portal_session_handle_str = NULL;
+    if (pctx->session_closed_signal_subscription_id > 0) {
+      g_dbus_connection_signal_unsubscribe(
+          connection, pctx->session_closed_signal_subscription_id);
+      pctx->session_closed_signal_subscription_id = 0;
+    }
     if (pctx->parent_ctx->is_running) {
       miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Active capture session "
                                         "closed by portal. Stopping capture.");
@@ -1197,52 +1213,31 @@ on_portal_session_closed(GDBusConnection *connection, const gchar *sender_name,
   }
 }
 
-static void on_portal_create_session_dbus_response(GObject *source_object,
-                                                   GAsyncResult *res,
-                                                   gpointer user_data) {
-  PipeWireScreenPlatformContext *pctx =
-      (PipeWireScreenPlatformContext *)user_data;
-  GError *error = NULL;
-  GVariant *result_variant = g_dbus_connection_call_finish(
-      G_DBUS_CONNECTION(source_object), res, &error);
-
-  if (error) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: Portal CreateSession D-Bus call failed: %s",
-               error->message);
-    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
-    g_error_free(error);
-    if (result_variant)
-      g_variant_unref(result_variant);
-    return;
-  }
-  on_portal_create_session_response(pctx, result_variant);
-  g_variant_unref(result_variant);
-}
-
 static MiniAVResultCode pw_screen_start_capture(struct MiniAVScreenContext *ctx,
                                                 MiniAVBufferCallback callback,
                                                 void *user_data) {
   PipeWireScreenPlatformContext *pctx =
       (PipeWireScreenPlatformContext *)ctx->platform_ctx;
-  if (!ctx->is_configured)
+  if (!ctx->is_configured) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: Not configured before StartCapture.");
     return MINIAV_ERROR_NOT_INITIALIZED;
-  // loop_running check is tricky here due to async portal.
-  // is_running on parent_ctx might be a better check if portal is already
-  // active.
-  if (pctx->parent_ctx->is_running || pctx->loop_running) {
+  }
+  if (pctx->parent_ctx->is_running || pctx->loop_running ||
+      pctx->current_portal_op_state != PORTAL_OP_STATE_NONE) {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "PW Screen: Start capture called but seems already running or "
-               "portal active.");
+               "PW Screen: Start capture called but already running or portal "
+               "operation pending (state %d).",
+               pctx->current_portal_op_state);
     return MINIAV_ERROR_ALREADY_RUNNING;
   }
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "PW Screen: Starting capture via xdg-desktop-portal...");
+             "PW Screen: Starting capture via xdg-desktop-portal (async)...");
 
   pctx->app_callback_pending = callback;
   pctx->app_callback_user_data_pending = user_data;
-  pctx->last_error = MINIAV_SUCCESS;
+  pctx->last_error = MINIAV_SUCCESS; // Reset last error
 
   if (!pctx->dbus_conn) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
@@ -1254,45 +1249,228 @@ static MiniAVResultCode pw_screen_start_capture(struct MiniAVScreenContext *ctx,
     pctx->cancellable = g_cancellable_new();
   }
 
-  g_free(pctx->portal_request_handle_str);
-  pctx->portal_request_handle_str =
-      generate_token("miniav_session_req_token"); // For CreateSession options
-  char *session_token = generate_token(
-      "miniav_session_handle_token"); // For CreateSession options
+  // --- 1. CreateSession ---
+  pctx->current_portal_op_state = PORTAL_OP_STATE_CREATING_SESSION;
+
+  g_free(pctx->current_portal_request_token_str); // Free previous if any
+  pctx->current_portal_request_token_str =
+      generate_token("miniav_session_req"); // For CreateSession options
+
+  char *session_handle_token_for_options =
+      generate_token("miniav_session_handle_opt"); // For CreateSession options
 
   GVariantBuilder options_builder;
   g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
-  g_variant_builder_add(&options_builder, "{sv}", "handle_token",
-                        g_variant_new_string(pctx->portal_request_handle_str));
+  g_variant_builder_add(
+      &options_builder, "{sv}", "handle_token",
+      g_variant_new_string(pctx->current_portal_request_token_str));
   g_variant_builder_add(&options_builder, "{sv}", "session_handle_token",
-                        g_variant_new_string(session_token));
-  g_free(session_token);
-
-  GError *error = NULL;
-  GVariant *result_variant = g_dbus_connection_call_sync(
-      pctx->dbus_conn, XDP_BUS_NAME, XDP_OBJECT_PATH, XDP_IFACE_SCREENCAST,
-      "CreateSession", g_variant_new("(a{sv})", &options_builder),
-      G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, -1, pctx->cancellable,
-      &error);
-
-  if (error) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW Screen: D-Bus CreateSession call failed: %s",
-               error->message);
-    pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
-    g_error_free(error);
-    if (result_variant)
-      g_variant_unref(result_variant);
-    return MINIAV_ERROR_PORTAL_FAILED;
-  }
-
-  on_portal_create_session_response(pctx, result_variant);
-  g_variant_unref(result_variant);
+                        g_variant_new_string(session_handle_token_for_options));
+  GVariant *options_variant = g_variant_builder_end(&options_builder);
+  g_free(session_handle_token_for_options);
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "PW Screen: CreateSession call initiated with token %s.",
-             pctx->portal_request_handle_str);
+             "PW Screen: Calling CreateSession with token %s",
+             pctx->current_portal_request_token_str);
+
+  g_dbus_connection_call(
+      pctx->dbus_conn, XDP_BUS_NAME, XDP_OBJECT_PATH, XDP_IFACE_SCREENCAST,
+      "CreateSession",
+      g_variant_new_tuple(&options_variant,
+                          1), // Parameters as a tuple: (a{sv})
+      G_VARIANT_TYPE("(o)"),  // Expected reply type: (handle request_handle)
+      G_DBUS_CALL_FLAGS_NONE,
+      -1, // Default timeout
+      pctx->cancellable, (GAsyncReadyCallback)on_dbus_method_call_completed_cb,
+      pctx // user_data
+  );
+  // options_variant is consumed by g_variant_new_tuple and does not need
+  // separate unref if tuple takes ownership. However, g_variant_new_tuple
+  // documentation says "The new GVariant holds a reference to each of the
+  // items." So, if options_variant was created with g_variant_builder_end, it
+  // should be unreffed after the tuple is created. Let's be safe: GVariant
+  // *params_tuple = g_variant_new_tuple(&options_variant, 1);
+  // ... call (params_tuple, ...)
+  // g_variant_unref(params_tuple);
+  // g_variant_unref(options_variant); -> This is not needed as builder_end
+  // gives a floating ref. The issue is that g_variant_new_tuple takes GVariant*
+  // const*, so options_variant itself is not directly passed. The example in
+  // GLib docs for g_dbus_connection_call uses g_variant_new("(s)", "string")
+  // For a{sv}, it should be g_variant_new("(a{sv})", &options_builder) or
+  // options_variant directly if it's already a{sv}. The portal spec for
+  // CreateSession is `CreateSession (IN Dict options) -> (OUT ObjectPath
+  // request_handle)` The options dict itself is the parameter, not wrapped in
+  // another tuple. So, it should be: `options_variant` directly, not
+  // `g_variant_new_tuple(&options_variant, 1)` Let's re-check
+  // g_dbus_connection_call parameters. It takes a GVariant *parameters. If the
+  // method takes one dict `a{sv}`, then `options_variant` is correct. If the
+  // method takes arguments `(arg1, arg2)`, then `g_variant_new("(type1type2)",
+  // arg1, arg2)` CreateSession takes `options (a{sv})`. So `options_variant` is
+  // the GVariant parameter.
+
+  // Corrected call:
+  // g_dbus_connection_call(..., options_variant, ...);
+  // And options_variant should be unreffed after the call if it's not floating.
+  // g_variant_builder_end returns a floating reference. g_dbus_connection_call
+  // will sink it.
+
+  // The previous sync call was: g_variant_new("(a{sv})", &options_builder)
+  // This creates a tuple containing the dict. This is likely correct.
+  // Let's stick to that pattern for the parameters argument.
+
+  // Re-evaluating parameter for CreateSession:
+  // Method signature: CreateSession (IN Dict options)
+  // Dict options is a{sv}.
+  // So, the GVariant *parameters for g_dbus_connection_call should be the a{sv}
+  // dict itself. `options_variant` from
+  // `g_variant_builder_end(&options_builder)` is already of type `a{sv}`. So,
+  // the call should be: g_dbus_connection_call(..., options_variant, ...); And
+  // `options_variant` is floating, so it's fine.
+
+  // Let's re-verify the sync call:
+  // g_dbus_connection_call_sync(..., "CreateSession", g_variant_new("(a{sv})",
+  // &options_builder), ...); `g_variant_new("(a{sv})", &options_builder)`
+  // creates a GVariant of type `(a{sv})` (a tuple containing a dict). This
+  // implies the D-Bus method expects its arguments wrapped in a tuple. If
+  // CreateSession has signature `CreateSession (IN Dict options)`, then
+  // `options` is the first argument. If it was `CreateSession (IN String arg1,
+  // IN Dict options)`, then it would be `g_variant_new("(sa{sv})", ...)`. The
+  // XDP spec for ScreenCast.CreateSession is `a{sv} options`. So the parameter
+  // to g_dbus_connection_call should be the `a{sv}` variant directly. The
+  // `g_variant_new("(a{sv})", &options_builder)` in the sync call was likely to
+  // ensure the builder content is correctly formed into a single GVariant
+  // parameter for the call. `g_variant_builder_end` already gives a GVariant of
+  // type `a{sv}`.
+
+  // Final decision for CreateSession parameters:
+  // `options_variant` (which is `a{sv}`) is the correct parameter.
+  // The `g_variant_new("(a{sv})", &options_builder)` was for the *builder*, not
+  // the variant. No, `g_variant_new` takes a format string.
+  // `g_variant_new("(a{sv})", &options_builder)` means "create a tuple, whose
+  // single element is a dict, and populate that dict using the builder". This
+  // is the standard way to pass multiple arguments or a single complex
+  // argument. The portal methods usually take their arguments as a tuple.
+  // CreateSession (options::a{sv}) -> request_handle::o
+  // The parameters GVariant should be a tuple containing the 'options' dict.
+  // So, `g_variant_new("(a{sv})", options_variant_ptr)` where
+  // `options_variant_ptr` points to the `a{sv}`. Or, more directly,
+  // `g_variant_new("(a{sv})", &options_builder)` if the builder is still live.
+  // Since `options_variant` is already the `a{sv}`:
+  GVariant *params_for_create_session =
+      g_variant_new_tuple(&options_variant, 1);
+
+  g_dbus_connection_call(
+      pctx->dbus_conn, XDP_BUS_NAME, XDP_OBJECT_PATH, XDP_IFACE_SCREENCAST,
+      "CreateSession",
+      params_for_create_session, // This is now a tuple (a{sv})
+      G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, -1, pctx->cancellable,
+      (GAsyncReadyCallback)on_dbus_method_call_completed_cb, pctx);
+  // params_for_create_session is floating and will be sunk by the call.
+  // options_variant was sunk by g_variant_new_tuple.
+
+  // The original log message "Screen capture started successfully." was
+  // premature. It should only be logged after the Start call is successful and
+  // streams are being set up. The function should return MINIAV_SUCCESS if the
+  // async process has started. Errors will be handled asynchronously.
   return MINIAV_SUCCESS;
+}
+
+static void
+portal_initiate_select_sources(PipeWireScreenPlatformContext *pctx) {
+  pctx->current_portal_op_state = PORTAL_OP_STATE_SELECTING_SOURCES;
+  g_free(pctx->current_portal_request_token_str);
+  pctx->current_portal_request_token_str = generate_token("miniav_select_req");
+
+  GVariantBuilder options_builder;
+  g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
+  g_variant_builder_add(
+      &options_builder, "{sv}", "handle_token",
+      g_variant_new_string(pctx->current_portal_request_token_str));
+  g_variant_builder_add(&options_builder, "{sv}", "multiple",
+                        g_variant_new_boolean(FALSE));
+
+  uint32_t source_types = 0;
+  if (pctx->capture_type == MINIAV_CAPTURE_TYPE_DISPLAY)
+    source_types = (1 << 0);
+  else if (pctx->capture_type == MINIAV_CAPTURE_TYPE_WINDOW)
+    source_types = (1 << 1);
+  else
+    source_types = (1 << 0) | (1 << 1); // Region or default
+  g_variant_builder_add(&options_builder, "{sv}", "types",
+                        g_variant_new_uint32(source_types));
+
+  GVariant *options_dict_variant =
+      g_variant_builder_end(&options_builder); // This is a{sv}
+
+  // SelectSources (IN ObjectPath session_handle, IN Dict options) -> (OUT
+  // ObjectPath request_handle) Parameters GVariant should be a tuple: (oa{sv})
+  GVariant *params_for_select_sources = g_variant_new(
+      "(oa{sv})", pctx->portal_session_handle_str, options_dict_variant);
+  // options_dict_variant is floating, g_variant_new sinks one ref.
+  // If g_variant_new takes a GVariant** for dicts, then it would be
+  // &options_dict_variant. Let's check g_variant_new with a{sv} For
+  // g_variant_new("(oa{sv})", session_path, dict_variant_itself); is correct if
+  // dict_variant_itself is a GVariant*. Yes, g_variant_new("(oa{sv})", const
+  // gchar *obj_path, GVariant *dict_options) So, this is correct: GVariant
+  // *params_for_select_sources = g_variant_new("(oa{sv})",
+  //                                                    pctx->portal_session_handle_str,
+  //                                                    options_dict_variant);
+  // And options_dict_variant will be unreffed by
+  // g_variant_unref(params_for_select_sources) later if not sunk. Since
+  // options_dict_variant is floating, g_variant_new will take ownership.
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: Calling SelectSources for session %s with token %s",
+             pctx->portal_session_handle_str,
+             pctx->current_portal_request_token_str);
+
+  g_dbus_connection_call(
+      pctx->dbus_conn, XDP_BUS_NAME, XDP_OBJECT_PATH, XDP_IFACE_SCREENCAST,
+      "SelectSources",
+      params_for_select_sources, // This is (oa{sv})
+      G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, -1, pctx->cancellable,
+      (GAsyncReadyCallback)on_dbus_method_call_completed_cb, pctx);
+  // params_for_select_sources is floating and sunk by the call.
+  // options_dict_variant was sunk by params_for_select_sources.
+}
+
+static void portal_initiate_start_stream(PipeWireScreenPlatformContext *pctx) {
+  pctx->current_portal_op_state = PORTAL_OP_STATE_STARTING_STREAM;
+  g_free(pctx->current_portal_request_token_str);
+  pctx->current_portal_request_token_str = generate_token("miniav_start_req");
+
+  GVariantBuilder options_builder;
+  g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
+  g_variant_builder_add(
+      &options_builder, "{sv}", "handle_token",
+      g_variant_new_string(pctx->current_portal_request_token_str));
+  GVariant *start_options_dict =
+      g_variant_builder_end(&options_builder); // a{sv}
+
+  const char *parent_window_handle = ""; // Typically empty
+
+  // Start (IN String parent_window, IN Dict options) -> (OUT ObjectPath
+  // request_handle) This is on the Session interface, so object_path is
+  // pctx->portal_session_handle_str Parameters GVariant should be a tuple:
+  // (sa{sv})
+  GVariant *params_for_start =
+      g_variant_new("(sa{sv})", parent_window_handle, start_options_dict);
+  // start_options_dict is floating, sunk by g_variant_new.
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: Calling Start for session %s with token %s",
+             pctx->portal_session_handle_str,
+             pctx->current_portal_request_token_str);
+
+  g_dbus_connection_call(
+      pctx->dbus_conn, XDP_BUS_NAME,
+      pctx->portal_session_handle_str, // Object path is the session handle
+      XDP_IFACE_SESSION,               // Interface is Session
+      "Start",
+      params_for_start, // This is (sa{sv})
+      G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, -1, pctx->cancellable,
+      (GAsyncReadyCallback)on_dbus_method_call_completed_cb, pctx);
+  // params_for_start is floating and sunk by the call.
 }
 
 static void

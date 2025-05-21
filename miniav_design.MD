@@ -236,7 +236,7 @@ This section details the public C API exposed by `miniav_c`.
     // Output Preference (set during configuration)
     typedef enum {
         MINIAV_OUTPUT_PREFERENCE_CPU,         // Prefer CPU-accessible buffers.
-        MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE // Prefer GPU handles if supported, otherwise fallback to CPU.
+        MINIAV_OUTPUT_PREFERENCE_GPU // Prefer GPU handles if supported, otherwise fallback to CPU.
     } MiniAVOutputPreference;
 
     // Common Pixel Formats (Extend as needed)
@@ -464,7 +464,7 @@ This API is for capturing audio output from the system or specific applications.
   * The `MiniAVBuffer` passed to the `MiniAVBufferCallback` has its `content_type` field indicating the nature of its data.
   * If `content_type` is `MINIAV_BUFFER_CONTENT_TYPE_CPU`, the relevant `planes` or `data` pointers in the union are valid.
   * If `content_type` is a GPU type, the relevant `native_gpu_...` fields are valid.
-  * The library attempts to honor the `MiniAVOutputPreference` set during configuration. If `MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE` was set but GPU output failed or is not supported, the buffer's `content_type` will be `MINIAV_BUFFER_CONTENT_TYPE_CPU`.
+  * The library attempts to honor the `MiniAVOutputPreference` set during configuration. If `MINIAV_OUTPUT_PREFERENCE_GPU` was set but GPU output failed or is not supported, the buffer's `content_type` will be `MINIAV_BUFFER_CONTENT_TYPE_CPU`.
   * The user (e.g., the Dart FFI layer) is **responsible for explicitly releasing** the underlying native buffer/resource when it is no longer needed by calling `MiniAV_ReleaseBuffer(buffer->internal_handle)` via FFI.
   * **Failure to call `MiniAV_ReleaseBuffer` will result in resource leaks** (e.g., holding onto camera frames, screen capture resources, D3D11 textures, NT HANDLES, audio buffers).
   * **Frame Drops:** If the user does not release buffers promptly, underlying native capture APIs may run out of internal buffers or resources, potentially leading to dropped frames or errors.

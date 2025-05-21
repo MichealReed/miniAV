@@ -235,7 +235,7 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   if (mf_ctx->dxgi_manager && mf_ctx->d3d_device &&
       mf_ctx->d3d_device_context &&
       (desired_output_pref ==
-       MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE)) { // Or other specific shared
+       MINIAV_OUTPUT_PREFERENCE_GPU)) { // Or other specific shared
                                                      // texture prefs
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "MF: Attempting GPU shared texture path.");
@@ -401,7 +401,7 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   // GPU_IF_AVAILABLE failed to produce shareable texture)
   if (!processed_as_gpu_texture) {
     buffer_ptr->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-    if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE) {
+    if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU) {
       miniav_log(MINIAV_LOG_LEVEL_INFO,
                  "MF: GPU_IF_AVAILABLE preference: Falling back to CPU path "
                  "for sample processing.");
@@ -1274,7 +1274,7 @@ static MiniAVResultCode mf_configure(
   // _SHARED_TEXTURE_DXGI_REQUIRE or _FALLBACK_CPU, include them in this
   // condition.
   bool use_gpu_preference =
-      format->output_preference == MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE;
+      format->output_preference == MINIAV_OUTPUT_PREFERENCE_GPU;
 
   if (use_gpu_preference) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,

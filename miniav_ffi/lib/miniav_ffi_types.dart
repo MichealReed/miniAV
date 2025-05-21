@@ -78,9 +78,7 @@ class VideoFormatInfo {
     required this.outputPreference,
   });
 
-  factory VideoFormatInfo.fromNative(
-    bindings.MiniAVVideoInfo nativeInfo,
-  ) {
+  factory VideoFormatInfo.fromNative(bindings.MiniAVVideoInfo nativeInfo) {
     return VideoFormatInfo(
       width: nativeInfo.width,
       height: nativeInfo.height,
@@ -225,9 +223,8 @@ extension VideoFormatInfoFFIToPlatform on VideoFormatInfo {
     outputPreference: outputPreference.toPlatformType(),
   );
 
-  static VideoFormatInfo fromNative(
-    bindings.MiniAVVideoInfo nativeInfo,
-  ) => VideoFormatInfo.fromNative(nativeInfo);
+  static VideoFormatInfo fromNative(bindings.MiniAVVideoInfo nativeInfo) =>
+      VideoFormatInfo.fromNative(nativeInfo);
 
   static VideoFormatInfo fromPlatformType(MiniAVVideoInfo info) =>
       VideoFormatInfo(
@@ -328,9 +325,7 @@ extension MiniAVOutputPreferenceX on bindings.MiniAVOutputPreference {
     switch (this) {
       case bindings.MiniAVOutputPreference.MINIAV_OUTPUT_PREFERENCE_CPU:
         return MiniAVOutputPreference.cpu;
-      case bindings
-          .MiniAVOutputPreference
-          .MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE:
+      case bindings.MiniAVOutputPreference.MINIAV_OUTPUT_PREFERENCE_GPU:
         return MiniAVOutputPreference.gpuIfAvailable;
     }
   }
@@ -342,9 +337,7 @@ extension MiniAVOutputPreferenceX on bindings.MiniAVOutputPreference {
       case MiniAVOutputPreference.cpu:
         return bindings.MiniAVOutputPreference.MINIAV_OUTPUT_PREFERENCE_CPU;
       case MiniAVOutputPreference.gpuIfAvailable:
-        return bindings
-            .MiniAVOutputPreference
-            .MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE;
+        return bindings.MiniAVOutputPreference.MINIAV_OUTPUT_PREFERENCE_GPU;
     }
   }
 }

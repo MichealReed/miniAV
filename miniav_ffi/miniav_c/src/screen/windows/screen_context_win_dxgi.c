@@ -13,15 +13,9 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 
-// Enum for payload type
-typedef enum DXGIPayloadType {
-  DXGI_PAYLOAD_TYPE_CPU,
-  DXGI_PAYLOAD_TYPE_GPU
-} DXGIPayloadType;
-
 // Payload for releasing DXGI frame resources
 typedef struct DXGIFrameReleasePayload {
-  DXGIPayloadType type;
+  MiniAVOutputPreference type;
   union {
     struct {                                      // For CPU
       ID3D11Texture2D *staging_texture_for_frame; // AddRef'd
@@ -456,7 +450,7 @@ dxgi_get_default_formats(const char *device_id_utf8,
   video_format_out->frame_rate_numerator = 60;                 // Common default
   video_format_out->frame_rate_denominator = 1;
   video_format_out->output_preference =
-      MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE; // Default preference
+      MINIAV_OUTPUT_PREFERENCE_GPU; // Default preference
 
   // Get display dimensions
   HRESULT hr;
@@ -929,7 +923,7 @@ static MiniAVResultCode dxgi_release_buffer(MiniAVScreenContext *ctx,
   DXGIFrameReleasePayload *frame_payload =
       (DXGIFrameReleasePayload *)payload->native_resource_ptr;
 
-  if (frame_payload->type == DXGI_PAYLOAD_TYPE_CPU) {
+  if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU) {
     if (frame_payload->cpu.d3d_context_for_unmap &&
         frame_payload->cpu.staging_texture_for_frame) {
       ID3D11DeviceContext_Unmap(
@@ -946,7 +940,7 @@ static MiniAVResultCode dxgi_release_buffer(MiniAVScreenContext *ctx,
                  "DXGI: Released CPU per-frame staging texture. Ref count: %lu",
                  ref_count);
     }
-  } else if (frame_payload->type == DXGI_PAYLOAD_TYPE_GPU) {
+  } else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU) {
     if (frame_payload->gpu.shared_gpu_texture) {
       ULONG ref_count =
           ID3D11Texture2D_Release(frame_payload->gpu.shared_gpu_texture);
@@ -1074,7 +1068,7 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
     HANDLE shared_handle_for_app = NULL;
 
     // Attempt GPU Path if preferred
-    if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE &&
+    if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU &&
         dxgi_ctx->d3d_device) {
       D3D11_TEXTURE2D_DESC acquired_desc;
       ID3D11Texture2D_GetDesc(acquired_texture, &acquired_desc);
@@ -1162,7 +1156,7 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
 
     // CPU Path (or fallback from GPU)
     if (!processed_as_gpu) {
-      if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE) {
+      if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU) {
         miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                    "DXGI: GPU path failed or not preferred, using CPU path.");
       }
@@ -1245,11 +1239,11 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
     }
 
     if (processed_as_gpu) {
-      frame_release_payload_app->type = DXGI_PAYLOAD_TYPE_GPU;
+      frame_release_payload_app->type = MINIAV_OUTPUT_PREFERENCE_GPU;
       frame_release_payload_app->gpu.shared_gpu_texture =
           texture_for_payload_ref; // Already AddRef'd for this purpose
     } else {                       // CPU
-      frame_release_payload_app->type = DXGI_PAYLOAD_TYPE_CPU;
+      frame_release_payload_app->type = MINIAV_OUTPUT_PREFERENCE_CPU;
       frame_release_payload_app->cpu.staging_texture_for_frame =
           texture_for_payload_ref; // This is the per_frame_staging_texture
       frame_release_payload_app->cpu.d3d_context_for_unmap =

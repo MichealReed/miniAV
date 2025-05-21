@@ -83,7 +83,7 @@ typedef enum {
 
 typedef enum {
   MINIAV_OUTPUT_PREFERENCE_CPU,
-  MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE
+  MINIAV_OUTPUT_PREFERENCE_GPU
 } MiniAVOutputPreference;
 
 // -- Format Info Structs (Now after enums) ---

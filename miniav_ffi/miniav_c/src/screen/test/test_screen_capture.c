@@ -226,7 +226,7 @@ int main() {
          capture_format.frame_rate_denominator);
   printf("  Requested Output Preference: %s\n",
          capture_format.output_preference ==
-                 MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE
+                 MINIAV_OUTPUT_PREFERENCE_GPU
              ? "GPU_IF_AVAILABLE"
              : "CPU_ONLY");
 
@@ -254,7 +254,7 @@ int main() {
          actual_format.frame_rate_denominator);
   printf("  Actual Output Preference: %s\n",
          actual_format.output_preference ==
-                 MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE
+                 MINIAV_OUTPUT_PREFERENCE_GPU
              ? "GPU_IF_AVAILABLE"
          : actual_format.output_preference == MINIAV_OUTPUT_PREFERENCE_CPU
              ? "CPU_ONLY"

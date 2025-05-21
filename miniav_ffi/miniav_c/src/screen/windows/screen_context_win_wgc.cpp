@@ -252,7 +252,7 @@ wgc_get_default_formats(const char *device_id_utf8,
   video_format_out->frame_rate_numerator = 60;
   video_format_out->frame_rate_denominator = 1;
   video_format_out->output_preference =
-      MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE; // Default preference
+      MINIAV_OUTPUT_PREFERENCE_GPU; // Default preference
 
   if (target_type == WGC_TARGET_DISPLAY) {
     MONITORINFOEXW mi;
@@ -1127,7 +1127,7 @@ wgc_release_buffer(MiniAVScreenContext *ctx,
   if (frame_payload->original_output_preference ==
           MINIAV_OUTPUT_PREFERENCE_CPU ||
       (frame_payload->original_output_preference ==
-           MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE &&
+           MINIAV_OUTPUT_PREFERENCE_GPU &&
        frame_payload
            ->cpu_staging_texture_to_unmap_release) // Fallback to CPU case
   ) {
@@ -1143,7 +1143,7 @@ wgc_release_buffer(MiniAVScreenContext *ctx,
       miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: Released CPU staging texture.");
     }
   } else if (frame_payload->original_output_preference ==
-             MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE) {
+             MINIAV_OUTPUT_PREFERENCE_GPU) {
     // GPU path
     if (frame_payload->gpu_texture_to_release) {
       frame_payload->gpu_texture_to_release->Release(); // Release our AddRef
@@ -1394,7 +1394,7 @@ static void wgc_on_frame_arrived(
         wgc_ctx->configured_video_format.output_preference;
 
     // --- GPU Path Attempt ---
-    if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE &&
+    if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU &&
         wgc_ctx->d3d_device) {
       D3D11_TEXTURE2D_DESC acquired_desc;
       acquired_texture_com->GetDesc(&acquired_desc);
@@ -1483,7 +1483,7 @@ static void wgc_on_frame_arrived(
 
     // --- CPU Path (or fallback) ---
     if (!processed_as_gpu) {
-      if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE) {
+      if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU) {
         miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                    "WGC: GPU path failed or not preferred, using CPU path.");
       }

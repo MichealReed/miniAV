@@ -21,15 +21,18 @@
 #include <spa/utils/defs.h>   // For SPA_FRACTION_INIT
 #include <spa/utils/result.h> // For spa_strerror
 
+#include <drm/drm_fourcc.h> // For formats
 #include <errno.h>
-#include <fcntl.h>    // For O_CLOEXEC, F_DUPFD_CLOEXEC
-#include <gio/gio.h>  // For D-Bus (GDBus)
-#include <glib.h>     // For GVariant, GError, etc.
-#include <inttypes.h> // For PRIu64
+#include <fcntl.h>         // For O_CLOEXEC, F_DUPFD_CLOEXEC
+#include <gio/gio.h>       // For D-Bus (GDBus)
+#include <glib.h>          // For GVariant, GError, etc.
+#include <inttypes.h>      // For PRIu64
+#include <linux/dma-buf.h> // For DMA_BUF_IOCTL_SYNC and struct dma_buf_sync
 #include <pthread.h>
-#include <string.h>   // For memset, strcmp
-#include <sys/mman.h> // For shm, if using DMABUF or similar
-#include <unistd.h>   // For pipe, read, write, close, getpid
+#include <string.h>    // For memset, strcmp
+#include <sys/ioctl.h> // For ioctl
+#include <sys/mman.h>  // For shm, if using DMABUF or similar
+#include <unistd.h>    // For pipe, read, write, close, getpid
 
 // Portal D-Bus definitions
 #define XDP_BUS_NAME "org.freedesktop.portal.Desktop"
@@ -46,6 +49,20 @@ static void *glib_main_loop_thread(void *arg) {
   return NULL;
 }
 
+typedef struct PipeWireFrameReleasePayload {
+  MiniAVOutputPreference type;
+  union {
+    struct {             // For CPU
+      void *cpu_ptr;     // Allocated CPU buffer (copied from DMABUF)
+      size_t cpu_size;   // Size of the buffer
+      int src_dmabuf_fd; // Original DMABUF fd (for debugging, not owned)
+    } cpu;
+    struct {             // For GPU
+      int dup_dmabuf_fd; // Duplicated DMABUF fd (must be closed)
+    } gpu;
+  };
+} PipeWireFrameReleasePayload;
+
 // --- Helper to convert formats (Simplified) ---
 static enum spa_video_format
 miniav_video_format_to_spa(MiniAVPixelFormat pixel_fmt) {
@@ -56,7 +73,7 @@ miniav_video_format_to_spa(MiniAVPixelFormat pixel_fmt) {
     return SPA_VIDEO_FORMAT_RGBA;
   case MINIAV_PIXEL_FORMAT_I420:
     return SPA_VIDEO_FORMAT_I420;
-      case MINIAV_PIXEL_FORMAT_BGRX32: // Add this if you have it
+  case MINIAV_PIXEL_FORMAT_BGRX32: // Add this if you have it
     return SPA_VIDEO_FORMAT_BGRx;
   // Add more mappings
   default:
@@ -73,7 +90,7 @@ spa_video_format_to_miniav(enum spa_video_format spa_fmt) {
     return MINIAV_PIXEL_FORMAT_RGBA32;
   case SPA_VIDEO_FORMAT_I420:
     return MINIAV_PIXEL_FORMAT_I420;
-      case SPA_VIDEO_FORMAT_BGRx:
+  case SPA_VIDEO_FORMAT_BGRx:
     return MINIAV_PIXEL_FORMAT_BGRX32;
   // Add more mappings
   default:
@@ -466,13 +483,11 @@ pw_screen_get_default_formats(const char *device_id,
 
   if (video_format_out) {
     video_format_out->pixel_format =
-        MINIAV_PIXEL_FORMAT_BGRA32; // Common, good quality default
+        MINIAV_PIXEL_FORMAT_BGRX32; // Common, good quality default
     video_format_out->width = 0;    // Request native/negotiated width
     video_format_out->height = 0;   // Request native/negotiated height
     video_format_out->frame_rate_numerator = 30; // Common default FPS
     video_format_out->frame_rate_denominator = 1;
-    video_format_out->output_preference =
-        MINIAV_OUTPUT_PREFERENCE_GPU_IF_AVAILABLE;
     // num_planes, strides, dmabuf_plane_offsets are not part of
     // MiniAVVideoInfo
   }
@@ -839,40 +854,40 @@ static void on_portal_request_response(GObject *source_object,
       (PipeWireScreenPlatformContext *)user_data;
   GError *error = NULL;
   GVariant *result_variant = g_dbus_connection_call_finish(
-    G_DBUS_CONNECTION(source_object), res, &error);
+      G_DBUS_CONNECTION(source_object), res, &error);
 
-if (error) {
+  if (error) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "PW Screen: D-Bus request call failed: %s", error->message);
     pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
     g_error_free(error);
     if (result_variant)
-        g_variant_unref(result_variant);
+      g_variant_unref(result_variant);
     if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
-        write(pctx->wakeup_pipe[1], "f", 1);
+      write(pctx->wakeup_pipe[1], "f", 1);
     }
     return;
-}
+  }
 
-const gchar *variant_type = g_variant_get_type_string(result_variant);
-if (g_strcmp0(variant_type, "(o)") != 0) {
+  const gchar *variant_type = g_variant_get_type_string(result_variant);
+  if (g_strcmp0(variant_type, "(o)") != 0) {
     gchar *dbg_str = g_variant_print(result_variant, TRUE);
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-        "PW Screen: Unexpected D-Bus reply type: %s, value: %s",
-        variant_type, dbg_str);
+               "PW Screen: Unexpected D-Bus reply type: %s, value: %s",
+               variant_type, dbg_str);
     g_free(dbg_str);
     g_variant_unref(result_variant);
     pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
     if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
-        write(pctx->wakeup_pipe[1], "f", 1);
+      write(pctx->wakeup_pipe[1], "f", 1);
     }
     return;
-}
+  }
 
-char *request_handle_path_temp;
-g_variant_get(result_variant, "(o)", &request_handle_path_temp);
-char *request_handle_path = g_strdup(request_handle_path_temp);
-g_variant_unref(result_variant);
+  char *request_handle_path_temp;
+  g_variant_get(result_variant, "(o)", &request_handle_path_temp);
+  char *request_handle_path = g_strdup(request_handle_path_temp);
+  g_variant_unref(result_variant);
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Screen: D-Bus request initiated, handle: %s. Waiting for "
@@ -1069,14 +1084,17 @@ static void on_portal_request_signal_response(
     gboolean found_handle = FALSE;
 
     // Try to look up as object path first (standard)
-    if (g_variant_lookup(results_dict, "session_handle", "o", &session_handle_temp)) {
-        found_handle = TRUE;
+    if (g_variant_lookup(results_dict, "session_handle", "o",
+                         &session_handle_temp)) {
+      found_handle = TRUE;
     }
     // If not found as object path, try as string (for robustness)
-    else if (g_variant_lookup(results_dict, "session_handle", "s", &session_handle_temp)) {
-        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                   "PW Screen: 'session_handle' found as type 's' (string), though 'o' (object path) was expected.");
-        found_handle = TRUE;
+    else if (g_variant_lookup(results_dict, "session_handle", "s",
+                              &session_handle_temp)) {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW Screen: 'session_handle' found as type 's' (string), "
+                 "though 'o' (object path) was expected.");
+      found_handle = TRUE;
     }
 
     if (found_handle && session_handle_temp != NULL) {
@@ -1105,20 +1123,27 @@ static void on_portal_request_signal_response(
 
       portal_initiate_select_sources(pctx); // Proceed to next step
     } else {
-      miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "PW Screen: 'session_handle' (type 'o' or 's') not found or is NULL in "
-                 "CreateSession response dict.");
+      miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: 'session_handle' (type "
+                                         "'o' or 's') not found or is NULL in "
+                                         "CreateSession response dict.");
       // Optional: Log the actual type for detailed debugging if the key exists
       if (results_dict && g_variant_is_container(results_dict)) {
-          GVariant *value = g_variant_lookup_value(results_dict, "session_handle", NULL);
-          if (value) {
-              const char* type_str = g_variant_get_type_string(value);
-              miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: 'session_handle' exists, actual GVariant type is '%s'.", type_str);
-              // If it's a string-like type, you could try to print its value too, e.g. with g_variant_get_string(value, NULL)
-              g_variant_unref(value);
-          } else {
-              miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: 'session_handle' key truly does not exist in results_dict.");
-          }
+        GVariant *value =
+            g_variant_lookup_value(results_dict, "session_handle", NULL);
+        if (value) {
+          const char *type_str = g_variant_get_type_string(value);
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                     "PW Screen: 'session_handle' exists, actual GVariant type "
+                     "is '%s'.",
+                     type_str);
+          // If it's a string-like type, you could try to print its value too,
+          // e.g. with g_variant_get_string(value, NULL)
+          g_variant_unref(value);
+        } else {
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                     "PW Screen: 'session_handle' key truly does not exist in "
+                     "results_dict.");
+        }
       }
       pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
       // TODO: Cleanup
@@ -1147,14 +1172,17 @@ static void on_portal_request_signal_response(
     if (results_dict) {
       gchar *results_str = g_variant_print(results_dict, TRUE);
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "PW Screen: Full Start response results_dict: %s", results_str);
+                 "PW Screen: Full Start response results_dict: %s",
+                 results_str);
       g_free(results_str);
     } else {
       miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "PW Screen: Start response results_dict is NULL, but response_code was success.");
+                 "PW Screen: Start response results_dict is NULL, but "
+                 "response_code was success.");
     }
 
-           GVariant *streams_variant = g_variant_lookup_value(results_dict, "streams", NULL);
+    GVariant *streams_variant =
+        g_variant_lookup_value(results_dict, "streams", NULL);
     gboolean video_node_found = FALSE;
     if (streams_variant) {
       // Unwrap if it's a variant
@@ -1165,12 +1193,15 @@ static void on_portal_request_signal_response(
       }
       if (g_variant_is_of_type(streams_variant, G_VARIANT_TYPE_ARRAY)) {
         gsize n_streams = g_variant_n_children(streams_variant);
-        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: streams array has %zu children", n_streams);
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW Screen: streams array has %zu children", n_streams);
         for (gsize i = 0; i < n_streams; ++i) {
-          GVariant *stream_tuple = g_variant_get_child_value(streams_variant, i);
+          GVariant *stream_tuple =
+              g_variant_get_child_value(streams_variant, i);
           guint32 stream_node_id_temp = 0;
           GVariant *stream_props_dict_variant = NULL;
-          g_variant_get(stream_tuple, "(ua{sv})", &stream_node_id_temp, &stream_props_dict_variant);
+          g_variant_get(stream_tuple, "(ua{sv})", &stream_node_id_temp,
+                        &stream_props_dict_variant);
 
           if (!video_node_found) {
             pctx->video_node_id = stream_node_id_temp;
@@ -1178,7 +1209,8 @@ static void on_portal_request_signal_response(
             miniav_log(MINIAV_LOG_LEVEL_INFO,
                        "PW Screen: Found video stream node ID: %u",
                        pctx->video_node_id);
-          } else if (pctx->audio_requested_by_user && pctx->audio_node_id == PW_ID_ANY) {
+          } else if (pctx->audio_requested_by_user &&
+                     pctx->audio_node_id == PW_ID_ANY) {
             pctx->audio_node_id = stream_node_id_temp;
             miniav_log(MINIAV_LOG_LEVEL_INFO,
                        "PW Screen: Found audio stream node ID: %u",
@@ -1190,12 +1222,13 @@ static void on_portal_request_signal_response(
           g_variant_unref(stream_tuple);
         }
       } else {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: streams is not an array!");
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "PW Screen: streams is not an array!");
       }
       g_variant_unref(streams_variant);
     } else {
-      miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "PW Screen: 'streams' key (a(ua{sv})) not found in Start response dict.");
+      miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: 'streams' key (a(ua{sv})) "
+                                         "not found in Start response dict.");
     }
     if (!video_node_found) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
@@ -1203,8 +1236,7 @@ static void on_portal_request_signal_response(
       pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
       // TODO: Cleanup
     } else {
-      miniav_log(MINIAV_LOG_LEVEL_INFO,
-                 "Screen capture started successfully.");
+      miniav_log(MINIAV_LOG_LEVEL_INFO, "Screen capture started successfully.");
       pw_screen_setup_pipewire_streams(pctx);
     }
     break;
@@ -1237,22 +1269,25 @@ on_portal_session_closed(GDBusConnection *connection, const gchar *sender_name,
   PipeWireScreenPlatformContext *pctx =
       (PipeWireScreenPlatformContext *)user_data;
   guint reason;
-    const gchar *ptype = g_variant_get_type_string(parameters);
-  
+  const gchar *ptype = g_variant_get_type_string(parameters);
+
   if (g_strcmp0(ptype, "(u)") == 0) {
     g_variant_get(parameters, "(u)", &reason);
   } else if (g_strcmp0(ptype, "(a{sv})") == 0) {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "PW Screen: Received Session Closed parameters as (a{sv}), assuming reason 0.");
+               "PW Screen: Received Session Closed parameters as (a{sv}), "
+               "assuming reason 0.");
     reason = 0;
   } else {
-    miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "PW Screen: Unexpected parameters type %s in Session Closed signal.", ptype);
+    miniav_log(
+        MINIAV_LOG_LEVEL_WARN,
+        "PW Screen: Unexpected parameters type %s in Session Closed signal.",
+        ptype);
   }
-  
+
   miniav_log(MINIAV_LOG_LEVEL_INFO,
-             "PW Screen: Portal session %s closed, reason: %u",
-             object_path, reason);
+             "PW Screen: Portal session %s closed, reason: %u", object_path,
+             reason);
 
   if (pctx->portal_session_handle_str &&
       strcmp(pctx->portal_session_handle_str, object_path) == 0) {
@@ -1283,83 +1318,85 @@ on_portal_session_closed(GDBusConnection *connection, const gchar *sender_name,
 static MiniAVResultCode pw_screen_start_capture(struct MiniAVScreenContext *ctx,
                                                 MiniAVBufferCallback callback,
                                                 void *user_data) {
-    PipeWireScreenPlatformContext *pctx = (PipeWireScreenPlatformContext *)ctx->platform_ctx;
-    if (!ctx->is_configured) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                   "PW Screen: Not configured before StartCapture.");
-        return MINIAV_ERROR_NOT_INITIALIZED;
-    }
-    if (pctx->parent_ctx->is_running || pctx->loop_running ||
-        pctx->current_portal_op_state != PORTAL_OP_STATE_NONE) {
-        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "PW Screen: Start capture called but already running or portal "
-                   "operation pending (state %d).",
-                   pctx->current_portal_op_state);
-        return MINIAV_ERROR_ALREADY_RUNNING;
-    }
+  PipeWireScreenPlatformContext *pctx =
+      (PipeWireScreenPlatformContext *)ctx->platform_ctx;
+  if (!ctx->is_configured) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: Not configured before StartCapture.");
+    return MINIAV_ERROR_NOT_INITIALIZED;
+  }
+  if (pctx->parent_ctx->is_running || pctx->loop_running ||
+      pctx->current_portal_op_state != PORTAL_OP_STATE_NONE) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW Screen: Start capture called but already running or portal "
+               "operation pending (state %d).",
+               pctx->current_portal_op_state);
+    return MINIAV_ERROR_ALREADY_RUNNING;
+  }
 
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: Starting capture via xdg-desktop-portal (async)...");
+
+  pctx->app_callback_pending = callback;
+  pctx->app_callback_user_data_pending = user_data;
+  pctx->last_error = MINIAV_SUCCESS; // Reset last error
+
+  if (!pctx->dbus_conn) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "PW Screen: D-Bus connection not available for portal.");
+    return MINIAV_ERROR_NOT_INITIALIZED;
+  }
+  if (g_cancellable_is_cancelled(pctx->cancellable)) {
+    g_object_unref(pctx->cancellable);
+    pctx->cancellable = g_cancellable_new();
+  }
+
+  // --- If a valid portal session already exists, reuse it ---
+  if (pctx->portal_session_handle_str != NULL) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "PW Screen: Starting capture via xdg-desktop-portal (async)...");
-
-    pctx->app_callback_pending = callback;
-    pctx->app_callback_user_data_pending = user_data;
-    pctx->last_error = MINIAV_SUCCESS; // Reset last error
-
-    if (!pctx->dbus_conn) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                   "PW Screen: D-Bus connection not available for portal.");
-        return MINIAV_ERROR_NOT_INITIALIZED;
-    }
-    if (g_cancellable_is_cancelled(pctx->cancellable)) {
-        g_object_unref(pctx->cancellable);
-        pctx->cancellable = g_cancellable_new();
-    }
-
-    // --- If a valid portal session already exists, reuse it ---
-    if (pctx->portal_session_handle_str != NULL) {
-        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                   "PW Screen: Reusing existing portal session: %s",
-                   pctx->portal_session_handle_str);
-        pctx->current_portal_op_state = PORTAL_OP_STATE_SELECTING_SOURCES;
-        portal_initiate_select_sources(pctx);
-        return MINIAV_SUCCESS;
-    }
-
-    // --- Otherwise, create a new session ---
-    pctx->current_portal_op_state = PORTAL_OP_STATE_CREATING_SESSION;
-
-    g_free(pctx->current_portal_request_token_str); // Free previous if any
-    pctx->current_portal_request_token_str =
-        generate_token("miniav_session_req"); // For CreateSession options
-
-    char *session_handle_token_for_options =
-        generate_token("miniav_session_handle_opt"); // For CreateSession options
-
-    GVariantBuilder options_builder;
-    g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
-    g_variant_builder_add(
-        &options_builder, "{sv}", "handle_token",
-        g_variant_new_string(pctx->current_portal_request_token_str));
-    g_variant_builder_add(&options_builder, "{sv}", "session_handle_token",
-                          g_variant_new_string(session_handle_token_for_options));
-    GVariant *options_variant = g_variant_builder_end(&options_builder);
-    g_free(session_handle_token_for_options);
-
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "PW Screen: Calling CreateSession with token %s",
-               pctx->current_portal_request_token_str);
-
-    g_dbus_connection_call(
-        pctx->dbus_conn, XDP_BUS_NAME, XDP_OBJECT_PATH, XDP_IFACE_SCREENCAST,
-        "CreateSession",
-        g_variant_new_tuple(&options_variant, 1), // Parameters as a tuple: (a{sv})
-        G_VARIANT_TYPE("(o)"),  // Expected reply type: (o)
-        G_DBUS_CALL_FLAGS_NONE,
-        -1, // Default timeout
-        pctx->cancellable, (GAsyncReadyCallback)on_dbus_method_call_completed_cb,
-        pctx // user_data
-    );
+               "PW Screen: Reusing existing portal session: %s",
+               pctx->portal_session_handle_str);
+    pctx->current_portal_op_state = PORTAL_OP_STATE_SELECTING_SOURCES;
+    portal_initiate_select_sources(pctx);
     return MINIAV_SUCCESS;
+  }
+
+  // --- Otherwise, create a new session ---
+  pctx->current_portal_op_state = PORTAL_OP_STATE_CREATING_SESSION;
+
+  g_free(pctx->current_portal_request_token_str); // Free previous if any
+  pctx->current_portal_request_token_str =
+      generate_token("miniav_session_req"); // For CreateSession options
+
+  char *session_handle_token_for_options =
+      generate_token("miniav_session_handle_opt"); // For CreateSession options
+
+  GVariantBuilder options_builder;
+  g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
+  g_variant_builder_add(
+      &options_builder, "{sv}", "handle_token",
+      g_variant_new_string(pctx->current_portal_request_token_str));
+  g_variant_builder_add(&options_builder, "{sv}", "session_handle_token",
+                        g_variant_new_string(session_handle_token_for_options));
+  GVariant *options_variant = g_variant_builder_end(&options_builder);
+  g_free(session_handle_token_for_options);
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: Calling CreateSession with token %s",
+             pctx->current_portal_request_token_str);
+
+  g_dbus_connection_call(
+      pctx->dbus_conn, XDP_BUS_NAME, XDP_OBJECT_PATH, XDP_IFACE_SCREENCAST,
+      "CreateSession",
+      g_variant_new_tuple(&options_variant,
+                          1), // Parameters as a tuple: (a{sv})
+      G_VARIANT_TYPE("(o)"),  // Expected reply type: (o)
+      G_DBUS_CALL_FLAGS_NONE,
+      -1, // Default timeout
+      pctx->cancellable, (GAsyncReadyCallback)on_dbus_method_call_completed_cb,
+      pctx // user_data
+  );
+  return MINIAV_SUCCESS;
 }
 
 static void
@@ -1410,16 +1447,14 @@ static void portal_initiate_start_stream(PipeWireScreenPlatformContext *pctx) {
   pctx->current_portal_request_token_str = generate_token("miniav_start_req");
 
   GVariantBuilder options_builder;
-g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
-g_variant_builder_add(
-    &options_builder, "{sv}", "handle_token",
-    g_variant_new_string(pctx->current_portal_request_token_str));
-// Do not call g_variant_builder_end; pass the builder pointer directly.
-const char *parent_window_handle = "";
-GVariant *params_for_start = g_variant_new("(osa{sv})",
-                                                pctx->portal_session_handle_str,
-                                                parent_window_handle,
-                                                &options_builder);
+  g_variant_builder_init(&options_builder, G_VARIANT_TYPE_VARDICT);
+  g_variant_builder_add(
+      &options_builder, "{sv}", "handle_token",
+      g_variant_new_string(pctx->current_portal_request_token_str));
+  const char *parent_window_handle = "";
+  GVariant *params_for_start =
+      g_variant_new("(osa{sv})", pctx->portal_session_handle_str,
+                    parent_window_handle, &options_builder);
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Screen: Calling Start for session %s with token %s",
@@ -1428,8 +1463,8 @@ GVariant *params_for_start = g_variant_new("(osa{sv})",
 
   g_dbus_connection_call(
       pctx->dbus_conn, XDP_BUS_NAME,
-      XDP_OBJECT_PATH, // Object path is the session handle
-      XDP_IFACE_SCREENCAST,               // Interface is Session
+      XDP_OBJECT_PATH,      // Object path is the session handle
+      XDP_IFACE_SCREENCAST, // Interface is Session
       "Start",
       params_for_start, // This is (sa{sv})
       G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, -1, pctx->cancellable,
@@ -1483,54 +1518,68 @@ pw_screen_setup_pipewire_streams(PipeWireScreenPlatformContext *pctx) {
     };
     pw_stream_add_listener(pctx->video_stream, &pctx->video_stream_listener,
                            &video_stream_events, pctx);
+uint8_t video_params_buffer[2048];
+struct spa_pod_builder b = SPA_POD_BUILDER_INIT(video_params_buffer, sizeof(video_params_buffer));
+const struct spa_pod *params[2];
+uint32_t n_params = 0;
 
-    uint8_t video_params_buffer[2048];
-    struct spa_pod_builder b =
-        SPA_POD_BUILDER_INIT(video_params_buffer, sizeof(video_params_buffer));
-    const struct spa_pod *params[2];
-    uint32_t n_params = 0;
+// 1. SPA_PARAM_Buffers
+uint32_t buffer_types = (1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
+params[n_params++] = spa_pod_builder_add_object(
+    &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+    SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(PW_SCREEN_MAX_BUFFERS, 1, PW_SCREEN_MAX_BUFFERS),
+    SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
+    SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(buffer_types)
+);
 
-    enum spa_video_format spa_fmt_req =
-        miniav_video_format_to_spa(pctx->requested_video_format.pixel_format);
-    if (spa_fmt_req == SPA_VIDEO_FORMAT_UNKNOWN)
-      spa_fmt_req = SPA_VIDEO_FORMAT_BGRA;
-
-    {
-    struct spa_pod_frame frame;
-    uint32_t buffer_types = (1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
-    spa_pod_builder_push_object(&b, &frame, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers);
-    spa_pod_builder_add(&b,
-        SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(PW_SCREEN_MAX_BUFFERS, 1, PW_SCREEN_MAX_BUFFERS),
-        SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
-        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(buffer_types),
-        0);
-    params[n_params++] = spa_pod_builder_pop(&b, &frame);
+// 2. SPA_PARAM_EnumFormat
+enum spa_video_format spa_fmt_req = miniav_video_format_to_spa(pctx->requested_video_format.pixel_format);
+if (spa_fmt_req == SPA_VIDEO_FORMAT_UNKNOWN) {
+    spa_fmt_req = SPA_VIDEO_FORMAT_BGRA;
+    miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Requested pixel format unknown to SPA, defaulting to BGRA for negotiation.");
 }
 
-    uint32_t buffer_types =
-        (1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
-    params[n_params++] = spa_pod_builder_add_object(
-        &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-        SPA_PARAM_BUFFERS_buffers,
-        SPA_POD_CHOICE_RANGE_Int(PW_SCREEN_MAX_BUFFERS, 1,
-                                 PW_SCREEN_MAX_BUFFERS),
-        SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1), SPA_PARAM_BUFFERS_dataType,
-        SPA_POD_CHOICE_FLAGS_Int(buffer_types));
+struct spa_pod_frame frame_format;
+spa_pod_builder_push_object(&b, &frame_format, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+if(pctx->requested_video_format.output_preference == MINIAV_OUTPUT_PREFERENCE_CPU){
+spa_pod_builder_add(&b,
+    SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
+    SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+    SPA_FORMAT_VIDEO_format, SPA_POD_Id(spa_fmt_req),
+    SPA_FORMAT_VIDEO_maxFramerate, SPA_POD_Fraction(&SPA_FRACTION(
+        pctx->requested_video_format.frame_rate_numerator,
+        pctx->requested_video_format.frame_rate_denominator)),
+    0 // <-- IMPORTANT: terminator for varargs!
+);
+}else{
+  spa_pod_builder_add(&b,
+    SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
+    SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+    SPA_FORMAT_VIDEO_format, SPA_POD_Id(spa_fmt_req),
+    SPA_FORMAT_VIDEO_modifier, SPA_POD_CHOICE_FLAGS_Long(0 /* any modifier */),
+    SPA_FORMAT_VIDEO_maxFramerate, SPA_POD_Fraction(&SPA_FRACTION(
+        pctx->requested_video_format.frame_rate_numerator,
+        pctx->requested_video_format.frame_rate_denominator)),
+    0 // <-- IMPORTANT: terminator for varargs!
+);
+}
+params[n_params++] = spa_pod_builder_pop(&b, &frame_format);
 
-    if (pw_stream_connect(
-            pctx->video_stream, PW_DIRECTION_INPUT, pctx->video_node_id,
-            PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
-                PW_STREAM_FLAG_RT_PROCESS,
-            params, n_params) != 0) {
-      miniav_log(
-          MINIAV_LOG_LEVEL_ERROR,
-          "PW Screen: Failed to connect video stream to node %u: %s",
-          pctx->video_node_id,
-          spa_strerror(
-              errno)); // errno might not be set by pw, use pw_context_errno
-      pctx->last_error = MINIAV_ERROR_STREAM_FAILED;
-      goto error_cleanup_pw_setup;
-    }
+    miniav_log(
+        MINIAV_LOG_LEVEL_INFO,
+        "PW Screen: Requesting video format %s with DRM_FORMAT_MOD_LINEAR.",
+        spa_debug_type_find_name(spa_type_video_format, spa_fmt_req));
+
+if (pw_stream_connect(
+        pctx->video_stream, PW_DIRECTION_INPUT, pctx->video_node_id,
+        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS,
+        params, n_params) != 0) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+        "PW Screen: Failed to connect video stream to node %u: %s",
+        pctx->video_node_id, spa_strerror(errno));
+    pctx->last_error = MINIAV_ERROR_STREAM_FAILED;
+    goto error_cleanup_pw_setup;
+}
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW Screen: Video stream connecting to node %u...",
                pctx->video_node_id);
@@ -1755,7 +1804,8 @@ pw_screen_release_buffer(struct MiniAVScreenContext *ctx,
   MINIAV_UNUSED(ctx);
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "PW Screen: release_buffer called with internal_handle_ptr=%p", internal_handle_ptr);
+             "PW Screen: release_buffer called with internal_handle_ptr=%p",
+             internal_handle_ptr);
 
   if (!internal_handle_ptr) {
     miniav_log(
@@ -1767,40 +1817,58 @@ pw_screen_release_buffer(struct MiniAVScreenContext *ctx,
   MiniAVNativeBufferInternalPayload *payload =
       (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
 
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "PW Screen: payload ptr=%p, handle_type=%d, native_resource_ptr=%p",
-             payload, payload->handle_type, payload->native_resource_ptr);
+  miniav_log(
+      MINIAV_LOG_LEVEL_DEBUG,
+      "PW Screen: payload ptr=%p, handle_type=%d, native_resource_ptr=%p",
+      payload, payload->handle_type, payload->native_resource_ptr);
 
   if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN) {
-    intptr_t fd_ptr_val = (intptr_t)payload->native_resource_ptr;
-    if (fd_ptr_val != -1 && fd_ptr_val != 0) {
-      int fd_to_close = (int)fd_ptr_val;
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "PW Screen: Releasing buffer, closing duplicated DMABUF FD: "
-                 "%d from payload.",
-                 fd_to_close);
-      if (close(fd_to_close) == -1) {
+    PipeWireFrameReleasePayload *frame_payload =
+        (PipeWireFrameReleasePayload *)payload->native_resource_ptr;
+    if (frame_payload) {
+      if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU) {
+        if (frame_payload->cpu.cpu_ptr) {
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                     "PW Screen: Freeing CPU buffer from DMABUF/MemFd copy.");
+          miniav_free(frame_payload->cpu.cpu_ptr);
+          frame_payload->cpu.cpu_ptr = NULL;
+        }
+        // src_dmabuf_fd is not owned, do not close
+      } else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU) {
+        if (frame_payload->gpu.dup_dmabuf_fd > 0) {
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                     "PW Screen: Closing duplicated DMABUF FD: %d",
+                     frame_payload->gpu.dup_dmabuf_fd);
+          if (close(frame_payload->gpu.dup_dmabuf_fd) == -1) {
+            miniav_log(MINIAV_LOG_LEVEL_WARN,
+                       "PW Screen: Failed to close DMABUF FD %d: %s",
+                       frame_payload->gpu.dup_dmabuf_fd, strerror(errno));
+          }
+          frame_payload->gpu.dup_dmabuf_fd = -1;
+        }
+      } else {
         miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "PW Screen: Failed to close DMABUF FD %d: %s", fd_to_close,
-                   strerror(errno));
+                   "PW Screen: release_buffer: Unknown frame_payload type %d",
+                   frame_payload->type);
       }
-    } else {
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "PW Screen: Releasing video buffer (payload resource was %p, "
-                 "likely CPU or not a duplicated FD).",
-                 payload->native_resource_ptr);
+      miniav_free(frame_payload);
+      payload->native_resource_ptr = NULL;
     }
+    miniav_free(payload);
+    return MINIAV_SUCCESS;
   } else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_AUDIO) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW Screen: Releasing audio buffer (no specific native resource "
                "to free from payload).");
+    miniav_free(payload);
+    return MINIAV_SUCCESS;
   } else {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
                "PW Screen: release_buffer called for unknown handle_type %d.",
                payload->handle_type);
+    miniav_free(payload);
+    return MINIAV_SUCCESS;
   }
-
-  return MINIAV_SUCCESS;
 }
 
 // --- PipeWire Thread and Event Handlers ---
@@ -1812,7 +1880,7 @@ static void *pw_screen_loop_thread_func(void *arg) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Screen: PipeWire loop thread started.");
   pctx->loop_running = true;
-  ctx->is_running = true; 
+  ctx->is_running = true;
 
   pw_main_loop_run(pctx->loop); // Blocks here
 
@@ -1932,8 +2000,8 @@ static void on_video_stream_param_changed(void *data, uint32_t id,
     miniav_log(
         MINIAV_LOG_LEVEL_ERROR,
         "PW Screen: Failed to parse media type/subtype for video format.");
-    // Ensure current format is marked as unknown to prevent using stale/invalid
-    // data
+    // Ensure current format is marked as unknown to prevent using
+    // stale/invalid data
     pctx->current_video_format_details.spa_format.format =
         SPA_VIDEO_FORMAT_UNKNOWN;
     pctx->current_video_format_details.derived_num_planes = 0;
@@ -2077,13 +2145,13 @@ static void on_video_stream_add_buffer(void *data, struct pw_buffer *buffer) {
             spa_buf->datas[0].fd, spa_buf->datas[0].maxsize);
       } else {
         pctx->current_video_format_details.is_dmabuf = false;
-        miniav_log(
-            MINIAV_LOG_LEVEL_DEBUG,
-            "PW Screen: Video add_buffer (idx %d): type %s (CPU path), size %u",
-            i,
-            spa_debug_type_find_name(spa_type_data_type,
-                                     spa_buf->datas[0].type),
-            spa_buf->datas[0].maxsize);
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW Screen: Video add_buffer (idx %d): type %s (CPU "
+                   "path), size %u",
+                   i,
+                   spa_debug_type_find_name(spa_type_data_type,
+                                            spa_buf->datas[0].type),
+                   spa_buf->datas[0].maxsize);
       }
       break;
     }
@@ -2105,181 +2173,206 @@ static void on_video_stream_remove_buffer(void *data,
 }
 
 static void on_video_stream_process(void *data) {
-  PipeWireScreenPlatformContext *pctx = (PipeWireScreenPlatformContext *)data;
-  struct pw_buffer *pw_buf;
-  MiniAVNativeBufferInternalPayload *payload_alloc = NULL;
+    PipeWireScreenPlatformContext *pctx = (PipeWireScreenPlatformContext *)data;
+    struct pw_buffer *pw_buf;
+    MiniAVNativeBufferInternalPayload *payload_alloc = NULL;
 
-  if (!pctx->parent_ctx->app_callback || !pctx->video_stream_active)
-    return;
+    if (!pctx->parent_ctx->app_callback || !pctx->video_stream_active)
+        return;
 
-  while ((pw_buf = pw_stream_dequeue_buffer(pctx->video_stream))) {
-    struct spa_buffer *spa_buf = pw_buf->buffer;
-    struct spa_meta_header *h;
-    payload_alloc = NULL; // Reset for each buffer
+    while ((pw_buf = pw_stream_dequeue_buffer(pctx->video_stream))) {
+        struct spa_buffer *spa_buf = pw_buf->buffer;
+        payload_alloc = NULL;
 
-    if (spa_buf->n_datas < 1) {
-      miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "PW Screen: Video buffer has no data planes.");
-      goto queue_and_continue_video;
-    }
-
-    MiniAVBuffer miniav_buffer = {0};
-    miniav_buffer.type = MINIAV_BUFFER_TYPE_VIDEO;
-    miniav_buffer.user_data = pctx->parent_ctx->app_callback_user_data;
-
-    // pw_buf->time is uint64_t nsec. SPA_ID_INVALID is the correct invalid
-    // marker.
-    miniav_buffer.timestamp_us = miniav_get_time_us();
-
-    // Populate MiniAVBuffer.data.video directly
-    // Use the already updated parent_ctx->configured_video_format which
-    // reflects negotiated params
-    miniav_buffer.data.video.info = pctx->parent_ctx->configured_video_format;
-
-    if (pctx->current_video_format_details.is_dmabuf &&
-        (spa_buf->datas[0].type == SPA_DATA_DmaBuf ||
-         spa_buf->datas[0].type == SPA_DATA_MemFd)) {
-      miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD;
-      int original_fd = spa_buf->datas[0].fd;
-      int dup_fd = fcntl(original_fd, F_DUPFD_CLOEXEC, 0);
-      if (dup_fd == -1) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                   "PW Screen: Failed to dup DMABUF FD %d: %s. Skipping frame.",
-                   original_fd, strerror(errno));
-        goto queue_and_continue_video;
-      }
-
-      miniav_buffer.data.video.native_gpu_dmabuf_fd = dup_fd;
-      // MiniAVBuffer does not have native_gpu_dmabuf_modifier
-
-      payload_alloc = (MiniAVNativeBufferInternalPayload *)miniav_calloc(
-          1, sizeof(MiniAVNativeBufferInternalPayload));
-      if (!payload_alloc) {
-        miniav_log(
-            MINIAV_LOG_LEVEL_ERROR,
-            "PW Screen: Failed to allocate payload for DMABUF. Closing FD %d.",
-            dup_fd);
-        close(dup_fd);
-        goto queue_and_continue_video;
-      }
-      payload_alloc->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN;
-      payload_alloc->context_owner = pctx->parent_ctx;
-      payload_alloc->native_resource_ptr = (void *)(intptr_t)dup_fd;
-      miniav_buffer.internal_handle = payload_alloc;
-
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "PW Screen: DMABUF frame: FD %d (orig %d), ts %" PRIu64
-                 "us", // modifier not in MiniAVBuffer
-                 dup_fd, original_fd, miniav_buffer.timestamp_us);
-
-    } else if (spa_buf->datas[0].type == SPA_DATA_MemPtr) {
-      miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-
-      uint32_t num_miniav_planes = get_miniav_pixel_format_planes(
-          miniav_buffer.data.video.info.pixel_format);
-
-      if (num_miniav_planes == 0 &&
-          miniav_buffer.data.video.info.pixel_format !=
-              MINIAV_PIXEL_FORMAT_UNKNOWN) {
-        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "PW Screen: CPU Video format %d resolved to 0 planes. Check "
-                   "get_miniav_pixel_format_planes.",
-                   miniav_buffer.data.video.info.pixel_format);
-        goto queue_and_continue_video;
-      }
-
-      uint32_t total_size = 0;
-      for (uint32_t i = 0;
-           i < num_miniav_planes && i < MINIAV_VIDEO_FORMAT_MAX_PLANES; ++i) {
-        if (i <
-            spa_buf->n_datas) { // Check if PipeWire provides this plane data
-          struct spa_data *d_plane = &spa_buf->datas[i];
-          if (!(d_plane->data && d_plane->chunk && d_plane->chunk->size > 0)) {
-            miniav_log(MINIAV_LOG_LEVEL_WARN,
-                       "PW Screen: CPU Video buffer plane %u invalid.", i);
-            if (i == 0)
-              goto queue_and_continue_video; // First plane must be valid
-            miniav_buffer.data.video.planes[i] = NULL;
-            miniav_buffer.data.video.stride_bytes[i] = 0;
-            continue;
-          }
-          miniav_buffer.data.video.planes[i] =
-              (uint8_t *)d_plane->data + d_plane->chunk->offset;
-          miniav_buffer.data.video.stride_bytes[i] = d_plane->chunk->stride;
-          if (d_plane->chunk->stride == 0 &&
-              miniav_buffer.data.video.info.pixel_format !=
-                  MINIAV_PIXEL_FORMAT_MJPEG) {
-            if (miniav_buffer.data.video.info.pixel_format ==
-                    MINIAV_PIXEL_FORMAT_BGRA32 ||
-                miniav_buffer.data.video.info.pixel_format ==
-                    MINIAV_PIXEL_FORMAT_RGBA32 ||
-                miniav_buffer.data.video.info.pixel_format ==
-                    MINIAV_PIXEL_FORMAT_ARGB32 ||
-                miniav_buffer.data.video.info.pixel_format ==
-                    MINIAV_PIXEL_FORMAT_ABGR32 || miniav_buffer.data.video.info.pixel_format ==
-        MINIAV_PIXEL_FORMAT_BGRX32) {
-              miniav_buffer.data.video.stride_bytes[i] =
-                  miniav_buffer.data.video.info.width * 4;
-            } else if (miniav_buffer.data.video.info.pixel_format ==
-                           MINIAV_PIXEL_FORMAT_RGB24 ||
-                       miniav_buffer.data.video.info.pixel_format ==
-                           MINIAV_PIXEL_FORMAT_BGR24) {
-              miniav_buffer.data.video.stride_bytes[i] =
-                  miniav_buffer.data.video.info.width * 3;
-            } else {
-              miniav_log(MINIAV_LOG_LEVEL_WARN,
-                         "PW Screen: CPU Video buffer plane %u has stride 0 "
-                         "from chunk for format %d. Data might be incorrect.",
-                         i, miniav_buffer.data.video.info.pixel_format);
-            }
-          }
-          total_size += d_plane->chunk->size; // Sum actual chunk sizes from PW
-        } else {
-          miniav_log(MINIAV_LOG_LEVEL_WARN,
-                     "PW Screen: MiniAV expects plane %u but PipeWire only "
-                     "provided %u data chunks.",
-                     i, spa_buf->n_datas);
-          miniav_buffer.data.video.planes[i] = NULL;
-          miniav_buffer.data.video.stride_bytes[i] = 0;
+        if (spa_buf->n_datas < 1) {
+            miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Video buffer has no data planes.");
+            goto queue_and_continue_video;
         }
-      }
-      miniav_buffer.data_size_bytes = total_size;
 
-      payload_alloc = (MiniAVNativeBufferInternalPayload *)miniav_calloc(
-          1, sizeof(MiniAVNativeBufferInternalPayload));
-      if (!payload_alloc) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                   "PW Screen: Failed to allocate payload for CPU buffer.");
-        goto queue_and_continue_video;
-      }
-      payload_alloc->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN;
-      payload_alloc->context_owner = pctx->parent_ctx;
-      payload_alloc->native_resource_ptr =
-          NULL; // No specific FD to release for CPU
-      miniav_buffer.internal_handle = payload_alloc;
+        MiniAVBuffer miniav_buffer = {0};
+        miniav_buffer.type = MINIAV_BUFFER_TYPE_VIDEO;
+        miniav_buffer.user_data = pctx->parent_ctx->app_callback_user_data;
+        miniav_buffer.timestamp_us = miniav_get_time_us();
+        miniav_buffer.data.video.info = pctx->parent_ctx->configured_video_format;
 
-      miniav_log(
-          MINIAV_LOG_LEVEL_DEBUG,
-          "PW Screen: CPU frame, plane0 ptr %p, total size %u, ts %" PRIu64
-          "us",
-          miniav_buffer.data.video.planes[0], total_size,
-          miniav_buffer.timestamp_us);
-    } else {
-      miniav_log(
-          MINIAV_LOG_LEVEL_WARN,
-          "PW Screen: Video buffer has unhandled data type: %s",
-          spa_debug_type_find_name(spa_type_data_type, spa_buf->datas[0].type));
-      goto queue_and_continue_video;
+        PipeWireFrameReleasePayload *frame_payload =
+            miniav_calloc(1, sizeof(PipeWireFrameReleasePayload));
+        if (!frame_payload) {
+            miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: Failed to alloc PipeWireFrameReleasePayload.");
+            goto queue_and_continue_video;
+        }
+
+        int buf_type = spa_buf->datas[0].type;
+        int fd = spa_buf->datas[0].fd;
+        size_t size = spa_buf->datas[0].maxsize;
+
+        if (buf_type == SPA_DATA_DmaBuf) {
+            // --- DMA-BUF path ---
+            if (pctx->requested_video_format.output_preference == MINIAV_OUTPUT_PREFERENCE_CPU) {
+                if (pctx->current_video_format_details.negotiated_modifier != DRM_FORMAT_MOD_LINEAR) {
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                        "PW Screen: DMABUF has non-linear modifier (%" PRIu64 "). Cannot directly mmap for CPU pixel copy. Skipping frame.",
+                        pctx->current_video_format_details.negotiated_modifier);
+                    miniav_free(frame_payload);
+                    goto queue_and_continue_video;
+                }
+                void *mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+                if (mapped == MAP_FAILED) {
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                        "PW Screen: Failed to mmap DMABUF for CPU copy: %s. Modifier: %" PRIu64,
+                        strerror(errno), pctx->current_video_format_details.negotiated_modifier);
+                    miniav_free(frame_payload);
+                    goto queue_and_continue_video;
+                }
+                struct dma_buf_sync sync_args;
+                int ret;
+                sync_args.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+                do {
+                    ret = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_args);
+                } while (ret == -1 && (errno == EAGAIN || errno == EINTR));
+                if (ret == -1) {
+                    if (errno == ENOTTY) {
+                        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                            "PW Screen: DMA_BUF_IOCTL_SYNC not supported on this buffer. Skipping frame.");
+                    } else {
+                        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                            "PW Screen: DMA_BUF_IOCTL_SYNC (START) failed: %s. Skipping frame.",
+                            strerror(errno));
+                    }
+                    munmap(mapped, size);
+                    miniav_free(frame_payload);
+                    goto queue_and_continue_video;
+                }
+                uint8_t *cpu_copy = (uint8_t *)miniav_calloc(1, size);
+                if (!cpu_copy) {
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: Failed to alloc CPU buffer for DMABUF copy.");
+                    sync_args.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+                    ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_args);
+                    munmap(mapped, size);
+                    miniav_free(frame_payload);
+                    goto queue_and_continue_video;
+                }
+                memcpy(cpu_copy, mapped, size);
+                sync_args.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+                ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_args);
+                munmap(mapped, size);
+
+                miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+                miniav_buffer.data.video.planes[0] = cpu_copy;
+                miniav_buffer.data_size_bytes = size;
+                miniav_buffer.data.video.stride_bytes[0] =
+                    pctx->current_video_format_details.spa_format.size.width * 4; // adjust for format
+
+                frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
+                frame_payload->cpu.cpu_ptr = cpu_copy;
+                frame_payload->cpu.cpu_size = size;
+                frame_payload->cpu.src_dmabuf_fd = fd;
+
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: DMABUF (linear, synced) mapped and copied to CPU buffer for app.");
+            } else {
+                // --- GPU path: pass DMABUF FD as before ---
+                int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+                if (dup_fd == -1) {
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                        "PW Screen: Failed to dup DMABUF FD %d: %s. Skipping frame.", fd, strerror(errno));
+                    miniav_free(frame_payload);
+                    goto queue_and_continue_video;
+                }
+                miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD;
+                miniav_buffer.data.video.native_gpu_dmabuf_fd = dup_fd;
+                miniav_buffer.data_size_bytes = size;
+
+                frame_payload->type = MINIAV_OUTPUT_PREFERENCE_GPU;
+                frame_payload->gpu.dup_dmabuf_fd = dup_fd;
+
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                    "PW Screen: DMABUF frame: FD %d (orig %d), ts %" PRIu64 "us",
+                    dup_fd, fd, miniav_buffer.timestamp_us);
+            }
+        } else if (buf_type == SPA_DATA_MemFd) {
+            // --- MemFd path ---
+            void *mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+            if (mapped == MAP_FAILED) {
+                miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: Failed to mmap MemFd: %s", strerror(errno));
+                miniav_free(frame_payload);
+                goto queue_and_continue_video;
+            }
+            uint8_t *cpu_copy = (uint8_t *)miniav_calloc(1, size);
+            if (!cpu_copy) {
+                miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: Failed to alloc CPU buffer for MemFd copy.");
+                munmap(mapped, size);
+                miniav_free(frame_payload);
+                goto queue_and_continue_video;
+            }
+            memcpy(cpu_copy, mapped, size);
+            munmap(mapped, size);
+
+            miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+            miniav_buffer.data.video.planes[0] = cpu_copy;
+            miniav_buffer.data_size_bytes = size;
+            miniav_buffer.data.video.stride_bytes[0] =
+                pctx->current_video_format_details.spa_format.size.width * 4; // adjust for format
+
+            frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
+            frame_payload->cpu.cpu_ptr = cpu_copy;
+            frame_payload->cpu.cpu_size = size;
+            frame_payload->cpu.src_dmabuf_fd = fd;
+
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: MemFd mapped and copied to CPU buffer for app.");
+        } else if (buf_type == SPA_DATA_MemPtr) {
+            // --- MemPtr path ---
+            miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+            miniav_buffer.data.video.planes[0] = spa_buf->datas[0].data;
+            miniav_buffer.data_size_bytes = size;
+            miniav_buffer.data.video.stride_bytes[0] =
+                pctx->current_video_format_details.spa_format.size.width * 4; // adjust for format
+
+            frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
+            frame_payload->cpu.cpu_ptr = NULL;
+            frame_payload->cpu.cpu_size = size;
+            frame_payload->cpu.src_dmabuf_fd = -1;
+
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: MemPtr buffer passed directly to app.");
+        } else {
+            miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Unhandled buffer type %d", buf_type);
+            miniav_free(frame_payload);
+            goto queue_and_continue_video;
+        }
+
+        // Attach the payload to the MiniAV buffer
+        payload_alloc = miniav_calloc(1, sizeof(MiniAVNativeBufferInternalPayload));
+        if (!payload_alloc) {
+            miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: Failed to alloc MiniAVNativeBufferInternalPayload.");
+            if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU && frame_payload->cpu.cpu_ptr)
+                miniav_free(frame_payload->cpu.cpu_ptr);
+            else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU && frame_payload->gpu.dup_dmabuf_fd > 0)
+                close(frame_payload->gpu.dup_dmabuf_fd);
+            miniav_free(frame_payload);
+            goto queue_and_continue_video;
+        }
+        payload_alloc->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN;
+        payload_alloc->context_owner = pctx->parent_ctx;
+        payload_alloc->native_resource_ptr = frame_payload;
+        miniav_buffer.internal_handle = payload_alloc;
+
+        // Deliver to app
+        pctx->parent_ctx->app_callback(&miniav_buffer, pctx->parent_ctx->app_callback_user_data);
+        payload_alloc = NULL; // Ownership passed to app
+
+    queue_and_continue_video:
+        if (payload_alloc) {
+            PipeWireFrameReleasePayload *fp = (PipeWireFrameReleasePayload *)payload_alloc->native_resource_ptr;
+            if (fp) {
+                if (fp->type == MINIAV_OUTPUT_PREFERENCE_CPU && fp->cpu.cpu_ptr)
+                    miniav_free(fp->cpu.cpu_ptr);
+                else if (fp->type == MINIAV_OUTPUT_PREFERENCE_GPU && fp->gpu.dup_dmabuf_fd > 0)
+                    close(fp->gpu.dup_dmabuf_fd);
+                miniav_free(fp);
+            }
+            miniav_free(payload_alloc);
+        }
+        pw_stream_queue_buffer(pctx->video_stream, pw_buf);
     }
-miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-    "PW Screen: About to call app_callback: payload_alloc=%p, internal_handle=%p, dup_fd=%d",
-    payload_alloc, miniav_buffer.internal_handle, miniav_buffer.data.video.native_gpu_dmabuf_fd);
-    pctx->parent_ctx->app_callback(&miniav_buffer,
-                                   pctx->parent_ctx->app_callback_user_data);
-
-  queue_and_continue_video:
-    pw_stream_queue_buffer(pctx->video_stream, pw_buf);
-  }
 }
 
 // --- Audio Stream Listener Callbacks ---
@@ -2405,7 +2498,7 @@ static void on_audio_stream_process(void *data) {
 
     if (pctx->parent_ctx) {
       miniav_buffer.data.audio.info = pctx->parent_ctx->configured_audio_format;
-    } else { 
+    } else {
       memset(&miniav_buffer.data.audio.info, 0, sizeof(MiniAVAudioInfo));
       miniav_buffer.data.audio.info.format = MINIAV_AUDIO_FORMAT_UNKNOWN;
     }
@@ -2493,9 +2586,9 @@ miniav_screen_context_platform_init_linux_pipewire(MiniAVScreenContext *ctx) {
   if (!ctx)
     return MINIAV_ERROR_INVALID_ARG;
 
-  miniav_log(
-      MINIAV_LOG_LEVEL_DEBUG,
-      "PW Screen: Initializing PipeWire platform backend for screen context.");
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: Initializing PipeWire platform backend for screen "
+             "context.");
 
   pw_init(NULL, NULL);
 

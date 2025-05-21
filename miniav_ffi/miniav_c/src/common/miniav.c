@@ -139,8 +139,6 @@ MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
                "internal payload anyway.",
                payload);
   }
-  miniav_free(payload); // Free the wrapper payload itself
-
   return res;
 }
 

@@ -271,62 +271,82 @@ const char *miniav_pixel_format_to_string_short(MiniAVPixelFormat format) {
   }
 }
 
-static void parse_spa_format(const struct spa_pod *format_pod,
-                             MiniAVVideoInfo *info,
-                             PipeWirePlatformContext *pw_ctx) { // pw_ctx can be NULL
+static void
+parse_spa_format(const struct spa_pod *format_pod, MiniAVVideoInfo *info,
+                 PipeWirePlatformContext *pw_ctx) { // pw_ctx can be NULL
   struct spa_video_info_raw raw_info = {0};
-  // MINIAV_UNUSED(pw_ctx); // If pw_ctx is truly unused in this function. Currently it is.
+  // MINIAV_UNUSED(pw_ctx); // If pw_ctx is truly unused in this function.
+  // Currently it is.
 
   if (spa_format_video_raw_parse(format_pod, &raw_info) >= 0) {
-    info->pixel_format =
-        spa_video_format_to_miniav(raw_info.format, format_pod); // Pass format_pod for MJPEG subtype check
+    info->pixel_format = spa_video_format_to_miniav(
+        raw_info.format, format_pod); // Pass format_pod for MJPEG subtype check
     info->width = raw_info.size.width;
     info->height = raw_info.size.height;
     info->frame_rate_numerator = raw_info.framerate.num;
     info->frame_rate_denominator = raw_info.framerate.denom;
 
-    // It's good practice to ensure framerate denominator is not zero if num is non-zero
+    // It's good practice to ensure framerate denominator is not zero if num is
+    // non-zero
     if (info->frame_rate_numerator != 0 && info->frame_rate_denominator == 0) {
-        miniav_log(MINIAV_LOG_LEVEL_WARN, "PW: Parsed format with numerator %u but denominator 0. Setting denominator to 1.", info->frame_rate_numerator);
-        info->frame_rate_denominator = 1; // Avoid division by zero later
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "PW: Parsed format with numerator %u but denominator 0. "
+                 "Setting denominator to 1.",
+                 info->frame_rate_numerator);
+      info->frame_rate_denominator = 1; // Avoid division by zero later
     }
 
   } else {
-    if (spa_pod_is_choice(format_pod)) { // This case should ideally be handled by parse_spa_format_choices
-      miniav_log(
-          MINIAV_LOG_LEVEL_DEBUG,
-          "PW: parse_spa_format called with a CHOICE/ANY type pod. This should be handled by parse_spa_format_choices.");
+    if (spa_pod_is_choice(format_pod)) { // This case should ideally be handled
+                                         // by parse_spa_format_choices
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW: parse_spa_format called with a CHOICE/ANY type pod. This "
+                 "should be handled by parse_spa_format_choices.");
     } else {
       // spa_format_video_raw_parse failed, and it wasn't a choice.
-      // This could be SPA_VIDEO_FORMAT_ENCODED without enough info for raw_parse, or other non-raw types.
-      // spa_video_format_to_miniav might still be able to identify MJPEG from SPA_VIDEO_FORMAT_ENCODED.
+      // This could be SPA_VIDEO_FORMAT_ENCODED without enough info for
+      // raw_parse, or other non-raw types. spa_video_format_to_miniav might
+      // still be able to identify MJPEG from SPA_VIDEO_FORMAT_ENCODED.
       struct spa_video_info_dsp dsp_info = {0}; // Declare the struct
       uint32_t spa_fmt_id = SPA_VIDEO_FORMAT_UNKNOWN;
 
-      if (spa_format_video_dsp_parse(format_pod, &dsp_info) >= 0) { // Pass address of struct
+      if (spa_format_video_dsp_parse(format_pod, &dsp_info) >=
+          0) {                        // Pass address of struct
         spa_fmt_id = dsp_info.format; // Extract the format
       } else {
-        // Fallback if dsp_parse also fails, though less likely to give a format ID
-        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: spa_format_video_dsp_parse also failed for non-raw format.");
+        // Fallback if dsp_parse also fails, though less likely to give a format
+        // ID
+        miniav_log(
+            MINIAV_LOG_LEVEL_DEBUG,
+            "PW: spa_format_video_dsp_parse also failed for non-raw format.");
       }
-
 
       info->pixel_format = spa_video_format_to_miniav(spa_fmt_id, format_pod);
       if (info->pixel_format == MINIAV_PIXEL_FORMAT_MJPEG) {
-          // For MJPEG, W/H/FPS might not be in spa_video_info_raw or spa_video_info_dsp.
-          // They might be in other properties of the format_pod.
-          // This part needs more complex parsing if MJPEG streams don't provide W/H/FPS via these parse functions.
-          // For now, we rely on spa_format_video_raw_parse or accept that W/H might be 0 for some encoded.
-          // The check for width/height == 0 in the caller will filter these out if they are unusable.
-          miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Identified MJPEG from non-raw/dsp parse. W/H/FPS might be missing from this path.");
+        // For MJPEG, W/H/FPS might not be in spa_video_info_raw or
+        // spa_video_info_dsp. They might be in other properties of the
+        // format_pod. This part needs more complex parsing if MJPEG streams
+        // don't provide W/H/FPS via these parse functions. For now, we rely on
+        // spa_format_video_raw_parse or accept that W/H might be 0 for some
+        // encoded. The check for width/height == 0 in the caller will filter
+        // these out if they are unusable.
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW: Identified MJPEG from non-raw/dsp parse. W/H/FPS might "
+                   "be missing from this path.");
       } else if (spa_fmt_id != SPA_VIDEO_FORMAT_UNKNOWN) {
-          miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Could not parse as spa_video_info_raw, but got format %u from dsp_parse.", spa_fmt_id);
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW: Could not parse as spa_video_info_raw, but got format "
+                   "%u from dsp_parse.",
+                   spa_fmt_id);
       } else {
-          miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Could not parse as spa_video_info_raw and not identifiable as MJPEG or from dsp_parse. Format unknown.");
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW: Could not parse as spa_video_info_raw and not "
+                   "identifiable as MJPEG or from dsp_parse. Format unknown.");
       }
     }
-    if (info->pixel_format == MINIAV_PIXEL_FORMAT_UNKNOWN) { // Ensure it's set if all parsing fails
-        info->pixel_format = MINIAV_PIXEL_FORMAT_UNKNOWN;
+    if (info->pixel_format ==
+        MINIAV_PIXEL_FORMAT_UNKNOWN) { // Ensure it's set if all parsing fails
+      info->pixel_format = MINIAV_PIXEL_FORMAT_UNKNOWN;
     }
   }
 }
@@ -907,32 +927,30 @@ enum_cleanup:
 
 static void parse_spa_format_choices(const struct spa_pod *format_pod,
                                      PipeWireFormatEnumData *format_data) {
-    MiniAVVideoInfo info = {0};
-    parse_spa_format(format_pod, &info,
-                     NULL); // pw_ctx is NULL as it's not available/needed here.
+  MiniAVVideoInfo info = {0};
+  parse_spa_format(format_pod, &info,
+                   NULL); // pw_ctx is NULL as it's not available/needed here.
 
-    if (info.pixel_format != MINIAV_PIXEL_FORMAT_UNKNOWN) {
-      if (info.width == 0 || info.height == 0) {
-        miniav_log(
-            MINIAV_LOG_LEVEL_DEBUG,
-            "PW: Fallback format %s resulted in 0 width/height. Skipping.",
-            miniav_pixel_format_to_string_short(info.pixel_format));
-      } else if (*format_data->formats_count < format_data->allocated_formats) {
-        format_data->formats_list[*format_data->formats_count] = info;
-        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                   "PW: Added format: %s, %ux%u @ %u/%u",
-                   miniav_pixel_format_to_string_short(info.pixel_format),
-                   info.width, info.height, info.frame_rate_numerator,
-                   info.frame_rate_denominator);
-        (*format_data->formats_count)++;
-      } else {
-        miniav_log(
-            MINIAV_LOG_LEVEL_WARN,
-            "PW: Reached allocated format limit (%u) with fallback parser.",
-            format_data->allocated_formats);
-      }
+  if (info.pixel_format != MINIAV_PIXEL_FORMAT_UNKNOWN) {
+    if (info.width == 0 || info.height == 0) {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW: Fallback format %s resulted in 0 width/height. Skipping.",
+                 miniav_pixel_format_to_string_short(info.pixel_format));
+    } else if (*format_data->formats_count < format_data->allocated_formats) {
+      format_data->formats_list[*format_data->formats_count] = info;
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Added format: %s, %ux%u @ %u/%u",
+                 miniav_pixel_format_to_string_short(info.pixel_format),
+                 info.width, info.height, info.frame_rate_numerator,
+                 info.frame_rate_denominator);
+      (*format_data->formats_count)++;
+    } else {
+      miniav_log(
+          MINIAV_LOG_LEVEL_WARN,
+          "PW: Reached allocated format limit (%u) with fallback parser.",
+          format_data->allocated_formats);
     }
   }
+}
 
 static void on_node_param(void *data, int seq, uint32_t id, uint32_t index,
                           uint32_t next, const struct spa_pod *param) {

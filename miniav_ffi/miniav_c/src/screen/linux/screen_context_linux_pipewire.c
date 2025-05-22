@@ -73,9 +73,8 @@ miniav_video_format_to_spa(MiniAVPixelFormat pixel_fmt) {
     return SPA_VIDEO_FORMAT_RGBA;
   case MINIAV_PIXEL_FORMAT_I420:
     return SPA_VIDEO_FORMAT_I420;
-  case MINIAV_PIXEL_FORMAT_BGRX32: // Add this if you have it
+  case MINIAV_PIXEL_FORMAT_BGRX32:
     return SPA_VIDEO_FORMAT_BGRx;
-  // Add more mappings
   default:
     return SPA_VIDEO_FORMAT_UNKNOWN;
   }
@@ -112,8 +111,6 @@ miniav_audio_format_to_spa_audio(MiniAVAudioFormat fmt) {
   }
 }
 
-// This function was missing from the previous compiler output but was in your
-// prior code.
 static MiniAVAudioFormat
 spa_audio_format_to_miniav_audio(enum spa_audio_format spa_fmt) {
   switch (spa_fmt) {
@@ -369,7 +366,6 @@ pw_screen_destroy_platform(struct MiniAVScreenContext *ctx) {
   }
 
   // Ensure capture is stopped (also handles loop thread join)
-  // Call a simplified stop if not already done by MiniAV_Screen_StopCapture
   if (pctx->video_stream)
     pw_stream_set_active(pctx->video_stream, false);
   if (pctx->audio_stream)
@@ -488,8 +484,6 @@ pw_screen_get_default_formats(const char *device_id,
     video_format_out->height = 0;   // Request native/negotiated height
     video_format_out->frame_rate_numerator = 30; // Common default FPS
     video_format_out->frame_rate_denominator = 1;
-    // num_planes, strides, dmabuf_plane_offsets are not part of
-    // MiniAVVideoInfo
   }
   if (audio_format_out) {
     audio_format_out->format = MINIAV_AUDIO_FORMAT_F32;
@@ -518,9 +512,6 @@ pw_screen_get_configured_video_formats(struct MiniAVScreenContext *ctx,
         ctx->configured_video_format.width > 0 &&
         ctx->configured_video_format.height > 0) {
       *video_format_out = ctx->configured_video_format;
-      // Ensure output_preference from the original request is preserved,
-      // as it's not part of PipeWire's video format negotiation in this
-      // context.
       video_format_out->output_preference =
           pctx->requested_video_format.output_preference;
     } else if (ctx->is_configured) { // Fallback to what was initially
@@ -552,9 +543,6 @@ static MiniAVResultCode
 pw_screen_enumerate_displays(MiniAVDeviceInfo **displays_out,
                              uint32_t *count_out) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: EnumerateDisplays called.");
-  // This still requires portal interaction (e.g. using a temporary session
-  // with SelectSources and parsing the results without actually starting).
-  // For now, returning a placeholder.
   *displays_out =
       (MiniAVDeviceInfo *)miniav_calloc(1, sizeof(MiniAVDeviceInfo));
   if (!*displays_out)
@@ -637,7 +625,6 @@ pw_screen_configure_display(struct MiniAVScreenContext *ctx,
           video_format->frame_rate_numerator;
       pctx->requested_video_format.frame_rate_denominator = 1;
     }
-    // output_preference is always taken from user input
     pctx->requested_video_format.output_preference =
         video_format->output_preference;
   }
@@ -655,8 +642,6 @@ pw_screen_configure_display(struct MiniAVScreenContext *ctx,
 
   pctx->capture_type = MINIAV_CAPTURE_TYPE_DISPLAY;
   pctx->audio_requested_by_user = ctx->capture_audio_requested;
-  // pctx->requested_audio_format is already populated by
-  // pw_screen_get_default_formats if audio was requested
 
   if (pctx->audio_requested_by_user) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
@@ -780,12 +765,7 @@ pw_screen_configure_region(struct MiniAVScreenContext *ctx,
   }
   // Then overlay other specifics from user's video_format
   if (video_format) {
-    // If user also specified width/height in video_format, and they are valid,
-    // let them override (though region parameters x,y,width,height are usually
-    // the source of truth for dimensions)
     if (video_format->width > 0 && video_format->height > 0) {
-      // This might be redundant if width/height params are always used, but
-      // good for safety
       pctx->requested_video_format.width = video_format->width;
       pctx->requested_video_format.height = video_format->height;
     }
@@ -954,7 +934,6 @@ static void on_dbus_method_call_completed_cb(GObject *source_object,
   g_free(pctx->current_portal_request_object_path_str); // Free old one if any
   pctx->current_portal_request_object_path_str =
       g_strdup(request_obj_path_temp);
-  // request_obj_path_temp is owned by result_variant, g_strdup makes a copy.
   g_variant_unref(result_variant);
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
@@ -985,7 +964,7 @@ static void on_dbus_method_call_completed_cb(GObject *source_object,
           G_DBUS_SIGNAL_FLAGS_NONE,
           (GDBusSignalCallback)on_portal_request_signal_response,
           pctx, // user_data
-          NULL  // GDestroyNotify for user_data (not needed for pctx)
+          NULL  // GDestroyNotify for user_data
       );
 
   if (pctx->current_request_signal_subscription_id == 0) {
@@ -993,7 +972,6 @@ static void on_dbus_method_call_completed_cb(GObject *source_object,
                "PW Screen: Failed to subscribe to Response signal for %s",
                pctx->current_portal_request_object_path_str);
     pctx->last_error = MINIAV_ERROR_PORTAL_FAILED;
-    // TODO: Notify application of failure
     g_free(pctx->current_portal_request_object_path_str);
     pctx->current_portal_request_object_path_str = NULL;
     g_free(pctx->current_portal_request_token_str);
@@ -1080,7 +1058,7 @@ static void on_portal_request_signal_response(
                pctx->current_portal_request_token_str
                    ? pctx->current_portal_request_token_str
                    : "N/A");
-    const char *session_handle_temp = NULL; // MODIFIED: char* to const char*
+    const char *session_handle_temp = NULL;
     gboolean found_handle = FALSE;
 
     // Try to look up as object path first (standard)
@@ -1437,8 +1415,6 @@ portal_initiate_select_sources(PipeWireScreenPlatformContext *pctx) {
       params_for_select_sources, // This is (oa{sv})
       G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, -1, pctx->cancellable,
       (GAsyncReadyCallback)on_dbus_method_call_completed_cb, pctx);
-  // params_for_select_sources is floating and sunk by the call.
-  // options_dict_variant was sunk by params_for_select_sources.
 }
 
 static void portal_initiate_start_stream(PipeWireScreenPlatformContext *pctx) {
@@ -1469,7 +1445,6 @@ static void portal_initiate_start_stream(PipeWireScreenPlatformContext *pctx) {
       params_for_start, // This is (sa{sv})
       G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, -1, pctx->cancellable,
       (GAsyncReadyCallback)on_dbus_method_call_completed_cb, pctx);
-  // params_for_start is floating and sunk by the call.
 }
 
 static void
@@ -1518,68 +1493,78 @@ pw_screen_setup_pipewire_streams(PipeWireScreenPlatformContext *pctx) {
     };
     pw_stream_add_listener(pctx->video_stream, &pctx->video_stream_listener,
                            &video_stream_events, pctx);
-uint8_t video_params_buffer[2048];
-struct spa_pod_builder b = SPA_POD_BUILDER_INIT(video_params_buffer, sizeof(video_params_buffer));
-const struct spa_pod *params[2];
-uint32_t n_params = 0;
+    uint8_t video_params_buffer[2048];
+    struct spa_pod_builder b =
+        SPA_POD_BUILDER_INIT(video_params_buffer, sizeof(video_params_buffer));
+    const struct spa_pod *params[2];
+    uint32_t n_params = 0;
 
-// 1. SPA_PARAM_Buffers
-uint32_t buffer_types = (1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
-params[n_params++] = spa_pod_builder_add_object(
-    &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-    SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(PW_SCREEN_MAX_BUFFERS, 1, PW_SCREEN_MAX_BUFFERS),
-    SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
-    SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(buffer_types)
-);
+    // 1. SPA_PARAM_Buffers
+    uint32_t buffer_types =
+        (1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
+    params[n_params++] = spa_pod_builder_add_object(
+        &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+        SPA_PARAM_BUFFERS_buffers,
+        SPA_POD_CHOICE_RANGE_Int(PW_SCREEN_MAX_BUFFERS, 1,
+                                 PW_SCREEN_MAX_BUFFERS),
+        SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1), SPA_PARAM_BUFFERS_dataType,
+        SPA_POD_CHOICE_FLAGS_Int(buffer_types));
 
-// 2. SPA_PARAM_EnumFormat
-enum spa_video_format spa_fmt_req = miniav_video_format_to_spa(pctx->requested_video_format.pixel_format);
-if (spa_fmt_req == SPA_VIDEO_FORMAT_UNKNOWN) {
-    spa_fmt_req = SPA_VIDEO_FORMAT_BGRA;
-    miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Requested pixel format unknown to SPA, defaulting to BGRA for negotiation.");
-}
+    // 2. SPA_PARAM_EnumFormat
+    enum spa_video_format spa_fmt_req =
+        miniav_video_format_to_spa(pctx->requested_video_format.pixel_format);
+    if (spa_fmt_req == SPA_VIDEO_FORMAT_UNKNOWN) {
+      spa_fmt_req = SPA_VIDEO_FORMAT_BGRA;
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "PW Screen: Requested pixel format unknown to SPA, defaulting "
+                 "to BGRA for negotiation.");
+    }
 
-struct spa_pod_frame frame_format;
-spa_pod_builder_push_object(&b, &frame_format, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
-if(pctx->requested_video_format.output_preference == MINIAV_OUTPUT_PREFERENCE_CPU){
-spa_pod_builder_add(&b,
-    SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
-    SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-    SPA_FORMAT_VIDEO_format, SPA_POD_Id(spa_fmt_req),
-    SPA_FORMAT_VIDEO_maxFramerate, SPA_POD_Fraction(&SPA_FRACTION(
-        pctx->requested_video_format.frame_rate_numerator,
-        pctx->requested_video_format.frame_rate_denominator)),
-    0 // <-- IMPORTANT: terminator for varargs!
-);
-}else{
-  spa_pod_builder_add(&b,
-    SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
-    SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-    SPA_FORMAT_VIDEO_format, SPA_POD_Id(spa_fmt_req),
-    SPA_FORMAT_VIDEO_modifier, SPA_POD_CHOICE_FLAGS_Long(0 /* any modifier */),
-    SPA_FORMAT_VIDEO_maxFramerate, SPA_POD_Fraction(&SPA_FRACTION(
-        pctx->requested_video_format.frame_rate_numerator,
-        pctx->requested_video_format.frame_rate_denominator)),
-    0 // <-- IMPORTANT: terminator for varargs!
-);
-}
-params[n_params++] = spa_pod_builder_pop(&b, &frame_format);
+    struct spa_pod_frame frame_format;
+    spa_pod_builder_push_object(&b, &frame_format, SPA_TYPE_OBJECT_Format,
+                                SPA_PARAM_EnumFormat);
+    if (pctx->requested_video_format.output_preference ==
+        MINIAV_OUTPUT_PREFERENCE_CPU) {
+      spa_pod_builder_add(
+          &b, SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+          SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+          SPA_FORMAT_VIDEO_format, SPA_POD_Id(spa_fmt_req),
+          SPA_FORMAT_VIDEO_maxFramerate,
+          SPA_POD_Fraction(&SPA_FRACTION(
+              pctx->requested_video_format.frame_rate_numerator,
+              pctx->requested_video_format.frame_rate_denominator)),
+          0);
+    } else {
+      spa_pod_builder_add(
+          &b, SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+          SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+          SPA_FORMAT_VIDEO_format, SPA_POD_Id(spa_fmt_req),
+          SPA_FORMAT_VIDEO_modifier,
+          SPA_POD_CHOICE_FLAGS_Long(0 /* any modifier */),
+          SPA_FORMAT_VIDEO_maxFramerate,
+          SPA_POD_Fraction(&SPA_FRACTION(
+              pctx->requested_video_format.frame_rate_numerator,
+              pctx->requested_video_format.frame_rate_denominator)),
+          0);
+    }
+    params[n_params++] = spa_pod_builder_pop(&b, &frame_format);
 
     miniav_log(
         MINIAV_LOG_LEVEL_INFO,
         "PW Screen: Requesting video format %s with DRM_FORMAT_MOD_LINEAR.",
         spa_debug_type_find_name(spa_type_video_format, spa_fmt_req));
 
-if (pw_stream_connect(
-        pctx->video_stream, PW_DIRECTION_INPUT, pctx->video_node_id,
-        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS,
-        params, n_params) != 0) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-        "PW Screen: Failed to connect video stream to node %u: %s",
-        pctx->video_node_id, spa_strerror(errno));
-    pctx->last_error = MINIAV_ERROR_STREAM_FAILED;
-    goto error_cleanup_pw_setup;
-}
+    if (pw_stream_connect(
+            pctx->video_stream, PW_DIRECTION_INPUT, pctx->video_node_id,
+            PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
+                PW_STREAM_FLAG_RT_PROCESS,
+            params, n_params) != 0) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "PW Screen: Failed to connect video stream to node %u: %s",
+                 pctx->video_node_id, spa_strerror(errno));
+      pctx->last_error = MINIAV_ERROR_STREAM_FAILED;
+      goto error_cleanup_pw_setup;
+    }
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW Screen: Video stream connecting to node %u...",
                pctx->video_node_id);
@@ -1656,7 +1641,6 @@ if (pw_stream_connect(
   miniav_log(
       MINIAV_LOG_LEVEL_INFO,
       "PW Screen: PipeWire streams configured and loop thread starting.");
-  // pctx->parent_ctx->is_running will be set by stream state changes.
   return;
 
 error_cleanup_pw_setup:
@@ -1668,10 +1652,7 @@ error_cleanup_pw_setup:
     pw_stream_destroy(pctx->audio_stream);
     pctx->audio_stream = NULL;
   }
-  // Notify app of failure if callback was set
   if (pctx->parent_ctx->app_callback) {
-    // TODO: How to signal this error to app? Maybe a special buffer or error
-    // callback? For now, the app will just not receive buffers.
     miniav_log(
         MINIAV_LOG_LEVEL_ERROR,
         "PW Screen: Failed to setup PipeWire streams. Capture will not start.");
@@ -1775,8 +1756,6 @@ pw_screen_stop_capture(struct MiniAVScreenContext *ctx) {
                pctx->portal_session_handle_str);
     GError *error = NULL;
     GCancellable *close_cancellable = g_cancellable_new();
-    // This should ideally be an async call if stop_capture itself needs to be
-    // non-blocking. For simplicity, using sync call here.
     g_dbus_connection_call_sync(
         pctx->dbus_conn, XDP_BUS_NAME, pctx->portal_session_handle_str,
         XDP_IFACE_SESSION, "Close", NULL, NULL, G_DBUS_CALL_FLAGS_NONE,
@@ -1897,7 +1876,7 @@ static void on_pw_core_info(void *data, const struct pw_core_info *info) {
              info->id, info->cookie, info->name ? info->name : "(null)",
              info->props ? spa_dict_lookup(info->props, PW_KEY_CORE_VERSION)
                          : "N/A");
-  pctx->core_connected = true; // Mark core as connected
+  pctx->core_connected = true;
 }
 
 static void on_pw_core_done(void *data, uint32_t id, int seq) {
@@ -1906,7 +1885,6 @@ static void on_pw_core_done(void *data, uint32_t id, int seq) {
              seq);
   if (id == PW_ID_CORE && seq == pctx->core_sync_seq) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: Core sync complete.");
-    // Potentially signal that core is fully ready if waiting on sync
   }
 }
 static void on_pw_core_error(void *data, uint32_t id, int seq, int res,
@@ -2108,10 +2086,7 @@ static void on_video_stream_param_changed(void *data, uint32_t id,
         pctx->current_video_format_details.spa_format.framerate.num;
     pctx->parent_ctx->configured_video_format.frame_rate_denominator =
         pctx->current_video_format_details.spa_format.framerate.denom;
-    // output_preference is set by configure_x, not negotiated by PipeWire for
-    // video. It remains as requested by the user.
-  } else { // This case should ideally be caught by earlier checks if parse
-           // failed or dimensions were zero
+  } else {
     miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Video format is unknown or "
                                       "not usable after param changed.");
     pctx->parent_ctx->configured_video_format.pixel_format =
@@ -2173,206 +2148,236 @@ static void on_video_stream_remove_buffer(void *data,
 }
 
 static void on_video_stream_process(void *data) {
-    PipeWireScreenPlatformContext *pctx = (PipeWireScreenPlatformContext *)data;
-    struct pw_buffer *pw_buf;
-    MiniAVNativeBufferInternalPayload *payload_alloc = NULL;
+  PipeWireScreenPlatformContext *pctx = (PipeWireScreenPlatformContext *)data;
+  struct pw_buffer *pw_buf;
+  MiniAVNativeBufferInternalPayload *payload_alloc = NULL;
 
-    if (!pctx->parent_ctx->app_callback || !pctx->video_stream_active)
-        return;
+  if (!pctx->parent_ctx->app_callback || !pctx->video_stream_active)
+    return;
 
-    while ((pw_buf = pw_stream_dequeue_buffer(pctx->video_stream))) {
-        struct spa_buffer *spa_buf = pw_buf->buffer;
-        payload_alloc = NULL;
+  while ((pw_buf = pw_stream_dequeue_buffer(pctx->video_stream))) {
+    struct spa_buffer *spa_buf = pw_buf->buffer;
+    payload_alloc = NULL;
 
-        if (spa_buf->n_datas < 1) {
-            miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Video buffer has no data planes.");
-            goto queue_and_continue_video;
-        }
-
-        MiniAVBuffer miniav_buffer = {0};
-        miniav_buffer.type = MINIAV_BUFFER_TYPE_VIDEO;
-        miniav_buffer.user_data = pctx->parent_ctx->app_callback_user_data;
-        miniav_buffer.timestamp_us = miniav_get_time_us();
-        miniav_buffer.data.video.info = pctx->parent_ctx->configured_video_format;
-
-        PipeWireFrameReleasePayload *frame_payload =
-            miniav_calloc(1, sizeof(PipeWireFrameReleasePayload));
-        if (!frame_payload) {
-            miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: Failed to alloc PipeWireFrameReleasePayload.");
-            goto queue_and_continue_video;
-        }
-
-        int buf_type = spa_buf->datas[0].type;
-        int fd = spa_buf->datas[0].fd;
-        size_t size = spa_buf->datas[0].maxsize;
-
-        if (buf_type == SPA_DATA_DmaBuf) {
-            // --- DMA-BUF path ---
-            if (pctx->requested_video_format.output_preference == MINIAV_OUTPUT_PREFERENCE_CPU) {
-                if (pctx->current_video_format_details.negotiated_modifier != DRM_FORMAT_MOD_LINEAR) {
-                    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                        "PW Screen: DMABUF has non-linear modifier (%" PRIu64 "). Cannot directly mmap for CPU pixel copy. Skipping frame.",
-                        pctx->current_video_format_details.negotiated_modifier);
-                    miniav_free(frame_payload);
-                    goto queue_and_continue_video;
-                }
-                void *mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
-                if (mapped == MAP_FAILED) {
-                    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                        "PW Screen: Failed to mmap DMABUF for CPU copy: %s. Modifier: %" PRIu64,
-                        strerror(errno), pctx->current_video_format_details.negotiated_modifier);
-                    miniav_free(frame_payload);
-                    goto queue_and_continue_video;
-                }
-                struct dma_buf_sync sync_args;
-                int ret;
-                sync_args.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
-                do {
-                    ret = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_args);
-                } while (ret == -1 && (errno == EAGAIN || errno == EINTR));
-                if (ret == -1) {
-                    if (errno == ENOTTY) {
-                        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                            "PW Screen: DMA_BUF_IOCTL_SYNC not supported on this buffer. Skipping frame.");
-                    } else {
-                        miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                            "PW Screen: DMA_BUF_IOCTL_SYNC (START) failed: %s. Skipping frame.",
-                            strerror(errno));
-                    }
-                    munmap(mapped, size);
-                    miniav_free(frame_payload);
-                    goto queue_and_continue_video;
-                }
-                uint8_t *cpu_copy = (uint8_t *)miniav_calloc(1, size);
-                if (!cpu_copy) {
-                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: Failed to alloc CPU buffer for DMABUF copy.");
-                    sync_args.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-                    ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_args);
-                    munmap(mapped, size);
-                    miniav_free(frame_payload);
-                    goto queue_and_continue_video;
-                }
-                memcpy(cpu_copy, mapped, size);
-                sync_args.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-                ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_args);
-                munmap(mapped, size);
-
-                miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-                miniav_buffer.data.video.planes[0] = cpu_copy;
-                miniav_buffer.data_size_bytes = size;
-                miniav_buffer.data.video.stride_bytes[0] =
-                    pctx->current_video_format_details.spa_format.size.width * 4; // adjust for format
-
-                frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
-                frame_payload->cpu.cpu_ptr = cpu_copy;
-                frame_payload->cpu.cpu_size = size;
-                frame_payload->cpu.src_dmabuf_fd = fd;
-
-                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: DMABUF (linear, synced) mapped and copied to CPU buffer for app.");
-            } else {
-                // --- GPU path: pass DMABUF FD as before ---
-                int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-                if (dup_fd == -1) {
-                    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                        "PW Screen: Failed to dup DMABUF FD %d: %s. Skipping frame.", fd, strerror(errno));
-                    miniav_free(frame_payload);
-                    goto queue_and_continue_video;
-                }
-                miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD;
-                miniav_buffer.data.video.native_gpu_dmabuf_fd = dup_fd;
-                miniav_buffer.data_size_bytes = size;
-
-                frame_payload->type = MINIAV_OUTPUT_PREFERENCE_GPU;
-                frame_payload->gpu.dup_dmabuf_fd = dup_fd;
-
-                miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                    "PW Screen: DMABUF frame: FD %d (orig %d), ts %" PRIu64 "us",
-                    dup_fd, fd, miniav_buffer.timestamp_us);
-            }
-        } else if (buf_type == SPA_DATA_MemFd) {
-            // --- MemFd path ---
-            void *mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
-            if (mapped == MAP_FAILED) {
-                miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: Failed to mmap MemFd: %s", strerror(errno));
-                miniav_free(frame_payload);
-                goto queue_and_continue_video;
-            }
-            uint8_t *cpu_copy = (uint8_t *)miniav_calloc(1, size);
-            if (!cpu_copy) {
-                miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: Failed to alloc CPU buffer for MemFd copy.");
-                munmap(mapped, size);
-                miniav_free(frame_payload);
-                goto queue_and_continue_video;
-            }
-            memcpy(cpu_copy, mapped, size);
-            munmap(mapped, size);
-
-            miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-            miniav_buffer.data.video.planes[0] = cpu_copy;
-            miniav_buffer.data_size_bytes = size;
-            miniav_buffer.data.video.stride_bytes[0] =
-                pctx->current_video_format_details.spa_format.size.width * 4; // adjust for format
-
-            frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
-            frame_payload->cpu.cpu_ptr = cpu_copy;
-            frame_payload->cpu.cpu_size = size;
-            frame_payload->cpu.src_dmabuf_fd = fd;
-
-            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: MemFd mapped and copied to CPU buffer for app.");
-        } else if (buf_type == SPA_DATA_MemPtr) {
-            // --- MemPtr path ---
-            miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-            miniav_buffer.data.video.planes[0] = spa_buf->datas[0].data;
-            miniav_buffer.data_size_bytes = size;
-            miniav_buffer.data.video.stride_bytes[0] =
-                pctx->current_video_format_details.spa_format.size.width * 4; // adjust for format
-
-            frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
-            frame_payload->cpu.cpu_ptr = NULL;
-            frame_payload->cpu.cpu_size = size;
-            frame_payload->cpu.src_dmabuf_fd = -1;
-
-            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: MemPtr buffer passed directly to app.");
-        } else {
-            miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Unhandled buffer type %d", buf_type);
-            miniav_free(frame_payload);
-            goto queue_and_continue_video;
-        }
-
-        // Attach the payload to the MiniAV buffer
-        payload_alloc = miniav_calloc(1, sizeof(MiniAVNativeBufferInternalPayload));
-        if (!payload_alloc) {
-            miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: Failed to alloc MiniAVNativeBufferInternalPayload.");
-            if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU && frame_payload->cpu.cpu_ptr)
-                miniav_free(frame_payload->cpu.cpu_ptr);
-            else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU && frame_payload->gpu.dup_dmabuf_fd > 0)
-                close(frame_payload->gpu.dup_dmabuf_fd);
-            miniav_free(frame_payload);
-            goto queue_and_continue_video;
-        }
-        payload_alloc->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN;
-        payload_alloc->context_owner = pctx->parent_ctx;
-        payload_alloc->native_resource_ptr = frame_payload;
-        miniav_buffer.internal_handle = payload_alloc;
-
-        // Deliver to app
-        pctx->parent_ctx->app_callback(&miniav_buffer, pctx->parent_ctx->app_callback_user_data);
-        payload_alloc = NULL; // Ownership passed to app
-
-    queue_and_continue_video:
-        if (payload_alloc) {
-            PipeWireFrameReleasePayload *fp = (PipeWireFrameReleasePayload *)payload_alloc->native_resource_ptr;
-            if (fp) {
-                if (fp->type == MINIAV_OUTPUT_PREFERENCE_CPU && fp->cpu.cpu_ptr)
-                    miniav_free(fp->cpu.cpu_ptr);
-                else if (fp->type == MINIAV_OUTPUT_PREFERENCE_GPU && fp->gpu.dup_dmabuf_fd > 0)
-                    close(fp->gpu.dup_dmabuf_fd);
-                miniav_free(fp);
-            }
-            miniav_free(payload_alloc);
-        }
-        pw_stream_queue_buffer(pctx->video_stream, pw_buf);
+    if (spa_buf->n_datas < 1) {
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "PW Screen: Video buffer has no data planes.");
+      goto queue_and_continue_video;
     }
+
+    MiniAVBuffer miniav_buffer = {0};
+    miniav_buffer.type = MINIAV_BUFFER_TYPE_VIDEO;
+    miniav_buffer.user_data = pctx->parent_ctx->app_callback_user_data;
+    miniav_buffer.timestamp_us = miniav_get_time_us();
+    miniav_buffer.data.video.info = pctx->parent_ctx->configured_video_format;
+
+    PipeWireFrameReleasePayload *frame_payload =
+        miniav_calloc(1, sizeof(PipeWireFrameReleasePayload));
+    if (!frame_payload) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "PW Screen: Failed to alloc PipeWireFrameReleasePayload.");
+      goto queue_and_continue_video;
+    }
+
+    int buf_type = spa_buf->datas[0].type;
+    int fd = spa_buf->datas[0].fd;
+    size_t size = spa_buf->datas[0].maxsize;
+
+    if (buf_type == SPA_DATA_DmaBuf) {
+      // --- DMA-BUF path ---
+      if (pctx->requested_video_format.output_preference ==
+          MINIAV_OUTPUT_PREFERENCE_CPU) {
+        if (pctx->current_video_format_details.negotiated_modifier !=
+            DRM_FORMAT_MOD_LINEAR) {
+          miniav_log(
+              MINIAV_LOG_LEVEL_ERROR,
+              "PW Screen: DMABUF has non-linear modifier (%" PRIu64
+              "). Cannot directly mmap for CPU pixel copy. Skipping frame.",
+              pctx->current_video_format_details.negotiated_modifier);
+          miniav_free(frame_payload);
+          goto queue_and_continue_video;
+        }
+        void *mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+        if (mapped == MAP_FAILED) {
+          miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                     "PW Screen: Failed to mmap DMABUF for CPU copy: %s. "
+                     "Modifier: %" PRIu64,
+                     strerror(errno),
+                     pctx->current_video_format_details.negotiated_modifier);
+          miniav_free(frame_payload);
+          goto queue_and_continue_video;
+        }
+        struct dma_buf_sync sync_args;
+        int ret;
+        sync_args.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+        do {
+          ret = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_args);
+        } while (ret == -1 && (errno == EAGAIN || errno == EINTR));
+        if (ret == -1) {
+          if (errno == ENOTTY) {
+            miniav_log(MINIAV_LOG_LEVEL_WARN,
+                       "PW Screen: DMA_BUF_IOCTL_SYNC not supported on this "
+                       "buffer. Skipping frame.");
+          } else {
+            miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                       "PW Screen: DMA_BUF_IOCTL_SYNC (START) failed: %s. "
+                       "Skipping frame.",
+                       strerror(errno));
+          }
+          munmap(mapped, size);
+          miniav_free(frame_payload);
+          goto queue_and_continue_video;
+        }
+        uint8_t *cpu_copy = (uint8_t *)miniav_calloc(1, size);
+        if (!cpu_copy) {
+          miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                     "PW Screen: Failed to alloc CPU buffer for DMABUF copy.");
+          sync_args.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+          ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_args);
+          munmap(mapped, size);
+          miniav_free(frame_payload);
+          goto queue_and_continue_video;
+        }
+        memcpy(cpu_copy, mapped, size);
+        sync_args.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+        ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_args);
+        munmap(mapped, size);
+
+        miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+        miniav_buffer.data.video.planes[0] = cpu_copy;
+        miniav_buffer.data_size_bytes = size;
+        miniav_buffer.data.video.stride_bytes[0] =
+            pctx->current_video_format_details.spa_format.size.width *
+            4; // adjust for format
+
+        frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
+        frame_payload->cpu.cpu_ptr = cpu_copy;
+        frame_payload->cpu.cpu_size = size;
+        frame_payload->cpu.src_dmabuf_fd = fd;
+
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW Screen: DMABUF (linear, synced) mapped and copied to "
+                   "CPU buffer for app.");
+      } else {
+        // --- GPU path: pass DMABUF FD as before ---
+        int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (dup_fd == -1) {
+          miniav_log(
+              MINIAV_LOG_LEVEL_ERROR,
+              "PW Screen: Failed to dup DMABUF FD %d: %s. Skipping frame.", fd,
+              strerror(errno));
+          miniav_free(frame_payload);
+          goto queue_and_continue_video;
+        }
+        miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD;
+        miniav_buffer.data.video.native_gpu_dmabuf_fd = dup_fd;
+        miniav_buffer.data_size_bytes = size;
+
+        frame_payload->type = MINIAV_OUTPUT_PREFERENCE_GPU;
+        frame_payload->gpu.dup_dmabuf_fd = dup_fd;
+
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW Screen: DMABUF frame: FD %d (orig %d), ts %" PRIu64 "us",
+                   dup_fd, fd, miniav_buffer.timestamp_us);
+      }
+    } else if (buf_type == SPA_DATA_MemFd) {
+      // --- MemFd path ---
+      void *mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+      if (mapped == MAP_FAILED) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "PW Screen: Failed to mmap MemFd: %s", strerror(errno));
+        miniav_free(frame_payload);
+        goto queue_and_continue_video;
+      }
+      uint8_t *cpu_copy = (uint8_t *)miniav_calloc(1, size);
+      if (!cpu_copy) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "PW Screen: Failed to alloc CPU buffer for MemFd copy.");
+        munmap(mapped, size);
+        miniav_free(frame_payload);
+        goto queue_and_continue_video;
+      }
+      memcpy(cpu_copy, mapped, size);
+      munmap(mapped, size);
+
+      miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+      miniav_buffer.data.video.planes[0] = cpu_copy;
+      miniav_buffer.data_size_bytes = size;
+      miniav_buffer.data.video.stride_bytes[0] =
+          pctx->current_video_format_details.spa_format.size.width *
+          4; // adjust for format
+
+      frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
+      frame_payload->cpu.cpu_ptr = cpu_copy;
+      frame_payload->cpu.cpu_size = size;
+      frame_payload->cpu.src_dmabuf_fd = fd;
+
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW Screen: MemFd mapped and copied to CPU buffer for app.");
+    } else if (buf_type == SPA_DATA_MemPtr) {
+      // --- MemPtr path ---
+      miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+      miniav_buffer.data.video.planes[0] = spa_buf->datas[0].data;
+      miniav_buffer.data_size_bytes = size;
+      miniav_buffer.data.video.stride_bytes[0] =
+          pctx->current_video_format_details.spa_format.size.width *
+          4; // adjust for format
+
+      frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
+      frame_payload->cpu.cpu_ptr = NULL;
+      frame_payload->cpu.cpu_size = size;
+      frame_payload->cpu.src_dmabuf_fd = -1;
+
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW Screen: MemPtr buffer passed directly to app.");
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Unhandled buffer type %d",
+                 buf_type);
+      miniav_free(frame_payload);
+      goto queue_and_continue_video;
+    }
+
+    // Attach the payload to the MiniAV buffer
+    payload_alloc = miniav_calloc(1, sizeof(MiniAVNativeBufferInternalPayload));
+    if (!payload_alloc) {
+      miniav_log(
+          MINIAV_LOG_LEVEL_ERROR,
+          "PW Screen: Failed to alloc MiniAVNativeBufferInternalPayload.");
+      if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU &&
+          frame_payload->cpu.cpu_ptr)
+        miniav_free(frame_payload->cpu.cpu_ptr);
+      else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU &&
+               frame_payload->gpu.dup_dmabuf_fd > 0)
+        close(frame_payload->gpu.dup_dmabuf_fd);
+      miniav_free(frame_payload);
+      goto queue_and_continue_video;
+    }
+    payload_alloc->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN;
+    payload_alloc->context_owner = pctx->parent_ctx;
+    payload_alloc->native_resource_ptr = frame_payload;
+    miniav_buffer.internal_handle = payload_alloc;
+
+    // Deliver to app
+    pctx->parent_ctx->app_callback(&miniav_buffer,
+                                   pctx->parent_ctx->app_callback_user_data);
+    payload_alloc = NULL; // Ownership passed to app
+
+  queue_and_continue_video:
+    if (payload_alloc) {
+      PipeWireFrameReleasePayload *fp =
+          (PipeWireFrameReleasePayload *)payload_alloc->native_resource_ptr;
+      if (fp) {
+        if (fp->type == MINIAV_OUTPUT_PREFERENCE_CPU && fp->cpu.cpu_ptr)
+          miniav_free(fp->cpu.cpu_ptr);
+        else if (fp->type == MINIAV_OUTPUT_PREFERENCE_GPU &&
+                 fp->gpu.dup_dmabuf_fd > 0)
+          close(fp->gpu.dup_dmabuf_fd);
+        miniav_free(fp);
+      }
+      miniav_free(payload_alloc);
+    }
+    pw_stream_queue_buffer(pctx->video_stream, pw_buf);
+  }
 }
 
 // --- Audio Stream Listener Callbacks ---
@@ -2391,7 +2396,6 @@ static void on_audio_stream_state_changed(void *data, enum pw_stream_state old,
     pctx->audio_stream_active = false;
     pctx->parent_ctx->is_running =
         pctx->video_stream_active || pctx->audio_stream_active;
-    // Don't necessarily quit main loop if video is fine
     break;
   case PW_STREAM_STATE_UNCONNECTED:
     pctx->audio_stream_active = false;

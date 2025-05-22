@@ -263,7 +263,7 @@ const char *miniav_pixel_format_to_string_short(MiniAVPixelFormat format) {
 }
 
 static void parse_spa_format(const struct spa_pod *format_pod,
-                             MiniAVVideoInfo *info, ) {
+                             MiniAVVideoInfo *info) {
   struct spa_video_info_raw raw_info = {0};
 
   if (spa_format_video_raw_parse(format_pod, &raw_info) >= 0) {
@@ -285,7 +285,7 @@ static void parse_spa_format(const struct spa_pod *format_pod,
     }
 
   } else {
-    if (spa_pod_is_choice(format_pod)) { 
+    if (spa_pod_is_choice(format_pod)) {
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "PW: parse_spa_format called with a CHOICE/ANY type pod. This "
                  "should be handled by parse_spa_format_choices.");
@@ -1163,8 +1163,7 @@ static MiniAVResultCode pw_start_capture(MiniAVCameraContext *ctx) {
       SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), SPA_FORMAT_VIDEO_format,
       SPA_POD_Id(miniav_pixel_format_to_spa(
           pw_ctx->configured_video_format.pixel_format)),
-      SPA_FORMAT_VIDEO_modifier,
-      SPA_POD_CHOICE_FLAGS_Long(0),
+      SPA_FORMAT_VIDEO_modifier, SPA_POD_CHOICE_FLAGS_Long(0),
       SPA_FORMAT_VIDEO_size,
       SPA_POD_Rectangle(&SPA_RECTANGLE(pw_ctx->configured_video_format.width,
                                        pw_ctx->configured_video_format.height)),
@@ -1208,8 +1207,7 @@ MiniAVResultCode pw_stop_capture(MiniAVCameraContext *ctx) {
   PipeWirePlatformContext *pw_ctx =
       (PipeWirePlatformContext *)ctx->platform_ctx;
 
-  if (!pw_ctx->loop_running &&
-      !pw_ctx->is_streaming) {
+  if (!pw_ctx->loop_running && !pw_ctx->is_streaming) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW: Capture not running or loop already stopped.");
     return MINIAV_SUCCESS;

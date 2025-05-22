@@ -99,7 +99,7 @@ MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
     MiniAVCameraContext *cam_ctx =
         (MiniAVCameraContext *)payload->context_owner;
     if (cam_ctx && cam_ctx->ops && cam_ctx->ops->release_buffer) {
-      res = cam_ctx->ops->release_buffer(cam_ctx, payload->native_resource_ptr);
+      res = cam_ctx->ops->release_buffer(cam_ctx, payload);
     } else {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "Invalid camera context or release_buffer op for payload %p.",

@@ -104,6 +104,21 @@ typedef struct MFPlatformContext {
 
 } MFPlatformContext;
 
+typedef struct MFFrameReleasePayload {
+  IMFSample *sample; // Always present
+  MiniAVOutputPreference type;
+  union {
+    struct {         // For CPU
+      void *cpu_ptr; // If you ever copy to CPU memory
+      size_t cpu_size;
+    } cpu;
+    struct {                        // For GPU
+      HANDLE shared_texture_handle; // If used
+      IUnknown *gpu_texture_ptr;    // e.g., ID3D11Texture2D*
+    } gpu;
+  };
+} MFFrameReleasePayload;
+
 // --- IMFSourceReaderCallback Implementation ---
 static HRESULT STDMETHODCALLTYPE MFPlatform_QueryInterface(
     IMFSourceReaderCallback *pThis, REFIID riid, void **ppvObject) {
@@ -207,19 +222,22 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   buffer_ptr->type = MINIAV_BUFFER_TYPE_VIDEO;
   buffer_ptr->timestamp_us = llTimestamp;
   buffer_ptr->data.video.info.width = parent_ctx->configured_video_format.width;
-  buffer_ptr->data.video.info.height = parent_ctx->configured_video_format.height;
+  buffer_ptr->data.video.info.height =
+      parent_ctx->configured_video_format.height;
   buffer_ptr->data.video.info.pixel_format =
       parent_ctx->configured_video_format.pixel_format;
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "MF: OnReadSample - parent_ctx->configured_video_format.pixel_format is "
-             "%d (0x%X)",
-             parent_ctx->configured_video_format.pixel_format,
-             parent_ctx->configured_video_format.pixel_format);
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "MF: OnReadSample - buffer.data.video.info.pixel_format is %d (0x%X) "
-             "before callback",
-             buffer_ptr->data.video.info.pixel_format,
-             buffer_ptr->data.video.info.pixel_format);
+  miniav_log(
+      MINIAV_LOG_LEVEL_DEBUG,
+      "MF: OnReadSample - parent_ctx->configured_video_format.pixel_format is "
+      "%d (0x%X)",
+      parent_ctx->configured_video_format.pixel_format,
+      parent_ctx->configured_video_format.pixel_format);
+  miniav_log(
+      MINIAV_LOG_LEVEL_DEBUG,
+      "MF: OnReadSample - buffer.data.video.info.pixel_format is %d (0x%X) "
+      "before callback",
+      buffer_ptr->data.video.info.pixel_format,
+      buffer_ptr->data.video.info.pixel_format);
   // Assuming MiniAVBuffer has these fields (actual_output_preference_achieved,
   // shared_texture_handle, native_gpu_texture_ptr)
   // buffer.data.video.actual_output_preference_achieved =
@@ -236,7 +254,7 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
       mf_ctx->d3d_device_context &&
       (desired_output_pref ==
        MINIAV_OUTPUT_PREFERENCE_GPU)) { // Or other specific shared
-                                                     // texture prefs
+                                        // texture prefs
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "MF: Attempting GPU shared texture path.");
     hr = IMFSample_GetBufferByIndex(pSample, 0, &media_buffer);
@@ -302,7 +320,8 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                              "copied texture: %p",
                              shared_handle);
                   buffer_ptr->data.video.planes[0] = NULL;
-                  buffer_ptr->data.video.native_gpu_texture_ptr = d3d11_texture;
+                  buffer_ptr->data.video.native_gpu_texture_ptr =
+                      shareable_texture;
                   buffer_ptr->data.video.native_gpu_shared_handle =
                       shared_handle;
                   buffer_ptr->data.video.stride_bytes[0] = 0;
@@ -311,8 +330,7 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                   buffer_ptr->content_type =
                       MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
                   // The application is responsible for
-                  // CloseHandle(shared_handle) The shareable_texture itself is
-                  // released below.
+                  // CloseHandle(shared_handle)
                 } else {
                   miniav_log(MINIAV_LOG_LEVEL_ERROR,
                              "MF: Failed to create DXGI shared handle from "
@@ -326,7 +344,6 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                            "texture: 0x%X. Will fallback to CPU.",
                            hr);
               }
-              ID3D11Texture2D_Release(shareable_texture);
             } else {
               miniav_log(MINIAV_LOG_LEVEL_ERROR,
                          "MF: Failed to create a shareable texture for copy: "
@@ -478,12 +495,14 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "MF: Using fallback stride calculation for pixel format %d.",
                  buffer_ptr->data.video.info.pixel_format);
-      if (buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_YUY2 ||
+      if (buffer_ptr->data.video.info.pixel_format ==
+              MINIAV_PIXEL_FORMAT_YUY2 ||
           buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_UYVY)
         stride = buffer_ptr->data.video.info.width * 2;
       else if (buffer_ptr->data.video.info.pixel_format ==
                    MINIAV_PIXEL_FORMAT_RGB24 ||
-               buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_BGR24)
+               buffer_ptr->data.video.info.pixel_format ==
+                   MINIAV_PIXEL_FORMAT_BGR24)
         stride = buffer_ptr->data.video.info.width * 3;
       else if (buffer_ptr->data.video.info.pixel_format ==
                    MINIAV_PIXEL_FORMAT_RGBA32 ||
@@ -496,9 +515,11 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
         stride = buffer_ptr->data.video.info.width * 4;
       else if (buffer_ptr->data.video.info.pixel_format ==
                    MINIAV_PIXEL_FORMAT_NV12 ||
-               buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_NV21)
+               buffer_ptr->data.video.info.pixel_format ==
+                   MINIAV_PIXEL_FORMAT_NV21)
         stride = buffer_ptr->data.video.info.width;
-      else if (buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_I420)
+      else if (buffer_ptr->data.video.info.pixel_format ==
+               MINIAV_PIXEL_FORMAT_I420)
         stride = buffer_ptr->data.video.info.width;
       else {
         miniav_log(
@@ -532,13 +553,43 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   // Common path for callback
   buffer_ptr->user_data = mf_ctx->app_callback_user_data_internal;
 
+  MFFrameReleasePayload *frame_payload =
+      (MFFrameReleasePayload *)miniav_calloc(1, sizeof(MFFrameReleasePayload));
+  if (!frame_payload) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "MF: Failed to allocate MFFrameReleasePayload.");
+    miniav_free(buffer_ptr);
+    if (processed_as_gpu_texture &&
+        buffer_ptr->data.video.native_gpu_shared_handle != NULL) {
+      CloseHandle(buffer_ptr->data.video.native_gpu_shared_handle);
+    }
+    hr = E_OUTOFMEMORY;
+    goto request_next_sample;
+  }
+
+  // Fill in the payload
+  frame_payload->sample = pSample;
+  frame_payload->type = processed_as_gpu_texture ? MINIAV_OUTPUT_PREFERENCE_GPU
+                                                 : MINIAV_OUTPUT_PREFERENCE_CPU;
+  if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU) {
+    frame_payload->cpu.cpu_ptr = raw_buffer_data;
+    frame_payload->cpu.cpu_size = current_length;
+    // No need to store IMFMediaBuffer* here, it's managed above
+  } else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU) {
+    frame_payload->gpu.shared_texture_handle =
+        buffer_ptr->data.video.native_gpu_shared_handle;
+    frame_payload->gpu.gpu_texture_ptr =
+        buffer_ptr->data.video.native_gpu_texture_ptr;
+  }
+
   MiniAVNativeBufferInternalPayload *payload =
       (MiniAVNativeBufferInternalPayload *)miniav_calloc(
           1, sizeof(MiniAVNativeBufferInternalPayload));
   if (!payload) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "MF: Failed to allocate internal handle payload.");
-    miniav_free(buffer_ptr); // Free the MiniAVBuffer we just allocated
+    miniav_free(frame_payload);
+    miniav_free(buffer_ptr);
     if (processed_as_gpu_texture &&
         buffer_ptr->data.video.native_gpu_shared_handle != NULL) {
       CloseHandle(buffer_ptr->data.video.native_gpu_shared_handle);
@@ -548,14 +599,8 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   }
   payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA;
   payload->context_owner = parent_ctx;
-  payload->native_resource_ptr = pSample;
-  payload->parent_miniav_buffer_ptr =
-      buffer_ptr; // Store pointer to the containing MiniAVBuffer
-
-  if (pSample) { // Only AddRef if pSample is not NULL (e.g. not a stream tick
-                 // without sample)
-    IMFSample_AddRef(pSample);
-  }
+  payload->native_resource_ptr = frame_payload;
+  payload->parent_miniav_buffer_ptr = buffer_ptr;
 
   buffer_ptr->internal_handle = payload;
 
@@ -565,8 +610,6 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
         mf_ctx->app_callback_user_data_internal);
   } else {
     // No app callback, release resources we took/created
-    if (pSample)
-      IMFSample_Release(pSample); // Release the AddRef for payload
     miniav_free(payload);
     miniav_free(buffer_ptr); // Free the MiniAVBuffer as well
     if (processed_as_gpu_texture &&
@@ -922,10 +965,9 @@ cleanup_and_exit:
   return SUCCEEDED(hr) ? MINIAV_SUCCESS : MINIAV_ERROR_SYSTEM_CALL_FAILED;
 }
 
-static MiniAVResultCode
-mf_get_supported_formats(const char *device_id_utf8,
-                         MiniAVVideoInfo **formats_out,
-                         uint32_t *count_out) {
+static MiniAVResultCode mf_get_supported_formats(const char *device_id_utf8,
+                                                 MiniAVVideoInfo **formats_out,
+                                                 uint32_t *count_out) {
   miniav_log(
       MINIAV_LOG_LEVEL_DEBUG,
       "MF: Getting supported formats for device %s (real). Thread ID: %lu",
@@ -1119,8 +1161,7 @@ mf_get_supported_formats(const char *device_id_utf8,
     if (found_formats >= allocated_formats) {
       allocated_formats = (allocated_formats == 0) ? 8 : allocated_formats * 2;
       MiniAVVideoInfo *new_list = (MiniAVVideoInfo *)miniav_realloc(
-          result_formats_list,
-          allocated_formats * sizeof(MiniAVVideoInfo));
+          result_formats_list, allocated_formats * sizeof(MiniAVVideoInfo));
       if (!new_list) {
         miniav_free(result_formats_list);
         result_formats_list = NULL;
@@ -1605,10 +1646,11 @@ static MiniAVResultCode mf_configure(
   mf_ctx->app_callback_user_data_internal = ctx->app_callback_user_data;
   ctx->configured_video_format = *format;
   mf_ctx->parent_ctx->configured_video_format = *format;
-  miniav_log(
-      MINIAV_LOG_LEVEL_DEBUG,
-      "MF: mf_configure - ctx->configured_video_format.pixel_format set to %d (0x%X)",
-      ctx->configured_video_format.pixel_format, ctx->configured_video_format.pixel_format);
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "MF: mf_configure - ctx->configured_video_format.pixel_format set "
+             "to %d (0x%X)",
+             ctx->configured_video_format.pixel_format,
+             ctx->configured_video_format.pixel_format);
 
   miniav_log(MINIAV_LOG_LEVEL_INFO,
              "MF: Configured device %ls successfully (real).",
@@ -1675,39 +1717,18 @@ error_cleanup_no_device_activate_release: // For errors before device_activate
              : MINIAV_ERROR_SYSTEM_CALL_FAILED;
 }
 
-static MiniAVResultCode
-mf_release_buffer(MiniAVCameraContext *ctx,
-                  void *native_buffer_payload_resource_ptr) {
-  MINIAV_UNUSED(ctx); // ctx might be used for logging or specific checks later
-  if (!native_buffer_payload_resource_ptr) {
-    miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "MF: mf_release_buffer called with NULL payload resource ptr.");
-    return MINIAV_ERROR_INVALID_ARG;
-  }
+static MiniAVResultCode mf_release_buffer(MiniAVCameraContext *ctx, void *internal_handle_ptr) {
+    MINIAV_UNUSED(ctx);
+    if (!internal_handle_ptr) return MINIAV_ERROR_INVALID_ARG;
 
-  IMFSample *pSample = (IMFSample *)native_buffer_payload_resource_ptr;
-
-  // The MiniAVNativeBufferInternalPayload that holds this pSample
-  // (and for which IMFSample_AddRef was called in OnReadSample)
-  // is freed by the caller (miniav_buffer_release).
-  // This function's job is to release the native resource (IMFSample)
-  // that was AddRef'd for the payload.
-
-  ULONG ref_count_after_release = IMFSample_Release(pSample);
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "MF: Released IMFSample via mf_release_buffer. Ref count after "
-             "release: %lu",
-             ref_count_after_release);
-
-  // If the MiniAVBuffer passed to the user contained a shared_texture_handle
-  // (HANDLE), the application is responsible for calling CloseHandle on it when
-  // it's done. If it contained a native_gpu_texture_ptr (e.g.,
-  // ID3D11Texture2D*) that was AddRef'd specifically for the application's use
-  // (beyond the IMFSample's ownership), the application would also be
-  // responsible for Releasing that. This function primarily manages the
-  // IMFSample's lifetime as tracked by the internal payload.
-
-  return MINIAV_SUCCESS;
+    MiniAVNativeBufferInternalPayload *payload = (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
+    if (payload->native_resource_ptr) {
+        MFFrameReleasePayload *frame_payload = (MFFrameReleasePayload *)payload->native_resource_ptr;
+        miniav_free(frame_payload);
+        payload->native_resource_ptr = NULL;
+    }
+    miniav_free(payload);
+    return MINIAV_SUCCESS;
 }
 
 static MiniAVResultCode mf_start_capture(MiniAVCameraContext *ctx) {

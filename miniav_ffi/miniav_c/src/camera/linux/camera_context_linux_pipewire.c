@@ -20,7 +20,7 @@
 #include <unistd.h> // For usleep (optional, for shutdown)
 
 // Max number of formats we'll try to report for a device
-#define PW_MAX_REPORTED_FORMATS 32
+#define PW_MAX_REPORTED_FORMATS 128
 // Max number of devices we'll report
 #define PW_MAX_REPORTED_DEVICES 32
 
@@ -46,8 +46,9 @@ typedef struct PipeWireFormatEnumData {
   uint32_t allocated_formats;
   MiniAVResultCode result;
   int pending_sync;
-  uint32_t node_id;     // Node ID to get formats for
-  struct pw_core *core; // Core, needed to get node info
+  uint32_t node_id;
+  struct pw_core *core;
+  struct pw_node *node_proxy;
 } PipeWireFormatEnumData;
 
 typedef struct PipeWirePlatformContext {
@@ -76,7 +77,6 @@ typedef struct PipeWirePlatformContext {
   PipeWireDeviceTempInfo temp_devices[PW_MAX_REPORTED_DEVICES];
   uint32_t num_temp_devices;
 
-  MiniAVVideoInfo temp_formats[PW_MAX_REPORTED_FORMATS];
   uint32_t num_temp_formats;
 
   int pending_sync_ops; // For sync operations during init/enum
@@ -84,17 +84,17 @@ typedef struct PipeWirePlatformContext {
 } PipeWirePlatformContext;
 
 typedef struct PipeWireFrameReleasePayload {
-    MiniAVOutputPreference type;
-    union {
-        struct { // For CPU
-            void *cpu_ptr;
-            size_t cpu_size;
-            int src_dmabuf_fd; // Not owned, for debug
-        } cpu;
-        struct { // For GPU
-            int dup_dmabuf_fd; // Must be closed
-        } gpu;
-    };
+  MiniAVOutputPreference type;
+  union {
+    struct { // For CPU
+      void *cpu_ptr;
+      size_t cpu_size;
+      int src_dmabuf_fd; // Not owned, for debug
+    } cpu;
+    struct {             // For GPU
+      int dup_dmabuf_fd; // Must be closed
+    } gpu;
+  };
 } PipeWireFrameReleasePayload;
 
 // Forward declarations for static functions
@@ -103,10 +103,9 @@ static MiniAVResultCode pw_init_platform(MiniAVCameraContext *ctx);
 static MiniAVResultCode pw_destroy_platform(MiniAVCameraContext *ctx);
 static MiniAVResultCode pw_enumerate_devices(MiniAVDeviceInfo **devices_out,
                                              uint32_t *count_out);
-static MiniAVResultCode
-pw_get_supported_formats(const char *device_id_str,
-                         MiniAVVideoInfo **formats_out,
-                         uint32_t *count_out);
+static MiniAVResultCode pw_get_supported_formats(const char *device_id_str,
+                                                 MiniAVVideoInfo **formats_out,
+                                                 uint32_t *count_out);
 static MiniAVResultCode pw_configure(MiniAVCameraContext *ctx,
                                      const char *device_id,
                                      const MiniAVVideoInfo *format);
@@ -200,9 +199,6 @@ spa_video_format_to_miniav(uint32_t spa_format,
                                         // one
 
   default:
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "PW: Unknown SPA video format enum: %u (%s)", spa_format,
-               spa_debug_type_find_name(spa_type_video_format, spa_format));
     return MINIAV_PIXEL_FORMAT_UNKNOWN;
   }
 }
@@ -277,179 +273,171 @@ const char *miniav_pixel_format_to_string_short(MiniAVPixelFormat format) {
 
 static void parse_spa_format(const struct spa_pod *format_pod,
                              MiniAVVideoInfo *info,
-                             PipeWirePlatformContext *pw_ctx) {
-  // First, try to parse as spa_video_info_raw for common properties like size
-  // and framerate
+                             PipeWirePlatformContext *pw_ctx) { // pw_ctx can be NULL
   struct spa_video_info_raw raw_info = {0};
+  // MINIAV_UNUSED(pw_ctx); // If pw_ctx is truly unused in this function. Currently it is.
+
   if (spa_format_video_raw_parse(format_pod, &raw_info) >= 0) {
-    info->pixel_format = spa_video_format_to_miniav(
-        raw_info.format, format_pod); // Pass the full pod for subtype check
+    info->pixel_format =
+        spa_video_format_to_miniav(raw_info.format, format_pod); // Pass format_pod for MJPEG subtype check
     info->width = raw_info.size.width;
     info->height = raw_info.size.height;
     info->frame_rate_numerator = raw_info.framerate.num;
     info->frame_rate_denominator = raw_info.framerate.denom;
-  } else {
-    // If raw_parse fails, it might be a purely encoded format pod that doesn't
-    // fit spa_video_info_raw structure well. This part would need more specific
-    // parsing based on how PipeWire structures purely encoded format pods. For
-    // now, we assume that even for encoded formats, some basic raw_info (like
-    // size/framerate) might be present or that the primary format enum is what
-    // we check.
-    miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "PW: Failed to parse SPA video format as raw. Format might be "
-               "purely encoded or malformed.");
-    // Attempt to get format type directly from the pod if possible (simplified)
-    if (spa_pod_is_object_type(format_pod, SPA_TYPE_OBJECT_Format)) {
-      uint32_t main_format_enum = SPA_VIDEO_FORMAT_UNKNOWN;
-      struct spa_pod_prop *prop;
-      struct spa_pod_object *obj = (struct spa_pod_object *)format_pod;
 
-      SPA_POD_OBJECT_FOREACH(obj, prop) {
-        if (prop->key ==
-            SPA_FORMAT_VIDEO_format) { // This is the enum spa_video_format
-          spa_pod_get_id(&prop->value,
-                         &main_format_enum); // Pass address of prop->value
-          break;
-        }
-      }
-      info->pixel_format =
-          spa_video_format_to_miniav(main_format_enum, format_pod);
-      // Width, height, framerate might need to be extracted from other
-      // properties if spa_video_info_raw_parse failed. This is common for
-      // encoded types. For example, SPA_FORMAT_VIDEO_size,
-      // SPA_FORMAT_VIDEO_framerate
-      SPA_POD_OBJECT_FOREACH(obj, prop) {
-        if (prop->key == SPA_FORMAT_VIDEO_size) {
-          spa_pod_get_rectangle(&prop->value, // Pass address of prop->value
-                                &raw_info.size);
-          info->width = raw_info.size.width;
-          info->height = raw_info.size.height;
-        } else if (prop->key == SPA_FORMAT_VIDEO_framerate) {
-          if (spa_pod_is_fraction(&prop->value)) { // Check the type
-            if (spa_pod_get_fraction(&prop->value, &raw_info.framerate) ==
-                0) { // Pass address of prop->value
-              info->frame_rate_numerator = raw_info.framerate.num;
-              info->frame_rate_denominator =
-                  raw_info.framerate.denom; // Corrected this previously
-            } else {
-              miniav_log(
-                  MINIAV_LOG_LEVEL_WARN,
-                  "PW: Failed to parse SPA_FORMAT_VIDEO_framerate pod value.");
-            }
-          } else {
-            miniav_log(MINIAV_LOG_LEVEL_WARN,
-                       "PW: SPA_FORMAT_VIDEO_framerate pod value is not of "
-                       "SPA_TYPE_Fraction.");
-          }
-        }
-      }
-    } else {
-      info->pixel_format = MINIAV_PIXEL_FORMAT_UNKNOWN;
+    // It's good practice to ensure framerate denominator is not zero if num is non-zero
+    if (info->frame_rate_numerator != 0 && info->frame_rate_denominator == 0) {
+        miniav_log(MINIAV_LOG_LEVEL_WARN, "PW: Parsed format with numerator %u but denominator 0. Setting denominator to 1.", info->frame_rate_numerator);
+        info->frame_rate_denominator = 1; // Avoid division by zero later
     }
-  }
 
-  // If pixel_format is still unknown or if it's a generic ENCODED type without
-  // MJPEG subtype identified yet, and you expect MJPEG, this is where you might
-  // log a more specific warning or error.
-  if (info->pixel_format == MINIAV_PIXEL_FORMAT_UNKNOWN) {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "PW: Could not determine MiniAV pixel format from SPA pod.");
+  } else {
+    if (spa_pod_is_choice(format_pod)) { // This case should ideally be handled by parse_spa_format_choices
+      miniav_log(
+          MINIAV_LOG_LEVEL_DEBUG,
+          "PW: parse_spa_format called with a CHOICE/ANY type pod. This should be handled by parse_spa_format_choices.");
+    } else {
+      // spa_format_video_raw_parse failed, and it wasn't a choice.
+      // This could be SPA_VIDEO_FORMAT_ENCODED without enough info for raw_parse, or other non-raw types.
+      // spa_video_format_to_miniav might still be able to identify MJPEG from SPA_VIDEO_FORMAT_ENCODED.
+      struct spa_video_info_dsp dsp_info = {0}; // Declare the struct
+      uint32_t spa_fmt_id = SPA_VIDEO_FORMAT_UNKNOWN;
+
+      if (spa_format_video_dsp_parse(format_pod, &dsp_info) >= 0) { // Pass address of struct
+        spa_fmt_id = dsp_info.format; // Extract the format
+      } else {
+        // Fallback if dsp_parse also fails, though less likely to give a format ID
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: spa_format_video_dsp_parse also failed for non-raw format.");
+      }
+
+
+      info->pixel_format = spa_video_format_to_miniav(spa_fmt_id, format_pod);
+      if (info->pixel_format == MINIAV_PIXEL_FORMAT_MJPEG) {
+          // For MJPEG, W/H/FPS might not be in spa_video_info_raw or spa_video_info_dsp.
+          // They might be in other properties of the format_pod.
+          // This part needs more complex parsing if MJPEG streams don't provide W/H/FPS via these parse functions.
+          // For now, we rely on spa_format_video_raw_parse or accept that W/H might be 0 for some encoded.
+          // The check for width/height == 0 in the caller will filter these out if they are unusable.
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Identified MJPEG from non-raw/dsp parse. W/H/FPS might be missing from this path.");
+      } else if (spa_fmt_id != SPA_VIDEO_FORMAT_UNKNOWN) {
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Could not parse as spa_video_info_raw, but got format %u from dsp_parse.", spa_fmt_id);
+      } else {
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Could not parse as spa_video_info_raw and not identifiable as MJPEG or from dsp_parse. Format unknown.");
+      }
+    }
+    if (info->pixel_format == MINIAV_PIXEL_FORMAT_UNKNOWN) { // Ensure it's set if all parsing fails
+        info->pixel_format = MINIAV_PIXEL_FORMAT_UNKNOWN;
+    }
   }
 }
-
 // --- Stream Callbacks ---
 static void on_stream_process(void *userdata) {
-    PipeWirePlatformContext *pw_ctx = (PipeWirePlatformContext *)userdata;
-    struct pw_buffer *pw_buf;
-    if (!pw_ctx || !pw_ctx->parent_ctx || !pw_ctx->parent_ctx->app_callback)
-        return;
+  PipeWirePlatformContext *pw_ctx = (PipeWirePlatformContext *)userdata;
+  struct pw_buffer *pw_buf;
+  if (!pw_ctx || !pw_ctx->parent_ctx || !pw_ctx->parent_ctx->app_callback)
+    return;
 
-    pw_buf = pw_stream_dequeue_buffer(pw_ctx->stream);
-    if (!pw_buf) return;
+  pw_buf = pw_stream_dequeue_buffer(pw_ctx->stream);
+  if (!pw_buf)
+    return;
 
-    struct spa_buffer *spa_buf = pw_buf->buffer;
-    struct spa_data *d = &spa_buf->datas[0];
+  struct spa_buffer *spa_buf = pw_buf->buffer;
+  struct spa_data *d = &spa_buf->datas[0];
 
-    // Log the buffer type
-    const char *type_str = "UNKNOWN";
-    switch (d->type) {
-        case SPA_DATA_DmaBuf: type_str = "DmaBuf"; break;
-        case SPA_DATA_MemFd:  type_str = "MemFd";  break;
-        case SPA_DATA_MemPtr: type_str = "MemPtr"; break;
-    }
-    miniav_log(MINIAV_LOG_LEVEL_INFO, "PW: Received buffer type: %s (type=%d)", type_str, d->type);
+  // Log the buffer type
+  const char *type_str = "UNKNOWN";
+  switch (d->type) {
+  case SPA_DATA_DmaBuf:
+    type_str = "DmaBuf";
+    break;
+  case SPA_DATA_MemFd:
+    type_str = "MemFd";
+    break;
+  case SPA_DATA_MemPtr:
+    type_str = "MemPtr";
+    break;
+  }
+  miniav_log(MINIAV_LOG_LEVEL_INFO, "PW: Received buffer type: %s (type=%d)",
+             type_str, d->type);
 
-    MiniAVBuffer *miniav_buf = (MiniAVBuffer *)miniav_calloc(1, sizeof(MiniAVBuffer));
-    if (!miniav_buf) {
-        pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
-        return;
-    }
-
-    miniav_buf->type = MINIAV_BUFFER_TYPE_VIDEO;
-    miniav_buf->timestamp_us = pw_buf->time; // TODO: convert if needed
-    miniav_buf->data.video.info = pw_ctx->configured_video_format;
-    miniav_buf->user_data = pw_ctx->parent_ctx->app_callback_user_data;
-
-    MiniAVNativeBufferInternalPayload *payload = (MiniAVNativeBufferInternalPayload *)miniav_calloc(1, sizeof(MiniAVNativeBufferInternalPayload));
-    if (!payload) {
-        miniav_free(miniav_buf);
-        pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
-        return;
-    }
-    payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA;
-    payload->context_owner = pw_ctx->parent_ctx;
-    payload->parent_miniav_buffer_ptr = miniav_buf;
-
-    PipeWireFrameReleasePayload *frame_payload = (PipeWireFrameReleasePayload *)miniav_calloc(1, sizeof(PipeWireFrameReleasePayload));
-    if (!frame_payload) {
-        miniav_free(payload);
-        miniav_free(miniav_buf);
-        pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
-        return;
-    }
-
-    bool ok = false;
-    if (d->type == SPA_DATA_DmaBuf && d->fd >= 0) {
-        int dup_fd = fcntl(d->fd, F_DUPFD_CLOEXEC, 0);
-        if (dup_fd != -1) {
-            miniav_buf->content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD;
-            miniav_buf->data.video.native_gpu_dmabuf_fd = dup_fd;
-            miniav_buf->data_size_bytes = d->maxsize;
-            frame_payload->type = MINIAV_OUTPUT_PREFERENCE_GPU;
-            frame_payload->gpu.dup_dmabuf_fd = dup_fd;
-            payload->native_resource_ptr = frame_payload;
-            ok = true;
-        }
-    } else if ((d->type == SPA_DATA_MemFd || d->type == SPA_DATA_MemPtr) &&
-               d->data && d->chunk && d->chunk->size > 0) {
-        void *cpu_ptr = miniav_malloc(d->chunk->size);
-        if (cpu_ptr) {
-            memcpy(cpu_ptr, d->data, d->chunk->size);
-            miniav_buf->data.video.planes[0] = cpu_ptr;
-            miniav_buf->data.video.stride_bytes[0] = d->chunk->stride;
-            miniav_buf->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-            miniav_buf->data_size_bytes = d->chunk->size;
-            frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
-            frame_payload->cpu.cpu_ptr = cpu_ptr;
-            frame_payload->cpu.cpu_size = d->chunk->size;
-            frame_payload->cpu.src_dmabuf_fd = (d->type == SPA_DATA_MemFd) ? d->fd : -1;
-            payload->native_resource_ptr = frame_payload;
-            ok = true;
-        }
-    }
-
-    if (!ok) {
-        miniav_free(frame_payload);
-        miniav_free(payload);
-        miniav_free(miniav_buf);
-        pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
-        return;
-    }
-
-    miniav_buf->internal_handle = payload;
-    pw_ctx->parent_ctx->app_callback(miniav_buf, pw_ctx->parent_ctx->app_callback_user_data);
-
+  MiniAVBuffer *miniav_buf =
+      (MiniAVBuffer *)miniav_calloc(1, sizeof(MiniAVBuffer));
+  if (!miniav_buf) {
     pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
+    return;
+  }
+
+  miniav_buf->type = MINIAV_BUFFER_TYPE_VIDEO;
+  miniav_buf->timestamp_us = pw_buf->time; // TODO: convert if needed
+  miniav_buf->data.video.info = pw_ctx->configured_video_format;
+  miniav_buf->user_data = pw_ctx->parent_ctx->app_callback_user_data;
+
+  MiniAVNativeBufferInternalPayload *payload =
+      (MiniAVNativeBufferInternalPayload *)miniav_calloc(
+          1, sizeof(MiniAVNativeBufferInternalPayload));
+  if (!payload) {
+    miniav_free(miniav_buf);
+    pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
+    return;
+  }
+  payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA;
+  payload->context_owner = pw_ctx->parent_ctx;
+  payload->parent_miniav_buffer_ptr = miniav_buf;
+
+  PipeWireFrameReleasePayload *frame_payload =
+      (PipeWireFrameReleasePayload *)miniav_calloc(
+          1, sizeof(PipeWireFrameReleasePayload));
+  if (!frame_payload) {
+    miniav_free(payload);
+    miniav_free(miniav_buf);
+    pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
+    return;
+  }
+
+  bool ok = false;
+  if (d->type == SPA_DATA_DmaBuf && d->fd >= 0) {
+    int dup_fd = fcntl(d->fd, F_DUPFD_CLOEXEC, 0);
+    if (dup_fd != -1) {
+      miniav_buf->content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD;
+      miniav_buf->data.video.native_gpu_dmabuf_fd = dup_fd;
+      miniav_buf->data_size_bytes = d->maxsize;
+      frame_payload->type = MINIAV_OUTPUT_PREFERENCE_GPU;
+      frame_payload->gpu.dup_dmabuf_fd = dup_fd;
+      payload->native_resource_ptr = frame_payload;
+      ok = true;
+    }
+  } else if ((d->type == SPA_DATA_MemFd || d->type == SPA_DATA_MemPtr) &&
+             d->data && d->chunk && d->chunk->size > 0) {
+    void *cpu_ptr = miniav_malloc(d->chunk->size);
+    if (cpu_ptr) {
+      memcpy(cpu_ptr, d->data, d->chunk->size);
+      miniav_buf->data.video.planes[0] = cpu_ptr;
+      miniav_buf->data.video.stride_bytes[0] = d->chunk->stride;
+      miniav_buf->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+      miniav_buf->data_size_bytes = d->chunk->size;
+      frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
+      frame_payload->cpu.cpu_ptr = cpu_ptr;
+      frame_payload->cpu.cpu_size = d->chunk->size;
+      frame_payload->cpu.src_dmabuf_fd =
+          (d->type == SPA_DATA_MemFd) ? d->fd : -1;
+      payload->native_resource_ptr = frame_payload;
+      ok = true;
+    }
+  }
+
+  if (!ok) {
+    miniav_free(frame_payload);
+    miniav_free(payload);
+    miniav_free(miniav_buf);
+    pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
+    return;
+  }
+
+  miniav_buf->internal_handle = payload;
+  pw_ctx->parent_ctx->app_callback(miniav_buf,
+                                   pw_ctx->parent_ctx->app_callback_user_data);
+
+  pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
 }
 
 static void on_stream_state_changed(void *userdata, enum pw_stream_state old,
@@ -487,8 +475,8 @@ static void on_stream_state_changed(void *userdata, enum pw_stream_state old,
       uint8_t buffer[1024];
       struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
       const struct spa_pod *params[1];
-      uint32_t spa_format =
-          miniav_pixel_format_to_spa(pw_ctx->configured_video_format.pixel_format);
+      uint32_t spa_format = miniav_pixel_format_to_spa(
+          pw_ctx->configured_video_format.pixel_format);
 
       params[0] = spa_format_video_raw_build(
           &b, SPA_PARAM_EnumFormat,
@@ -545,9 +533,10 @@ static void on_stream_param_changed(void *userdata, uint32_t id,
              current_stream_format.frame_rate_denominator);
 
   // Here you might want to verify if current_stream_format matches
-  // configured_video_format and potentially update pw_ctx->configured_video_format if the
-  // device chose a compatible alternative. For now, we assume the device
-  // accepted our request or something close.
+  // configured_video_format and potentially update
+  // pw_ctx->configured_video_format if the device chose a compatible
+  // alternative. For now, we assume the device accepted our request or
+  // something close.
 
   // After format is set, we can connect the stream if it's not already
   // connecting to streaming
@@ -916,86 +905,79 @@ enum_cleanup:
   return overall_res;
 }
 
-static void process_node_params_for_formats(PipeWireFormatEnumData *format_data,
-                                            const struct pw_node_info *info) {
-  if (!info)
-    return;
+static void parse_spa_format_choices(const struct spa_pod *format_pod,
+                                     PipeWireFormatEnumData *format_data) {
+    MiniAVVideoInfo info = {0};
+    parse_spa_format(format_pod, &info,
+                     NULL); // pw_ctx is NULL as it's not available/needed here.
 
-  for (uint32_t i = 0; i < info->n_params; i++) {
-    if (info->params[i].id == SPA_PARAM_EnumFormat) {
-      // This is simplified. We need to fetch the actual param values.
-      // This requires using pw_node_enum_params and then parsing the pods.
-      // For now, this is a placeholder for the complex logic.
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "PW: Node has SPA_PARAM_EnumFormat. Need to fetch and parse.");
-
-      // Example of how one might start fetching (very simplified):
-      // This part is highly complex due to async nature and pod parsing.
-      // A real implementation would involve pw_node_enum_params,
-      // handling the result (which is another event), and then parsing the
-      // pods.
-
-      // For now, let's add some common hardcoded formats as a placeholder
-      // until proper SPA_PARAM_EnumFormat parsing is implemented.
-      if (*format_data->formats_count < format_data->allocated_formats) {
-        format_data->formats_list[*format_data->formats_count] =
-            (MiniAVVideoInfo){.width = 640,
-                                    .height = 480,
-                                    .pixel_format = MINIAV_PIXEL_FORMAT_YUY2,
-                                    .frame_rate_numerator = 30,
-                                    .frame_rate_denominator = 1,
-                                    .output_preference =
-                                        MINIAV_OUTPUT_PREFERENCE_CPU};
+    if (info.pixel_format != MINIAV_PIXEL_FORMAT_UNKNOWN) {
+      if (info.width == 0 || info.height == 0) {
+        miniav_log(
+            MINIAV_LOG_LEVEL_DEBUG,
+            "PW: Fallback format %s resulted in 0 width/height. Skipping.",
+            miniav_pixel_format_to_string_short(info.pixel_format));
+      } else if (*format_data->formats_count < format_data->allocated_formats) {
+        format_data->formats_list[*format_data->formats_count] = info;
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW: Added format: %s, %ux%u @ %u/%u",
+                   miniav_pixel_format_to_string_short(info.pixel_format),
+                   info.width, info.height, info.frame_rate_numerator,
+                   info.frame_rate_denominator);
         (*format_data->formats_count)++;
-      }
-      if (*format_data->formats_count < format_data->allocated_formats) {
-        format_data->formats_list[*format_data->formats_count] =
-            (MiniAVVideoInfo){.width = 1280,
-                                    .height = 720,
-                                    .pixel_format = MINIAV_PIXEL_FORMAT_MJPEG,
-                                    .frame_rate_numerator = 30,
-                                    .frame_rate_denominator = 1,
-                                    .output_preference =
-                                        MINIAV_OUTPUT_PREFERENCE_CPU};
-        (*format_data->formats_count)++;
+      } else {
+        miniav_log(
+            MINIAV_LOG_LEVEL_WARN,
+            "PW: Reached allocated format limit (%u) with fallback parser.",
+            format_data->allocated_formats);
       }
     }
   }
+
+static void on_node_param(void *data, int seq, uint32_t id, uint32_t index,
+                          uint32_t next, const struct spa_pod *param) {
+  PipeWireFormatEnumData *format_data = (PipeWireFormatEnumData *)data;
+  const char *id_name = spa_debug_type_find_name(spa_type_param, id);
+  miniav_log(
+      MINIAV_LOG_LEVEL_DEBUG,
+      "PW: on_node_param: seq=%d, id=%s (%u), index=%u, next=%u, param_ptr=%p",
+      seq, id_name ? id_name : "UNKNOWN_ID", id, index, next, (void *)param);
+
+  if (param && id == SPA_PARAM_EnumFormat) {
+    parse_spa_format_choices(param, format_data);
+
+    pw_main_loop_quit(format_data->loop);
+  }
 }
 
-static void
-on_node_info(void *data,
-             const struct pw_node_info *info) { // Changed to pw_node_info
+static void on_node_info(void *data, const struct pw_node_info *info) {
   PipeWireFormatEnumData *format_data = (PipeWireFormatEnumData *)data;
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW: Received node info for format enumeration (node %u).",
              format_data->node_id);
 
-  // Access the spa_node_info if needed: const struct spa_node_info *spa_info =
-  // info ? info->info : NULL; However, pw_node_info itself contains the
-  // n_params and params array directly.
-  if (info) { // Check if info is not NULL
-    process_node_params_for_formats(format_data, info); // Pass pw_node_info
+  if (info) {
+    pw_node_enum_params(format_data->node_proxy, 1, SPA_PARAM_EnumFormat, 0,
+                        UINT32_MAX, NULL);
   } else {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
                "PW: on_node_info called with NULL info.");
-  }
-
-  format_data->result = MINIAV_SUCCESS;
-  if (format_data->loop) {
-    pw_main_loop_quit(format_data->loop);
+    format_data->result = MINIAV_ERROR_DEVICE_NOT_FOUND;
+    if (format_data->loop) {
+      pw_main_loop_quit(format_data->loop);
+    }
   }
 }
 
 static const struct pw_node_events node_info_events = {
-    PW_VERSION_NODE_EVENTS, .info = on_node_info,
-    // .param = on_node_param, // You would add this for pw_node_enum_params
+    PW_VERSION_NODE_EVENTS,
+    .info = on_node_info,
+    .param = on_node_param,
 };
 
-static MiniAVResultCode
-pw_get_supported_formats(const char *device_id_str,
-                         MiniAVVideoInfo **formats_out,
-                         uint32_t *count_out) {
+static MiniAVResultCode pw_get_supported_formats(const char *device_id_str,
+                                                 MiniAVVideoInfo **formats_out,
+                                                 uint32_t *count_out) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW: Getting supported formats for device ID %s.", device_id_str);
   if (!device_id_str || !formats_out || !count_out)
@@ -1053,6 +1035,7 @@ pw_get_supported_formats(const char *device_id_str,
   node_proxy = (struct pw_node *)pw_registry_bind(
       pw_core_get_registry(core, PW_VERSION_REGISTRY, 0), node_id,
       PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
+  format_data.node_proxy = node_proxy;
   if (!node_proxy) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "PW: Failed to bind to node %u for format enumeration.",
@@ -1065,27 +1048,15 @@ pw_get_supported_formats(const char *device_id_str,
   pw_node_add_listener(node_proxy, &node_listener_local, &node_info_events,
                        &format_data);
 
-  // The on_node_info callback will populate formats and quit the loop.
-  // A more robust implementation would use pw_node_enum_params.
-  // For SPA_PARAM_EnumFormat, you'd call pw_node_enum_params.
-  // The result comes via pw_node_event_param.
-  // This is a placeholder for that complex logic.
-  // For now, on_node_info will add some dummy formats and quit.
-  // To trigger on_node_info, the proxy needs to sync.
-  // pw_proxy_sync() or similar might be needed, or it might be triggered by
-  // binding. Let's assume binding + loop run is enough for on_node_info to be
-  // called once. If not, a sync mechanism after binding node_proxy would be
-  // needed.
-
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW: Running loop for node info (node %u).", node_id);
-  pw_main_loop_run(loop); // Runs until on_node_info calls quit
+  pw_main_loop_run(loop);
 
   if (format_data.result == MINIAV_SUCCESS) {
     if (*count_out > 0) {
       *formats_out = format_data.formats_list;
-      MiniAVVideoInfo *final_list = miniav_realloc(
-          *formats_out, (*count_out) * sizeof(MiniAVVideoInfo));
+      MiniAVVideoInfo *final_list =
+          miniav_realloc(*formats_out, (*count_out) * sizeof(MiniAVVideoInfo));
       if (final_list)
         *formats_out = final_list;
     } else {
@@ -1179,54 +1150,59 @@ static MiniAVResultCode pw_start_capture(MiniAVCameraContext *ctx) {
   pw_stream_add_listener(pw_ctx->stream, &pw_ctx->stream_listener,
                          &stream_events, pw_ctx);
 
-                         // In pw_start_capture or stream setup
-MiniAVOutputPreference pref = pw_ctx->configured_video_format.output_preference;
-uint32_t buffer_types = 0;
-switch (pref) {
-    case MINIAV_OUTPUT_PREFERENCE_GPU:
-        buffer_types = (1 << SPA_DATA_DmaBuf);
-        break;
-    case MINIAV_OUTPUT_PREFERENCE_CPU:
-        buffer_types = (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
-        break;
-    default:
-        buffer_types = (1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
-        break;
-}
+  // In pw_start_capture or stream setup
+  MiniAVOutputPreference pref =
+      pw_ctx->configured_video_format.output_preference;
+  uint32_t buffer_types = 0;
+  switch (pref) {
+  case MINIAV_OUTPUT_PREFERENCE_GPU:
+    buffer_types = (1 << SPA_DATA_DmaBuf);
+    break;
+  case MINIAV_OUTPUT_PREFERENCE_CPU:
+    buffer_types = (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
+    break;
+  default:
+    buffer_types =
+        (1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
+    break;
+  }
 
-uint8_t params_buffer[1024];
-struct spa_pod_builder b = SPA_POD_BUILDER_INIT(params_buffer, sizeof(params_buffer));
-const struct spa_pod *params[2];
-uint32_t n_params = 0;
+  uint8_t params_buffer[1024];
+  struct spa_pod_builder b =
+      SPA_POD_BUILDER_INIT(params_buffer, sizeof(params_buffer));
+  const struct spa_pod *params[2];
+  uint32_t n_params = 0;
 
-// Buffers param
-params[n_params++] = spa_pod_builder_add_object(
-    &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-    SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 1, 32),
-    SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
-    SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(buffer_types)
-);
+  // Buffers param
+  params[n_params++] = spa_pod_builder_add_object(
+      &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+      SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 1, 32),
+      SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1), SPA_PARAM_BUFFERS_dataType,
+      SPA_POD_CHOICE_FLAGS_Int(buffer_types));
 
-// Format param (allow any modifier)
-params[n_params++] = spa_pod_builder_add_object(
-    &b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-    SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
-    SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-    SPA_FORMAT_VIDEO_format, SPA_POD_Id(miniav_pixel_format_to_spa(pw_ctx->configured_video_format.pixel_format)),
-    SPA_FORMAT_VIDEO_modifier, SPA_POD_CHOICE_FLAGS_Long(0), // allow any modifier
-    SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&SPA_RECTANGLE(pw_ctx->configured_video_format.width, pw_ctx->configured_video_format.height)),
-    SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&SPA_FRACTION(pw_ctx->configured_video_format.frame_rate_numerator, pw_ctx->configured_video_format.frame_rate_denominator)),
-    0
-);
+  // Format param (allow any modifier)
+  params[n_params++] = spa_pod_builder_add_object(
+      &b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat, SPA_FORMAT_mediaType,
+      SPA_POD_Id(SPA_MEDIA_TYPE_video), SPA_FORMAT_mediaSubtype,
+      SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), SPA_FORMAT_VIDEO_format,
+      SPA_POD_Id(miniav_pixel_format_to_spa(
+          pw_ctx->configured_video_format.pixel_format)),
+      SPA_FORMAT_VIDEO_modifier,
+      SPA_POD_CHOICE_FLAGS_Long(0), // allow any modifier
+      SPA_FORMAT_VIDEO_size,
+      SPA_POD_Rectangle(&SPA_RECTANGLE(pw_ctx->configured_video_format.width,
+                                       pw_ctx->configured_video_format.height)),
+      SPA_FORMAT_VIDEO_framerate,
+      SPA_POD_Fraction(&SPA_FRACTION(
+          pw_ctx->configured_video_format.frame_rate_numerator,
+          pw_ctx->configured_video_format.frame_rate_denominator)),
+      0);
 
   // Connect stream
   if (pw_stream_connect(
-    pw_ctx->stream,
-    PW_DIRECTION_INPUT,
-    pw_ctx->target_node_id,
-    PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS,
-    params, n_params
-) < 0) { // No specific params to pass at connect time
+          pw_ctx->stream, PW_DIRECTION_INPUT, pw_ctx->target_node_id,
+          PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params,
+          n_params) < 0) { // No specific params to pass at connect time
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "PW: Failed to connect stream to node %u.",
                pw_ctx->target_node_id);
@@ -1306,53 +1282,70 @@ MiniAVResultCode pw_stop_capture(MiniAVCameraContext *ctx) {
   return MINIAV_SUCCESS;
 }
 
-static MiniAVResultCode pw_release_buffer(MiniAVCameraContext *ctx, void *internal_handle_ptr) {
-    MINIAV_UNUSED(ctx);
+static MiniAVResultCode pw_release_buffer(MiniAVCameraContext *ctx,
+                                          void *internal_handle_ptr) {
+  MINIAV_UNUSED(ctx);
 
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Camera: release_buffer called with internal_handle_ptr=%p", internal_handle_ptr);
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Camera: release_buffer called with internal_handle_ptr=%p",
+             internal_handle_ptr);
 
-    if (!internal_handle_ptr) {
-        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Camera: release_buffer called with NULL internal_handle_ptr.");
-        return MINIAV_SUCCESS;
-    }
+  if (!internal_handle_ptr) {
+    miniav_log(
+        MINIAV_LOG_LEVEL_DEBUG,
+        "PW Camera: release_buffer called with NULL internal_handle_ptr.");
+    return MINIAV_SUCCESS;
+  }
 
-    MiniAVNativeBufferInternalPayload *payload = (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
+  MiniAVNativeBufferInternalPayload *payload =
+      (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
 
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Camera: payload ptr=%p, handle_type=%d, native_resource_ptr=%p",
-               payload, payload->handle_type, payload->native_resource_ptr);
+  miniav_log(
+      MINIAV_LOG_LEVEL_DEBUG,
+      "PW Camera: payload ptr=%p, handle_type=%d, native_resource_ptr=%p",
+      payload, payload->handle_type, payload->native_resource_ptr);
 
-    if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA) {
-        PipeWireFrameReleasePayload *frame_payload = (PipeWireFrameReleasePayload *)payload->native_resource_ptr;
-        if (frame_payload) {
-            if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU) {
-                if (frame_payload->cpu.cpu_ptr) {
-                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Camera: Freeing CPU buffer from DMABUF/MemFd copy.");
-                    miniav_free(frame_payload->cpu.cpu_ptr);
-                    frame_payload->cpu.cpu_ptr = NULL;
-                }
-                // src_dmabuf_fd is not owned, do not close
-            } else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU) {
-                if (frame_payload->gpu.dup_dmabuf_fd > 0) {
-                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Camera: Closing duplicated DMABUF FD: %d", frame_payload->gpu.dup_dmabuf_fd);
-                    if (close(frame_payload->gpu.dup_dmabuf_fd) == -1) {
-                        miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Camera: Failed to close DMABUF FD %d: %s",
-                                   frame_payload->gpu.dup_dmabuf_fd, strerror(errno));
-                    }
-                    frame_payload->gpu.dup_dmabuf_fd = -1;
-                }
-            } else {
-                miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Camera: release_buffer: Unknown frame_payload type %d", frame_payload->type);
-            }
-            miniav_free(frame_payload);
-            payload->native_resource_ptr = NULL;
+  if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA) {
+    PipeWireFrameReleasePayload *frame_payload =
+        (PipeWireFrameReleasePayload *)payload->native_resource_ptr;
+    if (frame_payload) {
+      if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU) {
+        if (frame_payload->cpu.cpu_ptr) {
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                     "PW Camera: Freeing CPU buffer from DMABUF/MemFd copy.");
+          miniav_free(frame_payload->cpu.cpu_ptr);
+          frame_payload->cpu.cpu_ptr = NULL;
         }
-        miniav_free(payload);
-        return MINIAV_SUCCESS;
-    } else {
-        miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Camera: release_buffer called for unknown handle_type %d.", payload->handle_type);
-        miniav_free(payload);
-        return MINIAV_SUCCESS;
+        // src_dmabuf_fd is not owned, do not close
+      } else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU) {
+        if (frame_payload->gpu.dup_dmabuf_fd > 0) {
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                     "PW Camera: Closing duplicated DMABUF FD: %d",
+                     frame_payload->gpu.dup_dmabuf_fd);
+          if (close(frame_payload->gpu.dup_dmabuf_fd) == -1) {
+            miniav_log(MINIAV_LOG_LEVEL_WARN,
+                       "PW Camera: Failed to close DMABUF FD %d: %s",
+                       frame_payload->gpu.dup_dmabuf_fd, strerror(errno));
+          }
+          frame_payload->gpu.dup_dmabuf_fd = -1;
+        }
+      } else {
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "PW Camera: release_buffer: Unknown frame_payload type %d",
+                   frame_payload->type);
+      }
+      miniav_free(frame_payload);
+      payload->native_resource_ptr = NULL;
     }
+    miniav_free(payload);
+    return MINIAV_SUCCESS;
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW Camera: release_buffer called for unknown handle_type %d.",
+               payload->handle_type);
+    miniav_free(payload);
+    return MINIAV_SUCCESS;
+  }
 }
 
 // --- Global Ops Struct ---

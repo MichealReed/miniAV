@@ -27,7 +27,6 @@
 typedef struct PipeWireDeviceTempInfo {
   MiniAVDeviceInfo info;
   bool is_video_source;
-  // Add other temp fields if needed during enumeration
 } PipeWireDeviceTempInfo;
 
 typedef struct PipeWireEnumData {
@@ -167,8 +166,6 @@ spa_video_format_to_miniav(uint32_t spa_format,
                     strcmp(subtype_name, "mjpeg") == 0) {
                   return MINIAV_PIXEL_FORMAT_MJPEG;
                 }
-                // Add other encoded subtypes if needed by comparing
-                // subtype_name
               } else {
                 miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                            "PW: Media subtype ID %u not found in debug types.",
@@ -226,12 +223,7 @@ static uint32_t miniav_pixel_format_to_spa(MiniAVPixelFormat miniav_format) {
   case MINIAV_PIXEL_FORMAT_NV12:
     return SPA_VIDEO_FORMAT_NV12;
   case MINIAV_PIXEL_FORMAT_MJPEG:
-    return SPA_VIDEO_FORMAT_ENCODED; // MJPEG will be SPA_VIDEO_FORMAT_ENCODED
-                                     // The specific subtype "jpeg" or "mjpeg"
-                                     // needs to be set in the
-                                     // SPA_FORMAT_mediaSubtype property when
-                                     // building the params for
-                                     // pw_stream_update_params.
+    return SPA_VIDEO_FORMAT_ENCODED;
   default:
     return SPA_VIDEO_FORMAT_UNKNOWN;
   }
@@ -265,18 +257,14 @@ const char *miniav_pixel_format_to_string_short(MiniAVPixelFormat format) {
     return "ABGR32";
   case MINIAV_PIXEL_FORMAT_MJPEG:
     return "MJPG";
-  // Add all other formats your MiniAVPixelFormat enum supports
   default:
     return "INV"; // Invalid/Unknown
   }
 }
 
-static void
-parse_spa_format(const struct spa_pod *format_pod, MiniAVVideoInfo *info,
-                 PipeWirePlatformContext *pw_ctx) { // pw_ctx can be NULL
+static void parse_spa_format(const struct spa_pod *format_pod,
+                             MiniAVVideoInfo *info, ) {
   struct spa_video_info_raw raw_info = {0};
-  // MINIAV_UNUSED(pw_ctx); // If pw_ctx is truly unused in this function.
-  // Currently it is.
 
   if (spa_format_video_raw_parse(format_pod, &raw_info) >= 0) {
     info->pixel_format = spa_video_format_to_miniav(
@@ -297,16 +285,11 @@ parse_spa_format(const struct spa_pod *format_pod, MiniAVVideoInfo *info,
     }
 
   } else {
-    if (spa_pod_is_choice(format_pod)) { // This case should ideally be handled
-                                         // by parse_spa_format_choices
+    if (spa_pod_is_choice(format_pod)) { 
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "PW: parse_spa_format called with a CHOICE/ANY type pod. This "
                  "should be handled by parse_spa_format_choices.");
     } else {
-      // spa_format_video_raw_parse failed, and it wasn't a choice.
-      // This could be SPA_VIDEO_FORMAT_ENCODED without enough info for
-      // raw_parse, or other non-raw types. spa_video_format_to_miniav might
-      // still be able to identify MJPEG from SPA_VIDEO_FORMAT_ENCODED.
       struct spa_video_info_dsp dsp_info = {0}; // Declare the struct
       uint32_t spa_fmt_id = SPA_VIDEO_FORMAT_UNKNOWN;
 
@@ -314,8 +297,6 @@ parse_spa_format(const struct spa_pod *format_pod, MiniAVVideoInfo *info,
           0) {                        // Pass address of struct
         spa_fmt_id = dsp_info.format; // Extract the format
       } else {
-        // Fallback if dsp_parse also fails, though less likely to give a format
-        // ID
         miniav_log(
             MINIAV_LOG_LEVEL_DEBUG,
             "PW: spa_format_video_dsp_parse also failed for non-raw format.");
@@ -323,13 +304,6 @@ parse_spa_format(const struct spa_pod *format_pod, MiniAVVideoInfo *info,
 
       info->pixel_format = spa_video_format_to_miniav(spa_fmt_id, format_pod);
       if (info->pixel_format == MINIAV_PIXEL_FORMAT_MJPEG) {
-        // For MJPEG, W/H/FPS might not be in spa_video_info_raw or
-        // spa_video_info_dsp. They might be in other properties of the
-        // format_pod. This part needs more complex parsing if MJPEG streams
-        // don't provide W/H/FPS via these parse functions. For now, we rely on
-        // spa_format_video_raw_parse or accept that W/H might be 0 for some
-        // encoded. The check for width/height == 0 in the caller will filter
-        // these out if they are unusable.
         miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                    "PW: Identified MJPEG from non-raw/dsp parse. W/H/FPS might "
                    "be missing from this path.");
@@ -541,7 +515,7 @@ static void on_stream_param_changed(void *userdata, uint32_t id,
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Stream SPA_PARAM_Format changed.");
 
   MiniAVVideoInfo current_stream_format = {0};
-  parse_spa_format(param, &current_stream_format, pw_ctx);
+  parse_spa_format(param, &current_stream_format);
 
   miniav_log(MINIAV_LOG_LEVEL_INFO,
              "PW: Negotiated stream format: %s, %ux%u @ %u/%u.",
@@ -669,16 +643,11 @@ static void on_wakeup_pipe_event(void *data, int fd, uint32_t mask) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Wakeup pipe received quit signal.");
     pw_main_loop_quit(ctx->loop);
   } else if (len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-    // This case might not be strictly necessary if pw_loop only calls this when
-    // readable, but good for robustness if the fd was independently set to
-    // non-blocking.
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW: Wakeup pipe read would block (EAGAIN/EWOULDBLOCK).");
   } else if (len == 0) {
     // EOF - pipe closed from the other end unexpectedly?
     miniav_log(MINIAV_LOG_LEVEL_WARN, "PW: Wakeup pipe read EOF.");
-    // Optionally, quit the loop here too if this is an unrecoverable state
-    // pw_main_loop_quit(ctx->loop);
   } else if (len < 0) {
     // Actual read error
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
@@ -686,8 +655,6 @@ static void on_wakeup_pipe_event(void *data, int fd, uint32_t mask) {
                strerror(errno));
     pw_main_loop_quit(ctx->loop); // Quit on error to prevent busy loop
   }
-  // If len > 0 but buf[0] != 'q', it's unexpected data, can be ignored or
-  // logged.
 }
 
 static void *pipewire_loop_thread_func(void *arg) {
@@ -710,9 +677,6 @@ static void *pipewire_loop_thread_func(void *arg) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "PW: Failed to add wakeup_pipe IO source to loop. Loop may "
                  "not exit cleanly.");
-      // Decide if this is fatal. If the loop can't be signaled to quit, it
-      // might hang. For now, we'll let it continue, but pw_stop_capture might
-      // not work as expected.
     }
   } else {
     miniav_log(
@@ -848,7 +812,7 @@ static MiniAVResultCode pw_enumerate_devices(MiniAVDeviceInfo **devices_out,
   struct spa_hook core_listener_local;
 
   pw_init(NULL,
-          NULL); // Ensure library is initialized for this static-like call
+          NULL); // Ensure library is initialized
 
   loop = pw_main_loop_new(NULL);
   context = pw_context_new(pw_main_loop_get_loop(loop), NULL, 0);
@@ -890,8 +854,7 @@ static MiniAVResultCode pw_enumerate_devices(MiniAVDeviceInfo **devices_out,
 
   if (enum_data.result == MINIAV_SUCCESS) {
     if (*count_out > 0) {
-      *devices_out = enum_data.devices_list; // Transfer ownership
-                                             // Shrink to fit if desired:
+      *devices_out = enum_data.devices_list;
       MiniAVDeviceInfo *final_list =
           miniav_realloc(*devices_out, (*count_out) * sizeof(MiniAVDeviceInfo));
       if (final_list)
@@ -919,7 +882,6 @@ enum_cleanup:
     pw_context_destroy(context);
   if (loop)
     pw_main_loop_destroy(loop);
-  // pw_deinit(); // Consider static counter for pw_init/deinit calls
 
   miniav_log(MINIAV_LOG_LEVEL_INFO, "PW: Enumerated %u devices.", *count_out);
   return overall_res;
@@ -928,8 +890,7 @@ enum_cleanup:
 static void parse_spa_format_choices(const struct spa_pod *format_pod,
                                      PipeWireFormatEnumData *format_data) {
   MiniAVVideoInfo info = {0};
-  parse_spa_format(format_pod, &info,
-                   NULL); // pw_ctx is NULL as it's not available/needed here.
+  parse_spa_format(format_pod, &info);
 
   if (info.pixel_format != MINIAV_PIXEL_FORMAT_UNKNOWN) {
     if (info.width == 0 || info.height == 0) {
@@ -1018,8 +979,6 @@ static MiniAVResultCode pw_get_supported_formats(const char *device_id_str,
   struct pw_core *core = NULL;
   struct pw_node *node_proxy = NULL;
   struct spa_hook node_listener_local;
-  // struct spa_hook core_listener_local; // Not using core sync for this
-  // simplified version
 
   pw_init(NULL, NULL);
 
@@ -1152,8 +1111,7 @@ static MiniAVResultCode pw_start_capture(MiniAVCameraContext *ctx) {
   }
   if (pw_ctx->is_streaming || pw_ctx->loop_running) {
     miniav_log(MINIAV_LOG_LEVEL_WARN, "PW: Already streaming or loop running.");
-    return MINIAV_ERROR_INVALID_OPERATION; // Or SUCCESS if already running is
-                                           // ok
+    return MINIAV_ERROR_INVALID_OPERATION;
   }
 
   pw_ctx->stream = pw_stream_new(
@@ -1206,7 +1164,7 @@ static MiniAVResultCode pw_start_capture(MiniAVCameraContext *ctx) {
       SPA_POD_Id(miniav_pixel_format_to_spa(
           pw_ctx->configured_video_format.pixel_format)),
       SPA_FORMAT_VIDEO_modifier,
-      SPA_POD_CHOICE_FLAGS_Long(0), // allow any modifier
+      SPA_POD_CHOICE_FLAGS_Long(0),
       SPA_FORMAT_VIDEO_size,
       SPA_POD_Rectangle(&SPA_RECTANGLE(pw_ctx->configured_video_format.width,
                                        pw_ctx->configured_video_format.height)),
@@ -1241,8 +1199,6 @@ static MiniAVResultCode pw_start_capture(MiniAVCameraContext *ctx) {
 
   miniav_log(MINIAV_LOG_LEVEL_INFO,
              "PW: Capture started (stream connecting, loop thread running).");
-  // is_streaming will be set true by the stream state callback when it
-  // reaches PAUSED/STREAMING
   return MINIAV_SUCCESS;
 }
 
@@ -1253,8 +1209,7 @@ MiniAVResultCode pw_stop_capture(MiniAVCameraContext *ctx) {
       (PipeWirePlatformContext *)ctx->platform_ctx;
 
   if (!pw_ctx->loop_running &&
-      !pw_ctx->is_streaming) { // Check both as loop might run without stream
-                               // being fully up
+      !pw_ctx->is_streaming) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW: Capture not running or loop already stopped.");
     return MINIAV_SUCCESS;
@@ -1266,8 +1221,6 @@ MiniAVResultCode pw_stop_capture(MiniAVCameraContext *ctx) {
   if (pw_ctx->stream) {
     pw_stream_set_active(pw_ctx->stream, false);
     pw_stream_disconnect(pw_ctx->stream);
-    // Destruction of stream should happen after loop thread joins, or here if
-    // safe
   }
 
   if (pw_ctx->loop_running && pw_ctx->loop) {

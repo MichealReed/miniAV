@@ -56,7 +56,7 @@ miniav(monorepo)/
 │           │   ├── macos/
 │           │   │   └── loopback_context_macos_coreaudio.m
 │           │   └── linux/
-│           │       └── loopback_context_linux_pulse.c
+│           │       └── loopback_context_linux_pipewire.c  # PipeWire for system/app audio loopback
 │           ├── camera/               # Camera capture implementation.
 │           │   ├── camera_api.c        # Implementation of public MiniAV_Camera_* functions.
 │           │   ├── camera_context.h    # Internal camera context struct and common logic interface.
@@ -68,9 +68,8 @@ miniav(monorepo)/
 │           │   │   ├── camera_context_macos_avf.m # AVFoundation implementation (Objective-C).
 │           │   │   └── camera_context_macos_avf.h
 │           │   └── linux/
-│           │       ├── camera_context_linux_v4l2.c # V4L2 implementation.
-│           │       └── camera_context_linux_v4l2.h
-│           │       └── (camera_context_linux_pipewire.c) # Optional PipeWire.
+│           │       ├── camera_context_linux_pipewire.c # PipeWire implementation.
+│           │       └── camera_context_linux_pipewire.h
 │           └── screen/               # Screen capture implementation.
 │               ├── screen_api.c        # Implementation of public MiniAV_Screen_* functions.
 │               ├── screen_context.h    # Internal screen context struct and common logic interface.
@@ -85,7 +84,6 @@ miniav(monorepo)/
 │               └── linux/
 │                   ├── screen_context_linux_pipewire.c # PipeWire portal implementation.
 │                   └── screen_context_linux_pipewire.h
-│                   └── (screen_context_linux_x11.c) # Optional X11 fallback.
 │
 ├── miniav_web/                     # Web-specific implementation.
 │   ├── lib/
@@ -120,7 +118,7 @@ This standalone C library contains the core buffer definitions, the public C cap
 * **Capture API (`include/miniav_capture.h`, `include/miniav_types.h`):** Defines the public C functions (e.g., `MiniAV_Camera_CreateContext`, `MiniAV_Screen_StartCapture`, `MiniAV_Audio_Configure`, `MiniAV_ReleaseBuffer`, etc.) and types (`MiniAVDeviceInfo`, `MiniAVResultCode`, `MiniAVBufferCallback`, etc.). This header is used by `miniav_ffi` to generate Dart bindings.
 * **Implementation (`src/`):** Contains platform-independent logic (`src/common`), the `miniaudio` wrapper for audio (`src/audio`), and platform-specific implementations for camera and screen capture located within their respective directories (`src/camera/<platform>`, `src/screen/<platform>`). The common logic within `src/camera` and `src/screen` utilizes the platform-specific code.
 
-#### Platform-Specific Native APIs (Implemented within `miniav_c/src/camera/<platform>` and `miniav_c/src/screen/<platform>`)
+#### Platform-Specific Native APIs
 
 * **Windows:**
   * **Camera:** Media Foundation (preferred: `IMFSourceReader`), DirectShow (fallback).
@@ -147,31 +145,188 @@ This standalone C library contains the core buffer definitions, the public C cap
   * **Buffer Release:** Involves releasing the `CMSampleBufferRef`, `CVPixelBufferRef`, `IOSurfaceRef`, or `MTLTexture`.
 
 * **Linux:**
-  * **Camera:** V4L2 (Video for Linux 2). PipeWire as a higher-level alternative.
-  * **Screen:** X11 (`XShmGetImage`), Wayland (requires compositor-specific protocols or PipeWire portal). PipeWire screen capture portal is preferred for broader compatibility.
+  * **Camera:** PipeWire camera portal (preferred for modern systems and sandboxed applications).
+  * **Screen:** PipeWire screen capture portal (preferred for Wayland and modern desktop environments).
     * **System Audio:** If requested, PipeWire will be asked to provide a system audio loopback stream alongside the screen video stream.
   * **Audio:** ALSA / PulseAudio (via `miniaudio`). PipeWire for modern systems.
   * **Loopback Audio (Output Capture):**
     * **PipeWire:** Preferred. If capturing screen via PipeWire portal, request associated audio stream from the portal for per-application/window audio. For standalone system audio, connect to appropriate PipeWire audio sink/monitor.
-    * **PulseAudio:** Fallback for system-wide audio loopback by capturing from a monitor source of a sink. Per-application audio is difficult and unreliable.
   * **Zero-Copy / GPU Handles:**
-    * **V4L2 / PipeWire:** Can provide DMA-BUF file descriptors (`dmabuf fd`). These can be imported into Vulkan (`vkImportSemaphoreFdKHR`, `vkImportMemoryFdKHR`) or EGL/OpenGL (`eglCreateImageKHR` with `EGL_LINUX_DMA_BUF_EXT`) to create GPU textures.
-    * **CPU Buffers:** V4L2 buffer mapping (`mmap`), X11 shared memory extension (`XShm`).
-  * **Buffer Release:** Involves unmapping/returning buffers to the kernel/server, or closing `dmabuf fd`s and releasing associated GPU resources.
+    * **PipeWire:** Can provide DMA-BUF file descriptors (`dmabuf fd`). These can be imported into Vulkan (`vkImportSemaphoreFdKHR`, `vkImportMemoryFdKHR`) or EGL/OpenGL (`eglCreateImageKHR` with `EGL_LINUX_DMA_BUF_EXT`) to create GPU textures.
+    * **CPU Buffers:** PipeWire buffer mapping.
+  * **Buffer Release:** Involves returning buffers to PipeWire, or closing `dmabuf fd`s and releasing associated GPU resources.
 
-* **Android (`src/android/` - Future):**
+* **Android (Future):**
   * **Camera:** Camera2 API (Java/Kotlin via JNI) or NDK Camera (`ACameraManager`).
   * **Screen:** `MediaProjection` API (Java/Kotlin via JNI).
   * **Audio:** AAudio (preferred), OpenSL ES (fallback) - likely via `miniaudio`.
   * **Zero-Copy / GPU Handles:** `AHardwareBuffer` can be acquired and imported into Vulkan or OpenGL ES.
   * **Buffer Release:** Specific NDK/API calls for `AHardwareBuffer` or `ImageReader` buffers.
+  * **Loopback Audio (Output Capture):** **Not supported.** Android security model prohibits system audio capture. Alternatives include using a hardware loopback dongle or circuit.
 
-* **iOS (`src/ios/` - Future):**
+* **iOS (Future):**
   * **Camera:** AVFoundation (`AVCaptureSession`, `AVCaptureVideoDataOutput`).
   * **Screen:** ReplayKit (`RPScreenRecorder`).
   * **Audio:** Core Audio (via `miniaudio` or direct implementation).
   * **Zero-Copy / GPU Handles:** `CVPixelBufferRef` can be backed by `IOSurfaceRef` or `MTLTexture`.
   * **Buffer Release:** Releasing `CMSampleBufferRef`, `CVPixelBufferRef`, `IOSurfaceRef`, or `MTLTexture`.
+  * **Loopback Audio (Output Capture):** **Not supported.** iOS sandboxing and lack of public APIs prevent system audio capture. Alternatives include using a hardware loopback dongle or circuit.
+
+## Permissions and Security Requirements
+
+Modern operating systems require explicit user consent and proper application configuration for accessing cameras, microphones, screen content, and system audio. MiniAV applications must handle these requirements appropriately.
+
+### macOS
+
+* **Camera Access:**
+  * **Info.plist:** `NSCameraUsageDescription` key with user-facing explanation
+  * **Runtime:** System prompts user on first access; subsequent access uses stored preference
+  * **Enterprise:** Can be managed via MDM profiles
+
+* **Microphone Access:**
+  * **Info.plist:** `NSMicrophoneUsageDescription` key with user-facing explanation  
+  * **Runtime:** System prompts user on first access; subsequent access uses stored preference
+
+* **Screen Recording:**
+  * **Info.plist:** No key required, but recommended to include usage description for clarity
+  * **Runtime:** macOS 10.15+ requires manual user approval in System Preferences > Security & Privacy > Privacy > Screen Recording
+  * **Note:** Applications must be restarted after granting permission
+
+* **System Audio Capture (Audio Taps):**
+  * **Info.plist:** `NSAudioCaptureUsageDescription` key required for Audio Tap API (macOS 14.2+)
+  * **Runtime:** System prompts for "system audio recording" permission on first tap creation
+  * **Fallback:** Virtual audio drivers (BlackHole, etc.) don't require special permissions but must be user-installed
+
+* **Sandboxing Considerations:**
+  * App Store apps with sandboxing may have additional restrictions
+  * Camera/microphone entitlements: `com.apple.security.device.camera`, `com.apple.security.device.microphone`
+  * ScreenCaptureKit may require additional entitlements in sandboxed environments
+
+### Windows
+
+* **Camera Access:**
+  * **Modern Apps:** Windows 10+ Privacy Settings > Camera > Allow apps to access camera
+  * **Registry:** Can be controlled via group policy in enterprise environments
+  * **Manifest:** UWP apps require `webcam` capability in Package.appxmanifest
+
+* **Microphone Access:**
+  * **Modern Apps:** Windows 10+ Privacy Settings > Microphone > Allow apps to access microphone
+  * **Registry:** Can be controlled via group policy
+  * **Manifest:** UWP apps require `microphone` capability
+
+* **Screen Capture:**
+  * **Desktop Apps:** Generally no special permissions required for traditional Win32 applications
+  * **Modern Apps:** May require additional capabilities or user consent
+  * **Enterprise:** Can be restricted via group policy (e.g., preventing screen capture APIs)
+
+* **System Audio (WASAPI Loopback):**
+  * **Desktop Apps:** Generally no special permissions for loopback capture
+  * **Modern Apps:** May require audio capabilities in manifest
+  * **Note:** Some enterprise security software may block audio loopback
+
+### Linux
+
+* **Camera/Microphone Access:**
+  * **Permissions:** Typically requires user to be in `video` and `audio` groups
+  * **Device Files:** Direct access to `/dev/video*` and `/dev/snd/*` devices
+  * **Flatpak/Snap:** Require portal permissions for camera/microphone access
+
+* **Screen Capture:**
+  * **X11:** Generally unrestricted, but some compositors may require user consent
+  * **Wayland:** Requires portal permissions; user consent via desktop environment
+  * **PipeWire Portal:** Modern preferred method with user consent dialogs
+
+* **System Audio (PipeWire Loopback):**
+  * **Permissions:** User must be in `audio` group
+  * **PipeWire:** Modern systems use PipeWire for audio routing and capture
+  * **Pulse/ALSA:** Legacy systems may require additional configuration
+
+* **Sandboxing (Flatpak/Snap):**
+  * **Camera:** `--device=all` or `--socket=camera` 
+  * **Microphone:** `--device=all` or `--socket=microphone`
+  * **Screen:** `--socket=x11` or Wayland portal permissions
+  * **Audio:** `--socket=audio` or `--socket=pulse`
+
+### Android (Future)
+
+* **Camera Permission:**
+  * **Manifest:** `<uses-permission android:name="android.permission.CAMERA" />`
+  * **Runtime:** Android 6.0+ requires runtime permission request
+  * **Target API:** Android 13+ requires more granular camera permissions
+
+* **Microphone Permission:**
+  * **Manifest:** `<uses-permission android:name="android.permission.RECORD_AUDIO" />`
+  * **Runtime:** Requires runtime permission request
+
+* **Screen Capture:**
+  * **MediaProjection:** Requires user consent via system dialog (`MediaProjectionManager.createScreenCaptureIntent()`)
+  * **No Manifest Permission:** Screen capture intent handles permission
+
+* **System Audio Capture (Loopback):**
+  * **Not Supported:** Android security model prohibits system audio capture
+  * **Alternative:** Audio loopback dongle or circuit for hardware capture like a microphone
+
+### iOS (Future)
+
+* **Camera Access:**
+  * **Info.plist:** `NSCameraUsageDescription` required
+  * **Runtime:** System prompts user; uses stored preference thereafter
+  * **App Review:** Apple requires legitimate use case explanation
+
+* **Microphone Access:**
+  * **Info.plist:** `NSMicrophoneUsageDescription` required
+  * **Runtime:** System prompts user
+
+* **Screen Recording:**
+  * **ReplayKit:** No special permissions required for in-app recording
+  * **System Screen Recording:** iOS 11+ requires user consent via control center
+  * **Broadcast Extensions:** Special considerations for live streaming
+
+* **System Audio Capture (Loopback):**
+  * **Not Supported:** iOS sandboxing prevents system audio capture
+  * **Alternative:** Apps can only capture their own audio output via ReplayKit.
+  Audio loopback dongle or circuit for hardware capture like a microphone
+
+### Web
+
+* **Camera/Microphone Access:**
+  * **HTTPS Required:** Secure context mandatory for `getUserMedia()`
+  * **User Gesture:** Many browsers require user interaction to trigger permission prompt
+  * **Permissions API:** Query permission status: `navigator.permissions.query({name: 'camera'})`
+
+* **Screen Capture:**
+  * **getDisplayMedia():** Always requires user gesture and shows system picker
+  * **No Manifest:** Browser handles permission UI
+  * **Feature Policy:** Can be controlled by embedding page headers
+
+* **Audio Context:**
+  * **User Gesture:** Required for `AudioContext.resume()` due to autoplay policies
+  * **Cross-Origin:** Audio capture subject to CORS restrictions
+
+### Implementation Recommendations
+
+1. **Graceful Degradation:** Always check permission status before attempting capture
+2. **User Education:** Provide clear explanations of why permissions are needed
+3. **Fallback Strategies:** Offer alternative capture methods when primary methods are restricted
+4. **Permission Caching:** Cache permission status to avoid repeated system calls
+5. **Error Handling:** Provide specific error messages for permission-related failures
+6. **Documentation:** Clearly document all required permissions and Info.plist entries
+
+### Common Error Scenarios
+
+* **macOS:** Screen recording permission denied - requires manual user action in System Preferences
+* **Windows:** Camera blocked by privacy settings - user must enable in Windows Privacy Settings  
+* **Linux:** User not in video/audio groups - requires system administrator action
+* **Web:** Non-HTTPS context - getUserMedia() will fail silently or with error
+* **Sandboxed Apps:** Missing capabilities/entitlements - app may crash or receive empty device lists
+
+### Testing Considerations
+
+* **Fresh Installs:** Test on systems where permissions haven't been granted
+* **Denied Permissions:** Test behavior when user denies access
+* **Revoked Permissions:** Test when user later revokes previously granted access
+* **Enterprise Policies:** Test in managed environments with restrictive policies
+* **Multiple Apps:** Test permission sharing behavior when multiple apps access same resources
 
 ### 2. MiniAV FFI (`miniav_ffi`)
 
@@ -228,98 +383,99 @@ This section details the public C API exposed by `miniav_c`.
     // Indicates the nature of the buffer's primary data content
     typedef enum {
         MINIAV_BUFFER_CONTENT_TYPE_CPU,
-        MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE, // data.video.native_gpu_shared_handle is a D3D11 NT HANDLE
-        MINIAV_BUFFER_CONTENT_TYPE_GPU_METAL_TEXTURE, // data.video.native_gpu_texture_ptr is an id<MTLTexture>
-        MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD,     // data.video.native_gpu_dmabuf_fd is a DMA-BUF file descriptor
+        MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE, // GPU handle for D3D11 NT HANDLE
+        MINIAV_BUFFER_CONTENT_TYPE_GPU_METAL_TEXTURE, // GPU handle for Metal texture
+        MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD,     // GPU handle for DMA-BUF file descriptor
     } MiniAVBufferContentType;
 
     // Output Preference (set during configuration)
     typedef enum {
         MINIAV_OUTPUT_PREFERENCE_CPU,         // Prefer CPU-accessible buffers.
-        MINIAV_OUTPUT_PREFERENCE_GPU // Prefer GPU handles if supported, otherwise fallback to CPU.
+        MINIAV_OUTPUT_PREFERENCE_GPU          // Prefer GPU handles if supported, otherwise fallback to CPU.
     } MiniAVOutputPreference;
 
     // Common Pixel Formats (Extend as needed)
+    typedef enum {
+        MINIAV_PIXEL_FORMAT_UNKNOWN = 0,
+        MINIAV_PIXEL_FORMAT_I420,    // Planar YUV 4:2:0 (YYYY... UU... VV...)
+        MINIAV_PIXEL_FORMAT_NV12,    // Semi-Planar YUV 4:2:0 (YYYY... UVUV...)
+        MINIAV_PIXEL_FORMAT_NV21,    // Semi-Planar YUV 4:2:0 (YYYY... VUVU...)
+        MINIAV_PIXEL_FORMAT_YUY2,    // Packed YUV 4:2:2 (YUYV YUYV...)
+        MINIAV_PIXEL_FORMAT_UYVY,    // Packed YUV 4:2:2 (UYVY UYVY...)
+        MINIAV_PIXEL_FORMAT_RGB24,   // Packed RGB (RGB RGB...)
+        MINIAV_PIXEL_FORMAT_BGR24,   // Packed BGR (BGR BGR...)
+        MINIAV_PIXEL_FORMAT_RGBA32,  // Packed RGBA (RGBA RGBA...)
+        MINIAV_PIXEL_FORMAT_BGRA32,  // Packed BGRA (BGRA BGRA...)
+        MINIAV_PIXEL_FORMAT_ARGB32,  // Packed ARGB (ARGB ARGB...)
+        MINIAV_PIXEL_FORMAT_ABGR32,  // Packed ABGR (ABGR ABGR...)
+        MINIAV_PIXEL_FORMAT_MJPEG,   // Motion JPEG (Compressed format)
+    } MiniAVPixelFormat;
 
-  typedef enum {
-      MINIAV_PIXEL_FORMAT_UNKNOWN = 0,
-      MINIAV_PIXEL_FORMAT_I420,    // Planar YUV 4:2:0 (YYYY... UU... VV...)
-      MINIAV_PIXEL_FORMAT_NV12,    // Semi-Planar YUV 4:2:0 (YYYY... UVUV...)
-      MINIAV_PIXEL_FORMAT_NV21,    // Semi-Planar YUV 4:2:0 (YYYY... VUVU...)
-      MINIAV_PIXEL_FORMAT_YUY2,    // Packed YUV 4:2:2 (YUYV YUYV...)
-      MINIAV_PIXEL_FORMAT_UYVY,    // Packed YUV 4:2:2 (UYVY UYVY...)
-      MINIAV_PIXEL_FORMAT_RGB24,   // Packed RGB (RGB RGB...)
-      MINIAV_PIXEL_FORMAT_BGR24,   // Packed BGR (BGR BGR...)
-      MINIAV_PIXEL_FORMAT_RGBA32,  // Packed RGBA (RGBA RGBA...)
-      MINIAV_PIXEL_FORMAT_BGRA32,  // Packed BGRA (BGRA BGRA...)
-      MINIAV_PIXEL_FORMAT_ARGB32,  // Packed ARGB (ARGB ARGB...)
-      MINIAV_PIXEL_FORMAT_ABGR32,  // Packed ABGR (ABGR ABGR...)
-      MINIAV_PIXEL_FORMAT_MJPEG,   // Motion JPEG (Compressed format)
-  } MiniAVPixelFormat;
+    // Common Audio Sample Formats (Align with miniaudio where possible)
+    typedef enum {
+        MINIAV_AUDIO_FORMAT_UNKNOWN = 0,
+        MINIAV_AUDIO_FORMAT_U8,      // Unsigned 8-bit integer
+        MINIAV_AUDIO_FORMAT_S16,     // Signed 16-bit integer
+        MINIAV_AUDIO_FORMAT_S24,     // Signed 24-bit integer (often packed in 32 bits)
+        MINIAV_AUDIO_FORMAT_S32,     // Signed 32-bit integer
+        MINIAV_AUDIO_FORMAT_F32,     // 32-bit floating point
+    } MiniAVAudioFormat;
 
-  // Common Audio Sample Formats (Align with miniaudio where possible)
-  typedef enum {
-      MINIAV_AUDIO_FORMAT_UNKNOWN = 0,
-      MINIAV_AUDIO_FORMAT_U8,      // Unsigned 8-bit integer
-      MINIAV_AUDIO_FORMAT_S16,     // Signed 16-bit integer
-      MINIAV_AUDIO_FORMAT_S24,     // Signed 24-bit integer (often packed in 32 bits)
-      MINIAV_AUDIO_FORMAT_S32,     // Signed 32-bit integer
-      MINIAV_AUDIO_FORMAT_F32,     // 32-bit floating point
-  } MiniAVAudioFormat;
+    typedef enum {
+        MINIAV_LOOPBACK_TARGET_NONE,          // No target specified or invalid
+        MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO,  // Capture all system audio output (e.g., speaker output)
+        MINIAV_LOOPBACK_TARGET_PROCESS,       // Capture audio from a specific process ID
+        MINIAV_LOOPBACK_TARGET_WINDOW         // Capture audio associated with a specific window (platform-dependent feasibility)
+    } MiniAVLoopbackTargetType;
 
-  typedef enum {
-      MINIAV_LOOPBACK_TARGET_NONE,          // No target specified or invalid
-      MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO,  // Capture all system audio output (e.g., speaker output)
-      MINIAV_LOOPBACK_TARGET_PROCESS,       // Capture audio from a specific process ID
-      MINIAV_LOOPBACK_TARGET_WINDOW         // Capture audio associated with a specific window (platform-dependentfeasibility)
-  } MiniAVLoopbackTargetType;
-
-  typedef struct {
+    typedef struct {
         MiniAVLoopbackTargetType type;
         union {
             uint32_t process_id;        // For MINIAV_LOOPBACK_TARGET_PROCESS
             void* window_handle;        // For MINIAV_LOOPBACK_TARGET_WINDOW (platform-specific: HWND, NSWindow*, XID, etc.)
-        } TARGETHANDLE; 
+        } target_handle; 
     } MiniAVLoopbackTargetInfo;
 
-  // Video Format Information (used for configuration)
-  typedef struct {
-      uint32_t width;                       // Desired width (can be 0 for default)
-      uint32_t height;                      // Desired height (can be 0 for default)
-      MiniAVPixelFormat pixel_format;       // Desired pixel format for CPU output, or hint for GPU.
-      uint32_t frame_rate_numerator;
-      uint32_t frame_rate_denominator;
-      MiniAVOutputPreference output_preference; // User's preference for CPU or GPU output.
-      // Potentially other fields like color_space, etc.
-    } MiniAVVideoFormatInfo;
+    // Video Format Information (used for configuration)
+    typedef struct {
+        uint32_t width;                       // Desired width (can be 0 for default)
+        uint32_t height;                      // Desired height (can be 0 for default)
+        MiniAVPixelFormat pixel_format;       // Desired pixel format for CPU output, or hint for GPU.
+        uint32_t frame_rate_numerator;
+        uint32_t frame_rate_denominator;
+        MiniAVOutputPreference output_preference; // User's preference for CPU or GPU output.
+        // Potentially other fields like color_space, etc.
+    } MiniAVVideoInfo;
 
     // Audio Format Information (used for configuration)
     typedef struct {
-      uint32_t sample_rate;
-      uint32_t channel_count;
-      MiniAVAudioFormat format;
-      // MiniAVOutputPreference output_preference; // Currently ignored for audio, defaults to CPU.
-      // uint32_t buffer_frame_count; // Desired number of frames per callback
+        uint32_t sample_rate;
+        uint32_t channel_count;
+        MiniAVAudioFormat format;
+        // MiniAVOutputPreference output_preference; // Currently ignored for audio, defaults to CPU.
+        // uint32_t buffer_frame_count; // Desired number of frames per callback
     } MiniAVAudioInfo;
+
+    // Unified plane structure for video data
+    typedef struct {
+        void* data_ptr;               // Pointer to plane data (CPU) or GPU handle
+        uint32_t width;               // Plane width in pixels/samples
+        uint32_t height;              // Plane height in pixels/lines
+        uint32_t stride_bytes;        // Bytes per row/line (0 for GPU handles)
+        uint32_t offset_bytes;        // Offset from base buffer start
+        uint32_t subresource_index;   // GPU subresource index (0 for CPU)
+    } MiniAVPlane;
 
     typedef struct {
         MiniAVBufferType type;
         MiniAVBufferContentType content_type;
-        int64_t timestamp_us; // Monotonic timestamp in microseconds since an arbitrary epoch (e.g., capture start or system boot)
+        int64_t timestamp_us; // Monotonic timestamp in microseconds since an arbitrary epoch
 
         union {
             struct {
-                uint32_t width;
-                uint32_t height;
-                MiniAVPixelFormat pixel_format;
-                uint32_t stride_bytes[4]; // Stride for each plane (up to 4 for planar formats)
-                void* planes[4];          // Pointers to data planes. Valid until MiniAV_ReleaseBuffer is called.
-                // Valid if content_type is a GPU type (e.g., MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE)
-                void* native_gpu_shared_handle; 
-                void* native_gpu_texture_ptr;   
-                int native_gpu_dmabuf_fd;     
-                // Camera Intrinsics (fx, fy, cx, cy, distortion coeffs)
-                // double intrinsics[...];
+                MiniAVVideoInfo info;           // Video format information
+                uint8_t num_planes;             // Number of valid planes (1-4)
+                MiniAVPlane planes[4];          // Unified plane data (CPU pointers or GPU handles)
             } video;
             struct {
                 uint32_t frame_count;
@@ -371,13 +527,13 @@ This section details the public C API exposed by `miniav_c`.
 * `MiniAVResultCode MiniAV_Camera_EnumerateDevices(MiniAVDeviceInfo** devices, uint32_t* count);`
   * Allocates memory for the device list; caller must free using `MiniAV_FreeDeviceList`.
 * `MiniAVResultCode MiniAV_FreeDeviceList(MiniAVDeviceInfo* devices, uint32_t count);`
-* `MiniAVResultCode MiniAV_Camera_GetSupportedFormats(const char* device_id, MiniAVVideoFormatInfo** formats, uint32_t* count);`
+* `MiniAVResultCode MiniAV_Camera_GetSupportedFormats(const char* device_id, MiniAVVideoInfo** formats, uint32_t* count);`
   * Describes supported resolution, pixel format, frame rate combinations.
   * Allocates memory; caller must free using `MiniAV_FreeFormatList`.
-* `MiniAVResultCode MiniAV_FreeFormatList(MiniAVVideoFormatInfo* formats, uint32_t count);` // Needs refinement for distinct video/audio format lists/freeing
+* `MiniAVResultCode MiniAV_FreeFormatList(MiniAVVideoInfo* formats, uint32_t count);`
 * `MiniAVResultCode MiniAV_Camera_CreateContext(MiniAVCameraContextHandle* context);`
 * `MiniAVResultCode MiniAV_Camera_DestroyContext(MiniAVCameraContextHandle context);`
-* `MiniAVResultCode MiniAV_Camera_Configure(MiniAVCameraContextHandle context, const char* device_id, const MiniAVVideoFormatInfo* format);`
+* `MiniAVResultCode MiniAV_Camera_Configure(MiniAVCameraContextHandle context, const char* device_id, const MiniAVVideoInfo* format);`
   * `format->output_preference` guides the library on whether to attempt GPU handle output.
 * `MiniAVResultCode MiniAV_Camera_StartCapture(MiniAVCameraContextHandle context, MiniAVBufferCallback callback, void* user_data);`
 * `MiniAVResultCode MiniAV_Camera_StopCapture(MiniAVCameraContextHandle context);`
@@ -395,15 +551,14 @@ This section details the public C API exposed by `miniav_c`.
   * Allocates memory; caller must free using `MiniAV_FreeDeviceList`.
 * `MiniAVResultCode MiniAV_Screen_CreateContext(MiniAVScreenContextHandle* context);`
 * `MiniAVResultCode MiniAV_Screen_DestroyContext(MiniAVScreenContextHandle context);`
-* `MiniAVResultCode MiniAV_Screen_ConfigureDisplay(MiniAVScreenContextHandle context, const char* display_id, const MiniAVVideoFormatInfo* video_format);`
+* `MiniAVResultCode MiniAV_Screen_ConfigureDisplay(MiniAVScreenContextHandle context, const char* display_id, const MiniAVVideoInfo* video_format);`
   * `video_format->output_preference` guides the library for video. Audio is configured at StartCapture.
-* `MiniAVResultCode MiniAV_Screen_ConfigureWindow(MiniAVScreenContextHandle context, const char* window_id, const MiniAVVideoFormatInfo* video_format);`
+* `MiniAVResultCode MiniAV_Screen_ConfigureWindow(MiniAVScreenContextHandle context, const char* window_id, const MiniAVVideoInfo* video_format);`
   * `video_format->output_preference` guides the library for video. Audio is configured at StartCapture.
-* `MiniAVResultCode MiniAV_Screen_ConfigureRegion(MiniAVScreenContextHandle context, const char* display_id, int x, int y, int width, int height, const MiniAVVideoFormatInfo* video_format);`
+* `MiniAVResultCode MiniAV_Screen_ConfigureRegion(MiniAVScreenContextHandle context, const char* display_id, int x, int y, int width, int height, const MiniAVVideoInfo* video_format);`
   * `video_format->output_preference` guides the library for video. Audio is configured at StartCapture.
 * `MiniAVResultCode MiniAV_Screen_StartCapture(MiniAVScreenContextHandle context, MiniAVBufferCallback callback, void* user_data, const MiniAVAudioInfo* optional_audio_format_for_loopback);`
   * If `optional_audio_format_for_loopback` is not NULL, the library will attempt to capture system/application audio (depending on platform capabilities and configuration of the screen capture target) alongside the screen video **by utilizing the audio buffer the screen capture api provides or the Loopback Audio module**.
-  * The callback will receive buffers of `type = MINIAV_BUFFER_TYPE_VIDEO` and, if audio capture is enabled and successful, `type = MINIAV_BUFFER_TYPE_AUDIO`.
   * The callback will receive buffers of `type = MINIAV_BUFFER_TYPE_VIDEO` and, if audio capture is enabled and successful, `type = MINIAV_BUFFER_TYPE_AUDIO`.
 * `MiniAVResultCode MiniAV_Screen_StopCapture(MiniAVScreenContextHandle context);`
 * *(Property API - TBD: Define specific properties like cursor visibility, capture rate control, audio source selection if multiple loopbacks exist)*
@@ -462,19 +617,19 @@ This API is for capturing audio output from the system or specific applications.
 
 * **Data Ownership & Buffer Strategy:**
   * The `MiniAVBuffer` passed to the `MiniAVBufferCallback` has its `content_type` field indicating the nature of its data.
-  * If `content_type` is `MINIAV_BUFFER_CONTENT_TYPE_CPU`, the relevant `planes` or `data` pointers in the union are valid.
-  * If `content_type` is a GPU type, the relevant `native_gpu_...` fields are valid.
+  * If `content_type` is `MINIAV_BUFFER_CONTENT_TYPE_CPU`, the relevant `planes[].data_ptr` pointers in the video union are valid CPU-accessible memory.
+  * If `content_type` is a GPU type, the relevant `planes[0].data_ptr` contains the GPU handle (cast appropriately).
   * The library attempts to honor the `MiniAVOutputPreference` set during configuration. If `MINIAV_OUTPUT_PREFERENCE_GPU` was set but GPU output failed or is not supported, the buffer's `content_type` will be `MINIAV_BUFFER_CONTENT_TYPE_CPU`.
   * The user (e.g., the Dart FFI layer) is **responsible for explicitly releasing** the underlying native buffer/resource when it is no longer needed by calling `MiniAV_ReleaseBuffer(buffer->internal_handle)` via FFI.
   * **Failure to call `MiniAV_ReleaseBuffer` will result in resource leaks** (e.g., holding onto camera frames, screen capture resources, D3D11 textures, NT HANDLES, audio buffers).
   * **Frame Drops:** If the user does not release buffers promptly, underlying native capture APIs may run out of internal buffers or resources, potentially leading to dropped frames or errors.
   * This explicit release mechanism allows the user to:
-    * Pass raw CPU data pointers (`buffer->data.video.planes[0]`) for direct processing or CPU->GPU uploads.
-    * Pass native GPU handles (`buffer->data.video.native_gpu_shared_handle`) to other GPU-aware libraries (like `minigpu` or WebGPU) for direct import and use, enabling true zero-copy GPU-to-GPU pipelines.
+    * Pass raw CPU data pointers (`buffer->data.video.planes[0].data_ptr`) for direct processing or CPU->GPU uploads.
+    * Pass native GPU handles (`buffer->data.video.planes[0].data_ptr` cast to appropriate handle type) to other GPU-aware libraries (like `minigpu` or WebGPU) for direct import and use, enabling true zero-copy GPU-to-GPU pipelines.
   * **Internal Buffering:** `miniav_c` aims to be a thin layer. If the consuming application requires more complex buffering, it should implement that logic *after* receiving the buffer and its release handle.
   * **Zero-Copy Goal:**
     * **CPU Path:** `miniav_c` aims for minimal copies to provide CPU pointers. The explicit release enables consumers to avoid further copies in the FFI layer for CPU->GPU uploads.
-    * **GPU Path:** When `MiniAVBuffer` provides a `native_gpu_shared_handle` (or similar), the goal is to enable true zero-copy by allowing direct import of this GPU resource into another GPU context (e.g., WebGPU, another D3D11 device). This is highly platform-specific. The `internal_handle` and `MiniAV_ReleaseBuffer` will manage the lifetime of these shared GPU resources (e.g., releasing the underlying `ID3D11Texture2D` and closing the NT `HANDLE`).
+    * **GPU Path:** When `MiniAVBuffer` provides a GPU handle in `planes[0].data_ptr`, the goal is to enable true zero-copy by allowing direct import of this GPU resource into another GPU context (e.g., WebGPU, another D3D11 device). This is highly platform-specific. The `internal_handle` and `MiniAV_ReleaseBuffer` will manage the lifetime of these shared GPU resources (e.g., releasing the underlying `ID3D11Texture2D` and closing the NT `HANDLE`).
 
 * **Threading:**
   * The `MiniAVBufferCallback` is invoked on an **internal library thread** managed by `miniav_c` (or potentially the underlying native API's thread).
@@ -500,7 +655,7 @@ This API is for capturing audio output from the system or specific applications.
   * **Callbacks:** `miniav_ffi` manages `NativeCallable`.
   * **Pointer/Handle Ownership & Release:** The FFI layer receives `MiniAVBuffer`. It inspects `content_type`.
     * If CPU data, it extracts pointers, metadata, and `internal_handle`.
-    * If GPU handle, it extracts the `native_gpu_shared_handle`, `native_gpu_texture_ptr` (if applicable), metadata, and `internal_handle`.
+    * If GPU handle, it extracts the GPU handle from `planes[0].data_ptr`, metadata, and `internal_handle`.
     * It provides a Dart object representing the buffer, holding the `internal_handle` and relevant data/handles, ensuring `MiniAV_ReleaseBuffer` is called via FFI when the Dart object is disposed.
   * **Structs & String Handling:** Match C layout. Use `Utf8` for strings.
 
@@ -509,26 +664,26 @@ This API is for capturing audio output from the system or specific applications.
 1. **Initialization:** Dart application calls an initialization method defined in `miniav_platform_interface`. The `miniav_ffi` implementation might call `MiniAV_Initialize` (C API) if needed.
 2. **Context Creation:** Application requests a camera/screen/audio context via the platform interface. `miniav_ffi` calls the corresponding `MiniAV_<Type>_CreateContext` (C API) via FFI.
 3. **Device Discovery:** Application calls device listing methods. `miniav_ffi` calls `MiniAV_<Type>_EnumerateDevices` (C API) via FFI. `miniav_c` executes platform-specific discovery code. Results are marshalled back to Dart, and the native list is freed using `MiniAV_FreeDeviceList`.
-4. **Configuration:** Application selects device/format and sets `output_preference` in `MiniAVVideoFormatInfo` (or `MiniAVAudioInfo`). `miniav_ffi` translates these to C structs/calls (e.g., `MiniAV_Camera_Configure`). `miniav_c` stores this preference.
+4. **Configuration:** Application selects device/format and sets `output_preference` in `MiniAVVideoInfo` (or `MiniAVAudioInfo`). `miniav_ffi` translates these to C structs/calls (e.g., `MiniAV_Camera_Configure`). `miniav_c` stores this preference.
 5. **Capture Start:** Application calls start capture method, providing a Dart callback. `miniav_ffi` sets up a native FFI callback (`NativeCallable`) that wraps the Dart callback (potentially sending data via a `SendPort`) and passes its pointer (and user data containing necessary Dart state/ports) to `MiniAV_<Type>_StartCapture` (C API). `miniav_c` sets up the platform context and registers the native FFI callback.
 6. **Data Production (C Library):**
     * Platform-specific C code captures data, respecting the stored `output_preference`.
     * For video:
-      * **If `output_preference` was `_GPU_IF_AVAILABLE` and GPU output is successful:**
-          * Populates `MiniAVBuffer` with `type = MINIAV_BUFFER_TYPE_VIDEO`, `content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_...`, GPU handles, metadata, and `internal_handle`.
+      * **If `output_preference` was `_GPU` and GPU output is successful:**
+          * Populates `MiniAVBuffer` with `type = MINIAV_BUFFER_TYPE_VIDEO`, `content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_...`, GPU handles in `planes[0].data_ptr`, metadata, and `internal_handle`.
       * **Else (preference was `_CPU`, or GPU preferred but failed/unavailable):**
-          * Populates `MiniAVBuffer` with `type = MINIAV_BUFFER_TYPE_VIDEO`, `content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU`, CPU data pointers, metadata, and `internal_handle`.
+          * Populates `MiniAVBuffer` with `type = MINIAV_BUFFER_TYPE_VIDEO`, `content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU`, CPU data pointers in appropriate planes, metadata, and `internal_handle`.
     * For audio (if screen capture with audio is active):
         * Captures system audio.
         * Populates `MiniAVBuffer` with `type = MINIAV_BUFFER_TYPE_AUDIO`, `content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU`, audio data, metadata, and `internal_handle`.
     * Invokes the native FFI callback for each buffer (video or audio).
 7. **Callback Invocation (FFI Layer):**
     * Native FFI callback executes. Reads `MiniAVBuffer`.
-    * Based on `content_type`, extracts either CPU data pointers or GPU handles, along with metadata and `internal_handle`.
+    * Based on `content_type`, extracts either CPU data pointers from planes or GPU handles from `planes[0].data_ptr`, along with metadata and `internal_handle`.
     * Passes these (e.g., in a Dart object) to the Dart callback/`SendPort`.
 8. **Buffer Consumption (Dart Application):**
     * Receives the Dart object representing the buffer.
-    * **If GPU Handle:** Passes the `native_gpu_shared_handle` and metadata to a GPU-aware library (e.g., `minigpu`, WebGPU interop layer) for import and direct GPU processing.
+    * **If GPU Handle:** Passes the GPU handle and metadata to a GPU-aware library (e.g., `minigpu`, WebGPU interop layer) for import and direct GPU processing.
     * **If CPU Data:** Passes data pointers and metadata for CPU processing or CPU->GPU upload.
     * The Dart object holds the `internal_handle`.
 9. **GPU Interaction / Processing:** The consumer library (`minigpu`) uses the provided data pointer and metadata to perform its operations (e.g., upload to texture).

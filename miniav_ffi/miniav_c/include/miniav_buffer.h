@@ -36,8 +36,19 @@ typedef enum {
   MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD, // Video:
                                             // data.video.native_gpu_dmabuf_fd
                                             // is a DMA-BUF file descriptor
-  // ... other GPU types as needed for video.
 } MiniAVBufferContentType;
+
+typedef struct {
+  // Per-plane data (works for both CPU and GPU)
+  void *data_ptr;        // CPU: memory pointer, GPU: texture/handle pointer
+  uint32_t width;        // Plane width
+  uint32_t height;       // Plane height
+  uint32_t stride_bytes; // Row stride in bytes
+  uint32_t offset_bytes; // Offset within a shared resource (GPU DMA-BUF, D3D11
+                         // subresource)
+  uint32_t
+      subresource_index; // GPU: D3D11 subresource, Vulkan image aspect, etc.
+} MiniAVVideoPlane;
 
 typedef struct {
   MiniAVBufferType type;
@@ -46,16 +57,12 @@ typedef struct {
 
   union {
     struct {
-      MiniAVVideoInfo info;
-
-      // CPU data
-      uint32_t stride_bytes[4];
-      void *planes[4];
-
-      // GPU handles
-      void *native_gpu_shared_handle; // e.g., NT HANDLE for D3D11
-      void *native_gpu_texture_ptr;   // e.g., ID3D11Texture2D*
-      int native_gpu_dmabuf_fd;       // e.g., DMA-BUF file descriptor
+      MiniAVVideoInfo
+          info; // Overall frame info (total width, height, pixel format)
+      // Unified plane data (CPU or GPU)
+      uint32_t num_planes; // 1 for BGRA, 2 for NV12, 3 for I420
+      MiniAVVideoPlane
+          planes[MINIAV_VIDEO_FORMAT_MAX_PLANES]; // Unified plane info
     } video;
 
     struct {
@@ -72,12 +79,17 @@ typedef struct {
 
 typedef struct MiniAVNativeBufferInternalPayload {
   MiniAVNativeHandleType handle_type;
-  void *context_owner;       // e.g., MiniAVCameraContextHandle,
-                             // MiniAVAudioContextHandle
-  void *native_resource_ptr; // e.g., IMFMediaBuffer*, v4l2_buffer*,
-                             // CMSampleBufferRef
-  MiniAVBuffer
-      *parent_miniav_buffer_ptr; // Pointer to the heap-allocated MiniAVBuffer
+  void *context_owner;
+
+  // For single resources that need cleanup (CVPixelBuffer, HANDLE, etc.)
+  void *native_singular_resource_ptr;
+
+  // For multi-plane resources that need individual cleanup (multiple
+  // CVMetalTextureRef)
+  void *native_planar_resource_ptrs[MINIAV_VIDEO_FORMAT_MAX_PLANES];
+  uint32_t num_planar_resources_to_release;
+
+  MiniAVBuffer *parent_miniav_buffer_ptr;
 } MiniAVNativeBufferInternalPayload;
 
 #ifdef __cplusplus

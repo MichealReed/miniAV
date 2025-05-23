@@ -910,56 +910,109 @@ static MiniAVResultCode dxgi_stop_capture(MiniAVScreenContext *ctx) {
 static MiniAVResultCode dxgi_release_buffer(MiniAVScreenContext *ctx,
                                             void *internal_handle_ptr) {
   MINIAV_UNUSED(ctx);
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "DXGI: release_buffer called with internal_handle_ptr=%p",
+             internal_handle_ptr);
+
   if (!internal_handle_ptr) {
-    miniav_log(
-        MINIAV_LOG_LEVEL_ERROR,
-        "DXGI: native_buffer_payload_resource_ptr is NULL in release_buffer.");
-    return MINIAV_ERROR_INVALID_ARG;
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "DXGI: release_buffer called with NULL internal_handle_ptr.");
+    return MINIAV_SUCCESS;
   }
 
   MiniAVNativeBufferInternalPayload *payload =
       (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
 
-  DXGIFrameReleasePayload *frame_payload =
-      (DXGIFrameReleasePayload *)payload->native_resource_ptr;
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "DXGI: payload ptr=%p, handle_type=%d, "
+             "native_singular_resource_ptr=%p, num_planar_resources=%u",
+             payload, payload->handle_type,
+             payload->native_singular_resource_ptr,
+             payload->num_planar_resources_to_release);
 
-  if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU) {
-    if (frame_payload->cpu.d3d_context_for_unmap &&
-        frame_payload->cpu.staging_texture_for_frame) {
-      ID3D11DeviceContext_Unmap(
-          frame_payload->cpu.d3d_context_for_unmap,
-          (ID3D11Resource *)frame_payload->cpu.staging_texture_for_frame,
-          frame_payload->cpu.subresource_for_unmap);
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "DXGI: Unmapped CPU staging texture for frame.");
+  if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN) {
+
+    // Handle multi-plane resources (rarely used for DXGI, but supported)
+    if (payload->num_planar_resources_to_release > 0) {
+      for (uint32_t i = 0; i < payload->num_planar_resources_to_release; ++i) {
+        if (payload->native_planar_resource_ptrs[i]) {
+          // For DXGI, this would typically be additional D3D11 textures
+          ID3D11Texture2D *texture =
+              (ID3D11Texture2D *)payload->native_planar_resource_ptrs[i];
+          ULONG ref_count = ID3D11Texture2D_Release(texture);
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                     "DXGI: Released planar texture %u. Ref count: %lu", i,
+                     ref_count);
+          payload->native_planar_resource_ptrs[i] = NULL;
+        }
+      }
     }
-    if (frame_payload->cpu.staging_texture_for_frame) {
-      ULONG ref_count =
-          ID3D11Texture2D_Release(frame_payload->cpu.staging_texture_for_frame);
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "DXGI: Released CPU per-frame staging texture. Ref count: %lu",
-                 ref_count);
+
+    // Handle single resource (typical case)
+    if (payload->native_singular_resource_ptr) {
+      DXGIFrameReleasePayload *frame_payload =
+          (DXGIFrameReleasePayload *)payload->native_singular_resource_ptr;
+
+      if (frame_payload) {
+        if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU) {
+          if (frame_payload->cpu.d3d_context_for_unmap &&
+              frame_payload->cpu.staging_texture_for_frame) {
+            ID3D11DeviceContext_Unmap(
+                frame_payload->cpu.d3d_context_for_unmap,
+                (ID3D11Resource *)frame_payload->cpu.staging_texture_for_frame,
+                frame_payload->cpu.subresource_for_unmap);
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "DXGI: Unmapped CPU staging texture for frame.");
+          }
+          if (frame_payload->cpu.staging_texture_for_frame) {
+            ULONG ref_count = ID3D11Texture2D_Release(
+                frame_payload->cpu.staging_texture_for_frame);
+            miniav_log(
+                MINIAV_LOG_LEVEL_DEBUG,
+                "DXGI: Released CPU per-frame staging texture. Ref count: %lu",
+                ref_count);
+          }
+        } else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU) {
+          if (frame_payload->gpu.shared_gpu_texture) {
+            ULONG ref_count =
+                ID3D11Texture2D_Release(frame_payload->gpu.shared_gpu_texture);
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "DXGI: Released shared GPU texture. Ref count: %lu",
+                       ref_count);
+          }
+          // The shared handle should be closed by the application,
+          // but we can't verify that here
+        } else {
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "DXGI: Unknown payload type in release_buffer: %d",
+                     frame_payload->type);
+        }
+        miniav_free(frame_payload);
+        payload->native_singular_resource_ptr = NULL;
+      }
     }
-  } else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU) {
-    if (frame_payload->gpu.shared_gpu_texture) {
-      ULONG ref_count =
-          ID3D11Texture2D_Release(frame_payload->gpu.shared_gpu_texture);
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "DXGI: Released shared GPU texture. Ref count: %lu",
-                 ref_count);
+
+    // Clean up parent buffer
+    if (payload->parent_miniav_buffer_ptr) {
+      miniav_free(payload->parent_miniav_buffer_ptr);
+      payload->parent_miniav_buffer_ptr = NULL;
     }
-    // The application is responsible for calling CloseHandle on the
-    // native_gpu_shared_handle it received.
+
+    miniav_free(payload);
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "DXGI: Released buffer payload.");
+    return MINIAV_SUCCESS;
   } else {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
-               "DXGI: Unknown payload type in release_buffer: %d",
-               frame_payload->type);
+               "DXGI: release_buffer called for unknown handle_type %d.",
+               payload->handle_type);
+    if (payload->parent_miniav_buffer_ptr) {
+      miniav_free(payload->parent_miniav_buffer_ptr);
+      payload->parent_miniav_buffer_ptr = NULL;
+    }
+    miniav_free(payload);
+    return MINIAV_SUCCESS;
   }
-
-  miniav_free(frame_payload);
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "DXGI: Freed DXGIFrameReleasePayload.");
-
-  return MINIAV_SUCCESS;
 }
 
 static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
@@ -968,8 +1021,7 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
     return 1;
 
   HRESULT hr;
-  IDXGIResource *desktop_resource_handle =
-      NULL; // Renamed to avoid confusion with ID3D11Resource
+  IDXGIResource *desktop_resource_handle = NULL;
   DXGI_OUTDUPL_FRAME_INFO frame_info;
   ID3D11Texture2D *acquired_texture = NULL;
 
@@ -1052,19 +1104,24 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
       continue;
     }
 
-    MiniAVBuffer buffer;
-    memset(&buffer, 0, sizeof(MiniAVBuffer));
-    buffer.type = MINIAV_BUFFER_TYPE_VIDEO;
-    buffer.timestamp_us = miniav_qpc_to_microseconds(frame_info.LastPresentTime,
-                                                     dxgi_ctx->qpc_frequency);
-    buffer.data.video.info.width = dxgi_ctx->frame_width;
-    buffer.data.video.info.height = dxgi_ctx->frame_height;
-    buffer.data.video.info.pixel_format = dxgi_ctx->pixel_format;
-    buffer.user_data = dxgi_ctx->app_callback_user_data_internal;
+    MiniAVBuffer *buffer =
+        (MiniAVBuffer *)miniav_calloc(1, sizeof(MiniAVBuffer));
+    if (!buffer) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "DXGI: Failed to allocate MiniAVBuffer");
+      continue;
+    }
+
+    buffer->type = MINIAV_BUFFER_TYPE_VIDEO;
+    buffer->timestamp_us = miniav_qpc_to_microseconds(
+        frame_info.LastPresentTime, dxgi_ctx->qpc_frequency);
+    buffer->data.video.info.width = dxgi_ctx->frame_width;
+    buffer->data.video.info.height = dxgi_ctx->frame_height;
+    buffer->data.video.info.pixel_format = dxgi_ctx->pixel_format;
+    buffer->user_data = dxgi_ctx->app_callback_user_data_internal;
 
     BOOL processed_as_gpu = FALSE;
-    ID3D11Texture2D *texture_for_payload_ref =
-        NULL; // This will be AddRef'd for the payload
+    ID3D11Texture2D *texture_for_payload_ref = NULL;
     HANDLE shared_handle_for_app = NULL;
 
     // Attempt GPU Path if preferred
@@ -1072,26 +1129,21 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
         dxgi_ctx->d3d_device) {
       D3D11_TEXTURE2D_DESC acquired_desc;
       ID3D11Texture2D_GetDesc(acquired_texture, &acquired_desc);
-      ID3D11Texture2D *texture_to_share =
-          acquired_texture; // Start with the acquired one
+      ID3D11Texture2D *texture_to_share = acquired_texture;
       BOOL needs_copy_for_sharing =
           !(acquired_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED);
-      ID3D11Texture2D *shareable_copy_temp = NULL; // Temp holder for copy
+      ID3D11Texture2D *shareable_copy_temp = NULL;
 
       if (needs_copy_for_sharing) {
         miniav_log(
             MINIAV_LOG_LEVEL_DEBUG,
             "DXGI: Acquired texture not shareable, creating a shareable copy.");
         D3D11_TEXTURE2D_DESC shareable_desc;
-        ZeroMemory(&shareable_desc,
-                   sizeof(shareable_desc)); // Start with a clean slate
+        ZeroMemory(&shareable_desc, sizeof(shareable_desc));
 
-        // Copy essential properties from the acquired texture
         shareable_desc.Width = acquired_desc.Width;
         shareable_desc.Height = acquired_desc.Height;
         shareable_desc.Format = acquired_desc.Format;
-
-        // Set properties required for a shareable texture
         shareable_desc.MipLevels = 1;
         shareable_desc.ArraySize = 1;
         shareable_desc.SampleDesc.Count = 1;
@@ -1108,18 +1160,16 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
           ID3D11DeviceContext_CopyResource(
               dxgi_ctx->d3d_context, (ID3D11Resource *)shareable_copy_temp,
               (ID3D11Resource *)acquired_texture);
-          texture_to_share = shareable_copy_temp; // Now use the copy
+          texture_to_share = shareable_copy_temp;
         } else {
           miniav_log(
               MINIAV_LOG_LEVEL_ERROR,
               "DXGI: Failed to create shareable copy: 0x%X. Fallback to CPU.",
               hr);
-          needs_copy_for_sharing = TRUE; // Force CPU path if copy failed
         }
       }
 
-      if (SUCCEEDED(hr)) { // SUCCEEDED(hr) means either original was shareable
-                           // or copy was successful
+      if (SUCCEEDED(hr)) {
         IDXGIResource1 *dxgi_resource_to_share = NULL;
         hr = ID3D11Texture2D_QueryInterface(texture_to_share,
                                             &IID_IDXGIResource1,
@@ -1129,7 +1179,7 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
                                                  DXGI_SHARED_RESOURCE_READ,
                                                  NULL, &shared_handle_for_app);
           if (SUCCEEDED(hr)) {
-            ID3D11Texture2D_AddRef(texture_to_share); // AddRef for payload
+            ID3D11Texture2D_AddRef(texture_to_share);
             texture_for_payload_ref = texture_to_share;
             processed_as_gpu = TRUE;
             miniav_log(MINIAV_LOG_LEVEL_DEBUG,
@@ -1162,9 +1212,7 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
       }
       ID3D11Texture2D *per_frame_staging_texture = NULL;
       D3D11_TEXTURE2D_DESC staging_desc_cpu;
-      ID3D11Texture2D_GetDesc(
-          dxgi_ctx->staging_texture,
-          &staging_desc_cpu); // Use desc from main staging texture
+      ID3D11Texture2D_GetDesc(dxgi_ctx->staging_texture, &staging_desc_cpu);
 
       hr = ID3D11Device_CreateTexture2D(dxgi_ctx->d3d_device, &staging_desc_cpu,
                                         NULL, &per_frame_staging_texture);
@@ -1172,6 +1220,7 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR,
                    "DXGI: Failed to create per-frame CPU staging texture: 0x%X",
                    hr);
+        miniav_free(buffer);
         continue;
       }
 
@@ -1188,25 +1237,39 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
                    "DXGI: Failed to map per-frame CPU staging texture: 0x%X",
                    hr);
         ID3D11Texture2D_Release(per_frame_staging_texture);
+        miniav_free(buffer);
         continue;
       }
 
-      buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-      buffer.data.video.planes[0] = mapped_rect_cpu.pData;
-      buffer.data.video.stride_bytes[0] = mapped_rect_cpu.RowPitch;
-      buffer.data_size_bytes =
+      buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+
+      // Set up single plane for BGRA32 format
+      buffer->data.video.num_planes = 1;
+      buffer->data.video.planes[0].data_ptr = mapped_rect_cpu.pData;
+      buffer->data.video.planes[0].width = dxgi_ctx->frame_width;
+      buffer->data.video.planes[0].height = dxgi_ctx->frame_height;
+      buffer->data.video.planes[0].stride_bytes = mapped_rect_cpu.RowPitch;
+      buffer->data.video.planes[0].offset_bytes = 0;
+      buffer->data.video.planes[0].subresource_index = 0;
+
+      buffer->data_size_bytes =
           mapped_rect_cpu.RowPitch * dxgi_ctx->frame_height;
-      texture_for_payload_ref =
-          per_frame_staging_texture; // This texture will be managed by the
-                                     // payload
-    } else {                         // GPU Path successful
-      buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
-      buffer.data.video.native_gpu_shared_handle = shared_handle_for_app;
-      buffer.data.video.native_gpu_texture_ptr =
-          texture_for_payload_ref; // The AddRef'd texture
-      buffer.data.video.planes[0] = NULL;
-      buffer.data.video.stride_bytes[0] = 0;
-      buffer.data_size_bytes = 0;
+      texture_for_payload_ref = per_frame_staging_texture;
+    } else {
+      // GPU Path successful
+      buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
+
+      // Set up single plane for GPU texture
+      buffer->data.video.num_planes = 1;
+      buffer->data.video.planes[0].data_ptr = (void *)shared_handle_for_app;
+      buffer->data.video.planes[0].width = dxgi_ctx->frame_width;
+      buffer->data.video.planes[0].height = dxgi_ctx->frame_height;
+      buffer->data.video.planes[0].stride_bytes =
+          0; // GPU textures don't have stride
+      buffer->data.video.planes[0].offset_bytes = 0;
+      buffer->data.video.planes[0].subresource_index = 0;
+
+      buffer->data_size_bytes = 0; // GPU textures don't have size
     }
 
     MiniAVNativeBufferInternalPayload *internal_payload =
@@ -1223,10 +1286,9 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
         if (shared_handle_for_app)
           CloseHandle(shared_handle_for_app);
         if (texture_for_payload_ref)
-          ID3D11Texture2D_Release(
-              texture_for_payload_ref); // Release the AddRef for payload
-      } else {                          // CPU
-        if (texture_for_payload_ref) {  // This is the per_frame_staging_texture
+          ID3D11Texture2D_Release(texture_for_payload_ref);
+      } else {
+        if (texture_for_payload_ref) {
           ID3D11DeviceContext_Unmap(dxgi_ctx->d3d_context,
                                     (ID3D11Resource *)texture_for_payload_ref,
                                     0);
@@ -1235,17 +1297,18 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
       }
       miniav_free(internal_payload);
       miniav_free(frame_release_payload_app);
+      miniav_free(buffer);
       continue;
     }
 
     if (processed_as_gpu) {
       frame_release_payload_app->type = MINIAV_OUTPUT_PREFERENCE_GPU;
       frame_release_payload_app->gpu.shared_gpu_texture =
-          texture_for_payload_ref; // Already AddRef'd for this purpose
-    } else {                       // CPU
+          texture_for_payload_ref;
+    } else {
       frame_release_payload_app->type = MINIAV_OUTPUT_PREFERENCE_CPU;
       frame_release_payload_app->cpu.staging_texture_for_frame =
-          texture_for_payload_ref; // This is the per_frame_staging_texture
+          texture_for_payload_ref;
       frame_release_payload_app->cpu.d3d_context_for_unmap =
           dxgi_ctx->d3d_context;
       frame_release_payload_app->cpu.subresource_for_unmap = 0;
@@ -1253,12 +1316,15 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
 
     internal_payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN;
     internal_payload->context_owner = dxgi_ctx->parent_ctx;
-    internal_payload->native_resource_ptr = frame_release_payload_app;
-    buffer.internal_handle = internal_payload;
+    internal_payload->native_singular_resource_ptr = frame_release_payload_app;
+    internal_payload->num_planar_resources_to_release = 0;
+    internal_payload->parent_miniav_buffer_ptr =
+        buffer; // Store heap-allocated buffer
+    buffer->internal_handle = internal_payload;
 
     if (dxgi_ctx->app_callback_internal) {
       dxgi_ctx->app_callback_internal(
-          &buffer, dxgi_ctx->app_callback_user_data_internal);
+          buffer, dxgi_ctx->app_callback_user_data_internal);
     } else {
       miniav_log(MINIAV_LOG_LEVEL_WARN,
                  "DXGI: No app callback. Releasing frame internally.");
@@ -1278,10 +1344,10 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
       }
       miniav_free(frame_release_payload_app);
       miniav_free(internal_payload);
+      miniav_free(buffer);
     }
 
-    Sleep(frame_timeout_ms > 0 ? frame_timeout_ms
-                               : 1); // Use frame_timeout_ms here
+    Sleep(frame_timeout_ms > 0 ? frame_timeout_ms : 1);
   }
 
   if (acquired_texture) {

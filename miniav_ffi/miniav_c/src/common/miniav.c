@@ -118,7 +118,7 @@ MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
       res = MINIAV_ERROR_INVALID_HANDLE;
     }
   } else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_AUDIO) {
-    miniav_free(payload->native_resource_ptr);
+    miniav_free(payload->native_singular_resource_ptr);
     res = MINIAV_SUCCESS;
   }
    else {

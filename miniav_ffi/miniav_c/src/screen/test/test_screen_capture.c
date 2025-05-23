@@ -62,7 +62,7 @@ void test_screen_buffer_callback(const MiniAVBuffer *buffer, void *user_data) {
     last_video_timestamp_us = buffer->timestamp_us;
 
     if (buffer->content_type == MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE) {
-      printf("  GPU Buffer: Shared Handle = %p\n", buffer->data.video.native_gpu_shared_handle);
+      printf("  GPU Buffer: Shared Handle = %p\n", buffer->data.video.planes[0].data_ptr);
     }
 
     if (buffer->internal_handle) {
@@ -216,8 +216,8 @@ int main() {
   memset(&capture_format, 0, sizeof(MiniAVVideoInfo));
   capture_format.width = 1920;
   capture_format.height = 1080;
-  capture_format.output_preference = MINIAV_OUTPUT_PREFERENCE_CPU;
-  capture_format.frame_rate_numerator = 60;
+  capture_format.output_preference = MINIAV_OUTPUT_PREFERENCE_GPU;
+  capture_format.frame_rate_numerator = 240;
   capture_format.frame_rate_denominator = 1;
 
   printf("\nConfiguring screen capture for display '%s'...\n",

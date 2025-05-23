@@ -50,7 +50,7 @@ void test_camera_buffer_callback(const MiniAVBuffer *buffer, void *user_data) {
         "us, %ux%u, Format=%d, Size=%zu bytes, Plane0 Stride=%u, Frame #%d\n",
         buffer->timestamp_us, buffer->data.video.info.width,
         buffer->data.video.info.height, buffer->data.video.info.pixel_format,
-        buffer->data_size_bytes, buffer->data.video.stride_bytes[0],
+        buffer->data_size_bytes, buffer->data.video.planes[0].stride_bytes,
         g_frame_count);
 
     if (buffer->internal_handle) {

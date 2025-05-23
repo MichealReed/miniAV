@@ -190,6 +190,220 @@ static const char *screen_pixel_format_to_string(MiniAVPixelFormat format) {
   }
 }
 
+static void setup_cpu_planes_for_format(MiniAVBuffer *buffer,
+                                        MiniAVPixelFormat format,
+                                        uint32_t width, uint32_t height,
+                                        void *base_ptr, size_t total_size) {
+  switch (format) {
+  case MINIAV_PIXEL_FORMAT_BGRA32:
+  case MINIAV_PIXEL_FORMAT_RGBA32:
+  case MINIAV_PIXEL_FORMAT_ARGB32:
+  case MINIAV_PIXEL_FORMAT_ABGR32:
+  case MINIAV_PIXEL_FORMAT_BGRX32: {
+    // Single-plane RGB formats
+    buffer->data.video.num_planes = 1;
+    buffer->data.video.planes[0].data_ptr = base_ptr;
+    buffer->data.video.planes[0].width = width;
+    buffer->data.video.planes[0].height = height;
+    buffer->data.video.planes[0].stride_bytes = width * 4; // 4 bytes per pixel
+    buffer->data.video.planes[0].offset_bytes = 0;
+    buffer->data.video.planes[0].subresource_index = 0;
+    break;
+  }
+
+  case MINIAV_PIXEL_FORMAT_RGB24:
+  case MINIAV_PIXEL_FORMAT_BGR24: {
+    // Single-plane RGB formats
+    buffer->data.video.num_planes = 1;
+    buffer->data.video.planes[0].data_ptr = base_ptr;
+    buffer->data.video.planes[0].width = width;
+    buffer->data.video.planes[0].height = height;
+    buffer->data.video.planes[0].stride_bytes = width * 3; // 3 bytes per pixel
+    buffer->data.video.planes[0].offset_bytes = 0;
+    buffer->data.video.planes[0].subresource_index = 0;
+    break;
+  }
+
+  case MINIAV_PIXEL_FORMAT_I420: {
+    // Three-plane YUV format
+    buffer->data.video.num_planes = 3;
+    uint32_t y_size = width * height;
+    uint32_t uv_size = (width / 2) * (height / 2);
+
+    // Y plane
+    buffer->data.video.planes[0].data_ptr = base_ptr;
+    buffer->data.video.planes[0].width = width;
+    buffer->data.video.planes[0].height = height;
+    buffer->data.video.planes[0].stride_bytes = width;
+    buffer->data.video.planes[0].offset_bytes = 0;
+    buffer->data.video.planes[0].subresource_index = 0;
+
+    // U plane
+    buffer->data.video.planes[1].data_ptr = (uint8_t *)base_ptr + y_size;
+    buffer->data.video.planes[1].width = width / 2;
+    buffer->data.video.planes[1].height = height / 2;
+    buffer->data.video.planes[1].stride_bytes = width / 2;
+    buffer->data.video.planes[1].offset_bytes = y_size;
+    buffer->data.video.planes[1].subresource_index = 1;
+
+    // V plane
+    buffer->data.video.planes[2].data_ptr =
+        (uint8_t *)base_ptr + y_size + uv_size;
+    buffer->data.video.planes[2].width = width / 2;
+    buffer->data.video.planes[2].height = height / 2;
+    buffer->data.video.planes[2].stride_bytes = width / 2;
+    buffer->data.video.planes[2].offset_bytes = y_size + uv_size;
+    buffer->data.video.planes[2].subresource_index = 2;
+    break;
+  }
+
+  case MINIAV_PIXEL_FORMAT_NV12: {
+    // Two-plane YUV format
+    buffer->data.video.num_planes = 2;
+    uint32_t y_size = width * height;
+
+    // Y plane
+    buffer->data.video.planes[0].data_ptr = base_ptr;
+    buffer->data.video.planes[0].width = width;
+    buffer->data.video.planes[0].height = height;
+    buffer->data.video.planes[0].stride_bytes = width;
+    buffer->data.video.planes[0].offset_bytes = 0;
+    buffer->data.video.planes[0].subresource_index = 0;
+
+    // UV plane (interleaved)
+    buffer->data.video.planes[1].data_ptr = (uint8_t *)base_ptr + y_size;
+    buffer->data.video.planes[1].width = width / 2;
+    buffer->data.video.planes[1].height = height / 2;
+    buffer->data.video.planes[1].stride_bytes = width; // UV stride = Y stride
+    buffer->data.video.planes[1].offset_bytes = y_size;
+    buffer->data.video.planes[1].subresource_index = 1;
+    break;
+  }
+
+  default: {
+    // Unknown format - assume single plane
+    buffer->data.video.num_planes = 1;
+    buffer->data.video.planes[0].data_ptr = base_ptr;
+    buffer->data.video.planes[0].width = width;
+    buffer->data.video.planes[0].height = height;
+    buffer->data.video.planes[0].stride_bytes = width * 4; // Assume 4 bytes
+    buffer->data.video.planes[0].offset_bytes = 0;
+    buffer->data.video.planes[0].subresource_index = 0;
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW Screen: Unknown pixel format %d, assuming single plane",
+               format);
+    break;
+  }
+  }
+}
+
+static void setup_gpu_planes_for_format(MiniAVBuffer *buffer,
+                                        MiniAVPixelFormat format,
+                                        uint32_t width, uint32_t height,
+                                        int dmabuf_fd, size_t total_size) {
+  switch (format) {
+  case MINIAV_PIXEL_FORMAT_BGRA32:
+  case MINIAV_PIXEL_FORMAT_RGBA32:
+  case MINIAV_PIXEL_FORMAT_ARGB32:
+  case MINIAV_PIXEL_FORMAT_ABGR32:
+  case MINIAV_PIXEL_FORMAT_BGRX32: {
+    // Single-plane RGB formats
+    buffer->data.video.num_planes = 1;
+    buffer->data.video.planes[0].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    buffer->data.video.planes[0].width = width;
+    buffer->data.video.planes[0].height = height;
+    buffer->data.video.planes[0].stride_bytes = width * 4;
+    buffer->data.video.planes[0].offset_bytes = 0;
+    buffer->data.video.planes[0].subresource_index = 0;
+    break;
+  }
+
+  case MINIAV_PIXEL_FORMAT_RGB24:
+  case MINIAV_PIXEL_FORMAT_BGR24: {
+    // Single-plane RGB formats
+    buffer->data.video.num_planes = 1;
+    buffer->data.video.planes[0].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    buffer->data.video.planes[0].width = width;
+    buffer->data.video.planes[0].height = height;
+    buffer->data.video.planes[0].stride_bytes = width * 3;
+    buffer->data.video.planes[0].offset_bytes = 0;
+    buffer->data.video.planes[0].subresource_index = 0;
+    break;
+  }
+
+  case MINIAV_PIXEL_FORMAT_I420: {
+    // Three-plane YUV format - all using same DMA-BUF FD with different offsets
+    buffer->data.video.num_planes = 3;
+    uint32_t y_size = width * height;
+    uint32_t uv_size = (width / 2) * (height / 2);
+
+    // Y plane
+    buffer->data.video.planes[0].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    buffer->data.video.planes[0].width = width;
+    buffer->data.video.planes[0].height = height;
+    buffer->data.video.planes[0].stride_bytes = width;
+    buffer->data.video.planes[0].offset_bytes = 0;
+    buffer->data.video.planes[0].subresource_index = 0;
+
+    // U plane
+    buffer->data.video.planes[1].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    buffer->data.video.planes[1].width = width / 2;
+    buffer->data.video.planes[1].height = height / 2;
+    buffer->data.video.planes[1].stride_bytes = width / 2;
+    buffer->data.video.planes[1].offset_bytes = y_size;
+    buffer->data.video.planes[1].subresource_index = 1;
+
+    // V plane
+    buffer->data.video.planes[2].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    buffer->data.video.planes[2].width = width / 2;
+    buffer->data.video.planes[2].height = height / 2;
+    buffer->data.video.planes[2].stride_bytes = width / 2;
+    buffer->data.video.planes[2].offset_bytes = y_size + uv_size;
+    buffer->data.video.planes[2].subresource_index = 2;
+    break;
+  }
+
+  case MINIAV_PIXEL_FORMAT_NV12: {
+    // Two-plane YUV format
+    buffer->data.video.num_planes = 2;
+    uint32_t y_size = width * height;
+
+    // Y plane
+    buffer->data.video.planes[0].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    buffer->data.video.planes[0].width = width;
+    buffer->data.video.planes[0].height = height;
+    buffer->data.video.planes[0].stride_bytes = width;
+    buffer->data.video.planes[0].offset_bytes = 0;
+    buffer->data.video.planes[0].subresource_index = 0;
+
+    // UV plane
+    buffer->data.video.planes[1].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    buffer->data.video.planes[1].width = width / 2;
+    buffer->data.video.planes[1].height = height / 2;
+    buffer->data.video.planes[1].stride_bytes = width;
+    buffer->data.video.planes[1].offset_bytes = y_size;
+    buffer->data.video.planes[1].subresource_index = 1;
+    break;
+  }
+
+  default: {
+    // Unknown format - assume single plane
+    buffer->data.video.num_planes = 1;
+    buffer->data.video.planes[0].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    buffer->data.video.planes[0].width = width;
+    buffer->data.video.planes[0].height = height;
+    buffer->data.video.planes[0].stride_bytes = width * 4;
+    buffer->data.video.planes[0].offset_bytes = 0;
+    buffer->data.video.planes[0].subresource_index = 0;
+    miniav_log(
+        MINIAV_LOG_LEVEL_WARN,
+        "PW Screen: Unknown pixel format %d for GPU, assuming single plane",
+        format);
+    break;
+  }
+  }
+}
+
 // --- Forward Declarations for Static Functions ---
 static void *pw_screen_loop_thread_func(void *arg);
 
@@ -1796,55 +2010,94 @@ pw_screen_release_buffer(struct MiniAVScreenContext *ctx,
   MiniAVNativeBufferInternalPayload *payload =
       (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
 
-  miniav_log(
-      MINIAV_LOG_LEVEL_DEBUG,
-      "PW Screen: payload ptr=%p, handle_type=%d, native_resource_ptr=%p",
-      payload, payload->handle_type, payload->native_resource_ptr);
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PW Screen: payload ptr=%p, handle_type=%d, "
+             "native_singular_resource_ptr=%p, num_planar_resources=%u",
+             payload, payload->handle_type,
+             payload->native_singular_resource_ptr,
+             payload->num_planar_resources_to_release);
 
   if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN) {
-    PipeWireFrameReleasePayload *frame_payload =
-        (PipeWireFrameReleasePayload *)payload->native_resource_ptr;
-    if (frame_payload) {
-      if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU) {
-        if (frame_payload->cpu.cpu_ptr) {
-          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                     "PW Screen: Freeing CPU buffer from DMABUF/MemFd copy.");
-          miniav_free(frame_payload->cpu.cpu_ptr);
-          frame_payload->cpu.cpu_ptr = NULL;
-        }
-        // src_dmabuf_fd is not owned, do not close
-      } else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU) {
-        if (frame_payload->gpu.dup_dmabuf_fd > 0) {
-          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                     "PW Screen: Closing duplicated DMABUF FD: %d",
-                     frame_payload->gpu.dup_dmabuf_fd);
-          if (close(frame_payload->gpu.dup_dmabuf_fd) == -1) {
-            miniav_log(MINIAV_LOG_LEVEL_WARN,
-                       "PW Screen: Failed to close DMABUF FD %d: %s",
-                       frame_payload->gpu.dup_dmabuf_fd, strerror(errno));
+
+    // Handle multi-plane resources (rarely used for screen capture, but
+    // supported)
+    if (payload->num_planar_resources_to_release > 0) {
+      for (uint32_t i = 0; i < payload->num_planar_resources_to_release; ++i) {
+        if (payload->native_planar_resource_ptrs[i]) {
+          // For screen capture, this would typically be additional DMA-BUF FDs
+          int fd = (int)(intptr_t)payload->native_planar_resource_ptrs[i];
+          if (fd > 0) {
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "PW Screen: Closing planar DMA-BUF FD: %d", fd);
+            close(fd);
           }
-          frame_payload->gpu.dup_dmabuf_fd = -1;
+          payload->native_planar_resource_ptrs[i] = NULL;
         }
-      } else {
-        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "PW Screen: release_buffer: Unknown frame_payload type %d",
-                   frame_payload->type);
       }
-      miniav_free(frame_payload);
-      payload->native_resource_ptr = NULL;
     }
+
+    // Handle single resource (typical case)
+    if (payload->native_singular_resource_ptr) {
+      PipeWireFrameReleasePayload *frame_payload =
+          (PipeWireFrameReleasePayload *)payload->native_singular_resource_ptr;
+
+      if (frame_payload) {
+        if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU) {
+          if (frame_payload->cpu.cpu_ptr) {
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "PW Screen: Freeing CPU buffer from DMABUF/MemFd copy.");
+            miniav_free(frame_payload->cpu.cpu_ptr);
+            frame_payload->cpu.cpu_ptr = NULL;
+          }
+          // src_dmabuf_fd is not owned, do not close
+        } else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU) {
+          if (frame_payload->gpu.dup_dmabuf_fd > 0) {
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "PW Screen: Closing duplicated DMABUF FD: %d",
+                       frame_payload->gpu.dup_dmabuf_fd);
+            if (close(frame_payload->gpu.dup_dmabuf_fd) == -1) {
+              miniav_log(MINIAV_LOG_LEVEL_WARN,
+                         "PW Screen: Failed to close DMABUF FD %d: %s",
+                         frame_payload->gpu.dup_dmabuf_fd, strerror(errno));
+            }
+            frame_payload->gpu.dup_dmabuf_fd = -1;
+          }
+        } else {
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "PW Screen: release_buffer: Unknown frame_payload type %d",
+                     frame_payload->type);
+        }
+        miniav_free(frame_payload);
+        payload->native_singular_resource_ptr = NULL;
+      }
+    }
+
+    // Clean up parent buffer
+    if (payload->parent_miniav_buffer_ptr) {
+      miniav_free(payload->parent_miniav_buffer_ptr);
+      payload->parent_miniav_buffer_ptr = NULL;
+    }
+
     miniav_free(payload);
     return MINIAV_SUCCESS;
   } else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_AUDIO) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW Screen: Releasing audio buffer (no specific native resource "
                "to free from payload).");
+    if (payload->parent_miniav_buffer_ptr) {
+      miniav_free(payload->parent_miniav_buffer_ptr);
+      payload->parent_miniav_buffer_ptr = NULL;
+    }
     miniav_free(payload);
     return MINIAV_SUCCESS;
   } else {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
                "PW Screen: release_buffer called for unknown handle_type %d.",
                payload->handle_type);
+    if (payload->parent_miniav_buffer_ptr) {
+      miniav_free(payload->parent_miniav_buffer_ptr);
+      payload->parent_miniav_buffer_ptr = NULL;
+    }
     miniav_free(payload);
     return MINIAV_SUCCESS;
   }
@@ -2165,23 +2418,39 @@ static void on_video_stream_process(void *data) {
       goto queue_and_continue_video;
     }
 
-    MiniAVBuffer miniav_buffer = {0};
-    miniav_buffer.type = MINIAV_BUFFER_TYPE_VIDEO;
-    miniav_buffer.user_data = pctx->parent_ctx->app_callback_user_data;
-    miniav_buffer.timestamp_us = miniav_get_time_us();
-    miniav_buffer.data.video.info = pctx->parent_ctx->configured_video_format;
+    // ALLOCATE BUFFER ON HEAP - This was the issue!
+    MiniAVBuffer *miniav_buffer =
+        (MiniAVBuffer *)miniav_calloc(1, sizeof(MiniAVBuffer));
+    if (!miniav_buffer) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "PW Screen: Failed to allocate MiniAVBuffer");
+      goto queue_and_continue_video;
+    }
+
+    miniav_buffer->type = MINIAV_BUFFER_TYPE_VIDEO;
+    miniav_buffer->user_data = pctx->parent_ctx->app_callback_user_data;
+    miniav_buffer->timestamp_us = miniav_get_time_us();
+    miniav_buffer->data.video.info = pctx->parent_ctx->configured_video_format;
 
     PipeWireFrameReleasePayload *frame_payload =
         miniav_calloc(1, sizeof(PipeWireFrameReleasePayload));
     if (!frame_payload) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "PW Screen: Failed to alloc PipeWireFrameReleasePayload.");
+      miniav_free(miniav_buffer); // Clean up the buffer we just allocated
       goto queue_and_continue_video;
     }
 
     int buf_type = spa_buf->datas[0].type;
     int fd = spa_buf->datas[0].fd;
     size_t size = spa_buf->datas[0].maxsize;
+
+    MiniAVPixelFormat format =
+        pctx->parent_ctx->configured_video_format.pixel_format;
+    uint32_t width = pctx->parent_ctx->configured_video_format.width;
+    uint32_t height = pctx->parent_ctx->configured_video_format.height;
+
+    bool success = false;
 
     if (buf_type == SPA_DATA_DmaBuf) {
       // --- DMA-BUF path ---
@@ -2195,6 +2464,7 @@ static void on_video_stream_process(void *data) {
               "). Cannot directly mmap for CPU pixel copy. Skipping frame.",
               pctx->current_video_format_details.negotiated_modifier);
           miniav_free(frame_payload);
+          miniav_free(miniav_buffer);
           goto queue_and_continue_video;
         }
         void *mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
@@ -2205,8 +2475,10 @@ static void on_video_stream_process(void *data) {
                      strerror(errno),
                      pctx->current_video_format_details.negotiated_modifier);
           miniav_free(frame_payload);
+          miniav_free(miniav_buffer);
           goto queue_and_continue_video;
         }
+
         struct dma_buf_sync sync_args;
         int ret;
         sync_args.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
@@ -2217,17 +2489,19 @@ static void on_video_stream_process(void *data) {
           if (errno == ENOTTY) {
             miniav_log(MINIAV_LOG_LEVEL_WARN,
                        "PW Screen: DMA_BUF_IOCTL_SYNC not supported on this "
-                       "buffer. Skipping frame.");
+                       "buffer. Proceeding without sync.");
           } else {
             miniav_log(MINIAV_LOG_LEVEL_ERROR,
                        "PW Screen: DMA_BUF_IOCTL_SYNC (START) failed: %s. "
                        "Skipping frame.",
                        strerror(errno));
+            munmap(mapped, size);
+            miniav_free(frame_payload);
+            miniav_free(miniav_buffer);
+            goto queue_and_continue_video;
           }
-          munmap(mapped, size);
-          miniav_free(frame_payload);
-          goto queue_and_continue_video;
         }
+
         uint8_t *cpu_copy = (uint8_t *)miniav_calloc(1, size);
         if (!cpu_copy) {
           miniav_log(MINIAV_LOG_LEVEL_ERROR,
@@ -2236,6 +2510,7 @@ static void on_video_stream_process(void *data) {
           ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_args);
           munmap(mapped, size);
           miniav_free(frame_payload);
+          miniav_free(miniav_buffer);
           goto queue_and_continue_video;
         }
         memcpy(cpu_copy, mapped, size);
@@ -2243,23 +2518,25 @@ static void on_video_stream_process(void *data) {
         ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_args);
         munmap(mapped, size);
 
-        miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-        miniav_buffer.data.video.planes[0] = cpu_copy;
-        miniav_buffer.data_size_bytes = size;
-        miniav_buffer.data.video.stride_bytes[0] =
-            pctx->current_video_format_details.spa_format.size.width *
-            4; // adjust for format
+        miniav_buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+
+        // Set up CPU plane pointers based on format
+        setup_cpu_planes_for_format(miniav_buffer, format, width, height,
+                                    cpu_copy, size);
+
+        miniav_buffer->data_size_bytes = size;
 
         frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
         frame_payload->cpu.cpu_ptr = cpu_copy;
         frame_payload->cpu.cpu_size = size;
         frame_payload->cpu.src_dmabuf_fd = fd;
+        success = true;
 
         miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                    "PW Screen: DMABUF (linear, synced) mapped and copied to "
                    "CPU buffer for app.");
       } else {
-        // --- GPU path: pass DMABUF FD as before ---
+        // --- GPU path: pass DMABUF FD ---
         int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
         if (dup_fd == -1) {
           miniav_log(
@@ -2267,18 +2544,25 @@ static void on_video_stream_process(void *data) {
               "PW Screen: Failed to dup DMABUF FD %d: %s. Skipping frame.", fd,
               strerror(errno));
           miniav_free(frame_payload);
+          miniav_free(miniav_buffer);
           goto queue_and_continue_video;
         }
-        miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD;
-        miniav_buffer.data.video.native_gpu_dmabuf_fd = dup_fd;
-        miniav_buffer.data_size_bytes = size;
+
+        miniav_buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD;
+
+        // Set up GPU plane pointers based on format
+        setup_gpu_planes_for_format(miniav_buffer, format, width, height,
+                                    dup_fd, size);
+
+        miniav_buffer->data_size_bytes = size;
 
         frame_payload->type = MINIAV_OUTPUT_PREFERENCE_GPU;
         frame_payload->gpu.dup_dmabuf_fd = dup_fd;
+        success = true;
 
         miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                    "PW Screen: DMABUF frame: FD %d (orig %d), ts %" PRIu64 "us",
-                   dup_fd, fd, miniav_buffer.timestamp_us);
+                   dup_fd, fd, miniav_buffer->timestamp_us);
       }
     } else if (buf_type == SPA_DATA_MemFd) {
       // --- MemFd path ---
@@ -2287,6 +2571,7 @@ static void on_video_stream_process(void *data) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR,
                    "PW Screen: Failed to mmap MemFd: %s", strerror(errno));
         miniav_free(frame_payload);
+        miniav_free(miniav_buffer);
         goto queue_and_continue_video;
       }
       uint8_t *cpu_copy = (uint8_t *)miniav_calloc(1, size);
@@ -2295,38 +2580,44 @@ static void on_video_stream_process(void *data) {
                    "PW Screen: Failed to alloc CPU buffer for MemFd copy.");
         munmap(mapped, size);
         miniav_free(frame_payload);
+        miniav_free(miniav_buffer);
         goto queue_and_continue_video;
       }
       memcpy(cpu_copy, mapped, size);
       munmap(mapped, size);
 
-      miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-      miniav_buffer.data.video.planes[0] = cpu_copy;
-      miniav_buffer.data_size_bytes = size;
-      miniav_buffer.data.video.stride_bytes[0] =
-          pctx->current_video_format_details.spa_format.size.width *
-          4; // adjust for format
+      miniav_buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+
+      // Set up CPU plane pointers based on format
+      setup_cpu_planes_for_format(miniav_buffer, format, width, height,
+                                  cpu_copy, size);
+
+      miniav_buffer->data_size_bytes = size;
 
       frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
       frame_payload->cpu.cpu_ptr = cpu_copy;
       frame_payload->cpu.cpu_size = size;
       frame_payload->cpu.src_dmabuf_fd = fd;
+      success = true;
 
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "PW Screen: MemFd mapped and copied to CPU buffer for app.");
     } else if (buf_type == SPA_DATA_MemPtr) {
       // --- MemPtr path ---
-      miniav_buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-      miniav_buffer.data.video.planes[0] = spa_buf->datas[0].data;
-      miniav_buffer.data_size_bytes = size;
-      miniav_buffer.data.video.stride_bytes[0] =
-          pctx->current_video_format_details.spa_format.size.width *
-          4; // adjust for format
+      miniav_buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+
+      // Set up CPU plane pointers based on format - direct pointer to PipeWire
+      // data
+      setup_cpu_planes_for_format(miniav_buffer, format, width, height,
+                                  spa_buf->datas[0].data, size);
+
+      miniav_buffer->data_size_bytes = size;
 
       frame_payload->type = MINIAV_OUTPUT_PREFERENCE_CPU;
-      frame_payload->cpu.cpu_ptr = NULL;
+      frame_payload->cpu.cpu_ptr = NULL; // Direct pointer, don't copy
       frame_payload->cpu.cpu_size = size;
       frame_payload->cpu.src_dmabuf_fd = -1;
+      success = true;
 
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "PW Screen: MemPtr buffer passed directly to app.");
@@ -2334,6 +2625,13 @@ static void on_video_stream_process(void *data) {
       miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Unhandled buffer type %d",
                  buf_type);
       miniav_free(frame_payload);
+      miniav_free(miniav_buffer);
+      goto queue_and_continue_video;
+    }
+
+    if (!success) {
+      miniav_free(frame_payload);
+      miniav_free(miniav_buffer);
       goto queue_and_continue_video;
     }
 
@@ -2350,22 +2648,27 @@ static void on_video_stream_process(void *data) {
                frame_payload->gpu.dup_dmabuf_fd > 0)
         close(frame_payload->gpu.dup_dmabuf_fd);
       miniav_free(frame_payload);
+      miniav_free(miniav_buffer);
       goto queue_and_continue_video;
     }
     payload_alloc->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN;
     payload_alloc->context_owner = pctx->parent_ctx;
-    payload_alloc->native_resource_ptr = frame_payload;
-    miniav_buffer.internal_handle = payload_alloc;
+    payload_alloc->native_singular_resource_ptr = frame_payload;
+    payload_alloc->num_planar_resources_to_release = 0;
+    payload_alloc->parent_miniav_buffer_ptr =
+        miniav_buffer; // Store pointer to heap buffer
+    miniav_buffer->internal_handle = payload_alloc;
 
     // Deliver to app
-    pctx->parent_ctx->app_callback(&miniav_buffer,
+    pctx->parent_ctx->app_callback(miniav_buffer,
                                    pctx->parent_ctx->app_callback_user_data);
     payload_alloc = NULL; // Ownership passed to app
 
   queue_and_continue_video:
     if (payload_alloc) {
       PipeWireFrameReleasePayload *fp =
-          (PipeWireFrameReleasePayload *)payload_alloc->native_resource_ptr;
+          (PipeWireFrameReleasePayload *)
+              payload_alloc->native_singular_resource_ptr;
       if (fp) {
         if (fp->type == MINIAV_OUTPUT_PREFERENCE_CPU && fp->cpu.cpu_ptr)
           miniav_free(fp->cpu.cpu_ptr);
@@ -2373,6 +2676,9 @@ static void on_video_stream_process(void *data) {
                  fp->gpu.dup_dmabuf_fd > 0)
           close(fp->gpu.dup_dmabuf_fd);
         miniav_free(fp);
+      }
+      if (payload_alloc->parent_miniav_buffer_ptr) {
+        miniav_free(payload_alloc->parent_miniav_buffer_ptr);
       }
       miniav_free(payload_alloc);
     }

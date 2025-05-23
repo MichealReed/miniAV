@@ -106,10 +106,11 @@ typedef struct MFPlatformContext {
 
 typedef struct MFFrameReleasePayload {
   IMFSample *sample; // Always present
-  MiniAVOutputPreference type;
+  MiniAVOutputPreference original_output_preference;
   union {
-    struct {         // For CPU
-      void *cpu_ptr; // If you ever copy to CPU memory
+    struct {                        // For CPU
+      IMFMediaBuffer *media_buffer; // To properly unlock
+      void *mapped_cpu_ptr;
       size_t cpu_size;
     } cpu;
     struct {                        // For GPU
@@ -161,11 +162,7 @@ MFPlatform_Release(IMFSourceReaderCallback *pThis) {
 
 static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
     IMFSourceReaderCallback *pThis, HRESULT hrStatus, DWORD dwStreamIndex,
-    DWORD dwStreamFlags, LONGLONG llTimestamp,
-    IMFSample *
-        pSample // Can be NULL if dwStreamFlags has
-                // MF_SOURCE_READERF_ENDOFSTREAM or MF_SOURCE_READERF_STREAMTICK
-) {
+    DWORD dwStreamFlags, LONGLONG llTimestamp, IMFSample *pSample) {
   MFPlatformContext *mf_ctx = (MFPlatformContext *)pThis;
   MiniAVCameraContext *parent_ctx = mf_ctx->parent_ctx;
   HRESULT hr = S_OK; // hr for internal operations, hrStatus is from MF
@@ -189,14 +186,12 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "MF: OnReadSample received error status from MF: 0x%X",
                hrStatus);
-    hr = hrStatus; // Propagate MF error to our internal hr for
-                   // request_next_sample logic
+    hr = hrStatus;
     goto request_next_sample;
   }
 
   if (dwStreamFlags & MF_SOURCE_READERF_ENDOFSTREAM) {
     miniav_log(MINIAV_LOG_LEVEL_INFO, "MF: End of stream.");
-    // TODO: Signal application via callback with a special buffer type or flag
     goto done;
   }
   if (dwStreamFlags & MF_SOURCE_READERF_STREAMTICK) {
@@ -216,9 +211,9 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "MF: Failed to allocate MiniAVBuffer struct.");
     hr = E_OUTOFMEMORY;
-    goto request_next_sample; // Or appropriate cleanup that doesn't assume
-                              // media_buffer exists
+    goto request_next_sample;
   }
+
   buffer_ptr->type = MINIAV_BUFFER_TYPE_VIDEO;
   buffer_ptr->timestamp_us = llTimestamp;
   buffer_ptr->data.video.info.width = parent_ctx->configured_video_format.width;
@@ -226,24 +221,6 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
       parent_ctx->configured_video_format.height;
   buffer_ptr->data.video.info.pixel_format =
       parent_ctx->configured_video_format.pixel_format;
-  miniav_log(
-      MINIAV_LOG_LEVEL_DEBUG,
-      "MF: OnReadSample - parent_ctx->configured_video_format.pixel_format is "
-      "%d (0x%X)",
-      parent_ctx->configured_video_format.pixel_format,
-      parent_ctx->configured_video_format.pixel_format);
-  miniav_log(
-      MINIAV_LOG_LEVEL_DEBUG,
-      "MF: OnReadSample - buffer.data.video.info.pixel_format is %d (0x%X) "
-      "before callback",
-      buffer_ptr->data.video.info.pixel_format,
-      buffer_ptr->data.video.info.pixel_format);
-  // Assuming MiniAVBuffer has these fields (actual_output_preference_achieved,
-  // shared_texture_handle, native_gpu_texture_ptr)
-  // buffer.data.video.actual_output_preference_achieved =
-  // MINIAV_OUTPUT_PREFERENCE_CPU; // Default
-  buffer_ptr->data.video.native_gpu_shared_handle = NULL;
-  buffer_ptr->data.video.native_gpu_texture_ptr = NULL;
 
   MiniAVOutputPreference desired_output_pref =
       parent_ctx->configured_video_format.output_preference;
@@ -252,9 +229,7 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   // set
   if (mf_ctx->dxgi_manager && mf_ctx->d3d_device &&
       mf_ctx->d3d_device_context &&
-      (desired_output_pref ==
-       MINIAV_OUTPUT_PREFERENCE_GPU)) { // Or other specific shared
-                                        // texture prefs
+      (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU)) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "MF: Attempting GPU shared texture path.");
     hr = IMFSample_GetBufferByIndex(pSample, 0, &media_buffer);
@@ -275,24 +250,20 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                      tex_desc.Width, tex_desc.Height, tex_desc.Format,
                      tex_desc.MiscFlags, tex_desc.BindFlags);
 
+          ID3D11Texture2D *texture_to_share = d3d11_texture;
+          bool texture_needs_release = false;
+
           if (!(tex_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED)) {
             miniav_log(MINIAV_LOG_LEVEL_WARN,
-                       "MF: Texture from IMFDXGIBuffer is NOT shareable "
-                       "(D3D11_RESOURCE_MISC_SHARED flag missing). "
+                       "MF: Texture from IMFDXGIBuffer is NOT shareable. "
                        "Attempting to copy to a shareable texture.");
 
             ID3D11Texture2D *shareable_texture = NULL;
-            D3D11_TEXTURE2D_DESC shareable_tex_desc =
-                tex_desc; // Copy original desc
+            D3D11_TEXTURE2D_DESC shareable_tex_desc = tex_desc;
             shareable_tex_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED |
                                            D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
             shareable_tex_desc.CPUAccessFlags = 0;
             shareable_tex_desc.Usage = D3D11_USAGE_DEFAULT;
-            // BindFlags should be compatible with CopyResource source and
-            // render target/shader resource if needed later For now, let's keep
-            // original bind flags and see if CreateTexture2D and CopyResource
-            // work. If CreateTexture2D fails with E_INVALIDARG, BindFlags might
-            // need adjustment (e.g. ensure D3D11_BIND_SHADER_RESOURCE)
 
             hr = ID3D11Device_CreateTexture2D(mf_ctx->d3d_device,
                                               &shareable_tex_desc, NULL,
@@ -302,106 +273,81 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                   mf_ctx->d3d_device_context,
                   (ID3D11Resource *)shareable_texture,
                   (ID3D11Resource *)d3d11_texture);
+              texture_to_share = shareable_texture;
+              texture_needs_release = true;
               miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                          "MF: Copied to a new shareable texture.");
-
-              IDXGIResource1 *dxgi_resource_new = NULL;
-              hr = ID3D11Texture2D_QueryInterface(shareable_texture,
-                                                  &IID_IDXGIResource1,
-                                                  (void **)&dxgi_resource_new);
-              if (SUCCEEDED(hr)) {
-                HANDLE shared_handle = NULL;
-                hr = IDXGIResource1_CreateSharedHandle(
-                    dxgi_resource_new, NULL, DXGI_SHARED_RESOURCE_READ, NULL,
-                    &shared_handle);
-                if (SUCCEEDED(hr)) {
-                  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                             "MF: Successfully created DXGI shared handle from "
-                             "copied texture: %p",
-                             shared_handle);
-                  buffer_ptr->data.video.planes[0] = NULL;
-                  buffer_ptr->data.video.native_gpu_texture_ptr =
-                      shareable_texture;
-                  buffer_ptr->data.video.native_gpu_shared_handle =
-                      shared_handle;
-                  buffer_ptr->data.video.stride_bytes[0] = 0;
-                  buffer_ptr->data_size_bytes = 0;
-                  processed_as_gpu_texture = TRUE;
-                  buffer_ptr->content_type =
-                      MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
-                  // The application is responsible for
-                  // CloseHandle(shared_handle)
-                } else {
-                  miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                             "MF: Failed to create DXGI shared handle from "
-                             "copied texture: 0x%X. Will fallback to CPU.",
-                             hr);
-                }
-                IDXGIResource1_Release(dxgi_resource_new);
-              } else {
-                miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                           "MF: Failed to query IDXGIResource1 from copied "
-                           "texture: 0x%X. Will fallback to CPU.",
-                           hr);
-              }
             } else {
               miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                         "MF: Failed to create a shareable texture for copy: "
+                         "MF: Failed to create shareable GPU texture copy: "
                          "0x%X. Will fallback to CPU.",
                          hr);
             }
-          } else { // Original texture is shareable
+          }
+
+          if (SUCCEEDED(hr)) {
             IDXGIResource1 *dxgi_resource = NULL;
             hr = ID3D11Texture2D_QueryInterface(
-                d3d11_texture, &IID_IDXGIResource1, (void **)&dxgi_resource);
+                texture_to_share, &IID_IDXGIResource1, (void **)&dxgi_resource);
             if (SUCCEEDED(hr)) {
               HANDLE shared_handle = NULL;
-              hr = IDXGIResource1_CreateSharedHandle(
-                  dxgi_resource, NULL,       // No specific security attributes
-                  DXGI_SHARED_RESOURCE_READ, // Read-only access
-                  NULL,                      // Unnamed resource
-                  &shared_handle);
+              hr = IDXGIResource1_CreateSharedHandle(dxgi_resource, NULL,
+                                                     DXGI_SHARED_RESOURCE_READ,
+                                                     NULL, &shared_handle);
               if (SUCCEEDED(hr)) {
                 miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                           "MF: Successfully created DXGI shared handle from "
-                           "original texture: %p",
+                           "MF: Successfully created DXGI shared handle: %p",
                            shared_handle);
-                buffer_ptr->data.video.planes[0] = NULL;
-                buffer_ptr->data.video.native_gpu_shared_handle = shared_handle;
-                buffer_ptr->data.video.native_gpu_texture_ptr = d3d11_texture;
-                buffer_ptr->data.video.stride_bytes[0] = 0;
-                buffer_ptr->data_size_bytes = 0;
-                processed_as_gpu_texture = TRUE;
+
                 buffer_ptr->content_type =
                     MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
+                buffer_ptr->data.video.num_planes = 1;
+                buffer_ptr->data.video.planes[0].data_ptr =
+                    (void *)shared_handle;
+                buffer_ptr->data.video.planes[0].width =
+                    buffer_ptr->data.video.info.width;
+                buffer_ptr->data.video.planes[0].height =
+                    buffer_ptr->data.video.info.height;
+                buffer_ptr->data.video.planes[0].stride_bytes =
+                    0; // GPU textures don't have stride
+                buffer_ptr->data.video.planes[0].offset_bytes = 0;
+                buffer_ptr->data.video.planes[0].subresource_index = 0;
+                buffer_ptr->data_size_bytes = 0;
+
+                processed_as_gpu_texture = TRUE;
+
+                // Store texture reference for cleanup (with proper reference)
+                if (texture_needs_release) {
+                  ID3D11Texture2D_AddRef(
+                      texture_to_share); // AddRef for payload
+                }
               } else {
                 miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                           "MF: Failed to create DXGI shared handle from "
-                           "original texture: 0x%X. "
+                           "MF: Failed to create DXGI shared handle: 0x%X. "
                            "Will fallback to CPU.",
                            hr);
               }
               IDXGIResource1_Release(dxgi_resource);
             } else {
               miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                         "MF: Failed to query IDXGIResource1 from original "
-                         "texture: 0x%X. Will "
+                         "MF: Failed to query IDXGIResource1: 0x%X. Will "
                          "fallback to CPU.",
                          hr);
             }
           }
+
           ID3D11Texture2D_Release(d3d11_texture);
         } else {
           miniav_log(MINIAV_LOG_LEVEL_WARN,
                      "MF: Failed to get D3D11 texture from DXGI buffer: 0x%X. "
-                     "Might not be a D3D backed sample. Will fallback to CPU.",
+                     "Will fallback to CPU.",
                      hr);
         }
         IMFDXGIBuffer_Release(dxgi_buffer);
       } else {
         miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "MF: Failed to query IMFDXGIBuffer from media buffer: 0x%X. "
-                   "Not a DXGI buffer. Will fallback to CPU.",
+                   "MF: Failed to query IMFDXGIBuffer: 0x%X. Not a DXGI "
+                   "buffer. Will fallback to CPU.",
                    hr);
       }
       IMFMediaBuffer_Release(media_buffer);
@@ -414,37 +360,23 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
     }
   }
 
-  // CPU Path (if not processed as GPU texture, or if CPU is preferred, or if
-  // GPU_IF_AVAILABLE failed to produce shareable texture)
+  // CPU Path (if not processed as GPU texture)
   if (!processed_as_gpu_texture) {
     buffer_ptr->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
     if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU) {
-      miniav_log(MINIAV_LOG_LEVEL_INFO,
-                 "MF: GPU_IF_AVAILABLE preference: Falling back to CPU path "
-                 "for sample processing.");
+      miniav_log(MINIAV_LOG_LEVEL_INFO, "MF: GPU preference: Falling back to "
+                                        "CPU path for sample processing.");
     } else if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_CPU) {
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "MF: CPU preference: Processing sample on CPU path.");
     }
-    // Add handling here if you introduce a
-    // MINIAV_OUTPUT_PREFERENCE_SHARED_TEXTURE_DXGI_REQUIRE enum, in which case,
-    // if processed_as_gpu_texture is false, it would be a hard error. e.g., if
-    // (desired_output_pref ==
-    // MINIAV_OUTPUT_PREFERENCE_SHARED_TEXTURE_DXGI_REQUIRE &&
-    // !processed_as_gpu_texture) {
-    //    miniav_log(MINIAV_LOG_LEVEL_ERROR, "MF: DXGI shared texture was
-    //    required but could not be obtained."); hr = E_FAIL; // Or a more
-    //    specific error goto request_next_sample;
-    // }
-
-    // buffer.data.video.actual_output_preference_achieved =
-    // MINIAV_OUTPUT_PREFERENCE_CPU;
 
     hr = IMFSample_ConvertToContiguousBuffer(pSample, &media_buffer);
     if (FAILED(hr)) {
       miniav_log(
           MINIAV_LOG_LEVEL_ERROR,
           "MF: Failed to convert to contiguous buffer for CPU path: 0x%X", hr);
+      miniav_free(buffer_ptr);
       goto request_next_sample;
     }
 
@@ -453,14 +385,14 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
     if (FAILED(hr)) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "MF: Failed to lock media buffer for CPU path: 0x%X", hr);
+      IMFMediaBuffer_Release(media_buffer);
+      miniav_free(buffer_ptr);
       goto request_next_sample;
     }
 
-    buffer_ptr->data.video.planes[0] = raw_buffer_data;
-
+    // Calculate stride
     LONG temp_stride_signed = 0;
     UINT32 stride = 0;
-
     GUID mf_subtype = MiniAVPixelFormatToMfSubType(
         parent_ctx->configured_video_format.pixel_format);
 
@@ -477,24 +409,13 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
             temp_stride_signed, stride);
       } else {
         miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "MF: MFGetStrideForBitmapInfoHeader failed (0x%X) or "
-                   "returned 0 stride for format %lu (MiniAV format %d), width "
-                   "%u. Falling back to manual calculation.",
-                   hr_stride, mf_subtype.Data1,
-                   parent_ctx->configured_video_format.pixel_format,
-                   parent_ctx->configured_video_format.width);
+                   "MF: MFGetStrideForBitmapInfoHeader failed. Using fallback "
+                   "calculation.");
       }
-    } else {
-      miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "MF: Could not map MiniAVPixelFormat %d to MF subtype for "
-                 "stride calculation. Falling back to manual calculation.",
-                 parent_ctx->configured_video_format.pixel_format);
     }
 
     if (stride == 0) {
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "MF: Using fallback stride calculation for pixel format %d.",
-                 buffer_ptr->data.video.info.pixel_format);
+      // Fallback stride calculation
       if (buffer_ptr->data.video.info.pixel_format ==
               MINIAV_PIXEL_FORMAT_YUY2 ||
           buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_UYVY)
@@ -522,31 +443,93 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                MINIAV_PIXEL_FORMAT_I420)
         stride = buffer_ptr->data.video.info.width;
       else {
-        miniav_log(
-            MINIAV_LOG_LEVEL_WARN,
-            "MF: Unknown pixel format for fallback stride calculation: %d. "
-            "Defaulting stride to width * 4.",
-            buffer_ptr->data.video.info.pixel_format);
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "MF: Unknown pixel format for fallback stride calculation: "
+                   "%d. Defaulting stride to width * 4.",
+                   buffer_ptr->data.video.info.pixel_format);
         stride = buffer_ptr->data.video.info.width * 4;
       }
     }
-    buffer_ptr->data.video.stride_bytes[0] = stride;
 
+    // Set up planes based on pixel format
     if (buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_NV12 ||
         buffer_ptr->data.video.info.pixel_format == MINIAV_PIXEL_FORMAT_NV21) {
-      buffer_ptr->data.video.planes[1] =
+      // NV12/NV21: 2 planes (Y + UV)
+      buffer_ptr->data.video.num_planes = 2;
+
+      // Y plane
+      buffer_ptr->data.video.planes[0].data_ptr = raw_buffer_data;
+      buffer_ptr->data.video.planes[0].width =
+          buffer_ptr->data.video.info.width;
+      buffer_ptr->data.video.planes[0].height =
+          buffer_ptr->data.video.info.height;
+      buffer_ptr->data.video.planes[0].stride_bytes = stride;
+      buffer_ptr->data.video.planes[0].offset_bytes = 0;
+      buffer_ptr->data.video.planes[0].subresource_index = 0;
+
+      // UV plane
+      buffer_ptr->data.video.planes[1].data_ptr =
           raw_buffer_data + (stride * buffer_ptr->data.video.info.height);
-      buffer_ptr->data.video.stride_bytes[1] = stride;
+      buffer_ptr->data.video.planes[1].width =
+          buffer_ptr->data.video.info.width / 2;
+      buffer_ptr->data.video.planes[1].height =
+          buffer_ptr->data.video.info.height / 2;
+      buffer_ptr->data.video.planes[1].stride_bytes = stride;
+      buffer_ptr->data.video.planes[1].offset_bytes =
+          stride * buffer_ptr->data.video.info.height;
+      buffer_ptr->data.video.planes[1].subresource_index = 1;
     } else if (buffer_ptr->data.video.info.pixel_format ==
                MINIAV_PIXEL_FORMAT_I420) {
-      buffer_ptr->data.video.planes[1] =
+      // I420: 3 planes (Y + U + V)
+      buffer_ptr->data.video.num_planes = 3;
+
+      // Y plane
+      buffer_ptr->data.video.planes[0].data_ptr = raw_buffer_data;
+      buffer_ptr->data.video.planes[0].width =
+          buffer_ptr->data.video.info.width;
+      buffer_ptr->data.video.planes[0].height =
+          buffer_ptr->data.video.info.height;
+      buffer_ptr->data.video.planes[0].stride_bytes = stride;
+      buffer_ptr->data.video.planes[0].offset_bytes = 0;
+      buffer_ptr->data.video.planes[0].subresource_index = 0;
+
+      // U plane
+      UINT32 uv_stride = stride / 2;
+      UINT32 uv_height = buffer_ptr->data.video.info.height / 2;
+      buffer_ptr->data.video.planes[1].data_ptr =
           raw_buffer_data + (stride * buffer_ptr->data.video.info.height);
-      buffer_ptr->data.video.stride_bytes[1] = stride / 2;
-      buffer_ptr->data.video.planes[2] =
+      buffer_ptr->data.video.planes[1].width =
+          buffer_ptr->data.video.info.width / 2;
+      buffer_ptr->data.video.planes[1].height = uv_height;
+      buffer_ptr->data.video.planes[1].stride_bytes = uv_stride;
+      buffer_ptr->data.video.planes[1].offset_bytes =
+          stride * buffer_ptr->data.video.info.height;
+      buffer_ptr->data.video.planes[1].subresource_index = 1;
+
+      // V plane
+      buffer_ptr->data.video.planes[2].data_ptr =
           raw_buffer_data + (stride * buffer_ptr->data.video.info.height) +
-          (stride / 2 * buffer_ptr->data.video.info.height / 2);
-      buffer_ptr->data.video.stride_bytes[2] = stride / 2;
+          (uv_stride * uv_height);
+      buffer_ptr->data.video.planes[2].width =
+          buffer_ptr->data.video.info.width / 2;
+      buffer_ptr->data.video.planes[2].height = uv_height;
+      buffer_ptr->data.video.planes[2].stride_bytes = uv_stride;
+      buffer_ptr->data.video.planes[2].offset_bytes =
+          stride * buffer_ptr->data.video.info.height + uv_stride * uv_height;
+      buffer_ptr->data.video.planes[2].subresource_index = 2;
+    } else {
+      // Single plane formats (RGB, YUY2, etc.)
+      buffer_ptr->data.video.num_planes = 1;
+      buffer_ptr->data.video.planes[0].data_ptr = raw_buffer_data;
+      buffer_ptr->data.video.planes[0].width =
+          buffer_ptr->data.video.info.width;
+      buffer_ptr->data.video.planes[0].height =
+          buffer_ptr->data.video.info.height;
+      buffer_ptr->data.video.planes[0].stride_bytes = stride;
+      buffer_ptr->data.video.planes[0].offset_bytes = 0;
+      buffer_ptr->data.video.planes[0].subresource_index = 0;
     }
+
     buffer_ptr->data_size_bytes = current_length;
   }
 
@@ -558,28 +541,33 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   if (!frame_payload) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "MF: Failed to allocate MFFrameReleasePayload.");
-    miniav_free(buffer_ptr);
-    if (processed_as_gpu_texture &&
-        buffer_ptr->data.video.native_gpu_shared_handle != NULL) {
-      CloseHandle(buffer_ptr->data.video.native_gpu_shared_handle);
+
+    if (processed_as_gpu_texture && buffer_ptr->data.video.planes[0].data_ptr) {
+      CloseHandle((HANDLE)buffer_ptr->data.video.planes[0].data_ptr);
     }
+    if (media_buffer && raw_buffer_data) {
+      IMFMediaBuffer_Unlock(media_buffer);
+      IMFMediaBuffer_Release(media_buffer);
+    }
+    miniav_free(buffer_ptr);
     hr = E_OUTOFMEMORY;
     goto request_next_sample;
   }
 
   // Fill in the payload
   frame_payload->sample = pSample;
-  frame_payload->type = processed_as_gpu_texture ? MINIAV_OUTPUT_PREFERENCE_GPU
-                                                 : MINIAV_OUTPUT_PREFERENCE_CPU;
-  if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_CPU) {
-    frame_payload->cpu.cpu_ptr = raw_buffer_data;
-    frame_payload->cpu.cpu_size = current_length;
-    // No need to store IMFMediaBuffer* here, it's managed above
-  } else if (frame_payload->type == MINIAV_OUTPUT_PREFERENCE_GPU) {
+  IMFSample_AddRef(pSample); // AddRef for payload
+  frame_payload->original_output_preference = desired_output_pref;
+
+  if (processed_as_gpu_texture) {
     frame_payload->gpu.shared_texture_handle =
-        buffer_ptr->data.video.native_gpu_shared_handle;
-    frame_payload->gpu.gpu_texture_ptr =
-        buffer_ptr->data.video.native_gpu_texture_ptr;
+        (HANDLE)buffer_ptr->data.video.planes[0].data_ptr;
+    frame_payload->gpu.gpu_texture_ptr = NULL; // Could store texture if needed
+  } else {
+    frame_payload->cpu.media_buffer = media_buffer; // Transfer ownership
+    frame_payload->cpu.mapped_cpu_ptr = raw_buffer_data;
+    frame_payload->cpu.cpu_size = current_length;
+    media_buffer = NULL; // Transferred to payload
   }
 
   MiniAVNativeBufferInternalPayload *payload =
@@ -588,53 +576,53 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   if (!payload) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "MF: Failed to allocate internal handle payload.");
+
+    if (processed_as_gpu_texture && frame_payload->gpu.shared_texture_handle) {
+      CloseHandle(frame_payload->gpu.shared_texture_handle);
+    }
+    if (frame_payload->cpu.media_buffer && frame_payload->cpu.mapped_cpu_ptr) {
+      IMFMediaBuffer_Unlock(frame_payload->cpu.media_buffer);
+      IMFMediaBuffer_Release(frame_payload->cpu.media_buffer);
+    }
+    if (frame_payload->sample) {
+      IMFSample_Release(frame_payload->sample);
+    }
     miniav_free(frame_payload);
     miniav_free(buffer_ptr);
-    if (processed_as_gpu_texture &&
-        buffer_ptr->data.video.native_gpu_shared_handle != NULL) {
-      CloseHandle(buffer_ptr->data.video.native_gpu_shared_handle);
-    }
     hr = E_OUTOFMEMORY;
     goto request_next_sample;
   }
+
   payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA;
   payload->context_owner = parent_ctx;
-  payload->native_resource_ptr = frame_payload;
+  payload->native_singular_resource_ptr = frame_payload;
+  payload->num_planar_resources_to_release = 0;
   payload->parent_miniav_buffer_ptr = buffer_ptr;
 
   buffer_ptr->internal_handle = payload;
 
   if (mf_ctx->app_callback_internal) {
-    mf_ctx->app_callback_internal(
-        buffer_ptr, // Pass pointer to heap-allocated struct
-        mf_ctx->app_callback_user_data_internal);
+    mf_ctx->app_callback_internal(buffer_ptr,
+                                  mf_ctx->app_callback_user_data_internal);
   } else {
-    // No app callback, release resources we took/created
-    miniav_free(payload);
-    miniav_free(buffer_ptr); // Free the MiniAVBuffer as well
-    if (processed_as_gpu_texture &&
-        buffer_ptr->data.video.native_gpu_shared_handle != NULL) {
-      CloseHandle(buffer_ptr->data.video.native_gpu_shared_handle);
+    // No app callback, release resources
+    if (processed_as_gpu_texture && frame_payload->gpu.shared_texture_handle) {
+      CloseHandle(frame_payload->gpu.shared_texture_handle);
     }
+    if (frame_payload->cpu.media_buffer && frame_payload->cpu.mapped_cpu_ptr) {
+      IMFMediaBuffer_Unlock(frame_payload->cpu.media_buffer);
+      IMFMediaBuffer_Release(frame_payload->cpu.media_buffer);
+    }
+    if (frame_payload->sample) {
+      IMFSample_Release(frame_payload->sample);
+    }
+    miniav_free(frame_payload);
+    miniav_free(payload);
+    miniav_free(buffer_ptr);
   }
-
-  if (raw_buffer_data) { // Only unlock if it was locked (CPU path)
-    IMFMediaBuffer_Unlock(media_buffer);
-  }
-  // Note: If processed_as_gpu_texture, the shared_handle (stored in
-  // buffer.data.video.planes[0]) is passed to the application. The application
-  // is responsible for calling CloseHandle on it when it's done with the
-  // buffer (unless there was no app_callback_internal, in which case we closed
-  // it). MiniAV's mf_release_buffer will release the IMFSample.
 
 request_next_sample:
   if (mf_ctx->is_streaming && parent_ctx->is_running && mf_ctx->source_reader) {
-    // Only request next sample if the current sample processing was generally
-    // successful (hr is S_OK) or if the error was non-fatal for streaming (e.g.
-    // a recoverable glitch). For simplicity here, we request next sample if hr
-    // is SUCCEEDED. If hr is a failure (e.g. E_FAIL from a required GPU texture
-    // not being available, or E_OUTOFMEMORY), we might choose to stop streaming
-    // or log and continue trying.
     if (SUCCEEDED(hr)) {
       HRESULT hr_read = IMFSourceReader_ReadSample(
           mf_ctx->source_reader, (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0,
@@ -642,28 +630,25 @@ request_next_sample:
       if (FAILED(hr_read)) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR,
                    "MF: Failed to request next sample: 0x%X", hr_read);
-        mf_ctx->is_streaming = FALSE; // Stop streaming on read error
-        // Potentially signal an error to the application through a callback
-        // status
+        mf_ctx->is_streaming = FALSE;
       }
     } else {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "MF: Not requesting next sample due to error in current "
                  "sample processing: 0x%X",
                  hr);
-      // If a "REQUIRE_GPU" preference failed, this is where you might set
-      // mf_ctx->is_streaming = FALSE; For GPU_IF_AVAILABLE, a failure to get
-      // GPU texture already fell back to CPU, so 'hr' here would reflect issues
-      // in CPU path or payload allocation.
     }
   }
 
 done:
-  if (media_buffer)
+  if (media_buffer) {
+    if (raw_buffer_data) {
+      IMFMediaBuffer_Unlock(media_buffer);
+    }
     IMFMediaBuffer_Release(media_buffer);
+  }
   LeaveCriticalSection(&mf_ctx->critical_section);
-  return S_OK; // Always return S_OK from OnReadSample itself, errors are
-               // handled internally
+  return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE
@@ -1717,18 +1702,133 @@ error_cleanup_no_device_activate_release: // For errors before device_activate
              : MINIAV_ERROR_SYSTEM_CALL_FAILED;
 }
 
-static MiniAVResultCode mf_release_buffer(MiniAVCameraContext *ctx, void *internal_handle_ptr) {
-    MINIAV_UNUSED(ctx);
-    if (!internal_handle_ptr) return MINIAV_ERROR_INVALID_ARG;
+static MiniAVResultCode mf_release_buffer(MiniAVCameraContext *ctx,
+                                          void *internal_handle_ptr) {
+  MINIAV_UNUSED(ctx);
 
-    MiniAVNativeBufferInternalPayload *payload = (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
-    if (payload->native_resource_ptr) {
-        MFFrameReleasePayload *frame_payload = (MFFrameReleasePayload *)payload->native_resource_ptr;
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "MF: release_buffer called with internal_handle_ptr=%p",
+             internal_handle_ptr);
+
+  if (!internal_handle_ptr) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "MF: release_buffer called with NULL internal_handle_ptr.");
+    return MINIAV_SUCCESS;
+  }
+
+  MiniAVNativeBufferInternalPayload *payload =
+      (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "MF: payload ptr=%p, handle_type=%d, "
+             "native_singular_resource_ptr=%p, num_planar_resources=%u",
+             payload, payload->handle_type,
+             payload->native_singular_resource_ptr,
+             payload->num_planar_resources_to_release);
+
+  if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA) {
+
+    // Handle multi-plane resources (rarely used for MF, but supported)
+    if (payload->num_planar_resources_to_release > 0) {
+      for (uint32_t i = 0; i < payload->num_planar_resources_to_release; ++i) {
+        if (payload->native_planar_resource_ptrs[i]) {
+          // For MF, this would typically be additional COM objects
+          IUnknown *com_obj =
+              (IUnknown *)payload->native_planar_resource_ptrs[i];
+          ULONG ref_count = IUnknown_Release(com_obj);
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                     "MF: Released planar COM object %u. Ref count: %lu", i,
+                     ref_count);
+          payload->native_planar_resource_ptrs[i] = NULL;
+        }
+      }
+    }
+
+    // Handle single resource (typical case)
+    if (payload->native_singular_resource_ptr) {
+      MFFrameReleasePayload *frame_payload =
+          (MFFrameReleasePayload *)payload->native_singular_resource_ptr;
+
+      if (frame_payload) {
+        if (frame_payload->original_output_preference ==
+            MINIAV_OUTPUT_PREFERENCE_CPU) {
+          // CPU path cleanup
+          if (frame_payload->cpu.media_buffer &&
+              frame_payload->cpu.mapped_cpu_ptr) {
+            HRESULT hr_unlock =
+                IMFMediaBuffer_Unlock(frame_payload->cpu.media_buffer);
+            if (FAILED(hr_unlock)) {
+              miniav_log(MINIAV_LOG_LEVEL_WARN,
+                         "MF: Failed to unlock media buffer: 0x%X", hr_unlock);
+            } else {
+              miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                         "MF: Unlocked CPU media buffer.");
+            }
+          }
+          if (frame_payload->cpu.media_buffer) {
+            ULONG ref_count =
+                IMFMediaBuffer_Release(frame_payload->cpu.media_buffer);
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "MF: Released CPU media buffer. Ref count: %lu",
+                       ref_count);
+          }
+        } else if (frame_payload->original_output_preference ==
+                   MINIAV_OUTPUT_PREFERENCE_GPU) {
+          // GPU path cleanup
+          if (frame_payload->gpu.shared_texture_handle) {
+            // The application is responsible for closing the handle it
+            // received. We just log that we are aware of it.
+            miniav_log(
+                MINIAV_LOG_LEVEL_DEBUG,
+                "MF: App is responsible for closing GPU shared handle %p.",
+                frame_payload->gpu.shared_texture_handle);
+          }
+          if (frame_payload->gpu.gpu_texture_ptr) {
+            ULONG ref_count =
+                IUnknown_Release(frame_payload->gpu.gpu_texture_ptr);
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "MF: Released GPU texture COM object. Ref count: %lu",
+                       ref_count);
+          }
+        } else {
+          miniav_log(
+              MINIAV_LOG_LEVEL_WARN,
+              "MF: Unknown original_output_preference in release_buffer: %d",
+              frame_payload->original_output_preference);
+        }
+
+        // Always release the IMFSample
+        if (frame_payload->sample) {
+          ULONG ref_count = IMFSample_Release(frame_payload->sample);
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                     "MF: Released IMFSample. Ref count: %lu", ref_count);
+        }
+
         miniav_free(frame_payload);
-        payload->native_resource_ptr = NULL;
+        payload->native_singular_resource_ptr = NULL;
+      }
+    }
+
+    // Clean up parent buffer
+    if (payload->parent_miniav_buffer_ptr) {
+      miniav_free(payload->parent_miniav_buffer_ptr);
+      payload->parent_miniav_buffer_ptr = NULL;
+    }
+
+    miniav_free(payload);
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "MF: Released buffer payload.");
+    return MINIAV_SUCCESS;
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "MF: release_buffer called for unknown handle_type %d.",
+               payload->handle_type);
+    if (payload->parent_miniav_buffer_ptr) {
+      miniav_free(payload->parent_miniav_buffer_ptr);
+      payload->parent_miniav_buffer_ptr = NULL;
     }
     miniav_free(payload);
     return MINIAV_SUCCESS;
+  }
 }
 
 static MiniAVResultCode mf_start_capture(MiniAVCameraContext *ctx) {

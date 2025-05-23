@@ -351,8 +351,8 @@ wgc_get_default_formats(const char *device_id_utf8,
 
 static MiniAVResultCode
 wgc_get_configured_video_formats(MiniAVScreenContext *ctx,
-                           MiniAVVideoInfo *video_format_out,
-                           MiniAVAudioInfo *audio_format_out) {
+                                 MiniAVVideoInfo *video_format_out,
+                                 MiniAVAudioInfo *audio_format_out) {
   if (!ctx || !ctx->platform_ctx || !video_format_out) {
     return MINIAV_ERROR_INVALID_ARG;
   }
@@ -759,7 +759,8 @@ static MiniAVResultCode wgc_configure_capture_item(
     // Update parent context's configured format
     wgc_ctx->parent_ctx->configured_video_format.width = wgc_ctx->frame_width;
     wgc_ctx->parent_ctx->configured_video_format.height = wgc_ctx->frame_height;
-    wgc_ctx->parent_ctx->configured_video_format.pixel_format = wgc_ctx->pixel_format;
+    wgc_ctx->parent_ctx->configured_video_format.pixel_format =
+        wgc_ctx->pixel_format;
     wgc_ctx->parent_ctx->configured_video_format.frame_rate_numerator =
         wgc_ctx->target_fps;
     wgc_ctx->parent_ctx->configured_video_format.frame_rate_denominator = 1;
@@ -876,9 +877,9 @@ static MiniAVResultCode wgc_configure_capture_item(
   return MINIAV_SUCCESS;
 }
 
-static MiniAVResultCode
-wgc_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
-                      const MiniAVVideoInfo *format) {
+static MiniAVResultCode wgc_configure_display(MiniAVScreenContext *ctx,
+                                              const char *display_id_utf8,
+                                              const MiniAVVideoInfo *format) {
   if (!ctx || !ctx->platform_ctx || !display_id_utf8 || !format)
     return MINIAV_ERROR_INVALID_ARG;
   WGCScreenPlatformContext *wgc_ctx =
@@ -889,9 +890,9 @@ wgc_configure_display(MiniAVScreenContext *ctx, const char *display_id_utf8,
                                     WGC_TARGET_DISPLAY, format);
 }
 
-static MiniAVResultCode
-wgc_configure_window(MiniAVScreenContext *ctx, const char *window_id_utf8,
-                     const MiniAVVideoInfo *format) {
+static MiniAVResultCode wgc_configure_window(MiniAVScreenContext *ctx,
+                                             const char *window_id_utf8,
+                                             const MiniAVVideoInfo *format) {
   if (!ctx || !ctx->platform_ctx || !window_id_utf8 || !format)
     return MINIAV_ERROR_INVALID_ARG;
   WGCScreenPlatformContext *wgc_ctx =
@@ -902,10 +903,10 @@ wgc_configure_window(MiniAVScreenContext *ctx, const char *window_id_utf8,
                                     format);
 }
 
-static MiniAVResultCode
-wgc_configure_region(MiniAVScreenContext *ctx, const char *display_id_utf8,
-                     int x, int y, int width, int height,
-                     const MiniAVVideoInfo *format) {
+static MiniAVResultCode wgc_configure_region(MiniAVScreenContext *ctx,
+                                             const char *display_id_utf8, int x,
+                                             int y, int width, int height,
+                                             const MiniAVVideoInfo *format) {
   MINIAV_UNUSED(ctx);
   MINIAV_UNUSED(display_id_utf8);
   MINIAV_UNUSED(x);
@@ -1106,64 +1107,129 @@ static MiniAVResultCode wgc_stop_capture(MiniAVScreenContext *ctx) {
   return MINIAV_SUCCESS;
 }
 
-static MiniAVResultCode
-wgc_release_buffer(MiniAVScreenContext *ctx,
-                   void *internal_handle_ptr) {
+static MiniAVResultCode wgc_release_buffer(MiniAVScreenContext *ctx,
+                                           void *internal_handle_ptr) {
   MINIAV_UNUSED(
       ctx); // ctx might be useful for logging or D3D context if not in payload
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "WGC: release_buffer called with internal_handle_ptr=%p",
+             internal_handle_ptr);
+
   if (!internal_handle_ptr) {
-    miniav_log(
-        MINIAV_LOG_LEVEL_ERROR,
-        "WGC: native_buffer_payload_resource_ptr is NULL in release_buffer.");
-    return MINIAV_ERROR_INVALID_ARG;
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "WGC: release_buffer called with NULL internal_handle_ptr.");
+    return MINIAV_SUCCESS;
   }
 
   MiniAVNativeBufferInternalPayload *payload =
       (MiniAVNativeBufferInternalPayload *)internal_handle_ptr;
 
-  WGCFrameReleasePayload *frame_payload =
-      (WGCFrameReleasePayload *)payload->native_resource_ptr;
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "WGC: payload ptr=%p, handle_type=%d, "
+             "native_singular_resource_ptr=%p, num_planar_resources=%u",
+             payload, payload->handle_type,
+             payload->native_singular_resource_ptr,
+             payload->num_planar_resources_to_release);
 
-  if (frame_payload->original_output_preference ==
-          MINIAV_OUTPUT_PREFERENCE_CPU ||
-      (frame_payload->original_output_preference ==
-           MINIAV_OUTPUT_PREFERENCE_GPU &&
-       frame_payload
-           ->cpu_staging_texture_to_unmap_release) // Fallback to CPU case
-  ) {
-    if (frame_payload->d3d_context_for_unmap &&
-        frame_payload->cpu_staging_texture_to_unmap_release) {
-      frame_payload->d3d_context_for_unmap->Unmap(
-          frame_payload->cpu_staging_texture_to_unmap_release,
-          frame_payload->subresource_for_unmap);
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: Unmapped CPU staging texture.");
+  if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN) {
+
+    // Handle multi-plane resources (rarely used for WGC, but supported)
+    if (payload->num_planar_resources_to_release > 0) {
+      for (uint32_t i = 0; i < payload->num_planar_resources_to_release; ++i) {
+        if (payload->native_planar_resource_ptrs[i]) {
+          // For WGC, this would typically be additional D3D11 textures
+          ID3D11Texture2D *texture =
+              (ID3D11Texture2D *)payload->native_planar_resource_ptrs[i];
+          ULONG ref_count = texture->Release();
+          miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                     "WGC: Released planar texture %u. Ref count: %lu", i,
+                     ref_count);
+          payload->native_planar_resource_ptrs[i] = NULL;
+        }
+      }
     }
-    if (frame_payload->cpu_staging_texture_to_unmap_release) {
-      frame_payload->cpu_staging_texture_to_unmap_release->Release();
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: Released CPU staging texture.");
+
+    // Handle single resource (typical case)
+    if (payload->native_singular_resource_ptr) {
+      WGCFrameReleasePayload *frame_payload =
+          (WGCFrameReleasePayload *)payload->native_singular_resource_ptr;
+
+      if (frame_payload) {
+        if (frame_payload->original_output_preference ==
+                MINIAV_OUTPUT_PREFERENCE_CPU ||
+            (frame_payload->original_output_preference ==
+                 MINIAV_OUTPUT_PREFERENCE_GPU &&
+             frame_payload
+                 ->cpu_staging_texture_to_unmap_release) // Fallback to CPU case
+        ) {
+          if (frame_payload->d3d_context_for_unmap &&
+              frame_payload->cpu_staging_texture_to_unmap_release) {
+            frame_payload->d3d_context_for_unmap->Unmap(
+                frame_payload->cpu_staging_texture_to_unmap_release,
+                frame_payload->subresource_for_unmap);
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "WGC: Unmapped CPU staging texture.");
+          }
+          if (frame_payload->cpu_staging_texture_to_unmap_release) {
+            ULONG ref_count =
+                frame_payload->cpu_staging_texture_to_unmap_release->Release();
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "WGC: Released CPU staging texture. Ref count: %lu",
+                       ref_count);
+          }
+        } else if (frame_payload->original_output_preference ==
+                   MINIAV_OUTPUT_PREFERENCE_GPU) {
+          // GPU path
+          if (frame_payload->gpu_texture_to_release) {
+            ULONG ref_count = frame_payload->gpu_texture_to_release
+                                  ->Release(); // Release our AddRef
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "WGC: Released GPU texture for payload. Ref count: %lu",
+                       ref_count);
+          }
+          if (frame_payload->gpu_shared_handle_to_close) {
+            // The application is responsible for closing the handle it
+            // received. We just log that we are aware of it.
+            // CloseHandle(frame_payload->gpu_shared_handle_to_close); // DO NOT
+            // DO THIS HERE
+            miniav_log(
+                MINIAV_LOG_LEVEL_DEBUG,
+                "WGC: App is responsible for closing GPU shared handle %p.",
+                frame_payload->gpu_shared_handle_to_close);
+          }
+        } else {
+          miniav_log(
+              MINIAV_LOG_LEVEL_WARN,
+              "WGC: Unknown original_output_preference in release_buffer: %d",
+              frame_payload->original_output_preference);
+        }
+
+        miniav_free(frame_payload);
+        payload->native_singular_resource_ptr = NULL;
+      }
     }
-  } else if (frame_payload->original_output_preference ==
-             MINIAV_OUTPUT_PREFERENCE_GPU) {
-    // GPU path
-    if (frame_payload->gpu_texture_to_release) {
-      frame_payload->gpu_texture_to_release->Release(); // Release our AddRef
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "WGC: Released GPU texture for payload.");
+
+    // Clean up parent buffer
+    if (payload->parent_miniav_buffer_ptr) {
+      miniav_free(payload->parent_miniav_buffer_ptr);
+      payload->parent_miniav_buffer_ptr = NULL;
     }
-    if (frame_payload->gpu_shared_handle_to_close) {
-      // The application is responsible for closing the handle it received.
-      // We just log that we are aware of it.
-      // CloseHandle(frame_payload->gpu_shared_handle_to_close); // DO NOT DO
-      // THIS HERE
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "WGC: App is responsible for closing GPU shared handle %p.",
-                 frame_payload->gpu_shared_handle_to_close);
+
+    miniav_free(payload);
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: Released buffer payload.");
+    return MINIAV_SUCCESS;
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "WGC: release_buffer called for unknown handle_type %d.",
+               payload->handle_type);
+    if (payload->parent_miniav_buffer_ptr) {
+      miniav_free(payload->parent_miniav_buffer_ptr);
+      payload->parent_miniav_buffer_ptr = NULL;
     }
+    miniav_free(payload);
+    return MINIAV_SUCCESS;
   }
-
-  miniav_free(frame_payload);
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: Freed WGCFrameReleasePayload.");
-  return MINIAV_SUCCESS;
 }
 
 // --- D3D and WGC Resource Management ---
@@ -1301,6 +1367,7 @@ static void wgc_cleanup_capture_resources(WGCScreenPlatformContext *wgc_ctx) {
 }
 
 // --- Frame Arrived Handler ---
+// --- Frame Arrived Handler ---
 static void wgc_on_frame_arrived(
     WGCScreenPlatformContext *wgc_ctx,
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender,
@@ -1357,7 +1424,16 @@ static void wgc_on_frame_arrived(
     return;
   }
 
-  MiniAVBuffer buffer = {};
+  // ALLOCATE BUFFER ON HEAP - This is crucial!
+  MiniAVBuffer *buffer = (MiniAVBuffer *)miniav_calloc(1, sizeof(MiniAVBuffer));
+  if (!buffer) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR, "WGC: Failed to allocate MiniAVBuffer");
+    LeaveCriticalSection(&wgc_ctx->critical_section);
+    if (frame)
+      frame.Close();
+    return;
+  }
+
   WGCFrameReleasePayload *frame_payload_app = nullptr;
   MiniAVNativeBufferInternalPayload *internal_payload = nullptr;
   winrt::com_ptr<ID3D11Texture2D> acquired_texture_com = nullptr;
@@ -1380,15 +1456,17 @@ static void wgc_on_frame_arrived(
 
     auto timestamp_raw =
         frame.SystemRelativeTime(); // TimeSpan (100-nanosecond units)
-    buffer.timestamp_us = static_cast<uint64_t>(timestamp_raw.count() /
-                                                10); // Convert 100ns to us
+    buffer->timestamp_us = static_cast<uint64_t>(timestamp_raw.count() /
+                                                 10); // Convert 100ns to us
 
     auto frame_content_size = frame.ContentSize();
-    buffer.data.video.info.width = static_cast<uint32_t>(frame_content_size.Width);
-    buffer.data.video.info.height = static_cast<uint32_t>(frame_content_size.Height);
-    buffer.data.video.info.pixel_format = wgc_ctx->pixel_format; // BGRA32
-    buffer.type = MINIAV_BUFFER_TYPE_VIDEO;
-    buffer.user_data = wgc_ctx->app_callback_user_data_internal;
+    buffer->data.video.info.width =
+        static_cast<uint32_t>(frame_content_size.Width);
+    buffer->data.video.info.height =
+        static_cast<uint32_t>(frame_content_size.Height);
+    buffer->data.video.info.pixel_format = wgc_ctx->pixel_format; // BGRA32
+    buffer->type = MINIAV_BUFFER_TYPE_VIDEO;
+    buffer->user_data = wgc_ctx->app_callback_user_data_internal;
 
     MiniAVOutputPreference desired_output_pref =
         wgc_ctx->configured_video_format.output_preference;
@@ -1438,17 +1516,8 @@ static void wgc_on_frame_arrived(
       if (SUCCEEDED(hr) &&
           texture_to_share_com) { // Original was shareable or copy succeeded
         winrt::com_ptr<IDXGIResource1> dxgi_resource_to_share;
-        // Replace the problematic line:
-        // hr = texture_to_share_com.as(dxgi_resource_to_share); // QI
-        // With a direct QueryInterface call that returns HRESULT:
-        if (texture_to_share_com) { // Ensure the com_ptr is not null before
-                                    // dereferencing
-          hr = texture_to_share_com->QueryInterface(
-              IID_PPV_ARGS(dxgi_resource_to_share.put()));
-        } else {
-          hr = E_POINTER; // Should not happen if texture_to_share_com was
-                          // checked, but good practice
-        }
+        hr = texture_to_share_com->QueryInterface(
+            IID_PPV_ARGS(dxgi_resource_to_share.put()));
 
         if (SUCCEEDED(hr)) {
           hr = dxgi_resource_to_share->CreateSharedHandle(
@@ -1521,22 +1590,34 @@ static void wgc_on_frame_arrived(
         throw winrt::hresult_error(hr, L"Failed to map CPU staging texture");
       }
 
-      buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-      buffer.data.video.planes[0] = (uint8_t *)mapped_rect_cpu.pData;
-      buffer.data.video.stride_bytes[0] = mapped_rect_cpu.RowPitch;
-      buffer.data_size_bytes =
-          mapped_rect_cpu.RowPitch * buffer.data.video.info.height;
+      buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
 
+      // Set up single plane for BGRA32 format
+      buffer->data.video.num_planes = 1;
+      buffer->data.video.planes[0].data_ptr = mapped_rect_cpu.pData;
+      buffer->data.video.planes[0].width = buffer->data.video.info.width;
+      buffer->data.video.planes[0].height = buffer->data.video.info.height;
+      buffer->data.video.planes[0].stride_bytes = mapped_rect_cpu.RowPitch;
+      buffer->data.video.planes[0].offset_bytes = 0;
+      buffer->data.video.planes[0].subresource_index = 0;
+
+      buffer->data_size_bytes =
+          mapped_rect_cpu.RowPitch * buffer->data.video.info.height;
       texture_for_payload_ref_com = per_frame_staging_texture_com;
     } else { // GPU Path successful
-      buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
-      buffer.data.video.native_gpu_shared_handle = shared_handle_for_app;
-      buffer.data.video.native_gpu_texture_ptr =
-          texture_for_payload_ref_com.get(); // The AddRef'd texture
-      buffer.data.video.planes[0] = nullptr;
-      buffer.data.video.stride_bytes[0] =
-          0;                      // Stride not applicable for GPU handle
-      buffer.data_size_bytes = 0; // Size not applicable for GPU handle
+      buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
+
+      // Set up single plane for GPU texture
+      buffer->data.video.num_planes = 1;
+      buffer->data.video.planes[0].data_ptr = (void *)shared_handle_for_app;
+      buffer->data.video.planes[0].width = buffer->data.video.info.width;
+      buffer->data.video.planes[0].height = buffer->data.video.info.height;
+      buffer->data.video.planes[0].stride_bytes =
+          0; // GPU textures don't have stride
+      buffer->data.video.planes[0].offset_bytes = 0;
+      buffer->data.video.planes[0].subresource_index = 0;
+
+      buffer->data_size_bytes = 0; // GPU textures don't have size
     }
 
     // --- Prepare Payloads and Call App ---
@@ -1567,11 +1648,14 @@ static void wgc_on_frame_arrived(
 
     internal_payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN;
     internal_payload->context_owner = wgc_ctx->parent_ctx;
-    internal_payload->native_resource_ptr = frame_payload_app;
-    buffer.internal_handle = internal_payload;
+    internal_payload->native_singular_resource_ptr = frame_payload_app;
+    internal_payload->num_planar_resources_to_release = 0;
+    internal_payload->parent_miniav_buffer_ptr =
+        buffer; // Store heap-allocated buffer
+    buffer->internal_handle = internal_payload;
 
     // Callback is already checked and wgc_ctx is valid under critical section
-    wgc_ctx->app_callback_internal(&buffer,
+    wgc_ctx->app_callback_internal(buffer,
                                    wgc_ctx->app_callback_user_data_internal);
     // App now owns buffer.internal_handle and its payload, and
     // gpu_shared_handle_for_app if provided. App must call
@@ -1610,6 +1694,12 @@ static void wgc_on_frame_arrived(
       miniav_free(internal_payload);
       internal_payload = nullptr;
     }
+
+    // Clean up heap-allocated buffer
+    if (buffer) {
+      miniav_free(buffer);
+      buffer = nullptr;
+    }
   } catch (...) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "WGC: Unknown error in on_frame_arrived.");
@@ -1636,6 +1726,11 @@ static void wgc_on_frame_arrived(
       miniav_free(internal_payload);
       internal_payload = nullptr;
     }
+
+    if (buffer) {
+      miniav_free(buffer);
+      buffer = nullptr;
+    }
   }
 
   LeaveCriticalSection(&wgc_ctx->critical_section);
@@ -1658,13 +1753,18 @@ static void wgc_on_frame_arrived(
 
 // --- Ops struct and Platform Init ---
 const ScreenContextInternalOps g_screen_ops_win_wgc = {
-    wgc_init_platform,         wgc_destroy_platform,  wgc_enumerate_displays,
-    wgc_enumerate_windows,     wgc_configure_display, wgc_configure_window,
+    wgc_init_platform,
+    wgc_destroy_platform,
+    wgc_enumerate_displays,
+    wgc_enumerate_windows,
+    wgc_configure_display,
+    wgc_configure_window,
     wgc_configure_region, // Not supported
-    wgc_start_capture,         wgc_stop_capture,      wgc_release_buffer,
+    wgc_start_capture,
+    wgc_stop_capture,
+    wgc_release_buffer,
     wgc_get_default_formats,
-    wgc_get_configured_video_formats 
-};
+    wgc_get_configured_video_formats};
 
 MiniAVResultCode
 miniav_screen_context_platform_init_windows_wgc(MiniAVScreenContext *ctx) {

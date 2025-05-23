@@ -108,6 +108,425 @@ miniav(monorepo)/
     └── pubspec.yaml
 ```
 
+## Dependencies
+
+MiniAV requires various system libraries, development packages, and runtime components depending on the platform and enabled modules. This section outlines the required dependencies for building and running MiniAV applications.
+
+### Build Dependencies (All Platforms)
+
+* **CMake:** Version 3.15 or later
+* **C/C++ Compiler:** 
+  * **Windows:** Visual Studio 2019+ or MinGW-w64
+  * **macOS:** Xcode Command Line Tools (clang)
+  * **Linux:** GCC 9+ or Clang 10+
+  * **Android:** Android NDK r21+
+* **Dart SDK:** Version 3.0+ (for FFI package development)
+* **pkg-config:** Required on Linux for library detection
+
+### Windows Dependencies
+
+#### Runtime Libraries
+
+* **Visual C++ Redistributable:** 2019 or later (if using MSVC-built binaries)
+* **Windows 10 Version 1903+:** Required for Windows Graphics Capture (WGC)
+
+#### Development Libraries (Automatically Linked)
+
+* **Media Foundation:** `mfplat.lib`, `mf.lib`, `mfreadwrite.lib`, `mfuuid.lib`
+* **DirectX:** `d3d11.lib`, `dxgi.lib`
+* **Core Windows:** `ole32.lib`, `uuid.lib`, `shlwapi.lib`, `ksuser.lib`
+
+#### Optional Components
+
+* **Windows SDK:** Version 10.0.18362.0+ (for latest WGC features)
+
+### macOS Dependencies
+
+#### System Requirements
+
+* **macOS 10.15+:** Required for screen recording permissions
+* **macOS 12.3+:** Required for ScreenCaptureKit (optional, fallback available)
+* **macOS 14.2+:** Required for Audio Taps API (optional, fallback available)
+
+#### Development Tools
+
+* **Xcode:** Version 12+ (for Objective-C/C++ compilation)
+* **Command Line Tools:** `xcode-select --install`
+
+#### System Frameworks (Automatically Linked)
+
+* **Foundation.framework**
+* **CoreMedia.framework** 
+* **CoreVideo.framework**
+* **AVFoundation.framework**
+* **CoreGraphics.framework**
+* **ScreenCaptureKit.framework** (macOS 12.3+)
+* **CoreAudio.framework**
+* **AudioToolbox.framework**
+
+#### Optional Fallback Dependencies
+
+* **BlackHole:** Virtual audio driver for system audio capture fallback
+* **SoundFlower:** Alternative virtual audio driver (legacy)
+* **Loopback by Rogue Amoeba:** Commercial virtual audio solution
+
+### Linux Dependencies
+
+Linux has the most complex dependency requirements due to the variety of distributions and desktop environments.
+
+#### Core Development Packages
+
+**Ubuntu/Debian:**
+
+```bash
+# Essential build tools
+sudo apt update
+sudo apt install build-essential cmake pkg-config
+
+# Core libraries
+sudo apt install libc6-dev libpthread-stubs0-dev
+
+# Audio dependencies (miniaudio)
+sudo apt install libasound2-dev libpulse-dev
+
+# PipeWire dependencies (recommended)
+sudo apt install libpipewire-0.3-dev libspa-0.2-dev
+
+# D-Bus and Portal support
+sudo apt install libdbus-1-dev libgio-2.0-dev libglib2.0-dev
+
+# X11 dependencies (fallback screen capture)
+sudo apt install libx11-dev libxext-dev libxfixes-dev libxrandr-dev libxcomposite-dev
+
+# V4L2 dependencies (fallback camera)
+sudo apt install libv4l-dev linux-libc-dev
+```
+
+**Fedora/CentOS/RHEL:**
+
+```bash
+# Essential build tools
+sudo dnf install gcc gcc-c++ cmake pkgconf-pkg-config
+
+# Core libraries
+sudo dnf install glibc-devel
+
+# Audio dependencies
+sudo dnf install alsa-lib-devel pulseaudio-libs-devel
+
+# PipeWire dependencies
+sudo dnf install pipewire-devel
+
+# D-Bus and Portal support  
+sudo dnf install dbus-devel glib2-devel
+
+# X11 dependencies
+sudo dnf install libX11-devel libXext-devel libXfixes-devel libXrandr-devel libXcomposite-devel
+
+# V4L2 dependencies
+sudo dnf install libv4l-devel kernel-headers
+```
+
+**Arch Linux:**
+
+```bash
+# Essential build tools
+sudo pacman -S base-devel cmake pkgconf
+
+# Audio dependencies
+sudo pacman -S alsa-lib libpulse
+
+# PipeWire dependencies
+sudo pacman -S pipewire libpipewire
+
+# D-Bus and Portal support
+sudo pacman -S dbus glib2
+
+# X11 dependencies
+sudo pacman -S libx11 libxext libxfixes libxrandr libxcomposite
+
+# V4L2 dependencies
+sudo pacman -S v4l-utils linux-headers
+```
+
+#### Runtime Dependencies
+
+**Portal Support (Flatpak/Snap):**
+
+* **xdg-desktop-portal:** Base portal daemon
+* **xdg-desktop-portal-gtk:** GTK portal backend
+* **xdg-desktop-portal-kde:** KDE portal backend
+* **xdg-desktop-portal-wlr:** wlroots portal backend (Sway, etc.)
+
+**PipeWire Runtime:**
+```bash
+# Ubuntu/Debian
+sudo apt install pipewire pipewire-audio-client-libraries
+
+# Fedora
+sudo dnf install pipewire pipewire-pulseaudio
+
+# Arch
+sudo pacman -S pipewire pipewire-pulse
+```
+
+**User Groups and Permissions:**
+
+```bash
+# Add user to necessary groups
+sudo usermod -a -G audio,video $USER
+
+# Verify group membership
+groups $USER
+
+# Log out and back in for changes to take effect
+```
+
+#### Distribution-Specific Notes
+
+**Ubuntu 20.04 LTS:**
+
+* PipeWire support limited - may need to enable PipeWire PPA
+* PulseAudio and X11 backend fallbacks welcome
+
+**Ubuntu 22.04 LTS / Fedora 36+:**
+
+* Full PipeWire support available
+* Wayland default on GNOME - portal support required
+
+**Debian Stable:**
+
+* May need backports repository for latest PipeWire
+* Consider using Flatpak for newer dependencies
+
+### Android Dependencies
+
+#### Build Requirements
+
+* **Android SDK:** API level 21+ (Android 5.0+)
+* **Android NDK:** r21c or later
+* **Java/Kotlin:** OpenJDK 11+ or Oracle JDK 11+
+
+#### NDK Libraries (Automatically Linked)
+
+* **libcamera2ndk.so:** Camera2 NDK API
+* **libmediandk.so:** Media NDK API  
+* **libandroid.so:** Android native activity
+* **liblog.so:** Android logging
+
+#### Gradle Dependencies (app-level)
+
+```gradle
+dependencies {
+    implementation 'androidx.camera:camera-core:1.3.0'
+    implementation 'androidx.camera:camera-lifecycle:1.3.0'
+    implementation 'androidx.camera:camera-view:1.3.0'
+}
+```
+
+#### Permissions (AndroidManifest.xml)
+
+```xml
+<uses-permission android:name="android.permission.CAMERA" />
+<uses-permission android:name="android.permission.RECORD_AUDIO" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+```
+
+### iOS Dependencies
+
+#### Development Requirements
+
+* **Xcode:** Version 14+ 
+* **iOS SDK:** 13.0+ minimum deployment target
+* **Swift:** 5.7+ (for mixed Swift/Objective-C projects)
+
+#### System Frameworks (Automatically Linked)
+
+* **Foundation.framework**
+* **AVFoundation.framework**
+* **CoreMedia.framework**
+* **CoreVideo.framework**
+* **ReplayKit.framework**
+* **UIKit.framework**
+* **Metal.framework** (for GPU buffer support)
+
+#### Info.plist Requirements
+
+```xml
+<key>NSCameraUsageDescription</key>
+<string>This app uses the camera for video capture</string>
+<key>NSMicrophoneUsageDescription</key>
+<string>This app uses the microphone for audio recording</string>
+```
+
+### Web Dependencies
+
+#### Browser Requirements
+
+* **Chrome/Chromium:** Version 88+ (for getDisplayMedia improvements)
+* **Firefox:** Version 85+ (for screen sharing)
+* **Safari:** Version 14+ (limited MediaRecorder support)
+* **Edge:** Version 88+ (Chromium-based)
+
+#### Web APIs Required
+
+* **getUserMedia():** Camera and microphone access
+* **getDisplayMedia():** Screen capture
+* **WebRTC:** Real-time communication
+* **WebAssembly:** For shared C code (optional)
+* **SharedArrayBuffer:** For efficient data transfer (optional, requires COOP/COEP headers)
+
+#### HTTPS Requirement
+
+* All capture APIs require secure context (HTTPS or localhost)
+* Self-signed certificates acceptable for development
+
+#### Emscripten Build Dependencies
+
+```bash
+# Install Emscripten SDK
+git clone https://github.com/emscripten-core/emsdk.git
+cd emsdk
+./emsdk install latest
+./emsdk activate latest
+source ./emsdk_env.sh
+```
+
+### Development Environment Setup
+
+#### Ubuntu 22.04 LTS (Recommended Linux Development)
+
+```bash
+#!/bin/bash
+# Complete MiniAV development setup script
+
+# Update system
+sudo apt update && sudo apt upgrade -y
+
+# Install build essentials
+sudo apt install -y build-essential cmake pkg-config git
+
+# Install MiniAV dependencies
+sudo apt install -y \
+  libasound2-dev libpulse-dev \
+  libpipewire-0.3-dev libspa-0.2-dev \
+  libdbus-1-dev libgio-2.0-dev libglib2.0-dev \
+  libx11-dev libxext-dev libxfixes-dev libxrandr-dev libxcomposite-dev \
+  libv4l-dev linux-libc-dev
+
+# Install PipeWire runtime
+sudo apt install -y pipewire pipewire-audio-client-libraries
+
+# Add user to groups
+sudo usermod -a -G audio,video $USER
+
+# Install Dart SDK
+sudo apt-get update
+sudo apt-get install apt-transport-https
+wget -qO- https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/dart.gpg
+echo 'deb [signed-by=/usr/share/keyrings/dart.gpg arch=amd64] https://storage.googleapis.com/download.dartlang.org/linux/debian stable main' | sudo tee /etc/apt/sources.list.d/dart_stable.list
+sudo apt-get update
+sudo apt-get install dart
+
+echo "Setup complete! Please log out and back in for group changes to take effect."
+```
+
+#### macOS Development Setup
+
+```bash
+#!/bin/bash
+# MiniAV macOS development setup
+
+# Install Xcode Command Line Tools
+xcode-select --install
+
+# Install Homebrew if not present
+if ! command -v brew &> /dev/null; then
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+fi
+
+# Install development tools
+brew install cmake pkg-config
+
+# Install Dart SDK
+brew tap dart-lang/dart
+brew install dart
+
+# Optional: Install BlackHole for audio loopback testing
+brew install blackhole-2ch
+
+echo "Setup complete! Consider installing Xcode for full iOS development support."
+```
+
+### Troubleshooting Common Dependency Issues
+
+#### Linux: PipeWire Not Working
+
+```bash
+# Check if PipeWire is running
+systemctl --user status pipewire
+
+# Start PipeWire if not running
+systemctl --user start pipewire
+
+# Check PipeWire version
+pipewire --version
+
+# Test camera access
+v4l2-ctl --list-devices
+```
+
+#### Linux: Permission Denied Errors
+
+```bash
+# Check current groups
+groups
+
+# Verify device permissions
+ls -la /dev/video* /dev/snd/*
+
+# Test camera access without MiniAV
+ffmpeg -f v4l2 -list_formats all -i /dev/video0
+```
+
+#### macOS: Framework Not Found
+
+```bash
+# Verify Xcode installation
+xcode-select -p
+
+# Check framework locations
+find /System/Library/Frameworks -name "ScreenCaptureKit.framework" 2>/dev/null
+
+# Verify macOS version for ScreenCaptureKit
+sw_vers
+```
+
+#### Windows: Media Foundation Errors
+
+```batch
+REM Check Windows version
+winver
+
+REM Verify Media Foundation registration
+regsvr32 mfplat.dll
+
+REM Check DirectX installation
+dxdiag
+```
+
+### Minimum System Requirements Summary
+
+| Platform | OS Version | RAM | Additional Notes |
+|----------|------------|-----|------------------|
+| Windows | 10 1903+ | 4GB | DirectX 11 compatible GPU recommended |
+| macOS | 10.15+ | 8GB | Intel or Apple Silicon |
+| Linux | Ubuntu 20.04+ / equivalent | 4GB | PipeWire recommended, X11/Wayland |
+| Android | API 21+ (5.0) | 3GB | Camera2 API support |
+| iOS | 13.0+ | 3GB | 64-bit processor required |
+| Web | Modern browser | 2GB | HTTPS required for capture APIs |
+
 ## Module Breakdown
 
 ### 1. MiniAV Core C Library (`miniav_ffi/miniav_c`)

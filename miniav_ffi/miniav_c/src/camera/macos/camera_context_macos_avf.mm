@@ -568,6 +568,36 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
                   "AVF: Attempting to configure: %dx%d, PixelFormat: %d, FPS: %.2f", 
                   format_req->width, format_req->height, format_req->pixel_format, requested_fps);
 
+        BOOL format_set = NO;
+        
+        [platCtx->captureSession beginConfiguration];
+
+        // Remove existing input if any
+        if (platCtx->deviceInput) {
+            [platCtx->captureSession removeInput:platCtx->deviceInput];
+            [platCtx->deviceInput release];
+            platCtx->deviceInput = nil;
+        }
+
+        // Create new input
+        NSError *inputError = nil;
+        platCtx->deviceInput = [[AVCaptureDeviceInput alloc] initWithDevice:selectedDevice error:&inputError];
+        if (!platCtx->deviceInput) {
+            miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Failed to create device input: %s", 
+                      [[inputError localizedDescription] UTF8String]);
+            [platCtx->captureSession commitConfiguration];
+            return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+        }
+
+        if ([platCtx->captureSession canAddInput:platCtx->deviceInput]) {
+            [platCtx->captureSession addInput:platCtx->deviceInput];
+        } else {
+            miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Cannot add device input to session.");
+            [platCtx->deviceInput release];
+            platCtx->deviceInput = nil;
+            [platCtx->captureSession commitConfiguration];
+            return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+        }
 
         for (AVCaptureDeviceFormat *avFormat in selectedDevice.formats) {
             CMFormatDescriptionRef desc = avFormat.formatDescription;

@@ -2,6 +2,7 @@
 #include "../../common/miniav_logging.h"
 #include "../../common/miniav_utils.h"
 #include "../../../include/miniav_buffer.h"
+#include <mach/mach_time.h>
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -20,10 +21,9 @@
 
 // --- Platform Specific Context ---
 typedef struct CGScreenPlatformContext {
-    // Common fields
     MiniAVScreenContext* parent_ctx;
     dispatch_queue_t captureQueue;
-    bool is_capturing;
+    std::atomic<bool> is_streaming;
     
     // Metal for GPU path
     id<MTLDevice> metalDevice;
@@ -32,6 +32,29 @@ typedef struct CGScreenPlatformContext {
     // Legacy Core Graphics capture (fallback)
     CGDirectDisplayID displayID;
     dispatch_source_t captureTimer;
+    
+    // Timing
+    mach_timebase_info_data_t timebase;
+    
+    // Callback info (following WGC pattern)
+    MiniAVBufferCallback app_callback_internal;
+    void* app_callback_user_data_internal;
+    
+    // Configuration (following WGC pattern)
+    MiniAVVideoInfo configured_video_format;
+    char selected_item_id[MINIAV_DEVICE_ID_MAX_LEN];
+    
+    // Target type
+    typedef enum {
+        CG_TARGET_NONE,
+        CG_TARGET_DISPLAY,
+        CG_TARGET_WINDOW
+    } CGCaptureTargetType;
+    CGCaptureTargetType current_target_type;
+    
+    uint32_t frame_width;
+    uint32_t frame_height;
+    uint32_t target_fps;
     
 #if HAS_SCREEN_CAPTURE_KIT
     // Modern ScreenCaptureKit capture (macOS 12.3+)
@@ -43,13 +66,12 @@ typedef struct CGScreenPlatformContext {
 
 // --- Helper Functions ---
 static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo) {
-    CGImageAlphaInfo alphaInfo = bitmapInfo & kCGBitmapAlphaInfoMask;
+    CGImageAlphaInfo alphaInfo = (CGImageAlphaInfo)(bitmapInfo & kCGBitmapAlphaInfoMask);
     CGBitmapInfo byteOrder = bitmapInfo & kCGBitmapByteOrderMask;
     
-    // Common formats for screen capture
     if (byteOrder == kCGBitmapByteOrder32Little) {
         if (alphaInfo == kCGImageAlphaPremultipliedFirst) {
-            return MINIAV_PIXEL_FORMAT_BGRA32; // BGRA with premultiplied alpha
+            return MINIAV_PIXEL_FORMAT_BGRA32;
         } else if (alphaInfo == kCGImageAlphaFirst || alphaInfo == kCGImageAlphaNoneSkipFirst) {
             return MINIAV_PIXEL_FORMAT_BGRA32;
         }
@@ -63,37 +85,34 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
         }
     }
     
-    return MINIAV_PIXEL_FORMAT_BGRA32; // Default fallback
+    return MINIAV_PIXEL_FORMAT_BGRA32;
 }
 
 #if HAS_SCREEN_CAPTURE_KIT
 // --- ScreenCaptureKit Delegate ---
 @interface MiniAVScreenCaptureDelegate : NSObject <SCStreamDelegate, SCStreamOutput>
 {
-    MiniAVScreenContext* _screenCtx;
+    CGScreenPlatformContext* _cgCtx;
 }
-- (instancetype)initWithScreenContext:(MiniAVScreenContext*)ctx;
+- (instancetype)initWithCGContext:(CGScreenPlatformContext*)ctx;
 @end
 
 @implementation MiniAVScreenCaptureDelegate
 
-- (instancetype)initWithScreenContext:(MiniAVScreenContext*)ctx {
+- (instancetype)initWithCGContext:(CGScreenPlatformContext*)ctx {
     self = [super init];
     if (self) {
-        _screenCtx = ctx;
+        _cgCtx = ctx;
     }
     return self;
 }
 
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
-    if (!_screenCtx || !_screenCtx->app_callback || !_screenCtx->is_running || !_screenCtx->platform_ctx) {
+    if (!_cgCtx || !_cgCtx->is_streaming || !_cgCtx->app_callback_internal) {
         return;
     }
     
-    CGScreenPlatformContext* platCtx = (CGScreenPlatformContext*)_screenCtx->platform_ctx;
-    
     if (type == SCStreamOutputTypeScreen) {
-        // Handle video frame
         CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (!imageBuffer) {
             miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get image buffer from sample buffer.");
@@ -101,47 +120,40 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
         }
         
         [self processVideoFrame:imageBuffer withTimestamp:CMSampleBufferGetPresentationTimeStamp(sampleBuffer)];
-        
-    } else if (type == SCStreamOutputTypeAudio) {
-        // Handle audio frame
-        [self processAudioBuffer:sampleBuffer];
     }
+    // Note: Audio is handled by separate loopback system like WGC
 }
 
 - (void)processVideoFrame:(CVImageBufferRef)imageBuffer withTimestamp:(CMTime)timestamp {
-    CGScreenPlatformContext* platCtx = (CGScreenPlatformContext*)_screenCtx->platform_ctx;
-    MiniAVNativeBufferInternalPayload* payload = NULL;
-    MiniAVBuffer* mavBuffer_ptr = NULL;
-    
-    // Allocate payload and buffer
-    payload = (MiniAVNativeBufferInternalPayload*)miniav_calloc(1, sizeof(MiniAVNativeBufferInternalPayload));
-    if (!payload) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate video payload.");
+    // ALLOCATE BUFFER ON HEAP - crucial for consistency with WGC
+    MiniAVBuffer* buffer = (MiniAVBuffer*)miniav_calloc(1, sizeof(MiniAVBuffer));
+    if (!buffer) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate MiniAVBuffer");
         return;
     }
     
-    mavBuffer_ptr = (MiniAVBuffer*)miniav_calloc(1, sizeof(MiniAVBuffer));
-    if (!mavBuffer_ptr) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate video buffer.");
-        miniav_free(payload);
+    MiniAVNativeBufferInternalPayload* payload = (MiniAVNativeBufferInternalPayload*)miniav_calloc(1, sizeof(MiniAVNativeBufferInternalPayload));
+    if (!payload) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate payload");
+        miniav_free(buffer);
         return;
     }
     
     payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN;
-    payload->context_owner = _screenCtx;
-    payload->parent_miniav_buffer_ptr = mavBuffer_ptr;
-    mavBuffer_ptr->internal_handle = payload;
+    payload->context_owner = _cgCtx->parent_ctx;
+    payload->parent_miniav_buffer_ptr = buffer;
+    buffer->internal_handle = payload;
     
-    bool use_gpu_path = (_screenCtx->configured_video_format.output_preference == MINIAV_OUTPUT_PREFERENCE_GPU);
+    bool use_gpu_path = (_cgCtx->configured_video_format.output_preference == MINIAV_OUTPUT_PREFERENCE_GPU);
     bool gpu_path_successful = false;
     
     // Try GPU path with Metal texture
-    if (use_gpu_path && platCtx->metalDevice && platCtx->textureCache) {
+    if (use_gpu_path && _cgCtx->metalDevice && _cgCtx->textureCache) {
         IOSurfaceRef ioSurface = CVPixelBufferGetIOSurface(imageBuffer);
         if (ioSurface) {
             CVMetalTextureRef metalTextureRef = NULL;
             CVReturn err = CVMetalTextureCacheCreateTextureFromImage(
-                kCFAllocatorDefault, platCtx->textureCache, imageBuffer, NULL,
+                kCFAllocatorDefault, _cgCtx->textureCache, imageBuffer, NULL,
                 MTLPixelFormatBGRA8Unorm, CVPixelBufferGetWidth(imageBuffer), 
                 CVPixelBufferGetHeight(imageBuffer), 0, &metalTextureRef);
                 
@@ -151,18 +163,18 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
                     CFRetain(metalTextureRef);
                     payload->native_singular_resource_ptr = metalTextureRef;
                     
-                    mavBuffer_ptr->content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_METAL_TEXTURE;
-                    mavBuffer_ptr->data.video.info.width = [texture width];
-                    mavBuffer_ptr->data.video.info.height = [texture height];
-                    mavBuffer_ptr->data.video.info.pixel_format = MINIAV_PIXEL_FORMAT_BGRA32;
+                    buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_METAL_TEXTURE;
+                    buffer->data.video.info.width = [texture width];
+                    buffer->data.video.info.height = [texture height];
+                    buffer->data.video.info.pixel_format = MINIAV_PIXEL_FORMAT_BGRA32;
                     
-                    mavBuffer_ptr->data.video.num_planes = 1;
-                    mavBuffer_ptr->data.video.planes[0].data_ptr = (void*)texture;
-                    mavBuffer_ptr->data.video.planes[0].width = [texture width];
-                    mavBuffer_ptr->data.video.planes[0].height = [texture height];
-                    mavBuffer_ptr->data.video.planes[0].stride_bytes = 0;
-                    mavBuffer_ptr->data.video.planes[0].offset_bytes = 0;
-                    mavBuffer_ptr->data.video.planes[0].subresource_index = 0;
+                    buffer->data.video.num_planes = 1;
+                    buffer->data.video.planes[0].data_ptr = (void*)texture;
+                    buffer->data.video.planes[0].width = [texture width];
+                    buffer->data.video.planes[0].height = [texture height];
+                    buffer->data.video.planes[0].stride_bytes = 0;
+                    buffer->data.video.planes[0].offset_bytes = 0;
+                    buffer->data.video.planes[0].subresource_index = 0;
                     
                     gpu_path_successful = true;
                     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "SCK: GPU Path - Metal texture created from IOSurface.");
@@ -181,99 +193,36 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
         if (CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
             miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: CPU Path - Failed to lock pixel buffer.");
             CVBufferRelease(imageBuffer);
-            miniav_free(mavBuffer_ptr);
+            miniav_free(buffer);
             miniav_free(payload);
             return;
         }
         
-        mavBuffer_ptr->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-        mavBuffer_ptr->data.video.info.width = (uint32_t)CVPixelBufferGetWidth(imageBuffer);
-        mavBuffer_ptr->data.video.info.height = (uint32_t)CVPixelBufferGetHeight(imageBuffer);
-        mavBuffer_ptr->data.video.info.pixel_format = MINIAV_PIXEL_FORMAT_BGRA32; // ScreenCaptureKit typically provides BGRA
+        buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+        buffer->data.video.info.width = (uint32_t)CVPixelBufferGetWidth(imageBuffer);
+        buffer->data.video.info.height = (uint32_t)CVPixelBufferGetHeight(imageBuffer);
+        buffer->data.video.info.pixel_format = MINIAV_PIXEL_FORMAT_BGRA32;
         
-        mavBuffer_ptr->data.video.num_planes = 1;
-        mavBuffer_ptr->data.video.planes[0].data_ptr = CVPixelBufferGetBaseAddress(imageBuffer);
-        mavBuffer_ptr->data.video.planes[0].width = (uint32_t)CVPixelBufferGetWidth(imageBuffer);
-        mavBuffer_ptr->data.video.planes[0].height = (uint32_t)CVPixelBufferGetHeight(imageBuffer);
-        mavBuffer_ptr->data.video.planes[0].stride_bytes = (uint32_t)CVPixelBufferGetBytesPerRow(imageBuffer);
-        mavBuffer_ptr->data.video.planes[0].offset_bytes = 0;
-        mavBuffer_ptr->data.video.planes[0].subresource_index = 0;
+        buffer->data.video.num_planes = 1;
+        buffer->data.video.planes[0].data_ptr = CVPixelBufferGetBaseAddress(imageBuffer);
+        buffer->data.video.planes[0].width = (uint32_t)CVPixelBufferGetWidth(imageBuffer);
+        buffer->data.video.planes[0].height = (uint32_t)CVPixelBufferGetHeight(imageBuffer);
+        buffer->data.video.planes[0].stride_bytes = (uint32_t)CVPixelBufferGetBytesPerRow(imageBuffer);
+        buffer->data.video.planes[0].offset_bytes = 0;
+        buffer->data.video.planes[0].subresource_index = 0;
         
         CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
     }
     
     // Set common video properties
-    mavBuffer_ptr->type = MINIAV_BUFFER_TYPE_VIDEO;
-    mavBuffer_ptr->timestamp_us = CMTimeGetSeconds(timestamp) * 1000000;
-    mavBuffer_ptr->data.video.info.frame_rate_numerator = _screenCtx->configured_video_format.frame_rate_numerator;
-    mavBuffer_ptr->data.video.info.frame_rate_denominator = _screenCtx->configured_video_format.frame_rate_denominator;
-    mavBuffer_ptr->data.video.info.output_preference = _screenCtx->configured_video_format.output_preference;
-    mavBuffer_ptr->user_data = _screenCtx->app_callback_user_data;
+    buffer->type = MINIAV_BUFFER_TYPE_VIDEO;
+    buffer->timestamp_us = CMTimeGetSeconds(timestamp) * 1000000;
+    buffer->data.video.info.frame_rate_numerator = _cgCtx->configured_video_format.frame_rate_numerator;
+    buffer->data.video.info.frame_rate_denominator = _cgCtx->configured_video_format.frame_rate_denominator;
+    buffer->data.video.info.output_preference = _cgCtx->configured_video_format.output_preference;
+    buffer->user_data = _cgCtx->app_callback_user_data_internal;
     
-    _screenCtx->app_callback(mavBuffer_ptr, _screenCtx->app_callback_user_data);
-}
-
-- (void)processAudioBuffer:(CMSampleBufferRef)sampleBuffer {
-    if (!_screenCtx->configured_audio_format.enabled) {
-        return; // Audio not requested
-    }
-    
-    CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
-    if (!blockBuffer) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get audio block buffer.");
-        return;
-    }
-    
-    MiniAVNativeBufferInternalPayload* payload = NULL;
-    MiniAVBuffer* mavBuffer_ptr = NULL;
-    
-    // Allocate payload and buffer
-    payload = (MiniAVNativeBufferInternalPayload*)miniav_calloc(1, sizeof(MiniAVNativeBufferInternalPayload));
-    if (!payload) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate audio payload.");
-        return;
-    }
-    
-    mavBuffer_ptr = (MiniAVBuffer*)miniav_calloc(1, sizeof(MiniAVBuffer));
-    if (!mavBuffer_ptr) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate audio buffer.");
-        miniav_free(payload);
-        return;
-    }
-    
-    payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_AUDIO_SCREEN;
-    payload->context_owner = _screenCtx;
-    payload->parent_miniav_buffer_ptr = mavBuffer_ptr;
-    mavBuffer_ptr->internal_handle = payload;
-    
-    // Audio is always CPU-based
-    CFRetain(sampleBuffer);
-    payload->native_singular_resource_ptr = (void*)sampleBuffer;
-    
-    // Get audio format description
-    CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
-    const AudioStreamBasicDescription* asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc);
-    
-    // Get audio data
-    char* audioDataPtr = NULL;
-    size_t audioDataSize = 0;
-    CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &audioDataSize, &audioDataPtr);
-    
-    mavBuffer_ptr->type = MINIAV_BUFFER_TYPE_AUDIO;
-    mavBuffer_ptr->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-    mavBuffer_ptr->timestamp_us = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) * 1000000;
-    
-    // Set audio properties
-    mavBuffer_ptr->data.audio.info.sample_rate = (uint32_t)asbd->mSampleRate;
-    mavBuffer_ptr->data.audio.info.channels = asbd->mChannelsPerFrame;
-    mavBuffer_ptr->data.audio.info.sample_format = MINIAV_AUDIO_FORMAT_F32; // ScreenCaptureKit typically provides float32
-    mavBuffer_ptr->data.audio.info.samples_per_channel = (uint32_t)(audioDataSize / (asbd->mChannelsPerFrame * sizeof(float)));
-    
-    mavBuffer_ptr->data.audio.data_ptr = audioDataPtr;
-    mavBuffer_ptr->data.audio.data_size_bytes = (uint32_t)audioDataSize;
-    mavBuffer_ptr->user_data = _screenCtx->app_callback_user_data;
-    
-    _screenCtx->app_callback(mavBuffer_ptr, _screenCtx->app_callback_user_data);
+    _cgCtx->app_callback_internal(buffer, _cgCtx->app_callback_user_data_internal);
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
@@ -289,15 +238,18 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
 
 // --- Legacy Core Graphics Implementation ---
 static void legacy_capture_timer_callback(void* info) {
-    MiniAVScreenContext* ctx = (MiniAVScreenContext*)info;
-    if (!ctx || !ctx->is_running || !ctx->app_callback) {
+    CGScreenPlatformContext* cgCtx = (CGScreenPlatformContext*)info;
+    if (!cgCtx || !cgCtx->is_streaming || !cgCtx->app_callback_internal) {
         return;
     }
     
-    CGScreenPlatformContext* platCtx = (CGScreenPlatformContext*)ctx->platform_ctx;
+    // Check for deprecated API
+    CGImageRef screenImage = NULL;
+    if (@available(macOS 15.0, *)) {
+        miniav_log(MINIAV_LOG_LEVEL_WARN, "CG: Legacy capture not recommended on macOS 15+");
+    }
     
-    // Capture screen using Core Graphics
-    CGImageRef screenImage = CGDisplayCreateImage(platCtx->displayID);
+    screenImage = CGDisplayCreateImage(cgCtx->displayID);
     if (!screenImage) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "CG: Failed to create screen image.");
         return;
@@ -308,210 +260,406 @@ static void legacy_capture_timer_callback(void* info) {
     size_t height = CGImageGetHeight(screenImage);
     size_t bytesPerRow = CGImageGetBytesPerRow(screenImage);
     
+    MiniAVBuffer* buffer = (MiniAVBuffer*)miniav_calloc(1, sizeof(MiniAVBuffer));
     MiniAVNativeBufferInternalPayload* payload = (MiniAVNativeBufferInternalPayload*)miniav_calloc(1, sizeof(MiniAVNativeBufferInternalPayload));
-    MiniAVBuffer* mavBuffer_ptr = (MiniAVBuffer*)miniav_calloc(1, sizeof(MiniAVBuffer));
     
-    if (!payload || !mavBuffer_ptr) {
+    if (!payload || !buffer) {
         CGImageRelease(screenImage);
         miniav_free(payload);
-        miniav_free(mavBuffer_ptr);
+        miniav_free(buffer);
         return;
     }
     
     payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN;
-    payload->context_owner = ctx;
-    payload->parent_miniav_buffer_ptr = mavBuffer_ptr;
-    payload->native_singular_resource_ptr = (void*)screenImage; // Store CGImageRef
-    mavBuffer_ptr->internal_handle = payload;
+    payload->context_owner = cgCtx->parent_ctx;
+    payload->parent_miniav_buffer_ptr = buffer;
+    payload->native_singular_resource_ptr = (void*)screenImage;
+    buffer->internal_handle = payload;
     
     // Legacy path is always CPU
-    mavBuffer_ptr->type = MINIAV_BUFFER_TYPE_VIDEO;
-    mavBuffer_ptr->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-    mavBuffer_ptr->timestamp_us = mach_absolute_time() / 1000; // Approximate microseconds
+    buffer->type = MINIAV_BUFFER_TYPE_VIDEO;
+    buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
     
-    mavBuffer_ptr->data.video.info.width = (uint32_t)width;
-    mavBuffer_ptr->data.video.info.height = (uint32_t)height;
-    mavBuffer_ptr->data.video.info.pixel_format = CGBitmapInfoToMiniAVPixelFormat(CGImageGetBitmapInfo(screenImage));
-    mavBuffer_ptr->data.video.info.frame_rate_numerator = ctx->configured_video_format.frame_rate_numerator;
-    mavBuffer_ptr->data.video.info.frame_rate_denominator = ctx->configured_video_format.frame_rate_denominator;
-    mavBuffer_ptr->data.video.info.output_preference = MINIAV_OUTPUT_PREFERENCE_CPU;
+    // Fix timing calculation
+    uint64_t timestamp = mach_absolute_time();
+    buffer->timestamp_us = (timestamp * cgCtx->timebase.numer) / (cgCtx->timebase.denom * 1000);
     
-    mavBuffer_ptr->data.video.num_planes = 1;
-    mavBuffer_ptr->data.video.planes[0].data_ptr = (void*)CGDataProviderCopyData(CGImageGetDataProvider(screenImage));
-    mavBuffer_ptr->data.video.planes[0].width = (uint32_t)width;
-    mavBuffer_ptr->data.video.planes[0].height = (uint32_t)height;
-    mavBuffer_ptr->data.video.planes[0].stride_bytes = (uint32_t)bytesPerRow;
-    mavBuffer_ptr->data.video.planes[0].offset_bytes = 0;
-    mavBuffer_ptr->data.video.planes[0].subresource_index = 0;
+    buffer->data.video.info.width = (uint32_t)width;
+    buffer->data.video.info.height = (uint32_t)height;
+    buffer->data.video.info.pixel_format = CGBitmapInfoToMiniAVPixelFormat(CGImageGetBitmapInfo(screenImage));
+    buffer->data.video.info.frame_rate_numerator = cgCtx->configured_video_format.frame_rate_numerator;
+    buffer->data.video.info.frame_rate_denominator = cgCtx->configured_video_format.frame_rate_denominator;
+    buffer->data.video.info.output_preference = MINIAV_OUTPUT_PREFERENCE_CPU;
     
-    mavBuffer_ptr->user_data = ctx->app_callback_user_data;
+    buffer->data.video.num_planes = 1;
+    buffer->data.video.planes[0].data_ptr = (void*)CGDataProviderCopyData(CGImageGetDataProvider(screenImage));
+    buffer->data.video.planes[0].width = (uint32_t)width;
+    buffer->data.video.planes[0].height = (uint32_t)height;
+    buffer->data.video.planes[0].stride_bytes = (uint32_t)bytesPerRow;
+    buffer->data.video.planes[0].offset_bytes = 0;
+    buffer->data.video.planes[0].subresource_index = 0;
     
-    ctx->app_callback(mavBuffer_ptr, ctx->app_callback_user_data);
+    buffer->user_data = cgCtx->app_callback_user_data_internal;
+    
+    cgCtx->app_callback_internal(buffer, cgCtx->app_callback_user_data_internal);
 }
 
-// --- ScreenContextInternalOps Implementations ---
+// --- Platform Ops Implementation (following WGC pattern) ---
 
-static MiniAVResultCode macos_cg_init_platform(MiniAVScreenContext* ctx) {
-    if (!ctx || !ctx->platform_ctx) return MINIAV_ERROR_INVALID_ARG;
-    CGScreenPlatformContext* platCtx = (CGScreenPlatformContext*)ctx->platform_ctx;
+static MiniAVResultCode cg_get_default_formats(const char* device_id_utf8,
+                                               MiniAVVideoInfo* video_format_out,
+                                               MiniAVAudioInfo* audio_format_out) {
+    if (!device_id_utf8 || !video_format_out) {
+        return MINIAV_ERROR_INVALID_ARG;
+    }
+    
+    memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
+    if (audio_format_out) {
+        memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
+    }
+    
+    // Parse device ID
+    if (strncmp(device_id_utf8, "display_", 8) == 0) {
+        CGDirectDisplayID displayID;
+        if (sscanf_s(device_id_utf8, "display_%u", &displayID) == 1) {
+            CGRect bounds = CGDisplayBounds(displayID);
+            video_format_out->width = (uint32_t)bounds.size.width;
+            video_format_out->height = (uint32_t)bounds.size.height;
+        } else {
+            video_format_out->width = 1920;
+            video_format_out->height = 1080;
+        }
+    } else {
+        video_format_out->width = 1920;
+        video_format_out->height = 1080;
+    }
+    
+    video_format_out->pixel_format = MINIAV_PIXEL_FORMAT_BGRA32;
+    video_format_out->frame_rate_numerator = 60;
+    video_format_out->frame_rate_denominator = 1;
+    video_format_out->output_preference = MINIAV_OUTPUT_PREFERENCE_GPU;
+    
+    // Audio format (if requested)
+    if (audio_format_out) {
+        audio_format_out->format = MINIAV_AUDIO_FORMAT_F32;
+        audio_format_out->channels = 2;
+        audio_format_out->sample_rate = 48000;
+        audio_format_out->num_frames = 1024;
+    }
+    
+    return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode cg_get_configured_video_formats(MiniAVScreenContext* ctx,
+                                                        MiniAVVideoInfo* video_format_out,
+                                                        MiniAVAudioInfo* audio_format_out) {
+    if (!ctx || !ctx->platform_ctx || !video_format_out) {
+        return MINIAV_ERROR_INVALID_ARG;
+    }
+    
+    CGScreenPlatformContext* cgCtx = (CGScreenPlatformContext*)ctx->platform_ctx;
+    
+    memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
+    if (audio_format_out) {
+        memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
+    }
+    
+    if (!ctx->is_configured) {
+        return MINIAV_ERROR_NOT_INITIALIZED;
+    }
+    
+    *video_format_out = ctx->configured_video_format;
+    
+    // Audio format would come from loopback system (not implemented here)
+    if (audio_format_out && ctx->capture_audio_requested) {
+        audio_format_out->format = MINIAV_AUDIO_FORMAT_F32;
+        audio_format_out->channels = 2;
+        audio_format_out->sample_rate = 48000;
+        audio_format_out->num_frames = 1024;
+    }
+    
+    return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode cg_init_platform(MiniAVScreenContext* ctx) {
+    if (!ctx) return MINIAV_ERROR_INVALID_ARG;
+    
+    CGScreenPlatformContext* cgCtx = (CGScreenPlatformContext*)miniav_calloc(1, sizeof(CGScreenPlatformContext));
+    if (!cgCtx) {
+        return MINIAV_ERROR_OUT_OF_MEMORY;
+    }
+    
+    ctx->platform_ctx = cgCtx;
+    cgCtx->parent_ctx = ctx;
+    cgCtx->is_streaming = false;
+    
+    // Initialize timing
+    if (mach_timebase_info(&cgCtx->timebase) != KERN_SUCCESS) {
+        cgCtx->timebase.numer = 1;
+        cgCtx->timebase.denom = 1;
+    }
     
     @autoreleasepool {
-        platCtx->parent_ctx = ctx;
-        platCtx->captureQueue = dispatch_queue_create("com.miniav.screen.captureQueue", DISPATCH_QUEUE_SERIAL);
-        platCtx->is_capturing = false;
+        cgCtx->captureQueue = dispatch_queue_create("com.miniav.screen.captureQueue", DISPATCH_QUEUE_SERIAL);
         
         // Initialize Metal for GPU path
-        platCtx->metalDevice = MTLCreateSystemDefaultDevice();
-        if (platCtx->metalDevice) {
-            CVReturn err = CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, platCtx->metalDevice, NULL, &platCtx->textureCache);
+        cgCtx->metalDevice = MTLCreateSystemDefaultDevice();
+        if (cgCtx->metalDevice) {
+            CVReturn err = CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, cgCtx->metalDevice, NULL, &cgCtx->textureCache);
             if (err != kCVReturnSuccess) {
                 miniav_log(MINIAV_LOG_LEVEL_WARN, "CG: Failed to create Metal texture cache. GPU path unavailable.");
-                platCtx->textureCache = NULL;
+                cgCtx->textureCache = NULL;
             }
         }
         
-        // Get main display ID for legacy fallback
-        platCtx->displayID = CGMainDisplayID();
+        cgCtx->displayID = CGMainDisplayID();
     }
     
     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CG: Platform context initialized.");
     return MINIAV_SUCCESS;
 }
 
-static MiniAVResultCode macos_cg_destroy_platform(MiniAVScreenContext* ctx) {
+static MiniAVResultCode cg_destroy_platform(MiniAVScreenContext* ctx) {
     if (!ctx || !ctx->platform_ctx) return MINIAV_SUCCESS;
-    CGScreenPlatformContext* platCtx = (CGScreenPlatformContext*)ctx->platform_ctx;
+    
+    CGScreenPlatformContext* cgCtx = (CGScreenPlatformContext*)ctx->platform_ctx;
     
     @autoreleasepool {
-        // Stop capture if running
-        if (platCtx->is_capturing) {
+        if (cgCtx->is_streaming) {
+            // Stop any ongoing capture
+            cgCtx->is_streaming = false;
+        }
+        
+        // Clean up ScreenCaptureKit resources
 #if HAS_SCREEN_CAPTURE_KIT
-            if (@available(macOS 12.3, *)) {
-                if (platCtx->scStream) {
-                    [platCtx->scStream stopCaptureWithCompletionHandler:^(NSError * _Nullable error) {
-                        if (error) {
-                            miniav_log(MINIAV_LOG_LEVEL_WARN, "SCK: Error stopping stream: %s", [[error localizedDescription] UTF8String]);
-                        }
-                    }];
-                    platCtx->scStream = nil;
-                }
-                platCtx->scDelegate = nil;
-                platCtx->scStreamConfig = nil;
-            } else {
-#endif
-                if (platCtx->captureTimer) {
-                    dispatch_source_cancel(platCtx->captureTimer);
-                    platCtx->captureTimer = NULL;
-                }
-#if HAS_SCREEN_CAPTURE_KIT
+        if (@available(macOS 12.3, *)) {
+            if (cgCtx->scStream) {
+                [cgCtx->scStream stopCaptureWithCompletionHandler:nil];
+                cgCtx->scStream = nil;
             }
+            cgCtx->scDelegate = nil;
+            cgCtx->scStreamConfig = nil;
+        }
 #endif
+        
+        // Clean up legacy timer
+        if (cgCtx->captureTimer) {
+            dispatch_source_cancel(cgCtx->captureTimer);
+            cgCtx->captureTimer = NULL;
         }
         
         // Clean up Metal resources
-        if (platCtx->textureCache) {
-            CVMetalTextureCacheFlush(platCtx->textureCache, 0);
-            CFRelease(platCtx->textureCache);
-            platCtx->textureCache = NULL;
-        }
-        if (platCtx->metalDevice) {
-            [platCtx->metalDevice release];
-            platCtx->metalDevice = nil;
+        if (cgCtx->textureCache) {
+            CVMetalTextureCacheFlush(cgCtx->textureCache, 0);
+            CFRelease(cgCtx->textureCache);
+            cgCtx->textureCache = NULL;
         }
         
-        if (platCtx->captureQueue) {
-            dispatch_release(platCtx->captureQueue);
-            platCtx->captureQueue = nil;
+        if (cgCtx->captureQueue) {
+            dispatch_release(cgCtx->captureQueue);
+            cgCtx->captureQueue = nil;
         }
     }
     
-    miniav_free(platCtx);
+    miniav_free(cgCtx);
     ctx->platform_ctx = NULL;
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CG: Platform context destroyed.");
+    
     return MINIAV_SUCCESS;
 }
 
-static MiniAVResultCode macos_cg_configure(MiniAVScreenContext* ctx, const char* source_id_str, const MiniAVVideoInfo* video_format, const MiniAVAudioInfo* audio_format) {
-    if (!ctx || !ctx->platform_ctx) return MINIAV_ERROR_INVALID_ARG;
+static MiniAVResultCode cg_enumerate_displays(MiniAVDeviceInfo** displays_out, uint32_t* count_out) {
+    if (!displays_out || !count_out) return MINIAV_ERROR_INVALID_ARG;
     
-    // Store configuration
-    if (video_format) {
-        ctx->configured_video_format = *video_format;
+    *displays_out = NULL;
+    *count_out = 0;
+    
+    uint32_t displayCount;
+    CGDirectDisplayID* displays = NULL;
+    
+    if (CGGetActiveDisplayList(0, NULL, &displayCount) != kCGErrorSuccess) {
+        return MINIAV_ERROR_SYSTEM_CALL_FAILED;
     }
-    if (audio_format) {
-        ctx->configured_audio_format = *audio_format;
-    }
     
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CG: Screen capture configured.");
-    return MINIAV_SUCCESS;
-}
-
-static MiniAVResultCode macos_cg_start_capture(MiniAVScreenContext* ctx) {
-    if (!ctx || !ctx->platform_ctx) return MINIAV_ERROR_INVALID_ARG;
-    CGScreenPlatformContext* platCtx = (CGScreenPlatformContext*)ctx->platform_ctx;
-    
-    if (platCtx->is_capturing) {
-        miniav_log(MINIAV_LOG_LEVEL_WARN, "CG: Capture already running.");
+    if (displayCount == 0) {
         return MINIAV_SUCCESS;
     }
+    
+    displays = (CGDirectDisplayID*)miniav_calloc(displayCount, sizeof(CGDirectDisplayID));
+    if (!displays) {
+        return MINIAV_ERROR_OUT_OF_MEMORY;
+    }
+    
+    if (CGGetActiveDisplayList(displayCount, displays, &displayCount) != kCGErrorSuccess) {
+        miniav_free(displays);
+        return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+    }
+    
+    *displays_out = (MiniAVDeviceInfo*)miniav_calloc(displayCount, sizeof(MiniAVDeviceInfo));
+    if (!*displays_out) {
+        miniav_free(displays);
+        return MINIAV_ERROR_OUT_OF_MEMORY;
+    }
+    
+    for (uint32_t i = 0; i < displayCount; i++) {
+        MiniAVDeviceInfo* info = &(*displays_out)[i];
+        snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "display_%u", displays[i]);
+        snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "Display %u", displays[i]);
+        info->is_default = (displays[i] == CGMainDisplayID());
+    }
+    
+    *count_out = displayCount;
+    miniav_free(displays);
+    
+    return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode cg_enumerate_windows(MiniAVDeviceInfo** windows_out, uint32_t* count_out) {
+    if (!windows_out || !count_out) return MINIAV_ERROR_INVALID_ARG;
+    
+    *windows_out = NULL;
+    *count_out = 0;
+    
+    // For now, return empty list (window enumeration is complex on macOS)
+    return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode cg_configure_display(MiniAVScreenContext* ctx, const char* display_id, const MiniAVVideoInfo* format) {
+    if (!ctx || !ctx->platform_ctx || !display_id || !format) {
+        return MINIAV_ERROR_INVALID_ARG;
+    }
+    
+    CGScreenPlatformContext* cgCtx = (CGScreenPlatformContext*)ctx->platform_ctx;
+    
+    if (cgCtx->is_streaming) {
+        return MINIAV_ERROR_ALREADY_RUNNING;
+    }
+    
+    // Parse display ID
+    CGDirectDisplayID displayID;
+    if (sscanf_s(display_id, "display_%u", &displayID) != 1) {
+        return MINIAV_ERROR_INVALID_ARG;
+    }
+    
+    cgCtx->displayID = displayID;
+    cgCtx->configured_video_format = *format;
+    cgCtx->current_target_type = CG_TARGET_DISPLAY;
+    miniav_strlcpy(cgCtx->selected_item_id, display_id, MINIAV_DEVICE_ID_MAX_LEN);
+    
+    // Update parent context
+    ctx->configured_video_format = *format;
+    ctx->is_configured = true;
+    
+    // Calculate FPS
+    if (format->frame_rate_denominator > 0 && format->frame_rate_numerator > 0) {
+        cgCtx->target_fps = format->frame_rate_numerator / format->frame_rate_denominator;
+    } else {
+        cgCtx->target_fps = 60;
+    }
+    
+    CGRect bounds = CGDisplayBounds(displayID);
+    cgCtx->frame_width = (uint32_t)bounds.size.width;
+    cgCtx->frame_height = (uint32_t)bounds.size.height;
+    
+    // Update parent context with actual size
+    ctx->configured_video_format.width = cgCtx->frame_width;
+    ctx->configured_video_format.height = cgCtx->frame_height;
+    
+    miniav_log(MINIAV_LOG_LEVEL_INFO, "CG: Configured display %u (%ux%u)", displayID, cgCtx->frame_width, cgCtx->frame_height);
+    
+    return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode cg_configure_window(MiniAVScreenContext* ctx, const char* window_id, const MiniAVVideoInfo* format) {
+    MINIAV_UNUSED(ctx);
+    MINIAV_UNUSED(window_id);
+    MINIAV_UNUSED(format);
+    return MINIAV_ERROR_NOT_SUPPORTED;
+}
+
+static MiniAVResultCode cg_configure_region(MiniAVScreenContext* ctx, const char* target_id, int x, int y, int width, int height, const MiniAVVideoInfo* format) {
+    MINIAV_UNUSED(ctx);
+    MINIAV_UNUSED(target_id);
+    MINIAV_UNUSED(x);
+    MINIAV_UNUSED(y);
+    MINIAV_UNUSED(width);
+    MINIAV_UNUSED(height);
+    MINIAV_UNUSED(format);
+    return MINIAV_ERROR_NOT_SUPPORTED;
+}
+
+static MiniAVResultCode cg_start_capture(MiniAVScreenContext* ctx, MiniAVBufferCallback callback, void* user_data) {
+    if (!ctx || !ctx->platform_ctx || !callback) {
+        return MINIAV_ERROR_INVALID_ARG;
+    }
+    
+    CGScreenPlatformContext* cgCtx = (CGScreenPlatformContext*)ctx->platform_ctx;
+    
+    if (cgCtx->is_streaming) {
+        return MINIAV_ERROR_ALREADY_RUNNING;
+    }
+    
+    if (!ctx->is_configured) {
+        return MINIAV_ERROR_NOT_INITIALIZED;
+    }
+    
+    cgCtx->app_callback_internal = callback;
+    cgCtx->app_callback_user_data_internal = user_data;
     
     @autoreleasepool {
 #if HAS_SCREEN_CAPTURE_KIT
         if (@available(macOS 12.3, *)) {
             // Use modern ScreenCaptureKit
-            [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent * _Nullable content, NSError * _Nullable error) {
+            [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent* content, NSError* error) {
                 if (error || !content) {
-                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get shareable content: %s", error ? [[error localizedDescription] UTF8String] : "Unknown error");
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get shareable content");
                     return;
                 }
                 
-                SCDisplay* mainDisplay = content.displays.firstObject;
-                if (!mainDisplay) {
-                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: No displays available for capture.");
-                    return;
-                }
-                
-                SCContentFilter* filter = [[SCContentFilter alloc] initWithDisplay:mainDisplay excludingWindows:@[]];
-                
-                platCtx->scStreamConfig = [[SCStreamConfiguration alloc] init];
-                platCtx->scStreamConfig.width = mainDisplay.width;
-                platCtx->scStreamConfig.height = mainDisplay.height;
-                platCtx->scStreamConfig.pixelFormat = kCVPixelFormatType_32BGRA;
-                platCtx->scStreamConfig.minimumFrameInterval = CMTimeMake(ctx->configured_video_format.frame_rate_denominator, 
-                                                                         ctx->configured_video_format.frame_rate_numerator);
-                platCtx->scStreamConfig.queueDepth = 3;
-                
-                // Enable audio if requested
-                if (ctx->configured_audio_format.enabled) {
-                    platCtx->scStreamConfig.capturesAudio = YES;
-                    platCtx->scStreamConfig.sampleRate = ctx->configured_audio_format.sample_rate;
-                    platCtx->scStreamConfig.channelCount = ctx->configured_audio_format.channels;
-                }
-                
-                platCtx->scDelegate = [[MiniAVScreenCaptureDelegate alloc] initWithScreenContext:ctx];
-                platCtx->scStream = [[SCStream alloc] initWithFilter:filter configuration:platCtx->scStreamConfig delegate:platCtx->scDelegate];
-                
-                NSError* addOutputError = nil;
-                BOOL success = [platCtx->scStream addStreamOutput:platCtx->scDelegate type:SCStreamOutputTypeScreen sampleHandlerQueue:platCtx->captureQueue error:&addOutputError];
-                if (!success) {
-                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to add video output: %s", [[addOutputError localizedDescription] UTF8String]);
-                    return;
-                }
-                
-                if (ctx->configured_audio_format.enabled) {
-                    NSError* addAudioError = nil;
-                    BOOL audioSuccess = [platCtx->scStream addStreamOutput:platCtx->scDelegate type:SCStreamOutputTypeAudio sampleHandlerQueue:platCtx->captureQueue error:&addAudioError];
-                    if (!audioSuccess) {
-                        miniav_log(MINIAV_LOG_LEVEL_WARN, "SCK: Failed to add audio output: %s", [[addAudioError localizedDescription] UTF8String]);
+                SCDisplay* targetDisplay = nil;
+                for (SCDisplay* display in content.displays) {
+                    if (display.displayID == cgCtx->displayID) {
+                        targetDisplay = display;
+                        break;
                     }
                 }
                 
-                [platCtx->scStream startCaptureWithCompletionHandler:^(NSError * _Nullable error) {
+                if (!targetDisplay) {
+                    targetDisplay = content.displays.firstObject;
+                }
+                
+                if (!targetDisplay) {
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: No displays available for capture");
+                    return;
+                }
+                
+                SCContentFilter* filter = [[SCContentFilter alloc] initWithDisplay:targetDisplay excludingWindows:@[]];
+                
+                cgCtx->scStreamConfig = [[SCStreamConfiguration alloc] init];
+                cgCtx->scStreamConfig.width = targetDisplay.width;
+                cgCtx->scStreamConfig.height = targetDisplay.height;
+                cgCtx->scStreamConfig.pixelFormat = kCVPixelFormatType_32BGRA;
+                cgCtx->scStreamConfig.minimumFrameInterval = CMTimeMake(cgCtx->configured_video_format.frame_rate_denominator, 
+                                                                       cgCtx->configured_video_format.frame_rate_numerator);
+                cgCtx->scStreamConfig.queueDepth = 3;
+                
+                // Note: Audio would be handled by separate loopback system if ctx->capture_audio_requested
+                
+                cgCtx->scDelegate = [[MiniAVScreenCaptureDelegate alloc] initWithCGContext:cgCtx];
+                cgCtx->scStream = [[SCStream alloc] initWithFilter:filter configuration:cgCtx->scStreamConfig delegate:cgCtx->scDelegate];
+                
+                NSError* addOutputError = nil;
+                BOOL success = [cgCtx->scStream addStreamOutput:cgCtx->scDelegate type:SCStreamOutputTypeScreen sampleHandlerQueue:cgCtx->captureQueue error:&addOutputError];
+                if (!success) {
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to add video output");
+                    return;
+                }
+                
+                [cgCtx->scStream startCaptureWithCompletionHandler:^(NSError* error) {
                     if (error) {
-                        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to start stream: %s", [[error localizedDescription] UTF8String]);
+                        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to start stream");
                     } else {
-                        platCtx->is_capturing = true;
-                        miniav_log(MINIAV_LOG_LEVEL_INFO, "SCK: Screen capture started.");
+                        cgCtx->is_streaming = true;
+                        miniav_log(MINIAV_LOG_LEVEL_INFO, "SCK: Screen capture started");
                     }
                 }];
                 
@@ -520,17 +668,17 @@ static MiniAVResultCode macos_cg_start_capture(MiniAVScreenContext* ctx) {
         } else {
 #endif
             // Fallback to legacy Core Graphics capture
-            double fps = (double)ctx->configured_video_format.frame_rate_numerator / ctx->configured_video_format.frame_rate_denominator;
+            double fps = (double)cgCtx->configured_video_format.frame_rate_numerator / cgCtx->configured_video_format.frame_rate_denominator;
             uint64_t interval_ns = (uint64_t)(1000000000.0 / fps);
             
-            platCtx->captureTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, platCtx->captureQueue);
-            dispatch_source_set_timer(platCtx->captureTimer, DISPATCH_TIME_NOW, interval_ns, interval_ns / 10);
-            dispatch_source_set_event_handler_f(platCtx->captureTimer, legacy_capture_timer_callback);
-            dispatch_set_context(platCtx->captureTimer, ctx);
-            dispatch_resume(platCtx->captureTimer);
+            cgCtx->captureTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, cgCtx->captureQueue);
+            dispatch_source_set_timer(cgCtx->captureTimer, DISPATCH_TIME_NOW, interval_ns, interval_ns / 10);
+            dispatch_source_set_event_handler_f(cgCtx->captureTimer, legacy_capture_timer_callback);
+            dispatch_set_context(cgCtx->captureTimer, cgCtx);
+            dispatch_resume(cgCtx->captureTimer);
             
-            platCtx->is_capturing = true;
-            miniav_log(MINIAV_LOG_LEVEL_INFO, "CG: Legacy screen capture started.");
+            cgCtx->is_streaming = true;
+            miniav_log(MINIAV_LOG_LEVEL_INFO, "CG: Legacy screen capture started");
 #if HAS_SCREEN_CAPTURE_KIT
         }
 #endif
@@ -539,78 +687,74 @@ static MiniAVResultCode macos_cg_start_capture(MiniAVScreenContext* ctx) {
     return MINIAV_SUCCESS;
 }
 
-static MiniAVResultCode macos_cg_stop_capture(MiniAVScreenContext* ctx) {
-    if (!ctx || !ctx->platform_ctx) return MINIAV_ERROR_INVALID_ARG;
-    CGScreenPlatformContext* platCtx = (CGScreenPlatformContext*)ctx->platform_ctx;
+static MiniAVResultCode cg_stop_capture(MiniAVScreenContext* ctx) {
+    if (!ctx || !ctx->platform_ctx) {
+        return MINIAV_ERROR_INVALID_ARG;
+    }
     
-    if (!platCtx->is_capturing) {
+    CGScreenPlatformContext* cgCtx = (CGScreenPlatformContext*)ctx->platform_ctx;
+    
+    if (!cgCtx->is_streaming) {
         return MINIAV_SUCCESS;
     }
+    
+    cgCtx->is_streaming = false;
     
     @autoreleasepool {
 #if HAS_SCREEN_CAPTURE_KIT
         if (@available(macOS 12.3, *)) {
-            if (platCtx->scStream) {
-                [platCtx->scStream stopCaptureWithCompletionHandler:^(NSError * _Nullable error) {
-                    platCtx->is_capturing = false;
-                    if (error) {
-                        miniav_log(MINIAV_LOG_LEVEL_WARN, "SCK: Error stopping capture: %s", [[error localizedDescription] UTF8String]);
-                    } else {
-                        miniav_log(MINIAV_LOG_LEVEL_INFO, "SCK: Screen capture stopped.");
-                    }
-                }];
+            if (cgCtx->scStream) {
+                [cgCtx->scStream stopCaptureWithCompletionHandler:nil];
+                cgCtx->scStream = nil;
             }
+            cgCtx->scDelegate = nil;
+            cgCtx->scStreamConfig = nil;
         } else {
 #endif
-            if (platCtx->captureTimer) {
-                dispatch_source_cancel(platCtx->captureTimer);
-                platCtx->captureTimer = NULL;
+            if (cgCtx->captureTimer) {
+                dispatch_source_cancel(cgCtx->captureTimer);
+                cgCtx->captureTimer = NULL;
             }
-            platCtx->is_capturing = false;
-            miniav_log(MINIAV_LOG_LEVEL_INFO, "CG: Legacy screen capture stopped.");
 #if HAS_SCREEN_CAPTURE_KIT
         }
 #endif
     }
     
+    miniav_log(MINIAV_LOG_LEVEL_INFO, "CG: Screen capture stopped");
     return MINIAV_SUCCESS;
 }
 
-static MiniAVResultCode macos_cg_release_buffer(MiniAVScreenContext* ctx, void* native_buffer_payload_void) {
+static MiniAVResultCode cg_release_buffer(MiniAVScreenContext* ctx, void* internal_handle_ptr) {
     MINIAV_UNUSED(ctx);
-    if (!native_buffer_payload_void) return MINIAV_ERROR_INVALID_ARG;
     
-    MiniAVNativeBufferInternalPayload* payload = (MiniAVNativeBufferInternalPayload*)native_buffer_payload_void;
+    if (!internal_handle_ptr) {
+        return MINIAV_SUCCESS;
+    }
+    
+    MiniAVNativeBufferInternalPayload* payload = (MiniAVNativeBufferInternalPayload*)internal_handle_ptr;
     
     @autoreleasepool {
         if (payload->native_singular_resource_ptr) {
             if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN) {
-                if (payload->parent_miniav_buffer_ptr && 
-                    payload->parent_miniav_buffer_ptr->content_type == MINIAV_BUFFER_CONTENT_TYPE_GPU_METAL_TEXTURE) {
-                    // GPU Metal texture
+                CFTypeID typeID = CFGetTypeID(payload->native_singular_resource_ptr);
+                
+                if (typeID == CGImageGetTypeID()) {
+                    // Legacy CGImageRef
+                    CGImageRef image = (CGImageRef)payload->native_singular_resource_ptr;
+                    if (payload->parent_miniav_buffer_ptr && payload->parent_miniav_buffer_ptr->data.video.planes[0].data_ptr) {
+                        CFDataRef data = (CFDataRef)payload->parent_miniav_buffer_ptr->data.video.planes[0].data_ptr;
+                        CFRelease(data);
+                    }
+                    CGImageRelease(image);
+                } else if (typeID == CVPixelBufferGetTypeID()) {
+                    // CVPixelBufferRef
+                    CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)payload->native_singular_resource_ptr;
+                    CVBufferRelease(pixelBuffer);
+                } else {
+                    // Metal texture
                     CVMetalTextureRef metalTextureRef = (CVMetalTextureRef)payload->native_singular_resource_ptr;
                     CFRelease(metalTextureRef);
-                } else {
-                    // Check if it's CGImageRef (legacy) or CVImageBufferRef (modern)
-                    CFTypeID typeID = CFGetTypeID(payload->native_singular_resource_ptr);
-                    if (typeID == CGImageGetTypeID()) {
-                        CGImageRef image = (CGImageRef)payload->native_singular_resource_ptr;
-                        // Also release the copied data
-                        if (payload->parent_miniav_buffer_ptr && payload->parent_miniav_buffer_ptr->data.video.planes[0].data_ptr) {
-                            CFDataRef data = (CFDataRef)payload->parent_miniav_buffer_ptr->data.video.planes[0].data_ptr;
-                            CFRelease(data);
-                        }
-                        CGImageRelease(image);
-                    } else {
-                        // Assume CVImageBufferRef
-                        CVImageBufferRef imageBuffer = (CVImageBufferRef)payload->native_singular_resource_ptr;
-                        CVBufferRelease(imageBuffer);
-                    }
                 }
-            } else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_AUDIO_SCREEN) {
-                // Audio sample buffer
-                CMSampleBufferRef sampleBuffer = (CMSampleBufferRef)payload->native_singular_resource_ptr;
-                CFRelease(sampleBuffer);
             }
             payload->native_singular_resource_ptr = NULL;
         }
@@ -620,130 +764,25 @@ static MiniAVResultCode macos_cg_release_buffer(MiniAVScreenContext* ctx, void* 
         miniav_free(payload->parent_miniav_buffer_ptr);
         payload->parent_miniav_buffer_ptr = NULL;
     }
+    
     miniav_free(payload);
-    return MINIAV_SUCCESS;
-}
-
-static MiniAVResultCode macos_cg_enumerate_sources(MiniAVScreenSourceInfo** sources_out, uint32_t* count_out) {
-    if (!sources_out || !count_out) return MINIAV_ERROR_INVALID_ARG;
-    *sources_out = NULL;
-    *count_out = 0;
-    
-    @autoreleasepool {
-#if HAS_SCREEN_CAPTURE_KIT
-        if (@available(macOS 12.3, *)) {
-            // Use ScreenCaptureKit for enumeration
-            dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-            __block MiniAVResultCode result = MINIAV_SUCCESS;
-            
-            [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent * _Nullable content, NSError * _Nullable error) {
-                if (error || !content) {
-                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to enumerate sources: %s", error ? [[error localizedDescription] UTF8String] : "Unknown error");
-                    result = MINIAV_ERROR_SYSTEM_CALL_FAILED;
-                } else {
-                    NSUInteger totalCount = [content.displays count] + [content.windows count];
-                    if (totalCount > 0) {
-                        *count_out = (uint32_t)totalCount;
-                        *sources_out = (MiniAVScreenSourceInfo*)miniav_calloc(*count_out, sizeof(MiniAVScreenSourceInfo));
-                        
-                        uint32_t index = 0;
-                        
-                        // Add displays
-                        for (SCDisplay* display in content.displays) {
-                            MiniAVScreenSourceInfo* info = &(*sources_out)[index++];
-                            snprintf(info->source_id, MINIAV_SCREEN_SOURCE_ID_MAX_LEN, "display_%u", display.displayID);
-                            snprintf(info->name, MINIAV_SCREEN_SOURCE_NAME_MAX_LEN, "Display %u (%dx%d)", 
-                                    display.displayID, (int)display.width, (int)display.height);
-                            info->type = MINIAV_SCREEN_SOURCE_TYPE_DISPLAY;
-                            info->width = (uint32_t)display.width;
-                            info->height = (uint32_t)display.height;
-                        }
-                        
-                        // Add windows (limit to reasonable number)
-                        for (SCWindow* window in content.windows) {
-                            if (index >= *count_out) break;
-                            if (window.frame.size.width < 100 || window.frame.size.height < 100) continue; // Skip very small windows
-                            
-                            MiniAVScreenSourceInfo* info = &(*sources_out)[index++];
-                            snprintf(info->source_id, MINIAV_SCREEN_SOURCE_ID_MAX_LEN, "window_%u", window.windowID);
-                            snprintf(info->name, MINIAV_SCREEN_SOURCE_NAME_MAX_LEN, "%.100s", [window.title UTF8String] ?: "Untitled Window");
-                            info->type = MINIAV_SCREEN_SOURCE_TYPE_WINDOW;
-                            info->width = (uint32_t)window.frame.size.width;
-                            info->height = (uint32_t)window.frame.size.height;
-                        }
-                        
-                        *count_out = index; // Update count to actual items added
-                    }
-                }
-                dispatch_semaphore_signal(semaphore);
-            }];
-            
-            dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
-            dispatch_release(semaphore);
-            return result;
-        } else {
-#endif
-            // Fallback to Core Graphics display enumeration
-            uint32_t displayCount;
-            CGDirectDisplayID* displays = NULL;
-            
-            if (CGGetActiveDisplayList(0, NULL, &displayCount) != kCGErrorSuccess) {
-                miniav_log(MINIAV_LOG_LEVEL_ERROR, "CG: Failed to get display count.");
-                return MINIAV_ERROR_SYSTEM_CALL_FAILED;
-            }
-            
-            if (displayCount == 0) {
-                return MINIAV_SUCCESS;
-            }
-            
-            displays = (CGDirectDisplayID*)miniav_calloc(displayCount, sizeof(CGDirectDisplayID));
-            if (!displays) {
-                return MINIAV_ERROR_OUT_OF_MEMORY;
-            }
-            
-            if (CGGetActiveDisplayList(displayCount, displays, &displayCount) != kCGErrorSuccess) {
-                miniav_free(displays);
-                return MINIAV_ERROR_SYSTEM_CALL_FAILED;
-            }
-            
-            *count_out = displayCount;
-            *sources_out = (MiniAVScreenSourceInfo*)miniav_calloc(*count_out, sizeof(MiniAVScreenSourceInfo));
-            if (!*sources_out) {
-                miniav_free(displays);
-                *count_out = 0;
-                return MINIAV_ERROR_OUT_OF_MEMORY;
-            }
-            
-            for (uint32_t i = 0; i < displayCount; i++) {
-                MiniAVScreenSourceInfo* info = &(*sources_out)[i];
-                snprintf(info->source_id, MINIAV_SCREEN_SOURCE_ID_MAX_LEN, "display_%u", displays[i]);
-                snprintf(info->name, MINIAV_SCREEN_SOURCE_NAME_MAX_LEN, "Display %u", displays[i]);
-                info->type = MINIAV_SCREEN_SOURCE_TYPE_DISPLAY;
-                
-                CGRect bounds = CGDisplayBounds(displays[i]);
-                info->width = (uint32_t)bounds.size.width;
-                info->height = (uint32_t)bounds.size.height;
-            }
-            
-            miniav_free(displays);
-#if HAS_SCREEN_CAPTURE_KIT
-        }
-#endif
-    }
-    
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CG: Enumerated %u screen sources.", *count_out);
     return MINIAV_SUCCESS;
 }
 
 // --- Global Ops Table ---
 const ScreenContextInternalOps g_screen_ops_macos_cg = {
-    .init_platform = macos_cg_init_platform,
-    .destroy_platform = macos_cg_destroy_platform,
-    .configure = macos_cg_configure,
-    .start_capture = macos_cg_start_capture,
-    .stop_capture = macos_cg_stop_capture,
-    .release_buffer = macos_cg_release_buffer,
-    .enumerate_sources = macos_cg_enumerate_sources,
+    .init_platform = cg_init_platform,
+    .destroy_platform = cg_destroy_platform,
+    .enumerate_displays = cg_enumerate_displays,
+    .enumerate_windows = cg_enumerate_windows,
+    .configure_display = cg_configure_display,
+    .configure_window = cg_configure_window,
+    .configure_region = cg_configure_region,
+    .start_capture = cg_start_capture,
+    .stop_capture = cg_stop_capture,
+    .release_buffer = cg_release_buffer,
+    .get_default_formats = cg_get_default_formats,
+    .get_configured_video_formats = cg_get_configured_video_formats,
 };
 
 // --- Platform Init for Selection ---
@@ -751,12 +790,6 @@ MiniAVResultCode miniav_screen_context_platform_init_macos_cg(MiniAVScreenContex
     if (!ctx) return MINIAV_ERROR_INVALID_ARG;
     
     ctx->ops = &g_screen_ops_macos_cg;
-    ctx->platform_ctx = miniav_calloc(1, sizeof(CGScreenPlatformContext));
-    if (!ctx->platform_ctx) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR, "CG: Failed to allocate platform context.");
-        ctx->ops = NULL;
-        return MINIAV_ERROR_OUT_OF_MEMORY;
-    }
     
     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CG: Screen capture platform selected.");
     return MINIAV_SUCCESS;

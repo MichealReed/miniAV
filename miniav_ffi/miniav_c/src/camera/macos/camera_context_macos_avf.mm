@@ -505,6 +505,39 @@ static MiniAVResultCode macos_avf_destroy_platform(MiniAVCameraContext* ctx) {
     return MINIAV_SUCCESS;
 }
 
+static BOOL macos_avf_validate_format_support(AVCaptureDevice *device, const MiniAVVideoInfo* format_req) {
+    if (!device || !format_req) return NO;
+    
+    float requested_fps = (format_req->frame_rate_denominator > 0) ? 
+                         (float)format_req->frame_rate_numerator / format_req->frame_rate_denominator : 0;
+    
+    for (AVCaptureDeviceFormat *avFormat in device.formats) {
+        CMFormatDescriptionRef desc = avFormat.formatDescription;
+        CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(desc);
+        OSType fourCC = CMFormatDescriptionGetMediaSubType(desc);
+        MiniAVPixelFormat currentMiniAVFormat = FourCCToMiniAVPixelFormat(fourCC);
+        
+        // Check exact match
+        if (dimensions.width == format_req->width && 
+            dimensions.height == format_req->height &&
+            currentMiniAVFormat == format_req->pixel_format) {
+            
+            // Check frame rate support
+            for (AVFrameRateRange *range in avFormat.videoSupportedFrameRateRanges) {
+                if ((requested_fps == 0 && range.maxFrameRate > 0) || 
+                    (requested_fps >= range.minFrameRate && requested_fps <= range.maxFrameRate)) {
+                    return YES; // Format is supported
+                }
+            }
+        }
+    }
+    
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+              "AVF: Format validation failed - %dx%d, PixelFormat:%d, FPS:%.2f not supported", 
+              format_req->width, format_req->height, format_req->pixel_format, requested_fps);
+    return NO;
+}
+
 static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char* device_id_str, const MiniAVVideoInfo* format_req) {
     if (!ctx || !ctx->platform_ctx || !format_req) return MINIAV_ERROR_INVALID_ARG;
     AVFPlatformContext* platCtx = (AVFPlatformContext*)ctx->platform_ctx;
@@ -523,35 +556,18 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
             return MINIAV_ERROR_DEVICE_NOT_FOUND;
         }
 
-        NSError *error = nil;
-        AVCaptureDeviceInput *newInput = [AVCaptureDeviceInput deviceInputWithDevice:selectedDevice error:&error];
-        if (error || !newInput) {
-            miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Failed to create device input: %s", [[error localizedDescription] UTF8String]);
-            return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+        if (!macos_avf_validate_format_support(selectedDevice, format_req)) {
+            miniav_log(MINIAV_LOG_LEVEL_ERROR, 
+                      "AVF: Requested format not supported by device. Use MiniAV_Camera_GetSupportedFormats() to get valid options.");
+            return MINIAV_ERROR_FORMAT_NOT_SUPPORTED;
         }
 
-        [platCtx->captureSession beginConfiguration];
-
-        if (platCtx->deviceInput) {
-            [platCtx->captureSession removeInput:platCtx->deviceInput];
-            [platCtx->deviceInput release];
-            platCtx->deviceInput = nil;
-        }
-        
-        if ([platCtx->captureSession canAddInput:newInput]) {
-            [platCtx->captureSession addInput:newInput];
-            platCtx->deviceInput = [newInput retain];
-        } else {
-            miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Cannot add input to session.");
-            [newInput release];
-            [platCtx->captureSession commitConfiguration];
-            return MINIAV_ERROR_SYSTEM_CALL_FAILED;
-        }
-        [newInput release]; 
-
-        BOOL format_set = NO;
         float requested_fps = (format_req->frame_rate_denominator > 0) ? 
-                              (float)format_req->frame_rate_numerator / format_req->frame_rate_denominator : 0;
+                             (float)format_req->frame_rate_numerator / format_req->frame_rate_denominator : 0;
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                  "AVF: Attempting to configure: %dx%d, PixelFormat: %d, FPS: %.2f", 
+                  format_req->width, format_req->height, format_req->pixel_format, requested_fps);
+
 
         for (AVCaptureDeviceFormat *avFormat in selectedDevice.formats) {
             CMFormatDescriptionRef desc = avFormat.formatDescription;
@@ -769,7 +785,7 @@ static MiniAVResultCode macos_avf_get_supported_formats(const char* device_id_st
             return MINIAV_SUCCESS;
         }
         
-        NSMutableArray<NSValue*> *tempFormatList = [NSMutableArray array]; // Store pointers to MiniAVVideoInfo
+        NSMutableArray<NSValue*> *tempFormatList = [NSMutableArray array];
 
         for (AVCaptureDeviceFormat *avFormat in avFormats) {
             CMFormatDescriptionRef formatDesc = [avFormat formatDescription];
@@ -777,17 +793,40 @@ static MiniAVResultCode macos_avf_get_supported_formats(const char* device_id_st
             OSType fourCC = CMFormatDescriptionGetMediaSubType(formatDesc);
             MiniAVPixelFormat miniAVFormat = FourCCToMiniAVPixelFormat(fourCC);
 
-            if (miniAVFormat == MINIAV_PIXEL_FORMAT_UNKNOWN) continue;
+            // **NEW: Add detailed format logging**
+            char fourCCStr[5] = {0};
+            *(OSType*)fourCCStr = CFSwapInt32HostToBig(fourCC);
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                      "AVF: Examining format: %dx%d, FourCC: '%.4s' (%u), MiniAV: %d", 
+                      dimensions.width, dimensions.height, fourCCStr, fourCC, miniAVFormat);
+
+            if (miniAVFormat == MINIAV_PIXEL_FORMAT_UNKNOWN) {
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Skipping unknown format");
+                continue;
+            }
+
+            // **NEW: Filter out unusually small resolutions**
+            if (dimensions.width < 160 || dimensions.height < 120) {
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                          "AVF: Skipping unusually small resolution: %dx%d", 
+                          dimensions.width, dimensions.height);
+                continue;
+            }
 
             for (AVFrameRateRange *range in avFormat.videoSupportedFrameRateRanges) {
-                // List each distinct frame rate or a representative one if it's a range.
-                // For simplicity, list max frame rate of the range.
-                // A more complex impl could list min, max, and common rates within the range.
-                float frameRate = range.maxFrameRate;
-                if (frameRate == 0 && range.minFrameRate > 0) frameRate = range.minFrameRate;
-                if (frameRate == 0) frameRate = 30; // Fallback if range is 0-0
+                float maxFrameRate = range.maxFrameRate;
+                if (maxFrameRate > 240.0f) {
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                              "AVF: Skipping extreme frame rate: %.2f", maxFrameRate);
+                    continue;
+                }
 
-                // Check if this exact format (res, pixfmt, fps) is already added
+                // List max frame rate of the range
+                float frameRate = maxFrameRate;
+                if (frameRate == 0 && range.minFrameRate > 0) frameRate = range.minFrameRate;
+                if (frameRate == 0) frameRate = 30; // Fallback
+
+                // Check if this exact format is already added
                 bool already_added = false;
                 for(NSValue* val in tempFormatList) {
                     MiniAVVideoInfo* existing = (MiniAVVideoInfo*)[val pointerValue];
@@ -796,7 +835,7 @@ static MiniAVResultCode macos_avf_get_supported_formats(const char* device_id_st
                     if(existing->width == dimensions.width && 
                        existing->height == dimensions.height && 
                        existing->pixel_format == miniAVFormat &&
-                       fabsf(existing_fps - frameRate) < 0.01f ) { // Compare float fps
+                       fabsf(existing_fps - frameRate) < 0.01f ) {
                         already_added = true; 
                         break;
                     }
@@ -813,10 +852,12 @@ static MiniAVResultCode macos_avf_get_supported_formats(const char* device_id_st
                     info->pixel_format = miniAVFormat;
                     info->frame_rate_numerator = (uint32_t)(frameRate * 1000); 
                     info->frame_rate_denominator = 1000;
-                    // output_preference is a request, not a capability of the format itself here.
-                    // Client can request GPU, and we'll try.
-                    info->output_preference = MINIAV_OUTPUT_PREFERENCE_CPU; // Default, actual attempt based on request
+                    info->output_preference = MINIAV_OUTPUT_PREFERENCE_CPU;
                     [tempFormatList addObject:[NSValue valueWithPointer:info]];
+                    
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                              "AVF: Added format: %dx%d @ %.2f FPS, PixelFormat: %d", 
+                              dimensions.width, dimensions.height, frameRate, miniAVFormat);
                 }
             }
         }

@@ -229,10 +229,6 @@ static MTLPixelFormat CVPixelFormatToMTLPixelFormat(OSType cvPixelFormat) {
             
         case kCVPixelFormatType_422YpCbCr8:
         case kCVPixelFormatType_422YpCbCr8_yuvs:
-        case kCVPixelFormatType_YUY2:
-            // Packed YUV formats - could use RG8Unorm with special shader handling
-            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Packed YUV format requires special shader handling");
-            return MTLPixelFormatInvalid; // Indicates special handling needed
             
         // --- 10-bit and specialized formats ---
         case kCVPixelFormatType_422YpCbCr10:

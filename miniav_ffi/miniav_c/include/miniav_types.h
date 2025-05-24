@@ -49,20 +49,55 @@ typedef struct {
 
 // --- Pixel Formats
 typedef enum {
-  MINIAV_PIXEL_FORMAT_UNKNOWN = 0,
-  MINIAV_PIXEL_FORMAT_I420,   // Planar YUV 4:2:0
-  MINIAV_PIXEL_FORMAT_NV12,   // Semi-Planar YUV 4:2:0
-  MINIAV_PIXEL_FORMAT_NV21,   // Semi-Planar YUV 4:2:0
-  MINIAV_PIXEL_FORMAT_YUY2,   // Packed YUV 4:2:2
-  MINIAV_PIXEL_FORMAT_UYVY,   // Packed YUV 4:2:2
-  MINIAV_PIXEL_FORMAT_RGB24,  // Packed RGB
-  MINIAV_PIXEL_FORMAT_BGR24,  // Packed BGR
-  MINIAV_PIXEL_FORMAT_RGBA32, // Packed RGBA
-  MINIAV_PIXEL_FORMAT_BGRA32, // Packed BGRA
-  MINIAV_PIXEL_FORMAT_ARGB32, // Packed ARGB
-  MINIAV_PIXEL_FORMAT_ABGR32, // Packed ABGR
-  MINIAV_PIXEL_FORMAT_MJPEG,   // Motion JPEG (compressed)
-  MINIAV_PIXEL_FORMAT_BGRX32, // 
+    MINIAV_PIXEL_FORMAT_UNKNOWN = 0,
+    
+    // --- Standard RGB Formats (8-bit) ---
+    MINIAV_PIXEL_FORMAT_RGB24,          // 24-bit RGB (no alpha)
+    MINIAV_PIXEL_FORMAT_BGR24,          // 24-bit BGR (no alpha)
+    MINIAV_PIXEL_FORMAT_RGBA32,         // 32-bit RGBA (alpha in MSB)
+    MINIAV_PIXEL_FORMAT_BGRA32,         // 32-bit BGRA (alpha in MSB)
+    MINIAV_PIXEL_FORMAT_ARGB32,         // 32-bit ARGB (alpha in LSB)
+    MINIAV_PIXEL_FORMAT_ABGR32,         // 32-bit ABGR (alpha in LSB)
+    MINIAV_PIXEL_FORMAT_RGBX32,         // 32-bit RGB with padding (X = unused)
+    MINIAV_PIXEL_FORMAT_BGRX32,         // 32-bit BGR with padding (X = unused)
+    MINIAV_PIXEL_FORMAT_XRGB32,         // 32-bit RGB with leading padding
+    MINIAV_PIXEL_FORMAT_XBGR32,         // 32-bit BGR with leading padding
+    
+    // --- Standard YUV Formats (8-bit) ---
+    MINIAV_PIXEL_FORMAT_I420,           // Planar YUV 4:2:0 (YYYY... UU... VV...)
+    MINIAV_PIXEL_FORMAT_YV12,           // Planar YUV 4:2:0 (YYYY... VV... UU...)
+    MINIAV_PIXEL_FORMAT_NV12,           // Semi-planar YUV 4:2:0 (YYYY... UVUV...)
+    MINIAV_PIXEL_FORMAT_NV21,           // Semi-planar YUV 4:2:0 (YYYY... VUVU...)
+    MINIAV_PIXEL_FORMAT_YUY2,           // Packed YUV 4:2:2 (YUYV YUYV...)
+    MINIAV_PIXEL_FORMAT_UYVY,           // Packed YUV 4:2:2 (UYVY UYVY...)
+    
+    // --- High-End RGB Formats ---
+    MINIAV_PIXEL_FORMAT_RGB30,          // 30-bit RGB (10-bit per channel)
+    MINIAV_PIXEL_FORMAT_RGB48,          // 48-bit RGB (16-bit per channel)
+    MINIAV_PIXEL_FORMAT_RGBA64,         // 64-bit RGBA (16-bit per channel)
+    MINIAV_PIXEL_FORMAT_RGBA64_HALF,    // 64-bit RGBA half-precision float
+    MINIAV_PIXEL_FORMAT_RGBA128_FLOAT,  // 128-bit RGBA IEEE float
+    
+    // --- High-End YUV Formats ---
+    MINIAV_PIXEL_FORMAT_YUV420_10BIT,   // 10-bit YUV 4:2:0
+    MINIAV_PIXEL_FORMAT_YUV422_10BIT,   // 10-bit YUV 4:2:2
+    MINIAV_PIXEL_FORMAT_YUV444_10BIT,   // 10-bit YUV 4:4:4
+    
+    // --- Grayscale Formats ---
+    MINIAV_PIXEL_FORMAT_GRAY8,          // 8-bit grayscale
+    MINIAV_PIXEL_FORMAT_GRAY16,         // 16-bit grayscale
+    
+    // --- Raw/Bayer Formats ---
+    MINIAV_PIXEL_FORMAT_BAYER_GRBG8,    // 8-bit Bayer GRBG
+    MINIAV_PIXEL_FORMAT_BAYER_RGGB8,    // 8-bit Bayer RGGB
+    MINIAV_PIXEL_FORMAT_BAYER_BGGR8,    // 8-bit Bayer BGGR
+    MINIAV_PIXEL_FORMAT_BAYER_GBRG8,    // 8-bit Bayer GBRG
+    MINIAV_PIXEL_FORMAT_BAYER_GRBG16,   // 16-bit Bayer GRBG
+    MINIAV_PIXEL_FORMAT_BAYER_RGGB16,   // 16-bit Bayer RGGB
+    MINIAV_PIXEL_FORMAT_BAYER_BGGR16,   // 16-bit Bayer BGGR
+    MINIAV_PIXEL_FORMAT_BAYER_GBRG16,   // 16-bit Bayer GBRG
+    
+    MINIAV_PIXEL_FORMAT_COUNT
 } MiniAVPixelFormat;
 
 // --- Audio Formats (Moved Here) ---

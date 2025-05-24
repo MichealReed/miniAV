@@ -27,61 +27,245 @@ typedef struct AVFPlatformContext {
 // --- Helper Functions (Static, internal to this file) ---
 static MiniAVPixelFormat FourCCToMiniAVPixelFormat(OSType fourCC) {
     switch (fourCC) {
-        case kCVPixelFormatType_420YpCbCr8Planar:       return MINIAV_PIXEL_FORMAT_I420;
-        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
-        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: return MINIAV_PIXEL_FORMAT_NV12;
-        case kCVPixelFormatType_YUY2:                   return MINIAV_PIXEL_FORMAT_YUY2;
-        case kCVPixelFormatType_24RGB:                  return MINIAV_PIXEL_FORMAT_RGB24;
-        case kCVPixelFormatType_32BGRA:                 return MINIAV_PIXEL_FORMAT_BGRA32;
-        case kCVPixelFormatType_32RGBA:                 return MINIAV_PIXEL_FORMAT_RGBA32;
-        case kCVPixelFormatType_32ARGB:                 return MINIAV_PIXEL_FORMAT_ARGB32;
-        case 'jpeg': /* kCVPixelFormatType_JPEG */      return MINIAV_PIXEL_FORMAT_MJPEG;
-        default:
-            // Log unknown FourCC using a character representation if printable
+        // --- Standard RGB Formats (8-bit) ---
+        case kCVPixelFormatType_24RGB:          return MINIAV_PIXEL_FORMAT_RGB24;
+        case kCVPixelFormatType_24BGR:          return MINIAV_PIXEL_FORMAT_BGR24;
+        case kCVPixelFormatType_32RGBA:         return MINIAV_PIXEL_FORMAT_RGBA32;
+        case kCVPixelFormatType_32BGRA:         return MINIAV_PIXEL_FORMAT_BGRA32;
+        case kCVPixelFormatType_32ARGB:         return MINIAV_PIXEL_FORMAT_ARGB32;
+        case kCVPixelFormatType_32ABGR:         return MINIAV_PIXEL_FORMAT_ABGR32;
+        
+        // --- Standard YUV Formats (8-bit) ---
+        case kCVPixelFormatType_420YpCbCr8Planar:           return MINIAV_PIXEL_FORMAT_I420;
+        case kCVPixelFormatType_420YpCbCr8PlanarFullRange:  return MINIAV_PIXEL_FORMAT_I420; // Full range variant
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return MINIAV_PIXEL_FORMAT_NV12;
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:  return MINIAV_PIXEL_FORMAT_NV12; // Full range variant
+        case kCVPixelFormatType_422YpCbCr8_yuvs:            return MINIAV_PIXEL_FORMAT_YUY2; // YUYV
+        case kCVPixelFormatType_422YpCbCr8:                 return MINIAV_PIXEL_FORMAT_UYVY; // UYVY (2vuy)
+        case kCVPixelFormatType_422YpCbCr8FullRange:        return MINIAV_PIXEL_FORMAT_YUY2; // Full range YUYV
+        case kCVPixelFormatType_YUY2:                       return MINIAV_PIXEL_FORMAT_YUY2; // Alternative YUYV
+        
+        // --- High-End RGB Formats ---
+        case kCVPixelFormatType_30RGB:                      return MINIAV_PIXEL_FORMAT_RGB30;
+        case kCVPixelFormatType_48RGB:                      return MINIAV_PIXEL_FORMAT_RGB48;
+        case kCVPixelFormatType_64ARGB:                     return MINIAV_PIXEL_FORMAT_RGBA64;
+        case kCVPixelFormatType_64RGBAHalf:                 return MINIAV_PIXEL_FORMAT_RGBA64_HALF;
+        case kCVPixelFormatType_128RGBAFloat:               return MINIAV_PIXEL_FORMAT_RGBA128_FLOAT;
+        case kCVPixelFormatType_30RGBLEPackedWideGamut:     return MINIAV_PIXEL_FORMAT_RGB30; // Wide gamut variant
+        case kCVPixelFormatType_ARGB2101010LEPacked:        return MINIAV_PIXEL_FORMAT_RGB30; // 10-bit with alpha
+        
+        // --- High-End YUV Formats ---
+        case kCVPixelFormatType_422YpCbCr10:                return MINIAV_PIXEL_FORMAT_YUV422_10BIT;
+        case kCVPixelFormatType_444YpCbCr10:                return MINIAV_PIXEL_FORMAT_YUV444_10BIT;
+        case kCVPixelFormatType_422YpCbCr16:                return MINIAV_PIXEL_FORMAT_YUV422_10BIT; // 10-16 bit variant
+        case kCVPixelFormatType_4444YpCbCrA8:               return MINIAV_PIXEL_FORMAT_YUV444_10BIT; // 4:4:4:4 with alpha
+        case kCVPixelFormatType_4444AYpCbCr8:               return MINIAV_PIXEL_FORMAT_YUV444_10BIT; // Alpha + 4:4:4
+        case kCVPixelFormatType_4444AYpCbCr16:              return MINIAV_PIXEL_FORMAT_YUV444_10BIT; // 16-bit alpha + 4:4:4
+        
+        // --- Lossless formats (typically from screen capture) ---
+        case kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarFullRange: 
+            return MINIAV_PIXEL_FORMAT_YUV420_10BIT;
+        case kCVPixelFormatType_Lossless_64RGBAHalf:        return MINIAV_PIXEL_FORMAT_RGBA64_HALF;
+        
+        // --- Grayscale Formats ---
+        case kCVPixelFormatType_OneComponent8:              return MINIAV_PIXEL_FORMAT_GRAY8;
+        case kCVPixelFormatType_16Gray:                     return MINIAV_PIXEL_FORMAT_GRAY16;
+        case kCVPixelFormatType_OneComponent16Half:         return MINIAV_PIXEL_FORMAT_GRAY16; // Half-precision
+        case kCVPixelFormatType_OneComponent32Float:        return MINIAV_PIXEL_FORMAT_GRAY16; // Float (map to 16-bit)
+        case kCVPixelFormatType_32AlphaGray:                return MINIAV_PIXEL_FORMAT_GRAY16; // 16-bit gray with alpha
+        
+        // --- Two-component formats (could be used for specialized workflows) ---
+        case kCVPixelFormatType_TwoComponent8:              return MINIAV_PIXEL_FORMAT_GRAY8;  // Map to gray for simplicity
+        case kCVPixelFormatType_TwoComponent16Half:         return MINIAV_PIXEL_FORMAT_GRAY16;
+        case kCVPixelFormatType_TwoComponent32Float:        return MINIAV_PIXEL_FORMAT_GRAY16;
+        
+        // --- Bayer Formats (Professional Cameras) ---
+        case kCVPixelFormatType_14Bayer_GRBG:               return MINIAV_PIXEL_FORMAT_BAYER_GRBG16;
+        case kCVPixelFormatType_14Bayer_RGGB:               return MINIAV_PIXEL_FORMAT_BAYER_RGGB16;
+        case kCVPixelFormatType_14Bayer_BGGR:               return MINIAV_PIXEL_FORMAT_BAYER_BGGR16;
+        case kCVPixelFormatType_14Bayer_GBRG:               return MINIAV_PIXEL_FORMAT_BAYER_GBRG16;
+        
+        // --- Legacy/Indexed Formats (very rare, mainly for legacy compatibility) ---
+        case kCVPixelFormatType_1Monochrome:                return MINIAV_PIXEL_FORMAT_GRAY8;  // Map to gray
+        case kCVPixelFormatType_8Indexed:                   return MINIAV_PIXEL_FORMAT_GRAY8;  // Map to gray
+        case kCVPixelFormatType_8IndexedGray_WhiteIsZero:   return MINIAV_PIXEL_FORMAT_GRAY8;
+        
+        // --- 16-bit RGB formats ---
+        case kCVPixelFormatType_16BE555:                    return MINIAV_PIXEL_FORMAT_RGB24;  // Map to 24-bit
+        case kCVPixelFormatType_16LE555:                    return MINIAV_PIXEL_FORMAT_RGB24;
+        case kCVPixelFormatType_16LE5551:                   return MINIAV_PIXEL_FORMAT_RGBA32; // Has alpha bit
+        case kCVPixelFormatType_16BE565:                    return MINIAV_PIXEL_FORMAT_RGB24;
+        case kCVPixelFormatType_16LE565:                    return MINIAV_PIXEL_FORMAT_RGB24;
+        
+        default: {
+            // Enhanced logging with format source detection
             char fourCCStr[5] = {0};
-            *(OSType*)fourCCStr = CFSwapInt32HostToBig(fourCC); // Ensure correct byte order for display
-            if (isprint(fourCCStr[0]) && isprint(fourCCStr[1]) && isprint(fourCCStr[2]) && isprint(fourCCStr[3])) {
-                 miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Unknown FourCC: %u ('%s')", fourCC, fourCCStr);
+            *(OSType*)fourCCStr = CFSwapInt32HostToBig(fourCC);
+            
+            bool is_printable = (isprint(fourCCStr[0]) && isprint(fourCCStr[1]) && 
+                               isprint(fourCCStr[2]) && isprint(fourCCStr[3]));
+            
+            if (is_printable) {
+                // Detect likely source based on format characteristics
+                const char* likely_source = "unknown";
+                if (strstr(fourCCStr, "Lossless") || 
+                    (fourCC >= kCVPixelFormatType_30RGB && fourCC <= kCVPixelFormatType_128RGBAFloat)) {
+                    likely_source = "screen capture/professional video";
+                } else if (fourCC >= kCVPixelFormatType_14Bayer_GRBG && fourCC <= kCVPixelFormatType_14Bayer_GBRG) {
+                    likely_source = "professional camera RAW";
+                } else if (fourCC >= kCVPixelFormatType_420YpCbCr8Planar && fourCC <= kCVPixelFormatType_422YpCbCr8FullRange) {
+                    likely_source = "video camera";
+                }
+                
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                          "AVF: Unknown FourCC: %u ('%.4s') - likely from %s", 
+                          fourCC, fourCCStr, likely_source);
             } else {
-                 miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Unknown FourCC: %u (non-printable)", fourCC);
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                          "AVF: Unknown FourCC: %u (non-printable)", fourCC);
             }
             return MINIAV_PIXEL_FORMAT_UNKNOWN;
+        }
     }
 }
 
 static OSType MiniAVPixelFormatToFourCC(MiniAVPixelFormat format) {
     switch (format) {
-        case MINIAV_PIXEL_FORMAT_I420:   return kCVPixelFormatType_420YpCbCr8Planar;
-        case MINIAV_PIXEL_FORMAT_NV12:   return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-        case MINIAV_PIXEL_FORMAT_YUY2:   return kCVPixelFormatType_YUY2;
-        case MINIAV_PIXEL_FORMAT_RGB24:  return kCVPixelFormatType_24RGB;
-        case MINIAV_PIXEL_FORMAT_BGRA32: return kCVPixelFormatType_32BGRA;
-        case MINIAV_PIXEL_FORMAT_RGBA32: return kCVPixelFormatType_32RGBA;
-        case MINIAV_PIXEL_FORMAT_ARGB32: return kCVPixelFormatType_32ARGB;
-        case MINIAV_PIXEL_FORMAT_MJPEG:  return 'jpeg'; // kCVPixelFormatType_JPEG
+        // --- Standard RGB Formats (8-bit) ---
+        case MINIAV_PIXEL_FORMAT_RGB24:          return kCVPixelFormatType_24RGB;
+        case MINIAV_PIXEL_FORMAT_BGR24:          return kCVPixelFormatType_24BGR;
+        case MINIAV_PIXEL_FORMAT_RGBA32:         return kCVPixelFormatType_32RGBA;
+        case MINIAV_PIXEL_FORMAT_BGRA32:         return kCVPixelFormatType_32BGRA;
+        case MINIAV_PIXEL_FORMAT_ARGB32:         return kCVPixelFormatType_32ARGB;
+        case MINIAV_PIXEL_FORMAT_ABGR32:         return kCVPixelFormatType_32ABGR;
+        
+        // --- Padding formats (may not have direct Core Video equivalents) ---
+        case MINIAV_PIXEL_FORMAT_RGBX32:         return 'RGBX'; // May not be directly supported
+        case MINIAV_PIXEL_FORMAT_BGRX32:         return 'BGRX'; // May not be directly supported  
+        case MINIAV_PIXEL_FORMAT_XRGB32:         return 'XRGB'; // May not be directly supported
+        case MINIAV_PIXEL_FORMAT_XBGR32:         return 'XBGR'; // May not be directly supported
+        
+        // --- Standard YUV Formats (8-bit) ---
+        case MINIAV_PIXEL_FORMAT_I420:           return kCVPixelFormatType_420YpCbCr8Planar;
+        case MINIAV_PIXEL_FORMAT_YV12:           return kCVPixelFormatType_420YpCbCr8Planar; // No direct YV12, use I420
+        case MINIAV_PIXEL_FORMAT_NV12:           return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+        case MINIAV_PIXEL_FORMAT_NV21:           return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange; // No direct NV21
+        case MINIAV_PIXEL_FORMAT_YUY2:           return kCVPixelFormatType_422YpCbCr8_yuvs; // YUYV
+        case MINIAV_PIXEL_FORMAT_UYVY:           return kCVPixelFormatType_422YpCbCr8; // UYVY (2vuy)
+        
+        // --- High-End RGB Formats ---
+        case MINIAV_PIXEL_FORMAT_RGB30:          return kCVPixelFormatType_30RGB;
+        case MINIAV_PIXEL_FORMAT_RGB48:          return kCVPixelFormatType_48RGB;
+        case MINIAV_PIXEL_FORMAT_RGBA64:         return kCVPixelFormatType_64ARGB;
+        case MINIAV_PIXEL_FORMAT_RGBA64_HALF:    return kCVPixelFormatType_64RGBAHalf;
+        case MINIAV_PIXEL_FORMAT_RGBA128_FLOAT:  return kCVPixelFormatType_128RGBAFloat;
+        
+        // --- High-End YUV Formats ---
+        case MINIAV_PIXEL_FORMAT_YUV420_10BIT:   return kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarFullRange;
+        case MINIAV_PIXEL_FORMAT_YUV422_10BIT:   return kCVPixelFormatType_422YpCbCr10;
+        case MINIAV_PIXEL_FORMAT_YUV444_10BIT:   return kCVPixelFormatType_444YpCbCr10;
+        
+        // --- Grayscale Formats ---
+        case MINIAV_PIXEL_FORMAT_GRAY8:          return kCVPixelFormatType_OneComponent8;
+        case MINIAV_PIXEL_FORMAT_GRAY16:         return kCVPixelFormatType_16Gray;
+        
+        // --- Bayer Formats ---
+        case MINIAV_PIXEL_FORMAT_BAYER_GRBG8:    return kCVPixelFormatType_14Bayer_GRBG; // Map 8-bit to 14-bit
+        case MINIAV_PIXEL_FORMAT_BAYER_RGGB8:    return kCVPixelFormatType_14Bayer_RGGB;
+        case MINIAV_PIXEL_FORMAT_BAYER_BGGR8:    return kCVPixelFormatType_14Bayer_BGGR;
+        case MINIAV_PIXEL_FORMAT_BAYER_GBRG8:    return kCVPixelFormatType_14Bayer_GBRG;
+        case MINIAV_PIXEL_FORMAT_BAYER_GRBG16:   return kCVPixelFormatType_14Bayer_GRBG;
+        case MINIAV_PIXEL_FORMAT_BAYER_RGGB16:   return kCVPixelFormatType_14Bayer_RGGB;
+        case MINIAV_PIXEL_FORMAT_BAYER_BGGR16:   return kCVPixelFormatType_14Bayer_BGGR;
+        case MINIAV_PIXEL_FORMAT_BAYER_GBRG16:   return kCVPixelFormatType_14Bayer_GBRG;
+        
         default:
-            return 0; 
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                      "AVF: No Core Video FourCC mapping for MiniAVPixelFormat %d", format);
+            return 0;
     }
 }
 
-// Helper to get Metal Pixel Format from CVPixelBufferFormatType
-// This is a simplified version. A full implementation would handle more formats, especially planar.
+// Enhanced Metal Pixel Format mapping with better coverage
 static MTLPixelFormat CVPixelFormatToMTLPixelFormat(OSType cvPixelFormat) {
     switch (cvPixelFormat) {
-        case kCVPixelFormatType_32BGRA:
-            return MTLPixelFormatBGRA8Unorm;
-        case kCVPixelFormatType_32RGBA:
-            return MTLPixelFormatRGBA8Unorm;
-        // Add more mappings as needed. For planar formats like NV12, this is more complex
-        // as it would typically involve two textures (Y and UV planes).
-        // For kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange (NV12):
-        // Plane 0 (Y): MTLPixelFormatR8Unorm
-        // Plane 1 (UV): MTLPixelFormatRG8Unorm
-        default:
+        // --- Standard RGB Formats ---
+        case kCVPixelFormatType_32BGRA:         return MTLPixelFormatBGRA8Unorm;
+        case kCVPixelFormatType_32RGBA:         return MTLPixelFormatRGBA8Unorm;
+        case kCVPixelFormatType_32ARGB:         return MTLPixelFormatBGRA8Unorm; // Need swizzling
+        case kCVPixelFormatType_32ABGR:         return MTLPixelFormatRGBA8Unorm; // Need swizzling
+        case kCVPixelFormatType_24RGB:          return MTLPixelFormatInvalid;    // No direct 24-bit support
+        case kCVPixelFormatType_24BGR:          return MTLPixelFormatInvalid;    // No direct 24-bit support
+        
+        // --- High-End RGB Formats ---
+        case kCVPixelFormatType_30RGB:          return MTLPixelFormatBGR10A2Unorm;
+        case kCVPixelFormatType_64ARGB:         return MTLPixelFormatRGBA16Unorm;
+        case kCVPixelFormatType_64RGBAHalf:     return MTLPixelFormatRGBA16Float;
+        case kCVPixelFormatType_128RGBAFloat:   return MTLPixelFormatRGBA32Float;
+        case kCVPixelFormatType_48RGB:          return MTLPixelFormatInvalid;    // No direct 48-bit RGB
+        
+        // --- Grayscale Formats ---
+        case kCVPixelFormatType_OneComponent8:  return MTLPixelFormatR8Unorm;
+        case kCVPixelFormatType_16Gray:         return MTLPixelFormatR16Unorm;
+        case kCVPixelFormatType_OneComponent16Half: return MTLPixelFormatR16Float;
+        case kCVPixelFormatType_OneComponent32Float: return MTLPixelFormatR32Float;
+        
+        // --- Two-component formats ---
+        case kCVPixelFormatType_TwoComponent8:  return MTLPixelFormatRG8Unorm;
+        case kCVPixelFormatType_TwoComponent16Half: return MTLPixelFormatRG16Float;
+        case kCVPixelFormatType_TwoComponent32Float: return MTLPixelFormatRG32Float;
+        
+        // --- YUV Formats (require multi-plane setup) ---
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            // NV12: Plane 0 (Y) = R8Unorm, Plane 1 (UV) = RG8Unorm
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: NV12 format requires multi-plane Metal texture setup");
+            return MTLPixelFormatInvalid; // Indicates special handling needed
+            
+        case kCVPixelFormatType_420YpCbCr8Planar:
+        case kCVPixelFormatType_420YpCbCr8PlanarFullRange:
+            // I420: 3 planes, all R8Unorm
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: I420 format requires 3-plane Metal texture setup");
+            return MTLPixelFormatInvalid; // Indicates special handling needed
+            
+        case kCVPixelFormatType_422YpCbCr8:
+        case kCVPixelFormatType_422YpCbCr8_yuvs:
+        case kCVPixelFormatType_YUY2:
+            // Packed YUV formats - could use RG8Unorm with special shader handling
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Packed YUV format requires special shader handling");
+            return MTLPixelFormatInvalid; // Indicates special handling needed
+            
+        // --- 10-bit and specialized formats ---
+        case kCVPixelFormatType_422YpCbCr10:
+        case kCVPixelFormatType_444YpCbCr10:
+        case kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarFullRange:
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: 10-bit YUV format requires specialized Metal texture setup");
+            return MTLPixelFormatInvalid; // Indicates special handling needed
+            
+        // --- Bayer formats ---
+        case kCVPixelFormatType_14Bayer_GRBG:
+        case kCVPixelFormatType_14Bayer_RGGB:
+        case kCVPixelFormatType_14Bayer_BGGR:
+        case kCVPixelFormatType_14Bayer_GBRG:
+            // Bayer could be treated as R16Unorm with demosaicing shader
+            return MTLPixelFormatR16Unorm;
+            
+        default: {
+            char fourCCStr[5] = {0};
+            *(OSType*)fourCCStr = CFSwapInt32HostToBig(cvPixelFormat);
+            if (isprint(fourCCStr[0]) && isprint(fourCCStr[1]) && 
+                isprint(fourCCStr[2]) && isprint(fourCCStr[3])) {
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                          "AVF: No Metal pixel format mapping for CVPixelFormat '%.4s' (%u)", 
+                          fourCCStr, cvPixelFormat);
+            } else {
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                          "AVF: No Metal pixel format mapping for CVPixelFormat %u", cvPixelFormat);
+            }
             return MTLPixelFormatInvalid;
+        }
     }
 }
-
 
 // --- AVFoundation Delegate for Video Output ---
 @interface MiniAVCaptureDelegate : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>

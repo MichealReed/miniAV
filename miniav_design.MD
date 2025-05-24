@@ -115,7 +115,7 @@ MiniAV requires various system libraries, development packages, and runtime comp
 ### Build Dependencies (All Platforms)
 
 * **CMake:** Version 3.15 or later
-* **C/C++ Compiler:** 
+* **C/C++ Compiler:**
   * **Windows:** Visual Studio 2019+ or MinGW-w64
   * **macOS:** Xcode Command Line Tools (clang)
   * **Linux:** GCC 9+ or Clang 10+
@@ -156,7 +156,7 @@ MiniAV requires various system libraries, development packages, and runtime comp
 #### System Frameworks (Automatically Linked)
 
 * **Foundation.framework**
-* **CoreMedia.framework** 
+* **CoreMedia.framework**
 * **CoreVideo.framework**
 * **AVFoundation.framework**
 * **CoreGraphics.framework**
@@ -259,6 +259,7 @@ sudo pacman -S v4l-utils linux-headers
 * **xdg-desktop-portal-wlr:** wlroots portal backend (Sway, etc.)
 
 **PipeWire Runtime:**
+
 ```bash
 # Ubuntu/Debian
 sudo apt install pipewire pipewire-audio-client-libraries
@@ -337,7 +338,7 @@ dependencies {
 
 #### Development Requirements
 
-* **Xcode:** Version 14+ 
+* **Xcode:** Version 14+
 * **iOS SDK:** 13.0+ minimum deployment target
 * **Swift:** 5.7+ (for mixed Swift/Objective-C projects)
 
@@ -661,7 +662,7 @@ Modern operating systems require explicit user consent and proper application co
   * **Pulse/ALSA:** Legacy systems may require additional configuration
 
 * **Sandboxing (Flatpak/Snap):**
-  * **Camera:** `--device=all` or `--socket=camera` 
+  * **Camera:** `--device=all` or `--socket=camera`
   * **Microphone:** `--device=all` or `--socket=microphone`
   * **Screen:** `--socket=x11` or Wayland portal permissions
   * **Audio:** `--socket=audio` or `--socket=pulse`
@@ -1109,6 +1110,194 @@ This API is for capturing audio output from the system or specific applications.
 10. **Buffer Release:** Once the Dart application determines the buffer data is no longer needed (e.g., GPU upload is complete, processing is finished), it **must** trigger the release. This typically involves calling a method on the Dart `MiniAVBuffer` object which, in turn, calls the `MiniAV_ReleaseBuffer(internal_handle)` C function via FFI.
 11. **Capture Stop:** Application calls stop method. `miniav_ffi` calls `MiniAV_<Type>_StopCapture` (C API). The associated `NativeCallable` can be freed. Any outstanding buffers should ideally be released before or shortly after stopping.
 12. **Cleanup:** Application disposes of the context object. `miniav_ffi` calls `MiniAV_<Type>_DestroyContext` (C API).
+
+## Pixel Formats
+
+### MiniAV Unified Format Mapping
+
+Based on platform analysis, MiniAV defines a unified format enum:
+
+```c
+// --- Pixel Formats
+typedef enum {
+    MINIAV_PIXEL_FORMAT_UNKNOWN = 0,
+    
+    // --- Standard RGB Formats (8-bit) ---
+    MINIAV_PIXEL_FORMAT_RGB24,          // 24-bit RGB (no alpha)
+    MINIAV_PIXEL_FORMAT_BGR24,          // 24-bit BGR (no alpha)
+    MINIAV_PIXEL_FORMAT_RGBA32,         // 32-bit RGBA (alpha in MSB)
+    MINIAV_PIXEL_FORMAT_BGRA32,         // 32-bit BGRA (alpha in MSB)
+    MINIAV_PIXEL_FORMAT_ARGB32,         // 32-bit ARGB (alpha in LSB)
+    MINIAV_PIXEL_FORMAT_ABGR32,         // 32-bit ABGR (alpha in LSB)
+    MINIAV_PIXEL_FORMAT_RGBX32,         // 32-bit RGB with padding (X = unused)
+    MINIAV_PIXEL_FORMAT_BGRX32,         // 32-bit BGR with padding (X = unused)
+    MINIAV_PIXEL_FORMAT_XRGB32,         // 32-bit RGB with leading padding
+    MINIAV_PIXEL_FORMAT_XBGR32,         // 32-bit BGR with leading padding
+    
+    // --- Standard YUV Formats (8-bit) ---
+    MINIAV_PIXEL_FORMAT_I420,           // Planar YUV 4:2:0 (YYYY... UU... VV...)
+    MINIAV_PIXEL_FORMAT_YV12,           // Planar YUV 4:2:0 (YYYY... VV... UU...)
+    MINIAV_PIXEL_FORMAT_NV12,           // Semi-planar YUV 4:2:0 (YYYY... UVUV...)
+    MINIAV_PIXEL_FORMAT_NV21,           // Semi-planar YUV 4:2:0 (YYYY... VUVU...)
+    MINIAV_PIXEL_FORMAT_YUY2,           // Packed YUV 4:2:2 (YUYV YUYV...)
+    MINIAV_PIXEL_FORMAT_UYVY,           // Packed YUV 4:2:2 (UYVY UYVY...)
+    
+    // --- High-End RGB Formats ---
+    MINIAV_PIXEL_FORMAT_RGB30,          // 30-bit RGB (10-bit per channel)
+    MINIAV_PIXEL_FORMAT_RGB48,          // 48-bit RGB (16-bit per channel)
+    MINIAV_PIXEL_FORMAT_RGBA64,         // 64-bit RGBA (16-bit per channel)
+    MINIAV_PIXEL_FORMAT_RGBA64_HALF,    // 64-bit RGBA half-precision float
+    MINIAV_PIXEL_FORMAT_RGBA128_FLOAT,  // 128-bit RGBA IEEE float
+    
+    // --- High-End YUV Formats ---
+    MINIAV_PIXEL_FORMAT_YUV420_10BIT,   // 10-bit YUV 4:2:0
+    MINIAV_PIXEL_FORMAT_YUV422_10BIT,   // 10-bit YUV 4:2:2
+    MINIAV_PIXEL_FORMAT_YUV444_10BIT,   // 10-bit YUV 4:4:4
+    
+    // --- Grayscale Formats ---
+    MINIAV_PIXEL_FORMAT_GRAY8,          // 8-bit grayscale
+    MINIAV_PIXEL_FORMAT_GRAY16,         // 16-bit grayscale
+    
+    // --- Compressed Formats ---
+    MINIAV_PIXEL_FORMAT_MJPEG,          // Motion JPEG
+    MINIAV_PIXEL_FORMAT_H264,           // H.264 (future)
+    MINIAV_PIXEL_FORMAT_H265,           // H.265 (future)
+    
+    // --- Raw/Bayer Formats ---
+    MINIAV_PIXEL_FORMAT_BAYER_GRBG8,    // 8-bit Bayer GRBG
+    MINIAV_PIXEL_FORMAT_BAYER_RGGB8,    // 8-bit Bayer RGGB
+    MINIAV_PIXEL_FORMAT_BAYER_BGGR8,    // 8-bit Bayer BGGR
+    MINIAV_PIXEL_FORMAT_BAYER_GBRG8,    // 8-bit Bayer GBRG
+    MINIAV_PIXEL_FORMAT_BAYER_GRBG16,   // 16-bit Bayer GRBG
+    MINIAV_PIXEL_FORMAT_BAYER_RGGB16,   // 16-bit Bayer RGGB
+    MINIAV_PIXEL_FORMAT_BAYER_BGGR16,   // 16-bit Bayer BGGR
+    MINIAV_PIXEL_FORMAT_BAYER_GBRG16,   // 16-bit Bayer GBRG
+    
+    MINIAV_PIXEL_FORMAT_COUNT
+} MiniAVPixelFormat;
+```
+
+### Platform Format Support Matrix
+
+| Format | Windows MF/DXGI | macOS/iOS AVF | Linux V4L2 | Linux PipeWire | Android Camera2 | Web |
+|--------|-----------------|---------------|-------------|----------------|-----------------|-----|
+| **RGB24** | ✓ | ✓ | ✓ | ✓ | ✗ | ✓* |
+| **BGR24** | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ |
+| **RGBA32** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **BGRA32** | ✓ (native) | ✓ (native) | ✓ | ✓ | ✗ | ✗ |
+| **ARGB32** | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ |
+| **ABGR32** | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ |
+| **RGBX32** | ✓ (DXGI) | ✓ (rare) | ✓ | ✓ | ✗ | ✗ |
+| **BGRX32** | ✓ (DXGI native) | ✓ (rare) | ✓ (X11 common) | ✓ | ✗ | ✗ |
+| **XRGB32** | ✓ (legacy) | ✗ | ✓ | ✓ | ✗ | ✗ |
+| **XBGR32** | ✓ (rare) | ✗ | ✓ | ✓ | ✗ | ✗ |
+| **I420** | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
+| **YV12** | ✓ | ✗ | ✓ | ✓ | ✗ | ✗ |
+| **NV12** | ✓ (native) | ✓ (native) | ✓ | ✓ | ✓ (flexible) | ✗ |
+| **NV21** | ✗ | ✗ | ✓ | ✓ | ✓ (native) | ✗ |
+| **YUY2** | ✓ (native) | ✓ | ✓ | ✓ | ✗ | ✗ |
+| **UYVY** | ✓ | ✓ (native) | ✓ | ✓ | ✗ | ✗ |
+| **MJPEG** | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
+| **RGB30** | ✓ (DXGI) | ✓ (native) | ✗ | ✓** | ✗ | ✗ |
+| **RGB48** | ✓ (DXGI) | ✓ (native) | ✗ | ✓** | ✗ | ✗ |
+| **RGBA64** | ✓ (DXGI) | ✓ (native) | ✗ | ✓** | ✗ | ✗ |
+| **RGBA64_HALF** | ✓ (DXGI) | ✓ (native) | ✗ | ✓** | ✗ | ✗ |
+| **RGBA128_FLOAT** | ✓ (DXGI) | ✓ (native) | ✗ | ✓** | ✗ | ✗ |
+| **YUV420_10BIT** | ✓ (newer HW) | ✓ (native) | ✓*** | ✓** | ✓ (newer) | ✗ |
+| **YUV422_10BIT** | ✓ (newer HW) | ✓ (native) | ✓*** | ✓** | ✓ (newer) | ✗ |
+| **YUV444_10BIT** | ✓ (newer HW) | ✓ (native) | ✗ | ✓** | ✓ (newer) | ✗ |
+| **GRAY8** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓* |
+| **GRAY16** | ✓ | ✓ (native) | ✓ | ✓ | ✓ | ✗ |
+| **BAYER_GRBG8** | ✗ | ✓ (pro cameras) | ✓ | ✓ | ✓ (RAW API) | ✗ |
+| **BAYER_RGGB8** | ✗ | ✓ (pro cameras) | ✓ | ✓ | ✓ (RAW API) | ✗ |
+| **BAYER_BGGR8** | ✗ | ✓ (pro cameras) | ✓ | ✓ | ✓ (RAW API) | ✗ |
+| **BAYER_GBRG8** | ✗ | ✓ (pro cameras) | ✓ | ✓ | ✓ (RAW API) | ✗ |
+| **BAYER_GRBG16** | ✗ | ✓ (pro cameras) | ✓ | ✓ | ✓ (RAW API) | ✗ |
+| **BAYER_RGGB16** | ✗ | ✓ (pro cameras) | ✓ | ✓ | ✓ (RAW API) | ✗ |
+| **BAYER_BGGR16** | ✗ | ✓ (pro cameras) | ✓ | ✓ | ✓ (RAW API) | ✗ |
+| **BAYER_GBRG16** | ✗ | ✓ (pro cameras) | ✓ | ✓ | ✓ (RAW API) | ✗ |
+| **H264** | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) |
+| **H265** | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) |
+
+**Legend:**
+
+* ✓ = Supported natively by platform APIs
+* ✓ (native) = Preferred/most efficient format for this platform
+* ✓ (common) = Commonly encountered format
+* ✓ (rare) = Supported but rarely used
+* ✓ (legacy) = Supported for backward compatibility
+* ✓* = Supported via browser conversion to standard formats
+* ✓** = Supported in modern PipeWire with capable hardware/drivers
+* ✓*** = Supported with V4L2 and capable hardware
+* ✓ (future) = Planned future support for compressed formats
+* ✗ = Not supported or extremely rare
+
+### Platform-Specific Format Notes
+
+#### Windows (Media Foundation/DXGI)
+
+* **BGRA32**: Most common for both camera and screen capture
+* **BGRX32**: Native DXGI format (`DXGI_FORMAT_B8G8R8X8_UNORM`) for screen capture
+* **NV12**: Preferred for hardware-accelerated video processing
+* **RGB30**: Available on HDR-capable displays via DXGI
+
+#### macOS/iOS (Core Video/AVFoundation)
+
+* **BGRA32**: Most common camera format (`kCVPixelFormatType_32BGRA`)
+* **NV12**: Native format for efficient video processing
+* **High-end formats**: Full support for professional video workflows
+* **Bayer formats**: Available with professional cameras
+
+#### Linux V4L2
+
+* **BGRX32**: Common with X11 screen capture (24-bit padded to 32-bit)
+* **YUY2/UYVY**: Most common camera formats
+* **Limited 10-bit**: Depends on camera hardware capabilities
+
+#### Linux PipeWire
+
+* **Modern format support**: Best compatibility with high-end formats
+* **Portal-based**: Format support depends on desktop environment
+* **Hardware acceleration**: GPU formats available with modern drivers
+
+#### Android Camera2
+
+* **YUV_420_888**: Flexible format that can represent multiple layouts
+* **NV21**: Traditional Android camera format
+* **Limited RGB**: RGBA32 mainly for surface rendering
+* **RAW support**: Bayer formats available with Camera2 RAW API
+
+#### Web Browsers
+
+* **RGBA32**: Native ImageData format for Canvas
+* **Limited YUV**: Browsers handle YUV internally, expose as RGB
+* **No direct access**: Formats are abstracted by browser APIs
+
+### Format Recommendations by Use Case
+
+#### Real-time Computer Vision
+
+1. **BGRA32** - Universal compatibility, direct GPU upload
+2. **NV12** - Efficient for video processing pipelines
+3. **RGB24** - Lightweight for CPU-only processing
+
+#### High-Quality Imaging
+
+1. **RGB30** - 10-bit color for HDR workflows
+2. **RGBA64_HALF** - Professional imaging applications
+3. **Bayer formats** - Raw sensor data processing
+
+#### Cross-Platform Applications
+
+1. **BGRA32** - Best overall compatibility
+2. **NV12** - Good video processing support
+3. **RGBA32** - Web-compatible fallback
+
+#### Performance-Critical Applications
+
+1. **Platform native formats** - Avoid conversions
+2. **GPU-compatible formats** - Enable zero-copy workflows
+3. **Hardware-accelerated formats** - Leverage platform strengths
 
 ## Considerations for Computer Vision
 

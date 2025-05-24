@@ -628,7 +628,6 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
             return MINIAV_ERROR_SYSTEM_CALL_FAILED;
         }
 
-        // **ENHANCED FORMAT MATCHING WITH BETTER LOGGING**
         for (AVCaptureDeviceFormat *avFormat in selectedDevice.formats) {
             CMFormatDescriptionRef desc = avFormat.formatDescription;
             CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(desc);
@@ -673,10 +672,19 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
                            actual_fps_to_set = range.maxFrameRate;
                            targetFrameDuration = CMTimeMake(1, (int32_t)range.maxFrameRate);
                         } else {
-                           targetFrameDuration = CMTimeMake(format_req->frame_rate_denominator, format_req->frame_rate_numerator);
+                           targetFrameDuration = CMTimeMake(1, (int32_t)actual_fps_to_set);
+                           
+
+                           for (AVFrameRateRange *exactRange in avFormat.videoSupportedFrameRateRanges) {
+                               if (fabsf(exactRange.maxFrameRate - actual_fps_to_set) < 0.1f) {
+                                   targetFrameDuration = exactRange.maxFrameDuration;
+                                   miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                                             "AVF: Using device's preferred frame duration for %.2f FPS", actual_fps_to_set);
+                                   break;
+                               }
+                           }
                         }
                         
-                        // **ENHANCED DEVICE LOCKING WITH DETAILED ERROR REPORTING**
                         NSError *lockError = nil;
                         BOOL lockSuccess = [selectedDevice lockForConfiguration:&lockError];
                         
@@ -686,6 +694,12 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
                             // Set the format
                             selectedDevice.activeFormat = avFormat;
                             miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Set activeFormat");
+                            
+                            miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                                      "AVF: Setting frame duration: %lld/%d (%.6f seconds, %.2f FPS)", 
+                                      targetFrameDuration.value, targetFrameDuration.timescale,
+                                      CMTimeGetSeconds(targetFrameDuration), 
+                                      1.0 / CMTimeGetSeconds(targetFrameDuration));
                             
                             // Set frame rate
                             selectedDevice.activeVideoMinFrameDuration = targetFrameDuration;
@@ -706,7 +720,6 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
                                       "AVF: ❌ Failed to lock device for format config: %s (Code: %ld)", 
                                       errorDesc, lockError ? [lockError code] : -1);
                             
-                            // **CHECK IF DEVICE IS ALREADY IN USE**
                             if (lockError && [lockError code] == AVErrorDeviceAlreadyUsedByAnotherSession) {
                                 miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Device is already in use by another session");
                                 result = MINIAV_ERROR_DEVICE_BUSY;

@@ -20,9 +20,12 @@ extern const ScreenContextInternalOps g_screen_ops_linux_pipewire;
 extern MiniAVResultCode
 miniav_screen_context_platform_init_linux_pipewire(MiniAVScreenContext *ctx);
 #endif
-// #ifdef __APPLE__
-// ...
-// #endif
+#ifdef __APPLE__
+#include "macos/screen_context_macos_cg.h" // Ensure this header declares the ops and init function
+extern const ScreenContextInternalOps g_screen_ops_macos_cg;
+extern MiniAVResultCode
+miniav_screen_context_platform_init_macos_cg(MiniAVScreenContext *ctx);
+#endif
 
 // --- Backend Table ---
 // Order matters here for default preference.
@@ -30,9 +33,9 @@ miniav_screen_context_platform_init_linux_pipewire(MiniAVScreenContext *ctx);
 static const MiniAVScreenBackend g_screen_backends[] = {
 #ifdef _WIN32
     {"Windows Graphics Capture", &g_screen_ops_win_wgc,
-     miniav_screen_context_platform_init_windows_wgc}, 
+     miniav_screen_context_platform_init_windows_wgc},
     {"DXGI", &g_screen_ops_win_dxgi,
-     miniav_screen_context_platform_init_windows_dxgi}, 
+     miniav_screen_context_platform_init_windows_dxgi},
 #endif
 #ifdef __linux__
     {"Pipewire", &g_screen_ops_linux_pipewire,
@@ -40,10 +43,10 @@ static const MiniAVScreenBackend g_screen_backends[] = {
                                                           // acts as
                                                           // platform_init_for_selection
 #endif
-    // #ifdef __APPLE__
-    //    {"CoreGraphics", &g_screen_ops_macos_cg,
-    //    miniav_screen_context_platform_init_macos_cg},
-    // #endif
+#ifdef __APPLE__
+    {"CoreGraphics", &g_screen_ops_macos_cg,
+     miniav_screen_context_platform_init_macos_cg},
+#endif
     {NULL, NULL, NULL} // Sentinel
 };
 

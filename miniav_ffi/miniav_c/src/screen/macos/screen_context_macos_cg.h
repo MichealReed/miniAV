@@ -8,6 +8,8 @@
 extern "C" {
 #endif
 
+extern const ScreenContextInternalOps g_screen_ops_macos_cg;
+
 // Platform-specific initialization function
 MiniAVResultCode miniav_screen_context_platform_init_macos_cg(MiniAVScreenContext* ctx);
 

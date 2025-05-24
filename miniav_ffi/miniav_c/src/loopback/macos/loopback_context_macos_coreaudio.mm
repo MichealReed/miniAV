@@ -866,6 +866,72 @@ static MiniAVResultCode coreaudio_get_configured_format(MiniAVLoopbackContext* c
     return MINIAV_SUCCESS;
 }
 
+#if HAS_AUDIO_TAP_API
+// Helper function to convert PID to Audio Process Object ID
+static bool PIDToAudioProcessObjectID(pid_t pid, AudioObjectID* outProcessObjectID) {
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioHardwarePropertyTranslatePIDToProcessObject,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain
+    };
+    
+    UInt32 dataSize = sizeof(AudioObjectID);
+    OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 
+                                                sizeof(pid), &pid, &dataSize, outProcessObjectID);
+    
+    if (status != noErr) {
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Failed to translate PID %d to process object ID: %d", pid, status);
+        return false;
+    }
+    
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: PID %d -> Process Object ID %u", pid, *outProcessObjectID);
+    return true;
+}
+
+// Helper function to check if a process has active audio
+static bool ProcessHasActiveAudio(pid_t pid) {
+    // Get list of all audio processes
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioHardwarePropertyProcessObjectList,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain
+    };
+    
+    UInt32 dataSize = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize);
+    if (status != noErr || dataSize == 0) {
+        return false;
+    }
+    
+    int count = dataSize / sizeof(AudioObjectID);
+    AudioObjectID* processObjects = (AudioObjectID*)miniav_calloc(count, sizeof(AudioObjectID));
+    if (!processObjects) {
+        return false;
+    }
+    
+    status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize, processObjects);
+    if (status != noErr) {
+        miniav_free(processObjects);
+        return false;
+    }
+    
+    // Check if our PID is in the list
+    addr.mSelector = kAudioProcessPropertyPID;
+    for (int i = 0; i < count; i++) {
+        pid_t processPID = -1;
+        UInt32 pidSize = sizeof(pid_t);
+        status = AudioObjectGetPropertyData(processObjects[i], &addr, 0, NULL, &pidSize, &processPID);
+        if (status == noErr && processPID == pid) {
+            miniav_free(processObjects);
+            return true;
+        }
+    }
+    
+    miniav_free(processObjects);
+    return false;
+}
+#endif
+
 static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, MiniAVBufferCallback callback, void* user_data) {
     if (!ctx || !ctx->platform_ctx || !callback) return MINIAV_ERROR_INVALID_ARG;
     
@@ -913,37 +979,47 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
                 } else {
                     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Target process: %s (PID: %d)", process_name, platCtx->target_pid);
                     
-                    // Additional check - make sure it's not a system process
-                    if (platCtx->target_pid < 100) {
-                        miniav_log(MINIAV_LOG_LEVEL_WARN, "CoreAudio: Target PID %d appears to be a system process, this may not work", platCtx->target_pid);
+                    // Check if process has active audio
+                    if (!ProcessHasActiveAudio(platCtx->target_pid)) {
+                        miniav_log(MINIAV_LOG_LEVEL_WARN, "CoreAudio: Process %d (%s) does not have active audio streams", platCtx->target_pid, process_name);
+                        miniav_log(MINIAV_LOG_LEVEL_WARN, "CoreAudio: Process tap may fail - try starting audio in the target application first");
                     }
                     
-                    // Try different initialization methods for process taps
-                    NSArray* processArray = [NSArray arrayWithObject:[NSNumber numberWithInt:platCtx->target_pid]];
-                    
-                    // Try the most common method first
-                    if ([CATapDescription instancesRespondToSelector:@selector(initStereoMixdownOfProcesses:)]) {
-                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Using initStereoMixdownOfProcesses method");
-                        desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processArray];
-                    }
-                    
-                    // If that didn't work, try other methods
-                    if (!desc && [CATapDescription instancesRespondToSelector:@selector(initWithProcesses:andDeviceUID:)]) {
-                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Trying initWithProcesses:andDeviceUID method");
-                        desc = [[CATapDescription alloc] initWithProcesses:processArray andDeviceUID:nil];
-                    }
-                    
-                    // As a last resort, try mono mixdown
-                    if (!desc && [CATapDescription instancesRespondToSelector:@selector(initMonoMixdownOfProcesses:)]) {
-                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Trying initMonoMixdownOfProcesses method");
-                        desc = [[CATapDescription alloc] initMonoMixdownOfProcesses:processArray];
-                    }
-                    
-                    if (!desc) {
-                        miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to init CATapDescription for PID %d using any available method", platCtx->target_pid);
+                    // Convert PID to Audio Process Object ID
+                    AudioObjectID processObjectID = kAudioObjectUnknown;
+                    if (!PIDToAudioProcessObjectID(platCtx->target_pid, &processObjectID)) {
+                        miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to get process object ID for PID %d", platCtx->target_pid);
                         status = kAudioHardwareIllegalOperationError;
                     } else {
-                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Successfully created CATapDescription for process tap");
+                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Using process object ID %u for tap creation", processObjectID);
+                        
+                        // Use the process object ID instead of PID
+                        NSArray* processArray = [NSArray arrayWithObject:[NSNumber numberWithUnsignedInt:processObjectID]];
+                        
+                        // Try the most common method first
+                        if ([CATapDescription instancesRespondToSelector:@selector(initStereoMixdownOfProcesses:)]) {
+                            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Using initStereoMixdownOfProcesses method");
+                            desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processArray];
+                        }
+                        
+                        // If that didn't work, try other methods
+                        if (!desc && [CATapDescription instancesRespondToSelector:@selector(initWithProcesses:andDeviceUID:)]) {
+                            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Trying initWithProcesses:andDeviceUID method");
+                            desc = [[CATapDescription alloc] initWithProcesses:processArray andDeviceUID:nil];
+                        }
+                        
+                        // As a last resort, try mono mixdown
+                        if (!desc && [CATapDescription instancesRespondToSelector:@selector(initMonoMixdownOfProcesses:)]) {
+                            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Trying initMonoMixdownOfProcesses method");
+                            desc = [[CATapDescription alloc] initMonoMixdownOfProcesses:processArray];
+                        }
+                        
+                        if (!desc) {
+                            miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to init CATapDescription for process object ID %u using any available method", processObjectID);
+                            status = kAudioHardwareIllegalOperationError;
+                        } else {
+                            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Successfully created CATapDescription for process tap");
+                        }
                     }
                 }
             } else if (platCtx->capture_mode == CAPTURE_MODE_SYSTEM_TAP) {
@@ -1256,7 +1332,7 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
     // If we reach here, it means neither tap nor virtual device capture was successful or applicable
     pthread_mutex_unlock(&platCtx->capture_mutex);
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to start capture. No suitable method (Tap or Virtual Device) succeeded for mode %d.", platCtx->capture_mode);
-    return MINIAV_ERROR_NOT_SUPPORTED; // Or a more specific error like MINIAV_ERROR_DEVICE_NOT_FOUND
+    return MINIAV_ERROR_NOT_SUPPORTED;
 }
 
 static MiniAVResultCode coreaudio_stop_capture(MiniAVLoopbackContext* ctx) {

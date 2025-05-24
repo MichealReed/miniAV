@@ -3,6 +3,7 @@
 #include "../../common/miniav_utils.h"
 #include "../../../include/miniav_buffer.h"
 #include <mach/mach_time.h>
+#include <atomic>  // Add this for std::atomic
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -18,6 +19,13 @@
 #else
 #define HAS_SCREEN_CAPTURE_KIT 0
 #endif
+
+// Forward declare the enum outside struct
+typedef enum {
+    CG_TARGET_NONE,
+    CG_TARGET_DISPLAY,
+    CG_TARGET_WINDOW
+} CGCaptureTargetType;
 
 // --- Platform Specific Context ---
 typedef struct CGScreenPlatformContext {
@@ -44,12 +52,7 @@ typedef struct CGScreenPlatformContext {
     MiniAVVideoInfo configured_video_format;
     char selected_item_id[MINIAV_DEVICE_ID_MAX_LEN];
     
-    // Target type
-    typedef enum {
-        CG_TARGET_NONE,
-        CG_TARGET_DISPLAY,
-        CG_TARGET_WINDOW
-    } CGCaptureTargetType;
+    // Target type - use the enum we declared above
     CGCaptureTargetType current_target_type;
     
     uint32_t frame_width;
@@ -243,13 +246,25 @@ static void legacy_capture_timer_callback(void* info) {
         return;
     }
     
-    // Check for deprecated API
-    CGImageRef screenImage = NULL;
+    // Skip legacy capture entirely on macOS 15+ at compile time
+    #if __MAC_OS_X_VERSION_MIN_REQUIRED >= 150000
+        miniav_log(MINIAV_LOG_LEVEL_WARN, "CG: Legacy capture not available - compiled for macOS 15+");
+        return;
+    #endif
+    
+    // For older deployment targets, use runtime check and pragma to suppress warnings
     if (@available(macOS 15.0, *)) {
-        miniav_log(MINIAV_LOG_LEVEL_WARN, "CG: Legacy capture not recommended on macOS 15+");
+        miniav_log(MINIAV_LOG_LEVEL_WARN, "CG: Legacy capture not supported on macOS 15+");
+        return;
     }
     
+    CGImageRef screenImage = NULL;
+    
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     screenImage = CGDisplayCreateImage(cgCtx->displayID);
+    #pragma clang diagnostic pop
+    
     if (!screenImage) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "CG: Failed to create screen image.");
         return;
@@ -318,10 +333,10 @@ static MiniAVResultCode cg_get_default_formats(const char* device_id_utf8,
         memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
     }
     
-    // Parse device ID
+    // Parse device ID - use sscanf instead of sscanf_s
     if (strncmp(device_id_utf8, "display_", 8) == 0) {
         CGDirectDisplayID displayID;
-        if (sscanf_s(device_id_utf8, "display_%u", &displayID) == 1) {
+        if (sscanf(device_id_utf8, "display_%u", &displayID) == 1) {
             CGRect bounds = CGDisplayBounds(displayID);
             video_format_out->width = (uint32_t)bounds.size.width;
             video_format_out->height = (uint32_t)bounds.size.height;
@@ -356,8 +371,6 @@ static MiniAVResultCode cg_get_configured_video_formats(MiniAVScreenContext* ctx
     if (!ctx || !ctx->platform_ctx || !video_format_out) {
         return MINIAV_ERROR_INVALID_ARG;
     }
-    
-    CGScreenPlatformContext* cgCtx = (CGScreenPlatformContext*)ctx->platform_ctx;
     
     memset(video_format_out, 0, sizeof(MiniAVVideoInfo));
     if (audio_format_out) {
@@ -534,9 +547,9 @@ static MiniAVResultCode cg_configure_display(MiniAVScreenContext* ctx, const cha
         return MINIAV_ERROR_ALREADY_RUNNING;
     }
     
-    // Parse display ID
+    // Parse display ID - use sscanf instead of sscanf_s
     CGDirectDisplayID displayID;
-    if (sscanf_s(display_id, "display_%u", &displayID) != 1) {
+    if (sscanf(display_id, "display_%u", &displayID) != 1) {
         return MINIAV_ERROR_INVALID_ARG;
     }
     
@@ -648,7 +661,8 @@ static MiniAVResultCode cg_start_capture(MiniAVScreenContext* ctx, MiniAVBufferC
                 cgCtx->scStream = [[SCStream alloc] initWithFilter:filter configuration:cgCtx->scStreamConfig delegate:cgCtx->scDelegate];
                 
                 NSError* addOutputError = nil;
-                BOOL success = [cgCtx->scStream addStreamOutput:cgCtx->scDelegate type:SCStreamOutputTypeScreen sampleHandlerQueue:cgCtx->captureQueue error:&addOutputError];
+                // Fix: Cast delegate to id<SCStreamOutput>
+                BOOL success = [cgCtx->scStream addStreamOutput:(id<SCStreamOutput>)cgCtx->scDelegate type:SCStreamOutputTypeScreen sampleHandlerQueue:cgCtx->captureQueue error:&addOutputError];
                 if (!success) {
                     miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to add video output");
                     return;
@@ -668,17 +682,28 @@ static MiniAVResultCode cg_start_capture(MiniAVScreenContext* ctx, MiniAVBufferC
         } else {
 #endif
             // Fallback to legacy Core Graphics capture
-            double fps = (double)cgCtx->configured_video_format.frame_rate_numerator / cgCtx->configured_video_format.frame_rate_denominator;
-            uint64_t interval_ns = (uint64_t)(1000000000.0 / fps);
-            
-            cgCtx->captureTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, cgCtx->captureQueue);
-            dispatch_source_set_timer(cgCtx->captureTimer, DISPATCH_TIME_NOW, interval_ns, interval_ns / 10);
-            dispatch_source_set_event_handler_f(cgCtx->captureTimer, legacy_capture_timer_callback);
-            dispatch_set_context(cgCtx->captureTimer, cgCtx);
-            dispatch_resume(cgCtx->captureTimer);
-            
-            cgCtx->is_streaming = true;
-            miniav_log(MINIAV_LOG_LEVEL_INFO, "CG: Legacy screen capture started");
+            #if __MAC_OS_X_VERSION_MIN_REQUIRED >= 150000
+                miniav_log(MINIAV_LOG_LEVEL_ERROR, "CG: Legacy capture not available - compiled for macOS 15+");
+                return MINIAV_ERROR_NOT_SUPPORTED;
+            #else
+                // Check at runtime too
+                if (@available(macOS 15.0, *)) {
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "CG: Legacy capture not supported on macOS 15+");
+                    return MINIAV_ERROR_NOT_SUPPORTED;
+                }
+                
+                double fps = (double)cgCtx->configured_video_format.frame_rate_numerator / cgCtx->configured_video_format.frame_rate_denominator;
+                uint64_t interval_ns = (uint64_t)(1000000000.0 / fps);
+                
+                cgCtx->captureTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, cgCtx->captureQueue);
+                dispatch_source_set_timer(cgCtx->captureTimer, DISPATCH_TIME_NOW, interval_ns, interval_ns / 10);
+                dispatch_source_set_event_handler_f(cgCtx->captureTimer, legacy_capture_timer_callback);
+                dispatch_set_context(cgCtx->captureTimer, cgCtx);
+                dispatch_resume(cgCtx->captureTimer);
+                
+                cgCtx->is_streaming = true;
+                miniav_log(MINIAV_LOG_LEVEL_INFO, "CG: Legacy screen capture started");
+            #endif
 #if HAS_SCREEN_CAPTURE_KIT
         }
 #endif

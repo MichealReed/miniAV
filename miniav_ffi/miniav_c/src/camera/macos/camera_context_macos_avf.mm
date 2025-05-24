@@ -322,6 +322,25 @@ static MTLPixelFormat CVPixelFormatToMTLPixelFormat(OSType cvPixelFormat) {
     bool use_gpu_path = (_miniAVCtx->configured_video_format.output_preference == MINIAV_OUTPUT_PREFERENCE_GPU);
     bool gpu_path_successful = false;
 
+    size_t total_data_size = 0;
+
+    if (CVPixelBufferIsPlanar(imageBuffer)) {
+        size_t planeCount = CVPixelBufferGetPlaneCount(imageBuffer);
+        for (size_t i = 0; i < planeCount; ++i) {
+            size_t plane_height = CVPixelBufferGetHeightOfPlane(imageBuffer, i);
+            size_t plane_stride = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, i);
+            total_data_size += plane_height * plane_stride;
+        }
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Calculated planar data size: %zu bytes (%zu planes)", 
+                  total_data_size, planeCount);
+    } else {
+        size_t height = CVPixelBufferGetHeight(imageBuffer);
+        size_t stride = CVPixelBufferGetBytesPerRow(imageBuffer);
+        total_data_size = height * stride;
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Calculated non-planar data size: %zu bytes (%zux%zu)", 
+                  total_data_size, height, stride);
+    }
+
     if (use_gpu_path && platCtx->metalDevice && platCtx->textureCache) {
         size_t frame_width = CVPixelBufferGetWidth(imageBuffer);
         size_t frame_height = CVPixelBufferGetHeight(imageBuffer);
@@ -347,6 +366,7 @@ static MTLPixelFormat CVPixelFormatToMTLPixelFormat(OSType cvPixelFormat) {
                     mavBuffer_ptr->data.video.info.width = [texture width];
                     mavBuffer_ptr->data.video.info.height = [texture height];
                     mavBuffer_ptr->data.video.info.pixel_format = FourCCToMiniAVPixelFormat(cv_pixel_format_type);
+                    mavBuffer_ptr->data_size_bytes = total_data_size;
                     
                     // Use unified plane structure for GPU
                     mavBuffer_ptr->data.video.num_planes = 1;
@@ -388,6 +408,8 @@ static MTLPixelFormat CVPixelFormatToMTLPixelFormat(OSType cvPixelFormat) {
         mavBuffer_ptr->data.video.info.width = (uint32_t)CVPixelBufferGetWidth(imageBuffer);
         mavBuffer_ptr->data.video.info.height = (uint32_t)CVPixelBufferGetHeight(imageBuffer);
         mavBuffer_ptr->data.video.info.pixel_format = FourCCToMiniAVPixelFormat(CVPixelBufferGetPixelFormatType(imageBuffer));
+        mavBuffer_ptr->data_size_bytes = total_data_size;
+
 
         if (CVPixelBufferIsPlanar(imageBuffer)) {
             size_t planeCount = CVPixelBufferGetPlaneCount(imageBuffer);

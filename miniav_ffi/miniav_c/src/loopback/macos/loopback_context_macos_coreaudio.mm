@@ -1047,6 +1047,41 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
                     return MINIAV_ERROR_DEVICE_NOT_FOUND;
                 }
             } else {
+                // Successfully created tap, continue with aggregated device creation
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Process tap created successfully, creating aggregated device");
+                
+                NSString *deviceName = [NSString stringWithFormat:@"miniav-aggregated-%d", currentProcessID];
+                NSNumber *isPrivateKey = [NSNumber numberWithBool:true];
+                
+                NSArray* tapConf = [NSArray arrayWithObject:[NSDictionary dictionaryWithObjectsAndKeys:
+                                    [NSNumber numberWithBool:true], [NSString stringWithUTF8String:kAudioSubTapDriftCompensationKey],
+                                    tapUUID.UUIDString, [NSString stringWithUTF8String:kAudioSubTapUIDKey],
+                                    nil]];
+                
+                NSDictionary *dict = [NSDictionary dictionaryWithObjectsAndKeys:
+                                      deviceName, [NSString stringWithUTF8String:kAudioAggregateDeviceNameKey],
+                                      [[NSUUID UUID] UUIDString], [NSString stringWithUTF8String:kAudioAggregateDeviceUIDKey],
+                                      isPrivateKey, [NSString stringWithUTF8String:kAudioAggregateDeviceIsPrivateKey],
+                                      tapConf, [NSString stringWithUTF8String:kAudioAggregateDeviceTapListKey],
+                                      nil];
+                
+                CFDictionaryRef dictBridge = (__bridge CFDictionaryRef)dict;
+                status = AudioHardwareCreateAggregateDevice(dictBridge, &platCtx->aggregated_id);
+                
+                if (status != noErr) {
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to create aggregate device: %d (0x%X)", status, status);
+                    AudioHardwareDestroyProcessTap(platCtx->tap_id);
+                    platCtx->tap_id = kAudioObjectUnknown;
+                    
+                    // Fallback to virtual device
+                    platCtx->virtual_device_id = FindVirtualAudioDevice();
+                    if (platCtx->virtual_device_id != kAudioObjectUnknown) {
+                        platCtx->capture_mode = CAPTURE_MODE_VIRTUAL_DEVICE;
+                    } else {
+                        pthread_mutex_unlock(&platCtx->capture_mutex);
+                        return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+                    }
+                } else {
                     status = AudioDeviceCreateIOProcID(platCtx->aggregated_id, AudioTapIOProc, platCtx, &platCtx->io_proc_id);
                     if (status != noErr) {
                         miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to create IOProc: %d (0x%X)", status, status);

@@ -14,14 +14,25 @@
 #include <sys/proc_info.h>
 #include <mach/mach.h>
 #include <pthread.h>
+#include <Foundation/Foundation.h>
 
-// Audio Tap APIs (macOS 10.10+)
+// Audio Tap APIs (macOS 10.10+) - use the correct headers
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 101000
-#include <CoreAudio/AudioHardware.h>
+#import <CoreAudio/AudioHardwareTapping.h>
+#import <CoreAudio/CATapDescription.h>
+#import <AppKit/NSRunningApplication.h>
 #define HAS_AUDIO_TAP_API 1
 #else
 #define HAS_AUDIO_TAP_API 0
 #endif
+
+// --- Capture Mode Enum ---
+typedef enum {
+    CAPTURE_MODE_NONE,
+    CAPTURE_MODE_VIRTUAL_DEVICE,         // Virtual audio device (BlackHole, etc.)
+    CAPTURE_MODE_SYSTEM_TAP,             // System-wide audio tap
+    CAPTURE_MODE_PROCESS_TAP             // Process-specific audio tap
+} CoreAudioCaptureMode;
 
 // --- Platform Specific Context ---
 typedef struct CoreAudioLoopbackPlatformContext {
@@ -34,7 +45,9 @@ typedef struct CoreAudioLoopbackPlatformContext {
     
     // Audio Tap for process/system capture
     #if HAS_AUDIO_TAP_API
-    AudioHardwareTapRef tap_ref;
+    AudioObjectID tap_id;
+    AudioDeviceID aggregated_id;
+    AudioDeviceIOProcID io_proc_id;
     pid_t target_pid;
     #endif
     
@@ -51,12 +64,7 @@ typedef struct CoreAudioLoopbackPlatformContext {
     bool should_stop_capture;
     
     // Capture mode
-    enum {
-        CAPTURE_MODE_NONE,
-        CAPTURE_MODE_VIRTUAL_DEVICE,         // Virtual audio device (BlackHole, etc.)
-        CAPTURE_MODE_SYSTEM_TAP,             // System-wide audio tap
-        CAPTURE_MODE_PROCESS_TAP             // Process-specific audio tap
-    } capture_mode;
+    CoreAudioCaptureMode capture_mode;
     
 } CoreAudioLoopbackPlatformContext;
 
@@ -67,15 +75,13 @@ static MiniAVAudioFormat CoreAudioFormatToMiniAV(const AudioStreamBasicDescripti
             if (asbd->mBitsPerChannel == 32) {
                 return MINIAV_AUDIO_FORMAT_F32;
             }
-            // F64 not supported in MiniAV, fallback to F32
         } else { // Integer PCM
             if (asbd->mBitsPerChannel == 16) {
-                return (asbd->mFormatFlags & kAudioFormatFlagIsSignedInteger) ? 
-                       MINIAV_AUDIO_FORMAT_S16 : MINIAV_AUDIO_FORMAT_S16; // No U16 in MiniAV
+                return MINIAV_AUDIO_FORMAT_S16;
             } else if (asbd->mBitsPerChannel == 32) {
                 return MINIAV_AUDIO_FORMAT_S32;
             } else if (asbd->mBitsPerChannel == 8) {
-                return MINIAV_AUDIO_FORMAT_U8; // Use U8 for 8-bit
+                return MINIAV_AUDIO_FORMAT_U8;
             }
         }
     }
@@ -106,7 +112,6 @@ static void MiniAVFormatToCoreAudio(const MiniAVAudioInfo* miniav_format, AudioS
             asbd->mFormatFlags = kAudioFormatFlagIsPacked;
             break;
         default:
-            // Default to float32
             asbd->mBitsPerChannel = 32;
             asbd->mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
             break;
@@ -116,7 +121,6 @@ static void MiniAVFormatToCoreAudio(const MiniAVAudioInfo* miniav_format, AudioS
     asbd->mFramesPerPacket = 1;
     asbd->mBytesPerPacket = asbd->mBytesPerFrame * asbd->mFramesPerPacket;
     
-    // Use native endianness
     if (asbd->mFormatFlags & kAudioFormatFlagIsSignedInteger) {
         asbd->mFormatFlags |= kAudioFormatFlagsNativeEndian;
     }
@@ -145,25 +149,20 @@ static AudioObjectPropertyAddress GetPropertyAddress(AudioObjectPropertySelector
 
 // Check if a device is a virtual audio device (like BlackHole)
 static bool IsVirtualAudioDevice(AudioDeviceID deviceID) {
-    // Get device manufacturer
     AudioObjectPropertyAddress prop_addr = GetPropertyAddress(kAudioObjectPropertyManufacturer);
     CFStringRef manufacturer = NULL;
     UInt32 data_size = sizeof(CFStringRef);
     OSStatus status = AudioObjectGetPropertyData(deviceID, &prop_addr, 0, NULL, &data_size, &manufacturer);
     
     if (status == noErr && manufacturer) {
-        // Check for known virtual audio device manufacturers
         bool is_virtual = false;
         
-        // BlackHole
         if (CFStringCompare(manufacturer, CFSTR("ExistentialAudio Inc."), 0) == kCFCompareEqualTo) {
             is_virtual = true;
         }
-        // Loopback by Rogue Amoeba
         else if (CFStringCompare(manufacturer, CFSTR("Rogue Amoeba"), 0) == kCFCompareEqualTo) {
             is_virtual = true;
         }
-        // SoundFlower (deprecated but might still be around)
         else if (CFStringCompare(manufacturer, CFSTR("ma++ ingalls"), 0) == kCFCompareEqualTo) {
             is_virtual = true;
         }
@@ -176,20 +175,23 @@ static bool IsVirtualAudioDevice(AudioDeviceID deviceID) {
 }
 
 #if HAS_AUDIO_TAP_API
-// Audio Tap callback for system/process audio capture
-static OSStatus AudioTapCallback(void* inRefCon, 
-                                AudioHardwareTapRef inTap,
-                                const AudioTimeStamp* inTimeStamp,
-                                const AudioBufferList* inBufferList) {
-    CoreAudioLoopbackPlatformContext* platCtx = (CoreAudioLoopbackPlatformContext*)inRefCon;
+// Audio IOProc callback for process audio tap
+static OSStatus AudioTapIOProc(AudioObjectID          objID,
+                               const AudioTimeStamp*  inNow,
+                               const AudioBufferList* inInputData,
+                               const AudioTimeStamp*  inInputTime,
+                               AudioBufferList*       outOutputData,
+                               const AudioTimeStamp*  outOutputTime,
+                               void*                  inClientData) {
+    CoreAudioLoopbackPlatformContext* platCtx = (CoreAudioLoopbackPlatformContext*)inClientData;
     MiniAVLoopbackContext* ctx = platCtx->parent_ctx;
     
-    if (!ctx || !ctx->app_callback || !platCtx->is_capturing) {
-        return noErr;
+    if (!ctx || !ctx->app_callback || !platCtx->is_capturing || !inInputData) {
+        return kAudioHardwareNoError;
     }
     
     // Process the captured audio
-    if (inBufferList && inBufferList->mNumberBuffers > 0) {
+    if (inInputData->mNumberBuffers > 0) {
         MiniAVNativeBufferInternalPayload* payload = 
             (MiniAVNativeBufferInternalPayload*)miniav_calloc(1, sizeof(MiniAVNativeBufferInternalPayload));
         MiniAVBuffer* mavBuffer_ptr = (MiniAVBuffer*)miniav_calloc(1, sizeof(MiniAVBuffer));
@@ -197,7 +199,7 @@ static OSStatus AudioTapCallback(void* inRefCon,
         if (!payload || !mavBuffer_ptr) {
             miniav_free(payload);
             miniav_free(mavBuffer_ptr);
-            return noErr;
+            return kAudioHardwareNoError;
         }
         
         payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_AUDIO;
@@ -206,7 +208,7 @@ static OSStatus AudioTapCallback(void* inRefCon,
         mavBuffer_ptr->internal_handle = payload;
         
         // Copy audio data from the first buffer
-        const AudioBuffer* sourceBuffer = &inBufferList->mBuffers[0];
+        const AudioBuffer* sourceBuffer = &inInputData->mBuffers[0];
         void* audioCopy = miniav_calloc(sourceBuffer->mDataByteSize, 1);
         if (audioCopy) {
             memcpy(audioCopy, sourceBuffer->mData, sourceBuffer->mDataByteSize);
@@ -214,7 +216,7 @@ static OSStatus AudioTapCallback(void* inRefCon,
             
             mavBuffer_ptr->type = MINIAV_BUFFER_TYPE_AUDIO;
             mavBuffer_ptr->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
-            mavBuffer_ptr->timestamp_us = AudioConvertHostTimeToNanos(inTimeStamp->mHostTime) / 1000;
+            mavBuffer_ptr->timestamp_us = AudioConvertHostTimeToNanos(inNow->mHostTime) / 1000;
             
             // Calculate frame count from buffer size and format
             uint32_t frame_count = sourceBuffer->mDataByteSize / platCtx->stream_format.mBytesPerFrame;
@@ -236,7 +238,7 @@ static OSStatus AudioTapCallback(void* inRefCon,
         }
     }
     
-    return noErr;
+    return kAudioHardwareNoError;
 }
 #endif
 
@@ -365,11 +367,13 @@ static MiniAVResultCode coreaudio_init_platform(MiniAVLoopbackContext* ctx) {
     platCtx->parent_ctx = ctx;
     platCtx->is_capturing = false;
     platCtx->should_stop_capture = false;
-    platCtx->capture_mode = CoreAudioLoopbackPlatformContext::CAPTURE_MODE_NONE;
+    platCtx->capture_mode = CAPTURE_MODE_NONE;
     platCtx->virtual_device_id = kAudioObjectUnknown;
     
     #if HAS_AUDIO_TAP_API
-    platCtx->tap_ref = NULL;
+    platCtx->tap_id = kAudioObjectUnknown;
+    platCtx->aggregated_id = kAudioObjectUnknown;
+    platCtx->io_proc_id = NULL;
     platCtx->target_pid = 0;
     #endif
     
@@ -387,41 +391,6 @@ static MiniAVResultCode coreaudio_init_platform(MiniAVLoopbackContext* ctx) {
     }
     
     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Platform context initialized.");
-    return MINIAV_SUCCESS;
-}
-
-static MiniAVResultCode coreaudio_stop_capture(MiniAVLoopbackContext* ctx) {
-    if (!ctx || !ctx->platform_ctx) return MINIAV_ERROR_INVALID_ARG;
-    
-    CoreAudioLoopbackPlatformContext* platCtx = (CoreAudioLoopbackPlatformContext*)ctx->platform_ctx;
-    
-    if (!platCtx->is_capturing) {
-        return MINIAV_SUCCESS;
-    }
-    
-    pthread_mutex_lock(&platCtx->capture_mutex);
-    platCtx->should_stop_capture = true;
-    platCtx->is_capturing = false;
-    ctx->is_running = false;
-    
-    #if HAS_AUDIO_TAP_API
-    // Stop Audio Tap
-    if (platCtx->tap_ref) {
-        AudioHardwareTapStop(platCtx->tap_ref);
-        AudioHardwareTapDestroy(platCtx->tap_ref);
-        platCtx->tap_ref = NULL;
-    }
-    #endif
-    
-    // Stop AudioUnit
-    if (platCtx->input_unit) {
-        AudioOutputUnitStop(platCtx->input_unit);
-        AudioUnitUninitialize(platCtx->input_unit);
-    }
-    
-    pthread_mutex_unlock(&platCtx->capture_mutex);
-    
-    miniav_log(MINIAV_LOG_LEVEL_INFO, "CoreAudio: Loopback capture stopped");
     return MINIAV_SUCCESS;
 }
 
@@ -444,9 +413,19 @@ static MiniAVResultCode coreaudio_destroy_platform(MiniAVLoopbackContext* ctx) {
     
     #if HAS_AUDIO_TAP_API
     // Clean up Audio Tap
-    if (platCtx->tap_ref) {
-        AudioHardwareTapDestroy(platCtx->tap_ref);
-        platCtx->tap_ref = NULL;
+    if (platCtx->io_proc_id && platCtx->aggregated_id != kAudioObjectUnknown) {
+        AudioDeviceDestroyIOProcID(platCtx->aggregated_id, platCtx->io_proc_id);
+        platCtx->io_proc_id = NULL;
+    }
+    
+    if (platCtx->aggregated_id != kAudioObjectUnknown) {
+        AudioHardwareDestroyAggregateDevice(platCtx->aggregated_id);
+        platCtx->aggregated_id = kAudioObjectUnknown;
+    }
+    
+    if (platCtx->tap_id != kAudioObjectUnknown) {
+        AudioHardwareDestroyProcessTap(platCtx->tap_id);
+        platCtx->tap_id = kAudioObjectUnknown;
     }
     #endif
     
@@ -502,7 +481,6 @@ static MiniAVResultCode coreaudio_enumerate_targets(MiniAVLoopbackTargetType tar
         // Virtual audio devices as fallback method
         AudioDeviceID virtual_device = FindVirtualAudioDevice();
         if (virtual_device != kAudioObjectUnknown) {
-            // Get device name
             AudioObjectPropertyAddress prop_addr = GetPropertyAddress(kAudioObjectPropertyName);
             CFStringRef device_name = NULL;
             UInt32 data_size = sizeof(CFStringRef);
@@ -525,7 +503,6 @@ static MiniAVResultCode coreaudio_enumerate_targets(MiniAVLoopbackTargetType tar
                 found_count++;
             }
         } else if (!HAS_AUDIO_TAP_API) {
-            // No virtual device available and no Audio Tap support
             MiniAVDeviceInfo* info = &temp_devices[found_count];
             snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "no_virtual_device");
             snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "Install BlackHole or similar virtual audio device");
@@ -537,7 +514,6 @@ static MiniAVResultCode coreaudio_enumerate_targets(MiniAVLoopbackTargetType tar
     // Process-specific capture
     if (target_type_filter == MINIAV_LOOPBACK_TARGET_PROCESS) {
         #if HAS_AUDIO_TAP_API
-        // Add running audio processes (simplified - just show it's supported)
         MiniAVDeviceInfo* info = &temp_devices[found_count];
         snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "process_tap");
         snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "Process Audio Capture (Audio Tap)");
@@ -573,7 +549,6 @@ static MiniAVResultCode coreaudio_get_default_format(const char* target_device_i
     if (!format_out) return MINIAV_ERROR_INVALID_ARG;
     memset(format_out, 0, sizeof(MiniAVAudioInfo));
     
-    // Default format for loopback audio
     format_out->sample_rate = 44100;
     format_out->channels = 2;
     format_out->format = MINIAV_AUDIO_FORMAT_F32;
@@ -597,8 +572,8 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
     // Determine capture method based on target
     if (target_info && target_info->type == MINIAV_LOOPBACK_TARGET_PROCESS) {
         #if HAS_AUDIO_TAP_API
-        platCtx->target_pid = target_info->TARGETHANDLE.process_id;
-        platCtx->capture_mode = CoreAudioLoopbackPlatformContext::CAPTURE_MODE_PROCESS_TAP;
+        platCtx->target_pid = target_info->process.pid;
+        platCtx->capture_mode = CAPTURE_MODE_PROCESS_TAP;
         miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for process audio capture (PID: %d)", platCtx->target_pid);
         #else
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Process capture not supported in this build");
@@ -606,13 +581,13 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
         #endif
     } else if (target_info && target_info->type == MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO) {
         #if HAS_AUDIO_TAP_API
-        platCtx->capture_mode = CoreAudioLoopbackPlatformContext::CAPTURE_MODE_SYSTEM_TAP;
+        platCtx->capture_mode = CAPTURE_MODE_SYSTEM_TAP;
         miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for system audio capture (Audio Tap)");
         #else
         // Fallback to virtual device
         platCtx->virtual_device_id = FindVirtualAudioDevice();
         if (platCtx->virtual_device_id != kAudioObjectUnknown) {
-            platCtx->capture_mode = CoreAudioLoopbackPlatformContext::CAPTURE_MODE_VIRTUAL_DEVICE;
+            platCtx->capture_mode = CAPTURE_MODE_VIRTUAL_DEVICE;
             miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for system audio capture (Virtual Device)");
         } else {
             miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: No system audio capture method available");
@@ -623,7 +598,7 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
         if (strncmp(target_device_id, "pid:", 4) == 0) {
             #if HAS_AUDIO_TAP_API
             sscanf(target_device_id + 4, "%d", &platCtx->target_pid);
-            platCtx->capture_mode = CoreAudioLoopbackPlatformContext::CAPTURE_MODE_PROCESS_TAP;
+            platCtx->capture_mode = CAPTURE_MODE_PROCESS_TAP;
             miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for process capture (PID: %d)", platCtx->target_pid);
             #else
             miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Process capture not supported in this build");
@@ -631,7 +606,7 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
             #endif
         } else if (strcmp(target_device_id, "system_tap") == 0) {
             #if HAS_AUDIO_TAP_API
-            platCtx->capture_mode = CoreAudioLoopbackPlatformContext::CAPTURE_MODE_SYSTEM_TAP;
+            platCtx->capture_mode = CAPTURE_MODE_SYSTEM_TAP;
             miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for system audio tap");
             #else
             miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: System tap not supported in this build");
@@ -639,8 +614,8 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
             #endif
         } else if (strcmp(target_device_id, "process_tap") == 0) {
             #if HAS_AUDIO_TAP_API
-            platCtx->capture_mode = CoreAudioLoopbackPlatformContext::CAPTURE_MODE_PROCESS_TAP;
-            platCtx->target_pid = 0; // Will need to be set later
+            platCtx->capture_mode = CAPTURE_MODE_PROCESS_TAP;
+            platCtx->target_pid = 0;
             miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for process audio tap");
             #else
             miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Process tap not supported in this build");
@@ -648,7 +623,7 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
             #endif
         } else if (strncmp(target_device_id, "virtual_device:", 15) == 0) {
             sscanf(target_device_id + 15, "%u", &platCtx->virtual_device_id);
-            platCtx->capture_mode = CoreAudioLoopbackPlatformContext::CAPTURE_MODE_VIRTUAL_DEVICE;
+            platCtx->capture_mode = CAPTURE_MODE_VIRTUAL_DEVICE;
             miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for virtual device capture (ID: %u)", 
                        platCtx->virtual_device_id);
         } else if (strcmp(target_device_id, "no_virtual_device") == 0) {
@@ -677,7 +652,7 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
         return MINIAV_ERROR_ALREADY_RUNNING;
     }
     
-    if (platCtx->capture_mode == CoreAudioLoopbackPlatformContext::CAPTURE_MODE_NONE) {
+    if (platCtx->capture_mode == CAPTURE_MODE_NONE) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Not configured");
         return MINIAV_ERROR_NOT_INITIALIZED;
     }
@@ -688,34 +663,98 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
     OSStatus status = noErr;
     
     #if HAS_AUDIO_TAP_API
-    if (platCtx->capture_mode == CoreAudioLoopbackPlatformContext::CAPTURE_MODE_SYSTEM_TAP || platCtx->capture_mode == CoreAudioLoopbackPlatformContext::CAPTURE_MODE_PROCESS_TAP) {
+    if (platCtx->capture_mode == CAPTURE_MODE_SYSTEM_TAP || platCtx->capture_mode == CAPTURE_MODE_PROCESS_TAP) {
         miniav_log(MINIAV_LOG_LEVEL_INFO, "CoreAudio: Starting Audio Tap capture");
         
-        // Create Audio Tap
-        AudioHardwareTapDescription tapDesc = {0};
-        tapDesc.format = platCtx->stream_format;
-        tapDesc.callback = AudioTapCallback;
-        tapDesc.callbackRefCon = platCtx;
-        
-        if (platCtx->capture_mode == CoreAudioLoopbackPlatformContext::CAPTURE_MODE_PROCESS_TAP && platCtx->target_pid > 0) {
-            status = AudioHardwareTapCreateForProcess(platCtx->target_pid, &tapDesc, &platCtx->tap_ref);
-        } else {
-            status = AudioHardwareTapCreateForSystemOutput(&tapDesc, &platCtx->tap_ref);
-        }
-        
-        if (status != noErr || !platCtx->tap_ref) {
-            miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to create Audio Tap: %d", status);
-            pthread_mutex_unlock(&platCtx->capture_mutex);
-            return MINIAV_ERROR_SYSTEM_CALL_FAILED;
-        }
-        
-        status = AudioHardwareTapStart(platCtx->tap_ref);
-        if (status != noErr) {
-            miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to start Audio Tap: %d", status);
-            AudioHardwareTapDestroy(platCtx->tap_ref);
-            platCtx->tap_ref = NULL;
-            pthread_mutex_unlock(&platCtx->capture_mutex);
-            return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+        @autoreleasepool {
+            NSProcessInfo *processInfo = [NSProcessInfo processInfo];
+            int processID = [processInfo processIdentifier];
+            NSUUID* tapUUID = [NSUUID UUID];
+            
+            CATapDescription *desc = nil;
+            
+            if (platCtx->capture_mode == CAPTURE_MODE_PROCESS_TAP && platCtx->target_pid > 0) {
+                // Create process-specific tap
+                desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:
+                        [NSArray arrayWithObject:[NSNumber numberWithInt:platCtx->target_pid]]];
+            } else {
+                // Create system-wide tap
+                desc = [[CATapDescription alloc] initStereoMixdownOfSystemOutput];
+            }
+            
+            desc.name = [NSString stringWithFormat:@"miniav-tap-%d", processID];
+            desc.UUID = tapUUID;
+            desc.privateTap = true;
+            desc.muteBehavior = CATapUnmuted;
+            desc.exclusive = false;
+            desc.mixdown = true;
+            
+            // Create the process tap
+            status = AudioHardwareCreateProcessTap(desc, &platCtx->tap_id);
+            
+            if (status != noErr) {
+                miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to create process tap: %d", status);
+                pthread_mutex_unlock(&platCtx->capture_mutex);
+                return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+            }
+            
+            // Create aggregated device
+            NSString *deviceName = [NSString stringWithFormat:@"miniav-aggregated-%d", processID];
+            NSNumber *isPrivateKey = [NSNumber numberWithBool:true];
+            NSNumber *tapAutoStartKey = [NSNumber numberWithBool:true];
+            
+            NSArray* tapConf = [NSArray arrayWithObject:[NSDictionary dictionaryWithObjectsAndKeys:
+                                [NSNumber numberWithBool:true],
+                                [NSString stringWithUTF8String:kAudioSubTapDriftCompensationKey],
+                                tapUUID.UUIDString,
+                                [NSString stringWithUTF8String:kAudioSubTapUIDKey],
+                                nil]];
+            
+            NSDictionary *dict = [NSDictionary dictionaryWithObjectsAndKeys:
+                                  deviceName, [NSString stringWithUTF8String:kAudioAggregateDeviceNameKey],
+                                  [[NSUUID UUID] UUIDString], [NSString stringWithUTF8String:kAudioAggregateDeviceUIDKey],
+                                  isPrivateKey, [NSString stringWithUTF8String:kAudioAggregateDeviceIsPrivateKey],
+                                  tapConf, [NSString stringWithUTF8String:kAudioAggregateDeviceTapListKey],
+                                  nil];
+            
+            CFDictionaryRef dictBridge = (__bridge CFDictionaryRef)dict;
+            status = AudioHardwareCreateAggregateDevice(dictBridge, &platCtx->aggregated_id);
+            
+            if (status != noErr) {
+                miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to create aggregate device: %d", status);
+                AudioHardwareDestroyProcessTap(platCtx->tap_id);
+                platCtx->tap_id = kAudioObjectUnknown;
+                pthread_mutex_unlock(&platCtx->capture_mutex);
+                return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+            }
+            
+            // Create IOProc
+            status = AudioDeviceCreateIOProcID(platCtx->aggregated_id, AudioTapIOProc, platCtx, &platCtx->io_proc_id);
+            
+            if (status != noErr) {
+                miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to create IOProc: %d", status);
+                AudioHardwareDestroyAggregateDevice(platCtx->aggregated_id);
+                AudioHardwareDestroyProcessTap(platCtx->tap_id);
+                platCtx->aggregated_id = kAudioObjectUnknown;
+                platCtx->tap_id = kAudioObjectUnknown;
+                pthread_mutex_unlock(&platCtx->capture_mutex);
+                return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+            }
+            
+            // Start the device
+            status = AudioDeviceStart(platCtx->aggregated_id, platCtx->io_proc_id);
+            
+            if (status != noErr) {
+                miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to start audio device: %d", status);
+                AudioDeviceDestroyIOProcID(platCtx->aggregated_id, platCtx->io_proc_id);
+                AudioHardwareDestroyAggregateDevice(platCtx->aggregated_id);
+                AudioHardwareDestroyProcessTap(platCtx->tap_id);
+                platCtx->io_proc_id = NULL;
+                platCtx->aggregated_id = kAudioObjectUnknown;
+                platCtx->tap_id = kAudioObjectUnknown;
+                pthread_mutex_unlock(&platCtx->capture_mutex);
+                return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+            }
         }
         
         platCtx->is_capturing = true;
@@ -728,7 +767,7 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
     #endif
     
     // Virtual device capture (fallback)
-    if (platCtx->capture_mode == CoreAudioLoopbackPlatformContext::CAPTURE_MODE_VIRTUAL_DEVICE) {
+    if (platCtx->capture_mode == CAPTURE_MODE_VIRTUAL_DEVICE) {
         AudioDeviceID input_device_id = platCtx->virtual_device_id;
         
         miniav_log(MINIAV_LOG_LEVEL_INFO, "CoreAudio: Starting virtual device capture (ID: %u)", input_device_id);
@@ -842,6 +881,39 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
     pthread_mutex_unlock(&platCtx->capture_mutex);
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Unknown capture mode");
     return MINIAV_ERROR_NOT_SUPPORTED;
+}
+
+static MiniAVResultCode coreaudio_stop_capture(MiniAVLoopbackContext* ctx) {
+    if (!ctx || !ctx->platform_ctx) return MINIAV_ERROR_INVALID_ARG;
+    
+    CoreAudioLoopbackPlatformContext* platCtx = (CoreAudioLoopbackPlatformContext*)ctx->platform_ctx;
+    
+    if (!platCtx->is_capturing) {
+        return MINIAV_SUCCESS;
+    }
+    
+    pthread_mutex_lock(&platCtx->capture_mutex);
+    platCtx->should_stop_capture = true;
+    platCtx->is_capturing = false;
+    ctx->is_running = false;
+    
+    #if HAS_AUDIO_TAP_API
+    // Stop Audio Tap
+    if (platCtx->io_proc_id && platCtx->aggregated_id != kAudioObjectUnknown) {
+        AudioDeviceStop(platCtx->aggregated_id, platCtx->io_proc_id);
+    }
+    #endif
+    
+    // Stop AudioUnit
+    if (platCtx->input_unit) {
+        AudioOutputUnitStop(platCtx->input_unit);
+        AudioUnitUninitialize(platCtx->input_unit);
+    }
+    
+    pthread_mutex_unlock(&platCtx->capture_mutex);
+    
+    miniav_log(MINIAV_LOG_LEVEL_INFO, "CoreAudio: Loopback capture stopped");
+    return MINIAV_SUCCESS;
 }
 
 static MiniAVResultCode coreaudio_release_buffer(MiniAVLoopbackContext* ctx, void* native_buffer_payload_ptr) {

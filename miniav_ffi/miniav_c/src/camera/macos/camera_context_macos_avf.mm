@@ -9,6 +9,9 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h> // For Metal types
 
+// --- Forward Declarations ---
+@class MiniAVCaptureDelegate;
+
 // --- Platform Specific Context ---
 typedef struct AVFPlatformContext {
     AVCaptureSession *captureSession;
@@ -469,7 +472,7 @@ static MiniAVResultCode macos_avf_destroy_platform(MiniAVCameraContext* ctx) {
         if (platCtx->captureSession && [platCtx->captureSession isRunning]) {
             [platCtx->captureSession stopRunning];
         }
-        
+
         if (platCtx->captureDelegate) {
             if (platCtx->videoDataOutput) {
                 [platCtx->videoDataOutput setSampleBufferDelegate:nil queue:nil];

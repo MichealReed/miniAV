@@ -665,7 +665,7 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
     
     OSStatus status = noErr;
     
-    #if HAS_AUDIO_TAP_API
+#if HAS_AUDIO_TAP_API
     if (platCtx->capture_mode == CAPTURE_MODE_SYSTEM_TAP || platCtx->capture_mode == CAPTURE_MODE_PROCESS_TAP) {
         miniav_log(MINIAV_LOG_LEVEL_INFO, "CoreAudio: Starting Audio Tap capture");
         
@@ -677,12 +677,59 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
             CATapDescription *desc = nil;
             
             if (platCtx->capture_mode == CAPTURE_MODE_PROCESS_TAP && platCtx->target_pid > 0) {
-                // Create process-specific tap
+                // Create process-specific tap - use the correct method from your working example
                 desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:
                         [NSArray arrayWithObject:[NSNumber numberWithInt:platCtx->target_pid]]];
             } else {
-                // Create system-wide tap
-                desc = [[CATapDescription alloc] initStereoMixdownOfSystemOutput];
+                // For system-wide capture, we need to use a different approach
+                // The initStereoMixdownOfSystemOutput might not be available
+                // Let's try using all processes approach or check what's available
+                
+                // Option 1: Try to get all audio processes and tap them
+                AudioObjectPropertyAddress addr;
+                addr.mSelector = kAudioHardwarePropertyProcessObjectList;
+                addr.mScope = kAudioObjectPropertyScopeGlobal;
+                addr.mElement = kAudioObjectPropertyElementMain;
+                UInt32 dataSize = 0;
+                
+                OSStatus s = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize);
+                if (s == kAudioHardwareNoError && dataSize > 0) {
+                    int cnt = dataSize / sizeof(AudioObjectID);
+                    UInt32 *processObjects = new UInt32[cnt];
+                    
+                    s = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize, processObjects);
+                    if (s == kAudioHardwareNoError) {
+                        NSMutableArray *processArray = [NSMutableArray array];
+                        
+                        addr.mSelector = kAudioProcessPropertyPID;
+                        for (int i = 0; i < cnt; i++) {
+                            pid_t pid = -1;
+                            UInt32 pidSize = sizeof(pid_t);
+                            s = AudioObjectGetPropertyData(processObjects[i], &addr, 0, NULL, &pidSize, &pid);
+                            if (s == kAudioHardwareNoError && pid > 0) {
+                                [processArray addObject:[NSNumber numberWithInt:pid]];
+                            }
+                        }
+                        
+                        if ([processArray count] > 0) {
+                            desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processArray];
+                        }
+                    }
+                    delete[] processObjects;
+                }
+                
+                // If that fails, try a single process approach or fallback
+                if (!desc) {
+                    miniav_log(MINIAV_LOG_LEVEL_WARN, "CoreAudio: Could not create system-wide tap, falling back to current process");
+                    desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:
+                            [NSArray arrayWithObject:[NSNumber numberWithInt:processID]]];
+                }
+            }
+            
+            if (!desc) {
+                miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to create CATapDescription");
+                pthread_mutex_unlock(&platCtx->capture_mutex);
+                return MINIAV_ERROR_SYSTEM_CALL_FAILED;
             }
             
             desc.name = [NSString stringWithFormat:@"miniav-tap-%d", processID];

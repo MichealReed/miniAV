@@ -8,6 +8,7 @@
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreAudio/CoreAudio.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
 #include <AudioUnit/AudioUnit.h>
 #include <ApplicationServices/ApplicationServices.h>
 #include <libproc.h>
@@ -515,7 +516,7 @@ static MiniAVResultCode coreaudio_enumerate_targets(MiniAVLoopbackTargetType tar
     }
     
     // Process-specific capture
-    if (target_type_filter == MINIAV_LOOPBACK_TARGET_PROCESS) {
+    if (target_type_filter == MINIAV_LOOPBACK_TARGET_PROCESS || target_type_filter == MINIAV_LOOPBACK_TARGET_NONE) {
         #if HAS_AUDIO_TAP_API
         MiniAVDeviceInfo* info = &temp_devices[found_count];
         snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "process_tap");
@@ -526,6 +527,23 @@ static MiniAVResultCode coreaudio_enumerate_targets(MiniAVLoopbackTargetType tar
         MiniAVDeviceInfo* info = &temp_devices[found_count];
         snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "process_not_supported");
         snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "Process capture requires macOS 10.10+ and Audio Tap API");
+        info->is_default = false;
+        found_count++;
+        #endif
+    }
+
+        // Window-specific capture
+    if (target_type_filter == MINIAV_LOOPBACK_TARGET_WINDOW || target_type_filter == MINIAV_LOOPBACK_TARGET_NONE) {
+        #if HAS_AUDIO_TAP_API
+        MiniAVDeviceInfo* info = &temp_devices[found_count];
+        snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "window_tap");
+        snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "Window Audio Capture (Audio Tap)");
+        info->is_default = true;
+        found_count++;
+        #else
+        MiniAVDeviceInfo* info = &temp_devices[found_count];
+        snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "window_not_supported");
+        snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "Window capture requires macOS 10.10+ and Audio Tap API");
         info->is_default = false;
         found_count++;
         #endif
@@ -582,6 +600,38 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Process capture not supported in this build");
         return MINIAV_ERROR_NOT_SUPPORTED;
         #endif
+    } else if (target_info && target_info->type == MINIAV_LOOPBACK_TARGET_WINDOW) {
+        #if HAS_AUDIO_TAP_API
+        // For window targets, we need to get the process ID from the window handle
+        // On macOS, window handles are typically CGWindowID
+        CGWindowID windowID = (CGWindowID)target_info->TARGETHANDLE.window_handle;
+        
+        // Get window info to find the owning process
+        CFArrayRef windowList = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, windowID);
+        if (windowList && CFArrayGetCount(windowList) > 0) {
+            CFDictionaryRef windowInfo = (CFDictionaryRef)CFArrayGetValueAtIndex(windowList, 0);
+            CFNumberRef pidNumber = (CFNumberRef)CFDictionaryGetValue(windowInfo, kCGWindowOwnerPID);
+            
+            if (pidNumber) {
+                CFNumberGetValue(pidNumber, kCFNumberIntType, &platCtx->target_pid);
+                platCtx->capture_mode = CAPTURE_MODE_PROCESS_TAP;
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for window audio capture (Window ID: %u, PID: %d)", 
+                           windowID, platCtx->target_pid);
+            } else {
+                miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to get process ID for window %u", windowID);
+                if (windowList) CFRelease(windowList);
+                return MINIAV_ERROR_INVALID_ARG;
+            }
+            CFRelease(windowList);
+        } else {
+            miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to get info for window %u", windowID);
+            if (windowList) CFRelease(windowList);
+            return MINIAV_ERROR_INVALID_ARG;
+        }
+        #else
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Window capture not supported in this build");
+        return MINIAV_ERROR_NOT_SUPPORTED;
+        #endif
     } else if (target_info && target_info->type == MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO) {
         #if HAS_AUDIO_TAP_API
         platCtx->capture_mode = CAPTURE_MODE_SYSTEM_TAP;
@@ -607,6 +657,37 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
             miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Process capture not supported in this build");
             return MINIAV_ERROR_NOT_SUPPORTED;
             #endif
+        } else if (strncmp(target_device_id, "window:", 7) == 0) {
+            #if HAS_AUDIO_TAP_API
+            CGWindowID windowID;
+            sscanf(target_device_id + 7, "%u", &windowID);
+            
+            // Get window info to find the owning process
+            CFArrayRef windowList = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, windowID);
+            if (windowList && CFArrayGetCount(windowList) > 0) {
+                CFDictionaryRef windowInfo = (CFDictionaryRef)CFArrayGetValueAtIndex(windowList, 0);
+                CFNumberRef pidNumber = (CFNumberRef)CFDictionaryGetValue(windowInfo, kCGWindowOwnerPID);
+                
+                if (pidNumber) {
+                    CFNumberGetValue(pidNumber, kCFNumberIntType, &platCtx->target_pid);
+                    platCtx->capture_mode = CAPTURE_MODE_PROCESS_TAP;
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for window capture (Window ID: %u, PID: %d)", 
+                               windowID, platCtx->target_pid);
+                } else {
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to get process ID for window %u", windowID);
+                    if (windowList) CFRelease(windowList);
+                    return MINIAV_ERROR_INVALID_ARG;
+                }
+                CFRelease(windowList);
+            } else {
+                miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to get info for window %u", windowID);
+                if (windowList) CFRelease(windowList);
+                return MINIAV_ERROR_INVALID_ARG;
+            }
+            #else
+            miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Window capture not supported in this build");
+            return MINIAV_ERROR_NOT_SUPPORTED;
+            #endif
         } else if (strcmp(target_device_id, "system_tap") == 0) {
             #if HAS_AUDIO_TAP_API
             platCtx->capture_mode = CAPTURE_MODE_SYSTEM_TAP;
@@ -618,7 +699,7 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
         } else if (strcmp(target_device_id, "process_tap") == 0) {
             #if HAS_AUDIO_TAP_API
             platCtx->capture_mode = CAPTURE_MODE_PROCESS_TAP;
-            platCtx->target_pid = 0;
+            platCtx->target_pid = 0; // Will target current process or be set later
             miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for process audio tap");
             #else
             miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Process tap not supported in this build");

@@ -149,7 +149,7 @@ elseif(MINIAV_PLATFORM_MACOS)
         "-framework CoreVideo"
         "-framework Metal"
         "-framework MetalKit"
-    )
+        "-framework CoreGraphics")
     
 elseif(MINIAV_PLATFORM_IOS)
     list(APPEND ALL_DEFINITIONS "MINIAV_PLATFORM_IOS")
@@ -318,7 +318,6 @@ if(MINIAV_ENABLE_SCREEN)
             message(STATUS "macOS: Enabling CoreGraphics for screen capture")
             list(APPEND ALL_SOURCES "src/screen/macos/screen_context_macos_cg.mm")
             list(APPEND ALL_HEADERS "src/screen/macos/screen_context_macos_cg.h")
-            list(APPEND ALL_LINK_LIBS "-framework CoreGraphics")
             list(APPEND ALL_LINK_LIBS "-framework ScreenCaptureKit")
             list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_MACOS_CG_SCREEN_ENABLED")
         endif()

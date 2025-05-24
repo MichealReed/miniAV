@@ -561,7 +561,7 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
         for (AVCaptureDeviceFormat *avFormat in selectedDevice.formats) {
             CMFormatDescriptionRef desc = avFormat.formatDescription;
             CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(desc);
-            OSType fourCC = CMVideoFormatDescriptionGetMediaSubType(desc);
+            OSType fourCC = CMFormatDescriptionGetMediaSubType(desc);
             MiniAVPixelFormat currentMiniAVFormat = FourCCToMiniAVPixelFormat(fourCC);
 
             if (dimensions.width == format_req->width && 
@@ -779,7 +779,7 @@ static MiniAVResultCode macos_avf_get_supported_formats(const char* device_id_st
         for (AVCaptureDeviceFormat *avFormat in avFormats) {
             CMFormatDescriptionRef formatDesc = [avFormat formatDescription];
             CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(formatDesc);
-            OSType fourCC = CMVideoFormatDescriptionGetMediaSubType(formatDesc);
+            OSType fourCC = CMFormatDescriptionGetMediaSubType(formatDesc);
             MiniAVPixelFormat miniAVFormat = FourCCToMiniAVPixelFormat(fourCC);
 
             if (miniAVFormat == MINIAV_PIXEL_FORMAT_UNKNOWN) continue;
@@ -868,7 +868,7 @@ static MiniAVResultCode macos_avf_get_default_format(const char* device_id_str, 
         
         CMFormatDescriptionRef formatDesc = [activeFormat formatDescription];
         CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(formatDesc);
-        OSType fourCC = CMVideoFormatDescriptionGetMediaSubType(formatDesc);
+        OSType fourCC = CMFormatDescriptionGetMediaSubType(formatDesc);
 
         format_out->width = dimensions.width;
         format_out->height = dimensions.height;
@@ -919,10 +919,10 @@ static MiniAVResultCode macos_avf_get_configured_video_format(MiniAVCameraContex
             if (outputFourCCNum) {
                 format_out->pixel_format = FourCCToMiniAVPixelFormat([outputFourCCNum unsignedIntValue]);
             } else { // Fallback to device's active format's pixel format
-                 format_out->pixel_format = FourCCToMiniAVPixelFormat(CMVideoFormatDescriptionGetMediaSubType(formatDesc));
+                 format_out->pixel_format = FourCCToMiniAVPixelFormat(CMFormatDescriptionGetMediaSubType(formatDesc));
             }
         } else { // Fallback if videoDataOutput not fully set up
-            format_out->pixel_format = FourCCToMiniAVPixelFormat(CMVideoFormatDescriptionGetMediaSubType(formatDesc));
+            format_out->pixel_format = FourCCToMiniAVPixelFormat(CMFormatDescriptionGetMediaSubType(formatDesc));
         }
 
         CMTime frameDuration = platCtx->deviceInput.device.activeVideoMinFrameDuration;

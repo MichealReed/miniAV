@@ -645,6 +645,23 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
     return MINIAV_SUCCESS;
 }
 
+static MiniAVResultCode coreaudio_get_configured_format(MiniAVLoopbackContext* ctx, MiniAVAudioInfo* format_out) {
+    if (!ctx || !ctx->platform_ctx || !format_out) return MINIAV_ERROR_INVALID_ARG;
+    
+    if (!ctx->is_configured) {
+        return MINIAV_ERROR_NOT_INITIALIZED;
+    }
+    
+    CoreAudioLoopbackPlatformContext* platCtx = (CoreAudioLoopbackPlatformContext*)ctx->platform_ctx;
+    
+    format_out->sample_rate = (uint32_t)platCtx->stream_format.mSampleRate;
+    format_out->channels = platCtx->stream_format.mChannelsPerFrame;
+    format_out->format = CoreAudioFormatToMiniAV(&platCtx->stream_format);
+    format_out->num_frames = 1024; // Default frame count
+    
+    return MINIAV_SUCCESS;
+}
+
 static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, MiniAVBufferCallback callback, void* user_data) {
     if (!ctx || !ctx->platform_ctx || !callback) return MINIAV_ERROR_INVALID_ARG;
     
@@ -692,13 +709,14 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
                                     [CATapDescription instancesRespondToSelector:@selector(initStereoMixdownOfProcesses:)]);
                     }
                 } else if (platCtx->capture_mode == CAPTURE_MODE_SYSTEM_TAP) {
-                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Attempting system-wide audio tap (macOS 10.15+).");
-                    if ([CATapDescription instancesRespondToSelector:@selector(initStereoMixdownOfSystemOutput)]) {
-                        desc = [[CATapDescription alloc] initStereoMixdownOfSystemOutput];
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Creating system-wide audio tap (macOS 10.15+).");
+                    // Use initStereoGlobalTapButExcludeProcesses with an empty array to capture all system audio
+                    if ([CATapDescription instancesRespondToSelector:@selector(initStereoGlobalTapButExcludeProcesses:)]) {
+                        desc = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:@[]]; // Empty array = exclude nothing = capture all
                     }
                     if (!desc) {
-                         miniav_log(MINIAV_LOG_LEVEL_WARN, "CoreAudio: Failed to init CATapDescription for system output (selector available: %d). This selector might be missing from your CATapDescription version.",
-                                    [CATapDescription instancesRespondToSelector:@selector(initStereoMixdownOfSystemOutput)]);
+                         miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to init CATapDescription for system output (selector available: %d).",
+                                    [CATapDescription instancesRespondToSelector:@selector(initStereoGlobalTapButExcludeProcesses:)]);
                     }
                 } else if (platCtx->capture_mode == CAPTURE_MODE_PROCESS_TAP && platCtx->target_pid == 0) {
                     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Creating generic process tap, targeting current process PID: %d (macOS 10.15+)", currentProcessID);
@@ -1002,23 +1020,6 @@ static MiniAVResultCode coreaudio_release_buffer(MiniAVLoopbackContext* ctx, voi
     }
     
     miniav_free(payload);
-    return MINIAV_SUCCESS;
-}
-
-static MiniAVResultCode coreaudio_get_configured_format(MiniAVLoopbackContext* ctx, MiniAVAudioInfo* format_out) {
-    if (!ctx || !ctx->platform_ctx || !format_out) return MINIAV_ERROR_INVALID_ARG;
-    
-    if (!ctx->is_configured) {
-        return MINIAV_ERROR_NOT_INITIALIZED;
-    }
-    
-    CoreAudioLoopbackPlatformContext* platCtx = (CoreAudioLoopbackPlatformContext*)ctx->platform_ctx;
-    
-    format_out->sample_rate = (uint32_t)platCtx->stream_format.mSampleRate;
-    format_out->channels = platCtx->stream_format.mChannelsPerFrame;
-    format_out->format = CoreAudioFormatToMiniAV(&platCtx->stream_format);
-    format_out->num_frames = 1024; // Default frame count
-    
     return MINIAV_SUCCESS;
 }
 

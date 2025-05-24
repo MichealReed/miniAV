@@ -628,52 +628,120 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
             return MINIAV_ERROR_SYSTEM_CALL_FAILED;
         }
 
+        // **ENHANCED FORMAT MATCHING WITH BETTER LOGGING**
         for (AVCaptureDeviceFormat *avFormat in selectedDevice.formats) {
             CMFormatDescriptionRef desc = avFormat.formatDescription;
             CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(desc);
             OSType fourCC = CMFormatDescriptionGetMediaSubType(desc);
             MiniAVPixelFormat currentMiniAVFormat = FourCCToMiniAVPixelFormat(fourCC);
 
+            char fourCCStr[5] = {0};
+            *(OSType*)fourCCStr = CFSwapInt32HostToBig(fourCC);
+
             if (dimensions.width == format_req->width && 
                 dimensions.height == format_req->height &&
                 currentMiniAVFormat == format_req->pixel_format) {
 
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                          "AVF: **EXACT MATCH FOUND** - %dx%d, FourCC: '%.4s', PixelFormat: %d", 
+                          dimensions.width, dimensions.height, fourCCStr, currentMiniAVFormat);
+
                 for (AVFrameRateRange *range in avFormat.videoSupportedFrameRateRanges) {
-                    if ((requested_fps == 0 && range.maxFrameRate > 0) || 
-                        (requested_fps >= range.minFrameRate && requested_fps <= range.maxFrameRate)) {
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                              "AVF: Checking frame rate range: %.2f - %.2f for requested: %.2f", 
+                              range.minFrameRate, range.maxFrameRate, requested_fps);
+
+                    BOOL fps_in_range = NO;
+                    if (requested_fps == 0 && range.maxFrameRate > 0) {
+                        fps_in_range = YES;
+                    } else if (requested_fps > 0) {
+                        float tolerance = 0.1f;
+                        if (requested_fps >= (range.minFrameRate - tolerance) && 
+                            requested_fps <= (range.maxFrameRate + tolerance)) {
+                            fps_in_range = YES;
+                        }
+                    }
+
+                    if (fps_in_range) {
+                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                                  "AVF: Frame rate %.2f is within range %.2f-%.2f. Attempting to set format...", 
+                                  requested_fps, range.minFrameRate, range.maxFrameRate);
                         
                         CMTime targetFrameDuration;
                         float actual_fps_to_set = requested_fps;
-                        if (requested_fps == 0) { // If 0, pick max from current range
+                        if (requested_fps == 0) {
                            actual_fps_to_set = range.maxFrameRate;
                            targetFrameDuration = CMTimeMake(1, (int32_t)range.maxFrameRate);
                         } else {
                            targetFrameDuration = CMTimeMake(format_req->frame_rate_denominator, format_req->frame_rate_numerator);
                         }
                         
+                        // **ENHANCED DEVICE LOCKING WITH DETAILED ERROR REPORTING**
                         NSError *lockError = nil;
-                        if ([selectedDevice lockForConfiguration:&lockError]) {
+                        BOOL lockSuccess = [selectedDevice lockForConfiguration:&lockError];
+                        
+                        if (lockSuccess) {
+                            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Successfully locked device for configuration");
+                            
+                            // Set the format
                             selectedDevice.activeFormat = avFormat;
+                            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Set activeFormat");
+                            
+                            // Set frame rate
                             selectedDevice.activeVideoMinFrameDuration = targetFrameDuration;
                             selectedDevice.activeVideoMaxFrameDuration = targetFrameDuration;
+                            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Set frame durations");
+                            
                             [selectedDevice unlockForConfiguration];
                             format_set = YES;
-                            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Matched and set format: %dx%d @ %.2f FPS, PixelFormat: %d (FourCC: %.4s)",
-                                       format_req->width, format_req->height, actual_fps_to_set, format_req->pixel_format, (char*)&fourCC);
+                            
+                            miniav_log(MINIAV_LOG_LEVEL_INFO, 
+                                      "AVF: ✅ Successfully set format: %dx%d @ %.2f FPS, PixelFormat: %d (FourCC: '%.4s')",
+                                      format_req->width, format_req->height, actual_fps_to_set, 
+                                      format_req->pixel_format, fourCCStr);
                             break; 
                         } else {
-                            miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Failed to lock device for format config: %s", [[lockError localizedDescription] UTF8String]);
-                            result = MINIAV_ERROR_DEVICE_BUSY; 
+                            const char* errorDesc = lockError ? [[lockError localizedDescription] UTF8String] : "Unknown error";
+                            miniav_log(MINIAV_LOG_LEVEL_ERROR, 
+                                      "AVF: ❌ Failed to lock device for format config: %s (Code: %ld)", 
+                                      errorDesc, lockError ? [lockError code] : -1);
+                            
+                            // **CHECK IF DEVICE IS ALREADY IN USE**
+                            if (lockError && [lockError code] == AVErrorDeviceAlreadyUsedByAnotherSession) {
+                                miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Device is already in use by another session");
+                                result = MINIAV_ERROR_DEVICE_BUSY;
+                            } else if (lockError && [lockError code] == AVErrorDeviceNotAvailableInBackground) {
+                                miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Device not available in background");
+                                result = MINIAV_ERROR_DEVICE_NOT_FOUND;
+                            } else {
+                                result = MINIAV_ERROR_SYSTEM_CALL_FAILED;
+                            }
                         }
+                    } else {
+                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                                  "AVF: Frame rate %.2f NOT in range %.2f-%.2f", 
+                                  requested_fps, range.minFrameRate, range.maxFrameRate);
                     }
+                }
+            } else {
+                // Log why this format doesn't match
+                if (dimensions.width != format_req->width || dimensions.height != format_req->height) {
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                              "AVF: Skipping format - resolution mismatch: %dx%d (wanted %dx%d)", 
+                              dimensions.width, dimensions.height, format_req->width, format_req->height);
+                } else if (currentMiniAVFormat != format_req->pixel_format) {
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                              "AVF: Skipping format - pixel format mismatch: %d (wanted %d, FourCC: '%.4s')", 
+                              currentMiniAVFormat, format_req->pixel_format, fourCCStr);
                 }
             }
             if (format_set) break;
         }
 
         if (!format_set && result == MINIAV_SUCCESS) {
-            miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Could not find or set matching format for %dx%d PxFormat:%d FPS:%.2f.",
-                       format_req->width, format_req->height, format_req->pixel_format, requested_fps);
+            miniav_log(MINIAV_LOG_LEVEL_ERROR, 
+                      "AVF: ❌ Could not find or set matching format for %dx%d PxFormat:%d FPS:%.2f - despite validation passing!",
+                      format_req->width, format_req->height, format_req->pixel_format, requested_fps);
             result = MINIAV_ERROR_FORMAT_NOT_SUPPORTED;
         }
         
@@ -682,6 +750,7 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
             return result;
         }
 
+        // **REST OF THE FUNCTION CONTINUES...**
         if (platCtx->videoDataOutput) {
             [platCtx->captureSession removeOutput:platCtx->videoDataOutput];
             [platCtx->videoDataOutput release];
@@ -695,8 +764,6 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
             targetOutputFourCC = kCVPixelFormatType_32BGRA;
         }
         
-        // Check if the device's active format can output the targetOutputFourCC directly or if conversion is implied.
-        // For GPU path, the CVPixelBuffer format received in the delegate is what matters for Metal texture creation.
         NSDictionary *videoSettings = @{(id)kCVPixelBufferPixelFormatTypeKey: @(targetOutputFourCC)};
         platCtx->videoDataOutput.videoSettings = videoSettings;
         platCtx->videoDataOutput.alwaysDiscardsLateVideoFrames = YES;
@@ -709,7 +776,8 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
             [platCtx->captureSession addOutput:platCtx->videoDataOutput];
         } else {
             miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Cannot add video data output to session.");
-            [platCtx->videoDataOutput release]; platCtx->videoDataOutput = nil;
+            [platCtx->videoDataOutput release]; 
+            platCtx->videoDataOutput = nil;
             [platCtx->captureSession commitConfiguration];
             return MINIAV_ERROR_SYSTEM_CALL_FAILED;
         }
@@ -718,7 +786,7 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
     }
     
     if (result == MINIAV_SUCCESS) {
-         miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: Configured device: %s", device_id_str ? device_id_str : "Default");
+         miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: ✅ Successfully configured device: %s", device_id_str ? device_id_str : "Default");
     }
     return result;
 }

@@ -9,17 +9,17 @@
 // Example for Windows (e.g., in loopback_context_win_wasapi.c)
 #ifdef _WIN32
 extern const LoopbackContextInternalOps
-    g_loopback_ops_wasapi; // Example name
+    g_loopback_ops_wasapi;
 extern MiniAVResultCode miniav_loopback_context_platform_init_windows_wasapi(
-    MiniAVLoopbackContext *ctx); // Example name
+    MiniAVLoopbackContext *ctx);
 #endif
 
 // Example for macOS (e.g., in loopback_context_macos_coreaudio.c)
 #ifdef __APPLE__
 extern const LoopbackContextInternalOps
-    g_loopback_ops_macos_coreaudio; // Example name
+    g_loopback_ops_macos_coreaudio;
 extern MiniAVResultCode miniav_loopback_context_platform_init_macos_coreaudio(
-    MiniAVLoopbackContext *ctx); // Example name
+    MiniAVLoopbackContext *ctx);
 #endif
 
 #ifdef __linux__

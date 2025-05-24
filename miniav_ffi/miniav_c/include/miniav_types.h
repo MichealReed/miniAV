@@ -96,6 +96,8 @@ typedef enum {
     MINIAV_PIXEL_FORMAT_BAYER_RGGB16,   // 16-bit Bayer RGGB
     MINIAV_PIXEL_FORMAT_BAYER_BGGR16,   // 16-bit Bayer BGGR
     MINIAV_PIXEL_FORMAT_BAYER_GBRG16,   // 16-bit Bayer GBRG
+
+    MINIAV_PIXEL_FORMAT_MJPEG,          // Motion JPEG (MJPEG)
     
     MINIAV_PIXEL_FORMAT_COUNT
 } MiniAVPixelFormat;

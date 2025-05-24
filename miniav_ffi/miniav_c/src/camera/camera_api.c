@@ -12,10 +12,10 @@
 // miniav_camera_context_platform_init_windows_mf
 #include "windows/camera_context_win_mf.h"
 #elif defined(__APPLE__)
-// #include "macos/camera_context_macos_avf.h"
-// extern const CameraContextInternalOps g_camera_ops_macos_avf;
-// extern MiniAVResultCode
-// miniav_camera_context_platform_init_macos_avf(MiniAVCameraContext* ctx);
+#include "macos/camera_context_macos_avf.h"
+extern const CameraContextInternalOps g_camera_ops_macos_avf;
+extern MiniAVResultCode
+miniav_camera_context_platform_init_macos_avf(MiniAVCameraContext* ctx);
 #elif defined(__linux__)
 #include "linux/camera_context_linux_pipewire.h" // You will need to create this header
 extern const CameraContextInternalOps
@@ -32,8 +32,8 @@ static const MiniAVCameraBackend g_camera_backends[] = {
      miniav_camera_context_platform_init_windows_mf},
 #endif
 #if defined(__APPLE__)
-// {"AVFoundation", &g_camera_ops_macos_avf,
-// miniav_camera_context_platform_init_macos_avf},
+{"AVFoundation", &g_camera_ops_macos_avf,
+miniav_camera_context_platform_init_macos_avf},
 #endif
 #if defined(__linux__)
 {"pipewire", &g_camera_ops_pipewire,

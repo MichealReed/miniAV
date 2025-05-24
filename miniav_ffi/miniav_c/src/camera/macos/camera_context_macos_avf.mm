@@ -43,7 +43,6 @@ static MiniAVPixelFormat FourCCToMiniAVPixelFormat(OSType fourCC) {
         case kCVPixelFormatType_422YpCbCr8_yuvs:            return MINIAV_PIXEL_FORMAT_YUY2; // YUYV
         case kCVPixelFormatType_422YpCbCr8:                 return MINIAV_PIXEL_FORMAT_UYVY; // UYVY (2vuy)
         case kCVPixelFormatType_422YpCbCr8FullRange:        return MINIAV_PIXEL_FORMAT_YUY2; // Full range YUYV
-        case kCVPixelFormatType_YUY2:                       return MINIAV_PIXEL_FORMAT_YUY2; // Alternative YUYV
         
         // --- High-End RGB Formats ---
         case kCVPixelFormatType_30RGB:                      return MINIAV_PIXEL_FORMAT_RGB30;

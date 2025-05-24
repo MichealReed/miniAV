@@ -250,21 +250,15 @@ static void legacy_capture_timer_callback(void* info) {
     #if __MAC_OS_X_VERSION_MIN_REQUIRED >= 150000
         miniav_log(MINIAV_LOG_LEVEL_WARN, "CG: Legacy capture not available - compiled for macOS 15+");
         return;
-    #endif
-    
-    // For older deployment targets, use runtime check and pragma to suppress warnings
-    if (@available(macOS 15.0, *)) {
-        miniav_log(MINIAV_LOG_LEVEL_WARN, "CG: Legacy capture not supported on macOS 15+");
-        return;
-    }
+    #else
+        if (@available(macOS 15.0, *)) {
+            miniav_log(MINIAV_LOG_LEVEL_WARN, "CG: Legacy capture not supported on macOS 15+");
+            return;
+        }
     
     CGImageRef screenImage = NULL;
     
-    #pragma clang diagnostic push
-    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    screenImage = CGDisplayCreateImage(cgCtx->displayID);
-    #pragma clang diagnostic pop
-    
+    screenImage = CGDisplayCreateImage(cgCtx->displayID);    
     if (!screenImage) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "CG: Failed to create screen image.");
         return;
@@ -317,6 +311,7 @@ static void legacy_capture_timer_callback(void* info) {
     buffer->user_data = cgCtx->app_callback_user_data_internal;
     
     cgCtx->app_callback_internal(buffer, cgCtx->app_callback_user_data_internal);
+    #endif
 }
 
 // --- Platform Ops Implementation (following WGC pattern) ---

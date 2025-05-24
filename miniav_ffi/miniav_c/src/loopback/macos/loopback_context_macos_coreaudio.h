@@ -8,6 +8,8 @@
 extern "C" {
 #endif
 
+extern const LoopbackContextInternalOps g_loopback_ops_macos_coreaudio;
+
 // Platform-specific initialization function
 MiniAVResultCode miniav_loopback_context_platform_init_macos_coreaudio(MiniAVLoopbackContext* ctx);
 

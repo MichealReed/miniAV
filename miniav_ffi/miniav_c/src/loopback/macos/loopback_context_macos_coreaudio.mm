@@ -390,6 +390,41 @@ static MiniAVResultCode coreaudio_init_platform(MiniAVLoopbackContext* ctx) {
     return MINIAV_SUCCESS;
 }
 
+static MiniAVResultCode coreaudio_stop_capture(MiniAVLoopbackContext* ctx) {
+    if (!ctx || !ctx->platform_ctx) return MINIAV_ERROR_INVALID_ARG;
+    
+    CoreAudioLoopbackPlatformContext* platCtx = (CoreAudioLoopbackPlatformContext*)ctx->platform_ctx;
+    
+    if (!platCtx->is_capturing) {
+        return MINIAV_SUCCESS;
+    }
+    
+    pthread_mutex_lock(&platCtx->capture_mutex);
+    platCtx->should_stop_capture = true;
+    platCtx->is_capturing = false;
+    ctx->is_running = false;
+    
+    #if HAS_AUDIO_TAP_API
+    // Stop Audio Tap
+    if (platCtx->tap_ref) {
+        AudioHardwareTapStop(platCtx->tap_ref);
+        AudioHardwareTapDestroy(platCtx->tap_ref);
+        platCtx->tap_ref = NULL;
+    }
+    #endif
+    
+    // Stop AudioUnit
+    if (platCtx->input_unit) {
+        AudioOutputUnitStop(platCtx->input_unit);
+        AudioUnitUninitialize(platCtx->input_unit);
+    }
+    
+    pthread_mutex_unlock(&platCtx->capture_mutex);
+    
+    miniav_log(MINIAV_LOG_LEVEL_INFO, "CoreAudio: Loopback capture stopped");
+    return MINIAV_SUCCESS;
+}
+
 static MiniAVResultCode coreaudio_destroy_platform(MiniAVLoopbackContext* ctx) {
     if (!ctx || !ctx->platform_ctx) return MINIAV_SUCCESS;
     
@@ -562,7 +597,7 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
     // Determine capture method based on target
     if (target_info && target_info->type == MINIAV_LOOPBACK_TARGET_PROCESS) {
         #if HAS_AUDIO_TAP_API
-        platCtx->target_pid = target_info->process.pid;
+        platCtx->target_pid = target_info->TARGETHANDLE.process_id;
         platCtx->capture_mode = CoreAudioLoopbackPlatformContext::CAPTURE_MODE_PROCESS_TAP;
         miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for process audio capture (PID: %d)", platCtx->target_pid);
         #else
@@ -807,41 +842,6 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
     pthread_mutex_unlock(&platCtx->capture_mutex);
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Unknown capture mode");
     return MINIAV_ERROR_NOT_SUPPORTED;
-}
-
-static MiniAVResultCode coreaudio_stop_capture(MiniAVLoopbackContext* ctx) {
-    if (!ctx || !ctx->platform_ctx) return MINIAV_ERROR_INVALID_ARG;
-    
-    CoreAudioLoopbackPlatformContext* platCtx = (CoreAudioLoopbackPlatformContext*)ctx->platform_ctx;
-    
-    if (!platCtx->is_capturing) {
-        return MINIAV_SUCCESS;
-    }
-    
-    pthread_mutex_lock(&platCtx->capture_mutex);
-    platCtx->should_stop_capture = true;
-    platCtx->is_capturing = false;
-    ctx->is_running = false;
-    
-    #if HAS_AUDIO_TAP_API
-    // Stop Audio Tap
-    if (platCtx->tap_ref) {
-        AudioHardwareTapStop(platCtx->tap_ref);
-        AudioHardwareTapDestroy(platCtx->tap_ref);
-        platCtx->tap_ref = NULL;
-    }
-    #endif
-    
-    // Stop AudioUnit
-    if (platCtx->input_unit) {
-        AudioOutputUnitStop(platCtx->input_unit);
-        AudioUnitUninitialize(platCtx->input_unit);
-    }
-    
-    pthread_mutex_unlock(&platCtx->capture_mutex);
-    
-    miniav_log(MINIAV_LOG_LEVEL_INFO, "CoreAudio: Loopback capture stopped");
-    return MINIAV_SUCCESS;
 }
 
 static MiniAVResultCode coreaudio_release_buffer(MiniAVLoopbackContext* ctx, void* native_buffer_payload_ptr) {

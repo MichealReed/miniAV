@@ -21,6 +21,9 @@ typedef struct AVFPlatformContext {
     // Metal specific objects for GPU path
     id<MTLDevice> metalDevice;
     CVMetalTextureCacheRef textureCache;
+
+    MiniAVCaptureDelegate *captureDelegate;
+
 } AVFPlatformContext;
 
 
@@ -466,6 +469,17 @@ static MiniAVResultCode macos_avf_destroy_platform(MiniAVCameraContext* ctx) {
         if (platCtx->captureSession && [platCtx->captureSession isRunning]) {
             [platCtx->captureSession stopRunning];
         }
+        
+        if (platCtx->captureDelegate) {
+            if (platCtx->videoDataOutput) {
+                [platCtx->videoDataOutput setSampleBufferDelegate:nil queue:nil];
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: 🧹 Cleared sample buffer delegate");
+            }
+            [platCtx->captureDelegate release];
+            platCtx->captureDelegate = nil;
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: 🧹 Released capture delegate");
+        }
+
         if (platCtx->deviceInput) {
             if(platCtx->captureSession) [platCtx->captureSession removeInput:platCtx->deviceInput];
             [platCtx->deviceInput release];
@@ -710,7 +724,7 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
                             format_set = YES;
                             
                             miniav_log(MINIAV_LOG_LEVEL_INFO, 
-                                      "AVF: ✅ Successfully set format: %dx%d @ %.2f FPS, PixelFormat: %d (FourCC: '%.4s')",
+                                      "AVF:  Successfully set format: %dx%d @ %.2f FPS, PixelFormat: %d (FourCC: '%.4s')",
                                       format_req->width, format_req->height, actual_fps_to_set, 
                                       format_req->pixel_format, fourCCStr);
                             break; 
@@ -760,7 +774,6 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
             return result;
         }
 
-        // **REST OF THE FUNCTION CONTINUES...**
         if (platCtx->videoDataOutput) {
             [platCtx->captureSession removeOutput:platCtx->videoDataOutput];
             [platCtx->videoDataOutput release];
@@ -778,9 +791,8 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
         platCtx->videoDataOutput.videoSettings = videoSettings;
         platCtx->videoDataOutput.alwaysDiscardsLateVideoFrames = YES;
 
-        MiniAVCaptureDelegate *delegate = [[MiniAVCaptureDelegate alloc] initWithMiniAVContext:ctx];
-        [platCtx->videoDataOutput setSampleBufferDelegate:delegate queue:platCtx->videoOutputQueue];
-        [delegate release]; 
+        platCtx->captureDelegate = [[MiniAVCaptureDelegate alloc] initWithMiniAVContext:ctx];
+        [platCtx->videoDataOutput setSampleBufferDelegate:platCtx->captureDelegate queue:platCtx->videoOutputQueue];
 
         if ([platCtx->captureSession canAddOutput:platCtx->videoDataOutput]) {
             [platCtx->captureSession addOutput:platCtx->videoDataOutput];
@@ -796,7 +808,7 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
     }
     
     if (result == MINIAV_SUCCESS) {
-         miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: ✅ Successfully configured device: %s", device_id_str ? device_id_str : "Default");
+         miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF:  Successfully configured device: %s", device_id_str ? device_id_str : "Default");
     }
     return result;
 }

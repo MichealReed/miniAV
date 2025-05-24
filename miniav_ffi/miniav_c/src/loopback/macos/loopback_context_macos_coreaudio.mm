@@ -74,6 +74,143 @@ typedef struct CoreAudioLoopbackPlatformContext {
 } CoreAudioLoopbackPlatformContext;
 
 // --- Helper Functions ---
+#if HAS_AUDIO_TAP_API
+// Helper function to convert PID to Audio Process Object ID
+static bool PIDToAudioProcessObjectID(pid_t pid, AudioObjectID* outProcessObjectID) {
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioHardwarePropertyTranslatePIDToProcessObject,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain
+    };
+    
+    UInt32 dataSize = sizeof(AudioObjectID);
+    OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 
+                                                sizeof(pid), &pid, &dataSize, outProcessObjectID);
+    
+    if (status != noErr) {
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Failed to translate PID %d to process object ID: %d", pid, status);
+        return false;
+    }
+    
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: PID %d -> Process Object ID %u", pid, *outProcessObjectID);
+    return true;
+}
+
+// Helper function to check if a process has active audio
+static bool ProcessHasActiveAudio(pid_t pid) {
+    // Get list of all audio processes
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioHardwarePropertyProcessObjectList,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain
+    };
+    
+    UInt32 dataSize = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize);
+    if (status != noErr || dataSize == 0) {
+        return false;
+    }
+    
+    int count = dataSize / sizeof(AudioObjectID);
+    AudioObjectID* processObjects = (AudioObjectID*)miniav_calloc(count, sizeof(AudioObjectID));
+    if (!processObjects) {
+        return false;
+    }
+    
+    status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize, processObjects);
+    if (status != noErr) {
+        miniav_free(processObjects);
+        return false;
+    }
+    
+    // Check if our PID is in the list
+    addr.mSelector = kAudioProcessPropertyPID;
+    for (int i = 0; i < count; i++) {
+        pid_t processPID = -1;
+        UInt32 pidSize = sizeof(pid_t);
+        status = AudioObjectGetPropertyData(processObjects[i], &addr, 0, NULL, &pidSize, &processPID);
+        if (status == noErr && processPID == pid) {
+            miniav_free(processObjects);
+            return true;
+        }
+    }
+    
+    miniav_free(processObjects);
+    return false;
+}
+
+// Helper function to get all processes with active audio
+static uint32_t GetProcessesWithActiveAudio(pid_t** audio_pids_out, uint32_t* count_out) {
+    *audio_pids_out = NULL;
+    *count_out = 0;
+    
+    // Get list of all audio processes
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioHardwarePropertyProcessObjectList,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain
+    };
+    
+    UInt32 dataSize = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize);
+    if (status != noErr || dataSize == 0) {
+        return 0;
+    }
+    
+    int count = dataSize / sizeof(AudioObjectID);
+    AudioObjectID* processObjects = (AudioObjectID*)miniav_calloc(count, sizeof(AudioObjectID));
+    if (!processObjects) {
+        return 0;
+    }
+    
+    status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize, processObjects);
+    if (status != noErr) {
+        miniav_free(processObjects);
+        return 0;
+    }
+    
+    // Extract PIDs from process objects
+    pid_t* audio_pids = (pid_t*)miniav_calloc(count, sizeof(pid_t));
+    if (!audio_pids) {
+        miniav_free(processObjects);
+        return 0;
+    }
+    
+    uint32_t valid_count = 0;
+    addr.mSelector = kAudioProcessPropertyPID;
+    for (int i = 0; i < count; i++) {
+        pid_t pid = -1;
+        UInt32 pidSize = sizeof(pid_t);
+        status = AudioObjectGetPropertyData(processObjects[i], &addr, 0, NULL, &pidSize, &pid);
+        if (status == noErr && pid > 0) {
+            audio_pids[valid_count] = pid;
+            valid_count++;
+        }
+    }
+    
+    miniav_free(processObjects);
+    
+    if (valid_count > 0) {
+        *audio_pids_out = audio_pids;
+        *count_out = valid_count;
+        return valid_count;
+    } else {
+        miniav_free(audio_pids);
+        return 0;
+    }
+}
+
+// Helper function to check if PID is in active audio list
+static bool IsProcessInActiveAudioList(pid_t target_pid, pid_t* audio_pids, uint32_t audio_count) {
+    for (uint32_t i = 0; i < audio_count; i++) {
+        if (audio_pids[i] == target_pid) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 static MiniAVAudioFormat CoreAudioFormatToMiniAV(const AudioStreamBasicDescription* asbd) {
     if (asbd->mFormatID == kAudioFormatLinearPCM) {
         if (asbd->mFormatFlags & kAudioFormatFlagIsFloat) {
@@ -458,12 +595,57 @@ static MiniAVResultCode coreaudio_destroy_platform(MiniAVLoopbackContext* ctx) {
     return MINIAV_SUCCESS;
 }
 
-// ...existing includes...
-#include <sys/sysctl.h>
-
-// Helper function to enumerate running processes
+// Helper function to enumerate running processes (filtered for active audio)
 static uint32_t EnumerateRunningProcesses(MiniAVDeviceInfo* devices, uint32_t max_devices) {
     uint32_t found_count = 0;
+    
+    #if HAS_AUDIO_TAP_API
+    // Get list of processes with active audio first
+    pid_t* audio_pids = NULL;
+    uint32_t audio_count = 0;
+    GetProcessesWithActiveAudio(&audio_pids, &audio_count);
+    
+    if (audio_count == 0) {
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: No processes with active audio found");
+        return 0;
+    }
+    
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Found %u processes with active audio", audio_count);
+    
+    // Get detailed info for each process with active audio
+    for (uint32_t i = 0; i < audio_count && found_count < max_devices; i++) {
+        pid_t pid = audio_pids[i];
+        
+        // Skip system processes
+        if (pid <= 1) continue;
+        
+        // Get process name
+        char process_name[256] = {0};
+        bool got_name = GetProcessNameByPID(pid, process_name, sizeof(process_name));
+        
+        if (got_name && strlen(process_name) > 0) {
+            // Skip obvious system processes
+            if (strncmp(process_name, "kernel", 6) == 0) continue;
+            if (strncmp(process_name, "launchd", 7) == 0) continue;
+            if (strncmp(process_name, "coreaudiod", 10) == 0) continue;
+            if (strncmp(process_name, "AudioComponentRegistrar", 23) == 0) continue;
+            
+            MiniAVDeviceInfo* info = &devices[found_count];
+            snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "pid:%d", pid);
+            snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "%s (PID: %d) 🎵", 
+                     process_name, pid);
+            info->is_default = false;
+            found_count++;
+            
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Added audio process: %s (PID: %d)", process_name, pid);
+        }
+    }
+    
+    miniav_free(audio_pids);
+    
+    #else
+    // Fallback: show all processes but warn about functionality
+    miniav_log(MINIAV_LOG_LEVEL_WARN, "CoreAudio: Audio Tap API not available - showing all processes (audio filtering not possible)");
     
     // Get list of all processes
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
@@ -503,28 +685,34 @@ static uint32_t EnumerateRunningProcesses(MiniAVDeviceInfo* devices, uint32_t ma
         if (GetProcessNameByPID(proc->kp_proc.p_pid, process_name, sizeof(process_name))) {
             MiniAVDeviceInfo* info = &devices[found_count];
             snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "pid:%d", proc->kp_proc.p_pid);
-            snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "%s (PID: %d)", 
+            snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "%s (PID: %d) ⚠️", 
                      process_name, proc->kp_proc.p_pid);
-            info->is_default = false;
-            found_count++;
-        } else {
-            // Fallback to comm name
-            MiniAVDeviceInfo* info = &devices[found_count];
-            snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "pid:%d", proc->kp_proc.p_pid);
-            snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "%s (PID: %d)", 
-                     proc->kp_proc.p_comm, proc->kp_proc.p_pid);
             info->is_default = false;
             found_count++;
         }
     }
     
     miniav_free(processes);
+    #endif
+    
     return found_count;
 }
 
-// Helper function to enumerate windows
+// Helper function to enumerate windows (filtered for processes with active audio)
 static uint32_t EnumerateWindows(MiniAVDeviceInfo* devices, uint32_t max_devices) {
     uint32_t found_count = 0;
+    
+    #if HAS_AUDIO_TAP_API
+    // Get list of processes with active audio first
+    pid_t* audio_pids = NULL;
+    uint32_t audio_count = 0;
+    GetProcessesWithActiveAudio(&audio_pids, &audio_count);
+    
+    if (audio_count == 0) {
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: No processes with active audio found for window enumeration");
+        return 0;
+    }
+    #endif
     
     // Get list of all windows
     CFArrayRef windowList = CGWindowListCopyWindowInfo(
@@ -532,6 +720,9 @@ static uint32_t EnumerateWindows(MiniAVDeviceInfo* devices, uint32_t max_devices
         kCGNullWindowID);
     
     if (!windowList) {
+        #if HAS_AUDIO_TAP_API
+        miniav_free(audio_pids);
+        #endif
         return 0;
     }
     
@@ -547,6 +738,20 @@ static uint32_t EnumerateWindows(MiniAVDeviceInfo* devices, uint32_t max_devices
         CGWindowID windowID;
         CFNumberGetValue(windowNumber, kCFNumberSInt32Type, &windowID);
         
+        // Get PID
+        CFNumberRef pidNumber = (CFNumberRef)CFDictionaryGetValue(windowInfo, kCGWindowOwnerPID);
+        pid_t pid = 0;
+        if (pidNumber) {
+            CFNumberGetValue(pidNumber, kCFNumberIntType, &pid);
+        }
+        
+        #if HAS_AUDIO_TAP_API
+        // Only include windows from processes with active audio
+        if (!IsProcessInActiveAudioList(pid, audio_pids, audio_count)) {
+            continue;
+        }
+        #endif
+        
         // Get window name
         CFStringRef windowName = (CFStringRef)CFDictionaryGetValue(windowInfo, kCGWindowName);
         char windowNameStr[256] = "Unnamed Window";
@@ -559,13 +764,6 @@ static uint32_t EnumerateWindows(MiniAVDeviceInfo* devices, uint32_t max_devices
         char ownerNameStr[256] = "Unknown";
         if (ownerName) {
             CFStringGetCString(ownerName, ownerNameStr, sizeof(ownerNameStr), kCFStringEncodingUTF8);
-        }
-        
-        // Get PID
-        CFNumberRef pidNumber = (CFNumberRef)CFDictionaryGetValue(windowInfo, kCGWindowOwnerPID);
-        pid_t pid = 0;
-        if (pidNumber) {
-            CFNumberGetValue(pidNumber, kCFNumberIntType, &pid);
         }
         
         // Skip windows without proper names or from system processes
@@ -582,13 +780,28 @@ static uint32_t EnumerateWindows(MiniAVDeviceInfo* devices, uint32_t max_devices
         
         MiniAVDeviceInfo* info = &devices[found_count];
         snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "window:%u", windowID);
-        snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "%s - %s (Window ID: %u, PID: %d)", 
+        
+        #if HAS_AUDIO_TAP_API
+        snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "%s - %s 🎵 (Window ID: %u, PID: %d)", 
                  windowNameStr, ownerNameStr, windowID, pid);
+        #else
+        snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "%s - %s ⚠️ (Window ID: %u, PID: %d)", 
+                 windowNameStr, ownerNameStr, windowID, pid);
+        #endif
+        
         info->is_default = false;
         found_count++;
+        
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Added audio window: %s - %s (PID: %d)", 
+                   windowNameStr, ownerNameStr, pid);
     }
     
     CFRelease(windowList);
+    
+    #if HAS_AUDIO_TAP_API
+    miniav_free(audio_pids);
+    #endif
+    
     return found_count;
 }
 
@@ -866,71 +1079,6 @@ static MiniAVResultCode coreaudio_get_configured_format(MiniAVLoopbackContext* c
     return MINIAV_SUCCESS;
 }
 
-#if HAS_AUDIO_TAP_API
-// Helper function to convert PID to Audio Process Object ID
-static bool PIDToAudioProcessObjectID(pid_t pid, AudioObjectID* outProcessObjectID) {
-    AudioObjectPropertyAddress addr = {
-        .mSelector = kAudioHardwarePropertyTranslatePIDToProcessObject,
-        .mScope = kAudioObjectPropertyScopeGlobal,
-        .mElement = kAudioObjectPropertyElementMain
-    };
-    
-    UInt32 dataSize = sizeof(AudioObjectID);
-    OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 
-                                                sizeof(pid), &pid, &dataSize, outProcessObjectID);
-    
-    if (status != noErr) {
-        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Failed to translate PID %d to process object ID: %d", pid, status);
-        return false;
-    }
-    
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: PID %d -> Process Object ID %u", pid, *outProcessObjectID);
-    return true;
-}
-
-// Helper function to check if a process has active audio
-static bool ProcessHasActiveAudio(pid_t pid) {
-    // Get list of all audio processes
-    AudioObjectPropertyAddress addr = {
-        .mSelector = kAudioHardwarePropertyProcessObjectList,
-        .mScope = kAudioObjectPropertyScopeGlobal,
-        .mElement = kAudioObjectPropertyElementMain
-    };
-    
-    UInt32 dataSize = 0;
-    OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize);
-    if (status != noErr || dataSize == 0) {
-        return false;
-    }
-    
-    int count = dataSize / sizeof(AudioObjectID);
-    AudioObjectID* processObjects = (AudioObjectID*)miniav_calloc(count, sizeof(AudioObjectID));
-    if (!processObjects) {
-        return false;
-    }
-    
-    status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &dataSize, processObjects);
-    if (status != noErr) {
-        miniav_free(processObjects);
-        return false;
-    }
-    
-    // Check if our PID is in the list
-    addr.mSelector = kAudioProcessPropertyPID;
-    for (int i = 0; i < count; i++) {
-        pid_t processPID = -1;
-        UInt32 pidSize = sizeof(pid_t);
-        status = AudioObjectGetPropertyData(processObjects[i], &addr, 0, NULL, &pidSize, &processPID);
-        if (status == noErr && processPID == pid) {
-            miniav_free(processObjects);
-            return true;
-        }
-    }
-    
-    miniav_free(processObjects);
-    return false;
-}
-#endif
 
 static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, MiniAVBufferCallback callback, void* user_data) {
     if (!ctx || !ctx->platform_ctx || !callback) return MINIAV_ERROR_INVALID_ARG;

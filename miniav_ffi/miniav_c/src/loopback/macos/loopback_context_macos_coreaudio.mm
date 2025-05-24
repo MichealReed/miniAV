@@ -16,6 +16,7 @@
 #include <mach/mach.h>
 #include <pthread.h>
 #include <Foundation/Foundation.h>
+#include <sys/sysctl.h>
 
 // Audio Tap APIs (macOS 10.10+) - use the correct headers
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 101000
@@ -457,13 +458,147 @@ static MiniAVResultCode coreaudio_destroy_platform(MiniAVLoopbackContext* ctx) {
     return MINIAV_SUCCESS;
 }
 
+// ...existing includes...
+#include <sys/sysctl.h>
+
+// Helper function to enumerate running processes
+static uint32_t EnumerateRunningProcesses(MiniAVDeviceInfo* devices, uint32_t max_devices) {
+    uint32_t found_count = 0;
+    
+    // Get list of all processes
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t size;
+    
+    // Get size needed
+    if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0) {
+        return 0;
+    }
+    
+    struct kinfo_proc* processes = (struct kinfo_proc*)miniav_calloc(size, 1);
+    if (!processes) {
+        return 0;
+    }
+    
+    // Get actual process list
+    if (sysctl(mib, 4, processes, &size, NULL, 0) != 0) {
+        miniav_free(processes);
+        return 0;
+    }
+    
+    size_t process_count = size / sizeof(struct kinfo_proc);
+    
+    for (size_t i = 0; i < process_count && found_count < max_devices; i++) {
+        struct kinfo_proc* proc = &processes[i];
+        
+        // Skip kernel processes and system processes
+        if (proc->kp_proc.p_pid <= 1) continue;
+        if (strlen(proc->kp_proc.p_comm) == 0) continue;
+        
+        // Skip obvious system processes
+        if (strncmp(proc->kp_proc.p_comm, "kernel", 6) == 0) continue;
+        if (strncmp(proc->kp_proc.p_comm, "launchd", 7) == 0) continue;
+        
+        // Get more detailed process info
+        char process_name[256] = {0};
+        if (GetProcessNameByPID(proc->kp_proc.p_pid, process_name, sizeof(process_name))) {
+            MiniAVDeviceInfo* info = &devices[found_count];
+            snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "pid:%d", proc->kp_proc.p_pid);
+            snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "%s (PID: %d)", 
+                     process_name, proc->kp_proc.p_pid);
+            info->is_default = false;
+            found_count++;
+        } else {
+            // Fallback to comm name
+            MiniAVDeviceInfo* info = &devices[found_count];
+            snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "pid:%d", proc->kp_proc.p_pid);
+            snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "%s (PID: %d)", 
+                     proc->kp_proc.p_comm, proc->kp_proc.p_pid);
+            info->is_default = false;
+            found_count++;
+        }
+    }
+    
+    miniav_free(processes);
+    return found_count;
+}
+
+// Helper function to enumerate windows
+static uint32_t EnumerateWindows(MiniAVDeviceInfo* devices, uint32_t max_devices) {
+    uint32_t found_count = 0;
+    
+    // Get list of all windows
+    CFArrayRef windowList = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    
+    if (!windowList) {
+        return 0;
+    }
+    
+    CFIndex windowCount = CFArrayGetCount(windowList);
+    
+    for (CFIndex i = 0; i < windowCount && found_count < max_devices; i++) {
+        CFDictionaryRef windowInfo = (CFDictionaryRef)CFArrayGetValueAtIndex(windowList, i);
+        
+        // Get window ID
+        CFNumberRef windowNumber = (CFNumberRef)CFDictionaryGetValue(windowInfo, kCGWindowNumber);
+        if (!windowNumber) continue;
+        
+        CGWindowID windowID;
+        CFNumberGetValue(windowNumber, kCFNumberSInt32Type, &windowID);
+        
+        // Get window name
+        CFStringRef windowName = (CFStringRef)CFDictionaryGetValue(windowInfo, kCGWindowName);
+        char windowNameStr[256] = "Unnamed Window";
+        if (windowName) {
+            CFStringGetCString(windowName, windowNameStr, sizeof(windowNameStr), kCFStringEncodingUTF8);
+        }
+        
+        // Get owner name
+        CFStringRef ownerName = (CFStringRef)CFDictionaryGetValue(windowInfo, kCGWindowOwnerName);
+        char ownerNameStr[256] = "Unknown";
+        if (ownerName) {
+            CFStringGetCString(ownerName, ownerNameStr, sizeof(ownerNameStr), kCFStringEncodingUTF8);
+        }
+        
+        // Get PID
+        CFNumberRef pidNumber = (CFNumberRef)CFDictionaryGetValue(windowInfo, kCGWindowOwnerPID);
+        pid_t pid = 0;
+        if (pidNumber) {
+            CFNumberGetValue(pidNumber, kCFNumberIntType, &pid);
+        }
+        
+        // Skip windows without proper names or from system processes
+        if (strlen(windowNameStr) == 0 || strcmp(windowNameStr, "Unnamed Window") == 0) {
+            continue;
+        }
+        
+        // Skip system windows
+        if (strcmp(ownerNameStr, "Window Server") == 0 || 
+            strcmp(ownerNameStr, "Dock") == 0 ||
+            strcmp(ownerNameStr, "SystemUIServer") == 0) {
+            continue;
+        }
+        
+        MiniAVDeviceInfo* info = &devices[found_count];
+        snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "window:%u", windowID);
+        snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "%s - %s (Window ID: %u, PID: %d)", 
+                 windowNameStr, ownerNameStr, windowID, pid);
+        info->is_default = false;
+        found_count++;
+    }
+    
+    CFRelease(windowList);
+    return found_count;
+}
+
 static MiniAVResultCode coreaudio_enumerate_targets(MiniAVLoopbackTargetType target_type_filter,
                                                    MiniAVDeviceInfo** targets_out, uint32_t* count_out) {
     if (!targets_out || !count_out) return MINIAV_ERROR_INVALID_ARG;
     *targets_out = NULL;
     *count_out = 0;
     
-    const uint32_t MAX_TARGETS = 256;
+    const uint32_t MAX_TARGETS = 512; // Increased for process/window enumeration
     MiniAVDeviceInfo* temp_devices = (MiniAVDeviceInfo*)miniav_calloc(MAX_TARGETS, sizeof(MiniAVDeviceInfo));
     if (!temp_devices) {
         return MINIAV_ERROR_OUT_OF_MEMORY;
@@ -506,23 +641,14 @@ static MiniAVResultCode coreaudio_enumerate_targets(MiniAVLoopbackTargetType tar
                 CFRelease(device_name);
                 found_count++;
             }
-        } else if (!HAS_AUDIO_TAP_API) {
-            MiniAVDeviceInfo* info = &temp_devices[found_count];
-            snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "no_virtual_device");
-            snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "Install BlackHole or similar virtual audio device");
-            info->is_default = false;
-            found_count++;
         }
     }
     
-    // Process-specific capture
+    // Process-specific capture - enumerate all running processes
     if (target_type_filter == MINIAV_LOOPBACK_TARGET_PROCESS || target_type_filter == MINIAV_LOOPBACK_TARGET_NONE) {
         #if HAS_AUDIO_TAP_API
-        MiniAVDeviceInfo* info = &temp_devices[found_count];
-        snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "process_tap");
-        snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "Process Audio Capture (Audio Tap)");
-        info->is_default = true;
-        found_count++;
+        uint32_t process_count = EnumerateRunningProcesses(&temp_devices[found_count], MAX_TARGETS - found_count);
+        found_count += process_count;
         #else
         MiniAVDeviceInfo* info = &temp_devices[found_count];
         snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "process_not_supported");
@@ -532,14 +658,11 @@ static MiniAVResultCode coreaudio_enumerate_targets(MiniAVLoopbackTargetType tar
         #endif
     }
 
-        // Window-specific capture
+    // Window-specific capture - enumerate all visible windows
     if (target_type_filter == MINIAV_LOOPBACK_TARGET_WINDOW || target_type_filter == MINIAV_LOOPBACK_TARGET_NONE) {
         #if HAS_AUDIO_TAP_API
-        MiniAVDeviceInfo* info = &temp_devices[found_count];
-        snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "window_tap");
-        snprintf(info->name, MINIAV_DEVICE_NAME_MAX_LEN, "Window Audio Capture (Audio Tap)");
-        info->is_default = true;
-        found_count++;
+        uint32_t window_count = EnumerateWindows(&temp_devices[found_count], MAX_TARGETS - found_count);
+        found_count += window_count;
         #else
         MiniAVDeviceInfo* info = &temp_devices[found_count];
         snprintf(info->device_id, MINIAV_DEVICE_ID_MAX_LEN, "window_not_supported");

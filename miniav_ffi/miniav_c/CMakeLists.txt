@@ -325,7 +325,7 @@ if(MINIAV_ENABLE_SCREEN)
         
     elseif(MINIAV_PLATFORM_IOS AND MINIAV_BACKEND_IOS_REPLAYKIT)
         message(STATUS "iOS: Enabling ReplayKit for screen recording")
-        list(APPEND ALL_SOURCES "src/screen/ios/screen_context_ios_replaykit.mm)
+        list(APPEND ALL_SOURCES "src/screen/ios/screen_context_ios_replaykit.mm")
         list(APPEND ALL_HEADERS "src/screen/ios/screen_context_ios_replaykit.h")
         list(APPEND ALL_LINK_LIBS "-framework ReplayKit")
         list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_IOS_REPLAYKIT_SCREEN_ENABLED")

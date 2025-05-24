@@ -26,6 +26,9 @@
 #define HAS_AUDIO_TAP_API 0
 #endif
 
+// --- Forward Declarations ---
+static MiniAVResultCode coreaudio_stop_capture(MiniAVLoopbackContext* ctx);
+
 // --- Capture Mode Enum ---
 typedef enum {
     CAPTURE_MODE_NONE,
@@ -572,7 +575,7 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
     // Determine capture method based on target
     if (target_info && target_info->type == MINIAV_LOOPBACK_TARGET_PROCESS) {
         #if HAS_AUDIO_TAP_API
-        platCtx->target_pid = target_info->process.pid;
+        platCtx->target_pid = target_info->TARGETHANDLE.process_id;
         platCtx->capture_mode = CAPTURE_MODE_PROCESS_TAP;
         miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Configured for process audio capture (PID: %d)", platCtx->target_pid);
         #else

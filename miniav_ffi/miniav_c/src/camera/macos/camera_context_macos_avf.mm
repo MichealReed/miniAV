@@ -511,21 +511,50 @@ static BOOL macos_avf_validate_format_support(AVCaptureDevice *device, const Min
     float requested_fps = (format_req->frame_rate_denominator > 0) ? 
                          (float)format_req->frame_rate_numerator / format_req->frame_rate_denominator : 0;
     
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+              "AVF: Validating format: %dx%d, PixelFormat:%d, FPS:%.2f", 
+              format_req->width, format_req->height, format_req->pixel_format, requested_fps);
+    
     for (AVCaptureDeviceFormat *avFormat in device.formats) {
         CMFormatDescriptionRef desc = avFormat.formatDescription;
         CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(desc);
         OSType fourCC = CMFormatDescriptionGetMediaSubType(desc);
         MiniAVPixelFormat currentMiniAVFormat = FourCCToMiniAVPixelFormat(fourCC);
         
-        // Check exact match
+        char fourCCStr[5] = {0};
+        *(OSType*)fourCCStr = CFSwapInt32HostToBig(fourCC);
+        
+        // Check exact match for resolution and pixel format
         if (dimensions.width == format_req->width && 
             dimensions.height == format_req->height &&
             currentMiniAVFormat == format_req->pixel_format) {
             
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                      "AVF: Found matching format: %dx%d, FourCC: '%.4s', PixelFormat: %d", 
+                      dimensions.width, dimensions.height, fourCCStr, currentMiniAVFormat);
+            
             // Check frame rate support
             for (AVFrameRateRange *range in avFormat.videoSupportedFrameRateRanges) {
-                if ((requested_fps == 0 && range.maxFrameRate > 0) || 
-                    (requested_fps >= range.minFrameRate && requested_fps <= range.maxFrameRate)) {
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                          "AVF: Checking FPS range: %.2f - %.2f, requested: %.2f", 
+                          range.minFrameRate, range.maxFrameRate, requested_fps);
+                
+                BOOL fps_match = NO;
+                if (requested_fps == 0 && range.maxFrameRate > 0) {
+                    fps_match = YES; // Zero FPS means "any supported rate"
+                } else if (requested_fps > 0) {
+                    // **IMPORTANT FIX: Add tolerance for floating point comparison**
+                    float tolerance = 0.1f; // Allow 0.1 FPS difference
+                    if (requested_fps >= (range.minFrameRate - tolerance) && 
+                        requested_fps <= (range.maxFrameRate + tolerance)) {
+                        fps_match = YES;
+                    }
+                }
+                
+                if (fps_match) {
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+                              "AVF: Format validation SUCCESS - %dx%d, PixelFormat:%d, FPS:%.2f", 
+                              format_req->width, format_req->height, format_req->pixel_format, requested_fps);
                     return YES; // Format is supported
                 }
             }
@@ -769,7 +798,26 @@ static MiniAVResultCode macos_avf_enumerate_devices(MiniAVDeviceInfo** devices_o
     *devices_out = NULL; *count_out = 0;
 
     @autoreleasepool {
-        NSArray<AVCaptureDevice *> *avDevices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+        // **FIX DEPRECATED API**
+        AVCaptureDeviceDiscoverySession *discoverySession = nil;
+        if (@available(macOS 10.15, *)) {
+            discoverySession = [AVCaptureDeviceDiscoverySession 
+                               discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternalUnknown]
+                               mediaType:AVMediaTypeVideo
+                               position:AVCaptureDevicePositionUnspecified];
+        }
+        
+        NSArray<AVCaptureDevice *> *avDevices = nil;
+        if (discoverySession) {
+            avDevices = discoverySession.devices;
+        } else {
+            // Fallback for older macOS versions
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            avDevices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+#pragma clang diagnostic pop
+        }
+        
         if (!avDevices || [avDevices count] == 0) {
             miniav_log(MINIAV_LOG_LEVEL_INFO, "AVF: No video devices found.");
             return MINIAV_SUCCESS; 
@@ -1024,9 +1072,22 @@ MiniAVResultCode miniav_camera_context_platform_init_macos_avf(MiniAVCameraConte
     if (!ctx) return MINIAV_ERROR_INVALID_ARG;
 
     @autoreleasepool { // Check for basic usability
-        if (![AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo]) {
-            // This is unlikely to be nil, more likely an empty array.
-            // miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: No video devices found during platform selection check (devicesWithMediaType returned nil).");
+        AVCaptureDeviceDiscoverySession *discoverySession = nil;
+        if (@available(macOS 10.15, *)) {
+            discoverySession = [AVCaptureDeviceDiscoverySession 
+                               discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternalUnknown]
+                               mediaType:AVMediaTypeVideo
+                               position:AVCaptureDevicePositionUnspecified];
+        }
+        
+        if (!discoverySession) {
+            // Fallback check for older macOS
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            if (![AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo]) {
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "AVF: No video devices available during platform check");
+            }
+#pragma clang diagnostic pop
         }
     }
     

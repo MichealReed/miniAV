@@ -723,9 +723,6 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
                             if (lockError && [lockError code] == AVErrorDeviceAlreadyUsedByAnotherSession) {
                                 miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Device is already in use by another session");
                                 result = MINIAV_ERROR_DEVICE_BUSY;
-                            } else if (lockError && [lockError code] == AVErrorDeviceNotAvailableInBackground) {
-                                miniav_log(MINIAV_LOG_LEVEL_ERROR, "AVF: Device not available in background");
-                                result = MINIAV_ERROR_DEVICE_NOT_FOUND;
                             } else {
                                 result = MINIAV_ERROR_SYSTEM_CALL_FAILED;
                             }

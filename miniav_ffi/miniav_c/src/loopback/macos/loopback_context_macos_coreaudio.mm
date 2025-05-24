@@ -727,7 +727,7 @@ static MiniAVResultCode coreaudio_configure_loopback(MiniAVLoopbackContext* ctx,
         #if HAS_AUDIO_TAP_API
         // For window targets, we need to get the process ID from the window handle
         // On macOS, window handles are typically CGWindowID
-        CGWindowID windowID = (CGWindowID)target_info->TARGETHANDLE.window_handle;
+        CGWindowID windowID = (CGWindowID)(uintptr_t)target_info->TARGETHANDLE.window_handle;
         
         // Get window info to find the owning process
         CFArrayRef windowList = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, windowID);

@@ -788,7 +788,11 @@ static MiniAVResultCode macos_avf_configure(MiniAVCameraContext* ctx, const char
             targetOutputFourCC = kCVPixelFormatType_32BGRA;
         }
         
-        NSDictionary *videoSettings = @{(id)kCVPixelBufferPixelFormatTypeKey: @(targetOutputFourCC)};
+        NSDictionary *videoSettings = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(targetOutputFourCC),
+        (id)kCVPixelBufferWidthKey: @(format_req->width),
+        (id)kCVPixelBufferHeightKey: @(format_req->height)
+        };
         platCtx->videoDataOutput.videoSettings = videoSettings;
         platCtx->videoDataOutput.alwaysDiscardsLateVideoFrames = YES;
 

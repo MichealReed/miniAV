@@ -900,66 +900,96 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
             NSUUID* tapUUID = [NSUUID UUID];
             CATapDescription *desc = nil;
             
-            // Check if we have the necessary permissions first
-            // Audio taps require special entitlements or running as admin
-            if (@available(macOS 10.15, *)) {
-                if (platCtx->capture_mode == CAPTURE_MODE_PROCESS_TAP && platCtx->target_pid > 0) {
-                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Creating process-specific tap for PID: %d", platCtx->target_pid);
+            if (platCtx->capture_mode == CAPTURE_MODE_PROCESS_TAP && platCtx->target_pid > 0) {
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Creating process-specific tap for PID: %d", platCtx->target_pid);
+                
+                // Check if the target process exists and get more info about it
+                char process_name[256] = {0};
+                bool process_exists = GetProcessNameByPID(platCtx->target_pid, process_name, sizeof(process_name));
+                
+                if (!process_exists) {
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Target process PID %d does not exist or is not accessible", platCtx->target_pid);
+                    status = kAudioHardwareIllegalOperationError;
+                } else {
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Target process: %s (PID: %d)", process_name, platCtx->target_pid);
                     
-                    // Check if the target process exists
-                    if (kill(platCtx->target_pid, 0) != 0) {
-                        miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Target process PID %d does not exist or is not accessible", platCtx->target_pid);
-                        status = kAudioHardwareIllegalOperationError;
-                    } else {
-                        if ([CATapDescription instancesRespondToSelector:@selector(initStereoMixdownOfProcesses:)]) {
-                            desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:
-                                    [NSArray arrayWithObject:[NSNumber numberWithInt:platCtx->target_pid]]];
-                        }
-                        if (!desc) {
-                            miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to init CATapDescription for PID %d", platCtx->target_pid);
-                            status = kAudioHardwareIllegalOperationError;
-                        }
+                    // Additional check - make sure it's not a system process
+                    if (platCtx->target_pid < 100) {
+                        miniav_log(MINIAV_LOG_LEVEL_WARN, "CoreAudio: Target PID %d appears to be a system process, this may not work", platCtx->target_pid);
                     }
-                } else if (platCtx->capture_mode == CAPTURE_MODE_SYSTEM_TAP) {
-                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Creating system-wide audio tap");
                     
-                    // Try different initialization methods based on macOS version
-                    if ([CATapDescription instancesRespondToSelector:@selector(initStereoGlobalTapButExcludeProcesses:)]) {
-                        desc = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:@[]];
-                    } else if ([CATapDescription instancesRespondToSelector:@selector(initStereoGlobalTap)]) {
-                        desc = [[CATapDescription alloc] initStereoGlobalTap];
+                    // Try different initialization methods for process taps
+                    NSArray* processArray = [NSArray arrayWithObject:[NSNumber numberWithInt:platCtx->target_pid]];
+                    
+                    // Try the most common method first
+                    if ([CATapDescription instancesRespondToSelector:@selector(initStereoMixdownOfProcesses:)]) {
+                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Using initStereoMixdownOfProcesses method");
+                        desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processArray];
+                    }
+                    
+                    // If that didn't work, try other methods
+                    if (!desc && [CATapDescription instancesRespondToSelector:@selector(initWithProcesses:andDeviceUID:)]) {
+                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Trying initWithProcesses:andDeviceUID method");
+                        desc = [[CATapDescription alloc] initWithProcesses:processArray andDeviceUID:nil];
+                    }
+                    
+                    // As a last resort, try mono mixdown
+                    if (!desc && [CATapDescription instancesRespondToSelector:@selector(initMonoMixdownOfProcesses:)]) {
+                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Trying initMonoMixdownOfProcesses method");
+                        desc = [[CATapDescription alloc] initMonoMixdownOfProcesses:processArray];
                     }
                     
                     if (!desc) {
-                        miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to init CATapDescription for system output");
+                        miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to init CATapDescription for PID %d using any available method", platCtx->target_pid);
                         status = kAudioHardwareIllegalOperationError;
+                    } else {
+                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Successfully created CATapDescription for process tap");
                     }
                 }
-            } else {
-                // For older macOS versions, try legacy methods
-                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Attempting legacy Audio Tap initialization");
-                if ([CATapDescription instancesRespondToSelector:@selector(initStereoGlobalTap)]) {
+            } else if (platCtx->capture_mode == CAPTURE_MODE_SYSTEM_TAP) {
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Creating system-wide audio tap");
+                
+                // Try different initialization methods based on macOS version
+                if (@available(macOS 10.15, *)) {
+                    if ([CATapDescription instancesRespondToSelector:@selector(initStereoGlobalTapButExcludeProcesses:)]) {
+                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Using initStereoGlobalTapButExcludeProcesses method");
+                        desc = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:@[]];
+                    }
+                }
+                
+                if (!desc && [CATapDescription instancesRespondToSelector:@selector(initStereoGlobalTap)]) {
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Using initStereoGlobalTap method");
                     desc = [[CATapDescription alloc] initStereoGlobalTap];
                 }
                 
                 if (!desc) {
-                    miniav_log(MINIAV_LOG_LEVEL_WARN, "CoreAudio: Legacy Audio Tap initialization failed");
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to init CATapDescription for system output");
                     status = kAudioHardwareIllegalOperationError;
+                } else {
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Successfully created CATapDescription for system tap");
                 }
             }
 
             if (desc && status == noErr) {
-                desc.name = [NSString stringWithFormat:@"miniav-tap-%d", currentProcessID];
+                // Configure the tap description
+                desc.name = [NSString stringWithFormat:@"miniav-tap-%d-%d", currentProcessID, (int)platCtx->capture_mode];
                 desc.UUID = tapUUID;
                 desc.privateTap = true;
                 desc.muteBehavior = CATapUnmuted;
                 desc.exclusive = false;
                 desc.mixdown = true;
                 
+                // Log tap configuration for debugging
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Tap config - Name: %s, Private: %s, Exclusive: %s, Mixdown: %s", 
+                          [desc.name UTF8String],
+                          desc.privateTap ? "YES" : "NO",
+                          desc.exclusive ? "YES" : "NO", 
+                          desc.mixdown ? "YES" : "NO");
+                
                 miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Attempting to create process tap with description");
                 status = AudioHardwareCreateProcessTap(desc, &platCtx->tap_id);
                 
-                // Log the specific error
+                // Log the specific error with more detail
                 if (status != noErr) {
                     const char* error_name = "Unknown";
                     switch (status) {
@@ -978,26 +1008,32 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
                         case kAudioHardwareUnsupportedOperationError:
                             error_name = "Unsupported Operation";
                             break;
+                        case 560947818: // The specific error you mentioned
+                            error_name = "Audio Tap Creation Failed (Process may not have audio output)";
+                            break;
                         default:
                             break;
                     }
                     miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: AudioHardwareCreateProcessTap failed with status %d (0x%X): %s", 
                                status, status, error_name);
                     
-                    // Provide user-friendly guidance
-                    if (status == kAudioHardwareIllegalOperationError || status == 560947818) {
-                        miniav_log(MINIAV_LOG_LEVEL_WARN, "CoreAudio: Audio Tap creation failed. This may be due to:");
-                        miniav_log(MINIAV_LOG_LEVEL_WARN, "  1. Missing com.apple.audio.AudioHardwareService entitlement");
-                        miniav_log(MINIAV_LOG_LEVEL_WARN, "  2. App not running with elevated permissions");
-                        miniav_log(MINIAV_LOG_LEVEL_WARN, "  3. Target process not accessible");
-                        miniav_log(MINIAV_LOG_LEVEL_WARN, "  4. System audio tapping disabled by user/admin");
+                    // For process taps specifically, provide more targeted guidance
+                    if (platCtx->capture_mode == CAPTURE_MODE_PROCESS_TAP) {
+                        miniav_log(MINIAV_LOG_LEVEL_WARN, "CoreAudio: Process tap creation failed. This may be because:");
+                        miniav_log(MINIAV_LOG_LEVEL_WARN, "  1. The target process (PID: %d) is not currently producing audio output", platCtx->target_pid);
+                        miniav_log(MINIAV_LOG_LEVEL_WARN, "  2. The process doesn't have audio units or streams active");
+                        miniav_log(MINIAV_LOG_LEVEL_WARN, "  3. The process is a system process that doesn't allow tapping");
+                        miniav_log(MINIAV_LOG_LEVEL_WARN, "  4. Try playing audio in the target process first, then start capture");
                     }
+                } else {
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Process tap created successfully (ID: %u)", (unsigned int)platCtx->tap_id);
                 }
             } else if (!desc) {
                 status = kAudioHardwareIllegalOperationError;
                 miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Could not create CATapDescription");
             }
             
+            // Rest of the aggregated device creation logic...
             if (status != noErr) { 
                 miniav_log(MINIAV_LOG_LEVEL_WARN, "CoreAudio: Audio Tap creation failed, falling back to virtual device capture");
                 platCtx->virtual_device_id = FindVirtualAudioDevice();
@@ -1011,41 +1047,6 @@ static MiniAVResultCode coreaudio_start_capture(MiniAVLoopbackContext* ctx, Mini
                     return MINIAV_ERROR_DEVICE_NOT_FOUND;
                 }
             } else {
-                // Successfully created tap, continue with aggregated device creation
-                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "CoreAudio: Process tap created successfully, creating aggregated device");
-                
-                NSString *deviceName = [NSString stringWithFormat:@"miniav-aggregated-%d", currentProcessID];
-                NSNumber *isPrivateKey = [NSNumber numberWithBool:true];
-                
-                NSArray* tapConf = [NSArray arrayWithObject:[NSDictionary dictionaryWithObjectsAndKeys:
-                                    [NSNumber numberWithBool:true], [NSString stringWithUTF8String:kAudioSubTapDriftCompensationKey],
-                                    tapUUID.UUIDString, [NSString stringWithUTF8String:kAudioSubTapUIDKey],
-                                    nil]];
-                
-                NSDictionary *dict = [NSDictionary dictionaryWithObjectsAndKeys:
-                                      deviceName, [NSString stringWithUTF8String:kAudioAggregateDeviceNameKey],
-                                      [[NSUUID UUID] UUIDString], [NSString stringWithUTF8String:kAudioAggregateDeviceUIDKey],
-                                      isPrivateKey, [NSString stringWithUTF8String:kAudioAggregateDeviceIsPrivateKey],
-                                      tapConf, [NSString stringWithUTF8String:kAudioAggregateDeviceTapListKey],
-                                      nil];
-                
-                CFDictionaryRef dictBridge = (__bridge CFDictionaryRef)dict;
-                status = AudioHardwareCreateAggregateDevice(dictBridge, &platCtx->aggregated_id);
-                
-                if (status != noErr) {
-                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to create aggregate device: %d (0x%X)", status, status);
-                    AudioHardwareDestroyProcessTap(platCtx->tap_id);
-                    platCtx->tap_id = kAudioObjectUnknown;
-                    
-                    // Fallback to virtual device
-                    platCtx->virtual_device_id = FindVirtualAudioDevice();
-                    if (platCtx->virtual_device_id != kAudioObjectUnknown) {
-                        platCtx->capture_mode = CAPTURE_MODE_VIRTUAL_DEVICE;
-                    } else {
-                        pthread_mutex_unlock(&platCtx->capture_mutex);
-                        return MINIAV_ERROR_SYSTEM_CALL_FAILED;
-                    }
-                } else {
                     status = AudioDeviceCreateIOProcID(platCtx->aggregated_id, AudioTapIOProc, platCtx, &platCtx->io_proc_id);
                     if (status != noErr) {
                         miniav_log(MINIAV_LOG_LEVEL_ERROR, "CoreAudio: Failed to create IOProc: %d (0x%X)", status, status);

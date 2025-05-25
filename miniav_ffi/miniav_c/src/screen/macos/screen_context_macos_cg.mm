@@ -162,7 +162,7 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
         return;
     }
     
-    payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_AUDIO_SCREEN;
+    payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_AUDIO;
     payload->context_owner = _cgCtx->parent_ctx;
     payload->parent_miniav_buffer_ptr = buffer;
     buffer->internal_handle = payload;
@@ -225,7 +225,7 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
     buffer->data.audio.info.num_frames = (uint32_t)frameCount;
     
     // Set audio data pointer
-    buffer->data.audio.data_ptr = (void*)dataPtr;
+    buffer->data.audio.data = (void*)dataPtr;
     buffer->user_data = _cgCtx->app_callback_user_data_internal;
     
     miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
@@ -904,15 +904,23 @@ static MiniAVResultCode cg_release_buffer(MiniAVScreenContext* ctx, void* intern
                         CFRelease(data);
                     }
                     CGImageRelease(image);
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "SCK: Released CGImageRef");
                 } else if (typeID == CVPixelBufferGetTypeID()) {
                     // CVPixelBufferRef
                     CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)payload->native_singular_resource_ptr;
                     CVBufferRelease(pixelBuffer);
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "SCK: Released CVPixelBufferRef");
                 } else {
                     // Metal texture
                     CVMetalTextureRef metalTextureRef = (CVMetalTextureRef)payload->native_singular_resource_ptr;
                     CFRelease(metalTextureRef);
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "SCK: Released CVMetalTextureRef");
                 }
+            } 
+            else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_AUDIO) {
+                CMSampleBufferRef sampleBuffer = (CMSampleBufferRef)payload->native_singular_resource_ptr;
+                CFRelease(sampleBuffer);
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "SCK: Released generic audio CMSampleBufferRef");
             }
             payload->native_singular_resource_ptr = NULL;
         }

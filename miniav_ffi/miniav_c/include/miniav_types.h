@@ -108,7 +108,8 @@ typedef enum {
   MINIAV_AUDIO_FORMAT_U8,  // Unsigned 8-bit integer
   MINIAV_AUDIO_FORMAT_S16, // Signed 16-bit integer
   MINIAV_AUDIO_FORMAT_S32, // Signed 32-bit integer
-  MINIAV_AUDIO_FORMAT_F32  // 32-bit floating point
+  MINIAV_AUDIO_FORMAT_F32,  // 32-bit floating point
+  MINIAV_AUDIO_FORMAT_F64 // 64-bit floating point
 } MiniAVAudioFormat;
 
 // --- Capture Target Type (for Screen Capture) ---

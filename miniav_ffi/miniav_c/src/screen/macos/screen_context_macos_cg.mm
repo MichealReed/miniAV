@@ -148,10 +148,33 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
         return;
     }
     
+    // Get audio data first to check validity
+    CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
+    if (!blockBuffer) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get audio data buffer");
+        return;
+    }
+    
+    size_t totalLength = 0;
+    char* dataPtr = NULL;
+    OSStatus status = CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &totalLength, &dataPtr);
+    if (status != noErr || !dataPtr || totalLength == 0) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get audio data pointer (status: %d, length: %zu)", status, totalLength);
+        return;
+    }
+    
+    void* audioCopy = miniav_malloc(totalLength);
+    if (!audioCopy) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate audio data copy");
+        return;
+    }
+    memcpy(audioCopy, dataPtr, totalLength);
+    
     // Allocate audio buffer on heap
     MiniAVBuffer* buffer = (MiniAVBuffer*)miniav_calloc(1, sizeof(MiniAVBuffer));
     if (!buffer) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate audio MiniAVBuffer");
+        miniav_free(audioCopy);
         return;
     }
     

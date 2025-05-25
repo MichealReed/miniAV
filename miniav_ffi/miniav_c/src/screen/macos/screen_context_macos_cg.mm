@@ -123,8 +123,117 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
         }
         
         [self processVideoFrame:imageBuffer withTimestamp:CMSampleBufferGetPresentationTimeStamp(sampleBuffer)];
+    } 
+    // **ADD: Handle audio output**
+    else if (type == SCStreamOutputTypeAudio) {
+        [self processAudioBuffer:sampleBuffer];
     }
-    // Note: Audio is handled by separate loopback system like WGC
+}
+
+// **ADD: Audio processing method**
+- (void)processAudioBuffer:(CMSampleBufferRef)sampleBuffer {
+    if (!_cgCtx->parent_ctx->capture_audio_requested) {
+        return; // Audio not requested
+    }
+    
+    CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
+    if (!formatDesc) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get audio format description");
+        return;
+    }
+    
+    const AudioStreamBasicDescription* asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc);
+    if (!asbd) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get audio stream description");
+        return;
+    }
+    
+    // Allocate audio buffer on heap
+    MiniAVBuffer* buffer = (MiniAVBuffer*)miniav_calloc(1, sizeof(MiniAVBuffer));
+    if (!buffer) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate audio MiniAVBuffer");
+        return;
+    }
+    
+    MiniAVNativeBufferInternalPayload* payload = (MiniAVNativeBufferInternalPayload*)miniav_calloc(1, sizeof(MiniAVNativeBufferInternalPayload));
+    if (!payload) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate audio payload");
+        miniav_free(buffer);
+        return;
+    }
+    
+    payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_AUDIO_SCREEN;
+    payload->context_owner = _cgCtx->parent_ctx;
+    payload->parent_miniav_buffer_ptr = buffer;
+    buffer->internal_handle = payload;
+    
+    // Retain the sample buffer for the payload
+    CFRetain(sampleBuffer);
+    payload->native_singular_resource_ptr = (void*)sampleBuffer;
+    
+    // Get audio data
+    CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
+    if (!blockBuffer) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get audio data buffer");
+        CFRelease(sampleBuffer);
+        miniav_free(buffer);
+        miniav_free(payload);
+        return;
+    }
+    
+    size_t totalLength = 0;
+    char* dataPtr = NULL;
+    OSStatus status = CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &totalLength, &dataPtr);
+    if (status != noErr || !dataPtr) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get audio data pointer (status: %d)", status);
+        CFRelease(sampleBuffer);
+        miniav_free(buffer);
+        miniav_free(payload);
+        return;
+    }
+    
+    // Calculate frame count
+    CMItemCount frameCount = CMSampleBufferGetNumSamples(sampleBuffer);
+    
+    // Set up MiniAV audio buffer
+    buffer->type = MINIAV_BUFFER_TYPE_AUDIO;
+    buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU; // Audio is always CPU for now
+    buffer->timestamp_us = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) * 1000000;
+    buffer->data_size_bytes = totalLength;
+    
+    // Map Core Audio format to MiniAV format
+    MiniAVAudioFormat miniavFormat = MINIAV_AUDIO_FORMAT_UNKNOWN;
+    if (asbd->mFormatID == kAudioFormatLinearPCM) {
+        if (asbd->mFormatFlags & kAudioFormatFlagIsFloat) {
+            if (asbd->mBitsPerChannel == 32) {
+                miniavFormat = MINIAV_AUDIO_FORMAT_F32;
+            } else if (asbd->mBitsPerChannel == 64) {
+                miniavFormat = MINIAV_AUDIO_FORMAT_F64;
+            }
+        } else {
+            if (asbd->mBitsPerChannel == 16) {
+                miniavFormat = MINIAV_AUDIO_FORMAT_S16;
+            } else if (asbd->mBitsPerChannel == 32) {
+                miniavFormat = MINIAV_AUDIO_FORMAT_S32;
+            }
+        }
+    }
+    
+    buffer->data.audio.info.format = miniavFormat;
+    buffer->data.audio.info.channels = asbd->mChannelsPerFrame;
+    buffer->data.audio.info.sample_rate = (uint32_t)asbd->mSampleRate;
+    buffer->data.audio.info.num_frames = (uint32_t)frameCount;
+    
+    // Set audio data pointer
+    buffer->data.audio.data_ptr = (void*)dataPtr;
+    buffer->user_data = _cgCtx->app_callback_user_data_internal;
+    
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
+              "SCK: Delivering audio buffer: %u frames, %u channels, %u Hz, format=%d, %zu bytes", 
+              buffer->data.audio.info.num_frames, buffer->data.audio.info.channels, 
+              buffer->data.audio.info.sample_rate, buffer->data.audio.info.format, buffer->data_size_bytes);
+    
+    _cgCtx->app_callback_internal(buffer, _cgCtx->app_callback_user_data_internal);
 }
 
 - (void)processVideoFrame:(CVImageBufferRef)imageBuffer withTimestamp:(CMTime)timestamp {
@@ -616,7 +725,6 @@ static MiniAVResultCode cg_start_capture(MiniAVScreenContext* ctx, MiniAVBufferC
     @autoreleasepool {
 #if HAS_SCREEN_CAPTURE_KIT
         if (@available(macOS 12.3, *)) {
-            // Use modern ScreenCaptureKit
             [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent* content, NSError* error) {
                 if (error || !content) {
                     miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get shareable content");
@@ -650,25 +758,55 @@ static MiniAVResultCode cg_start_capture(MiniAVScreenContext* ctx, MiniAVBufferC
                                                                        cgCtx->configured_video_format.frame_rate_numerator);
                 cgCtx->scStreamConfig.queueDepth = 3;
                 
-                // Note: Audio would be handled by separate loopback system if ctx->capture_audio_requested
+                if (ctx->capture_audio_requested) {
+                    cgCtx->scStreamConfig.capturesAudio = YES;
+                    cgCtx->scStreamConfig.sampleRate = 48000; // Standard sample rate
+                    cgCtx->scStreamConfig.channelCount = 2;   // Stereo
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "SCK: Audio capture enabled - 48kHz stereo");
+                } else {
+                    cgCtx->scStreamConfig.capturesAudio = NO;
+                    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "SCK: Audio capture disabled");
+                }
                 
                 cgCtx->scDelegate = [[MiniAVScreenCaptureDelegate alloc] initWithCGContext:cgCtx];
                 cgCtx->scStream = [[SCStream alloc] initWithFilter:filter configuration:cgCtx->scStreamConfig delegate:cgCtx->scDelegate];
                 
-                NSError* addOutputError = nil;
-                // Fix: Cast delegate to id<SCStreamOutput>
-                BOOL success = [cgCtx->scStream addStreamOutput:(id<SCStreamOutput>)cgCtx->scDelegate type:SCStreamOutputTypeScreen sampleHandlerQueue:cgCtx->captureQueue error:&addOutputError];
-                if (!success) {
-                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to add video output");
+                // **ADD: Video output**
+                NSError* addVideoOutputError = nil;
+                BOOL videoSuccess = [cgCtx->scStream addStreamOutput:(id<SCStreamOutput>)cgCtx->scDelegate 
+                                                                 type:SCStreamOutputTypeScreen 
+                                                     sampleHandlerQueue:cgCtx->captureQueue 
+                                                                  error:&addVideoOutputError];
+                if (!videoSuccess) {
+                    miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to add video output: %s", 
+                              addVideoOutputError ? [[addVideoOutputError localizedDescription] UTF8String] : "Unknown error");
+                    [filter release];
                     return;
+                }
+                
+                if (ctx->capture_audio_requested) {
+                    NSError* addAudioOutputError = nil;
+                    BOOL audioSuccess = [cgCtx->scStream addStreamOutput:(id<SCStreamOutput>)cgCtx->scDelegate 
+                                                                     type:SCStreamOutputTypeAudio 
+                                                         sampleHandlerQueue:cgCtx->captureQueue 
+                                                                      error:&addAudioOutputError];
+                    if (!audioSuccess) {
+                        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to add audio output: %s", 
+                                  addAudioOutputError ? [[addAudioOutputError localizedDescription] UTF8String] : "Unknown error");
+                        // Continue with video-only capture
+                    } else {
+                        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "SCK: Audio output added successfully");
+                    }
                 }
                 
                 [cgCtx->scStream startCaptureWithCompletionHandler:^(NSError* error) {
                     if (error) {
-                        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to start stream");
+                        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to start stream: %s", 
+                                  [[error localizedDescription] UTF8String]);
                     } else {
                         cgCtx->is_streaming = true;
-                        miniav_log(MINIAV_LOG_LEVEL_INFO, "SCK: Screen capture started");
+                        miniav_log(MINIAV_LOG_LEVEL_INFO, "SCK: Screen capture started (video:%s, audio:%s)", 
+                                  "YES", ctx->capture_audio_requested ? "YES" : "NO");
                     }
                 }];
                 

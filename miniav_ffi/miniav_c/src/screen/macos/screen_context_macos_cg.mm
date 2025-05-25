@@ -182,6 +182,7 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
     if (!payload) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate audio payload");
         miniav_free(buffer);
+        miniav_free(audioCopy);
         return;
     }
     
@@ -190,37 +191,14 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
     payload->parent_miniav_buffer_ptr = buffer;
     buffer->internal_handle = payload;
     
-    // Retain the sample buffer for the payload
-    CFRetain(sampleBuffer);
-    payload->native_singular_resource_ptr = (void*)sampleBuffer;
-    
-    // Get audio data
-    CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
-    if (!blockBuffer) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get audio data buffer");
-        CFRelease(sampleBuffer);
-        miniav_free(buffer);
-        miniav_free(payload);
-        return;
-    }
-    
-    size_t totalLength = 0;
-    char* dataPtr = NULL;
-    OSStatus status = CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &totalLength, &dataPtr);
-    if (status != noErr || !dataPtr) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to get audio data pointer (status: %d)", status);
-        CFRelease(sampleBuffer);
-        miniav_free(buffer);
-        miniav_free(payload);
-        return;
-    }
+    payload->native_singular_resource_ptr = audioCopy;
     
     // Calculate frame count
     CMItemCount frameCount = CMSampleBufferGetNumSamples(sampleBuffer);
     
     // Set up MiniAV audio buffer
     buffer->type = MINIAV_BUFFER_TYPE_AUDIO;
-    buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU; // Audio is always CPU for now
+    buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
     buffer->timestamp_us = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) * 1000000;
     buffer->data_size_bytes = totalLength;
     
@@ -247,12 +225,12 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
     buffer->data.audio.info.sample_rate = (uint32_t)asbd->mSampleRate;
     buffer->data.audio.info.num_frames = (uint32_t)frameCount;
     
-    // Set audio data pointer
-    buffer->data.audio.data = (void*)dataPtr;
+    // **FIX: Use the copied data**
+    buffer->data.audio.data = audioCopy;
     buffer->user_data = _cgCtx->app_callback_user_data_internal;
     
     miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
-              "SCK: Delivering audio buffer: %u frames, %u channels, %u Hz, format=%d, %zu bytes", 
+              "SCK: 🎵 Delivering audio buffer: %u frames, %u channels, %u Hz, format=%d, %zu bytes", 
               buffer->data.audio.info.num_frames, buffer->data.audio.info.channels, 
               buffer->data.audio.info.sample_rate, buffer->data.audio.info.format, buffer->data_size_bytes);
     
@@ -941,9 +919,9 @@ static MiniAVResultCode cg_release_buffer(MiniAVScreenContext* ctx, void* intern
                 }
             } 
             else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_AUDIO) {
-                CMSampleBufferRef sampleBuffer = (CMSampleBufferRef)payload->native_singular_resource_ptr;
-                CFRelease(sampleBuffer);
-                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "SCK: Released generic audio CMSampleBufferRef");
+                void* audioData = payload->native_singular_resource_ptr;
+                miniav_free(audioData);
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG, "SCK: Released copied audio data");
             }
             payload->native_singular_resource_ptr = NULL;
         }

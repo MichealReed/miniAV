@@ -230,7 +230,7 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
     buffer->user_data = _cgCtx->app_callback_user_data_internal;
     
     miniav_log(MINIAV_LOG_LEVEL_DEBUG, 
-              "SCK: 🎵 Delivering audio buffer: %u frames, %u channels, %u Hz, format=%d, %zu bytes", 
+              "SCK: Delivering audio buffer: %u frames, %u channels, %u Hz, format=%d, %zu bytes", 
               buffer->data.audio.info.num_frames, buffer->data.audio.info.channels, 
               buffer->data.audio.info.sample_rate, buffer->data.audio.info.format, buffer->data_size_bytes);
     

@@ -2854,7 +2854,7 @@ static void on_audio_stream_process(void *data) {
     }
     payload_alloc->handle_type = MINIAV_NATIVE_HANDLE_TYPE_AUDIO;
     payload_alloc->context_owner = pctx->parent_ctx;
-    payload_alloc->native_resource_ptr = NULL; // No specific FD for audio
+    payload_alloc->native_singular_resource_ptr = NULL; // No specific FD for audio
     miniav_buffer.internal_handle = payload_alloc;
 
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,

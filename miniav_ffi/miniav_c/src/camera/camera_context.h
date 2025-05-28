@@ -26,7 +26,7 @@ typedef struct CameraContextInternalOps {
     // Stops the capture stream.
     MiniAVResultCode (*stop_capture)(MiniAVCameraContext* ctx);
     // Releases a specific buffer previously provided by the platform.
-    // native_buffer_payload is the MiniAVNativeBufferInternalPayload->native_resource_ptr.
+    // native_buffer_payload is the MiniAVNativeBufferInternalPayload->native_singular_resource_ptr.
     MiniAVResultCode (*release_buffer)(MiniAVCameraContext* ctx, void* native_buffer_payload);
 
     // Static-like operations (don't take a full MiniAVCameraContext but might need some platform init)

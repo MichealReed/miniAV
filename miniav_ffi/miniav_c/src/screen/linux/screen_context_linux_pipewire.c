@@ -21,6 +21,8 @@
 #include <spa/utils/defs.h>   // For SPA_FRACTION_INIT
 #include <spa/utils/result.h> // For spa_strerror
 
+#include <ctype.h>          // For isspace
+#include <dirent.h>         // For opendir, readdir
 #include <drm/drm_fourcc.h> // For formats
 #include <errno.h>
 #include <fcntl.h>         // For O_CLOEXEC, F_DUPFD_CLOEXEC
@@ -183,6 +185,8 @@ static const char *screen_pixel_format_to_string(MiniAVPixelFormat format) {
     return "ARGB32";
   case MINIAV_PIXEL_FORMAT_ABGR32:
     return "ABGR32";
+  case MINIAV_PIXEL_FORMAT_BGRX32:
+    return "BGRX32";
   case MINIAV_PIXEL_FORMAT_MJPEG:
     return "MJPEG";
   default:
@@ -402,6 +406,175 @@ static void setup_gpu_planes_for_format(MiniAVBuffer *buffer,
     break;
   }
   }
+}
+
+static uint32_t get_display_refresh_rate_hz(void) {
+  uint32_t detected_rate = 60; // Default fallback
+
+  // Method 1: Try to read from /sys/class/drm (improved parsing)
+  DIR *drm_dir = opendir("/sys/class/drm");
+  if (drm_dir) {
+    struct dirent *entry;
+    while ((entry = readdir(drm_dir)) != NULL) {
+      // Look for connector entries (card0-HDMI-A-1, card0-eDP-1, etc.)
+      if (strncmp(entry->d_name, "card0-", 6) == 0) {
+        char modes_path[256];
+        snprintf(modes_path, sizeof(modes_path), "/sys/class/drm/%s/modes",
+                 entry->d_name);
+
+        FILE *fp = fopen(modes_path, "r");
+        if (fp) {
+          char line[256];
+          // Read first mode line (usually the preferred/current mode)
+          if (fgets(line, sizeof(line), fp)) {
+            // Parse mode line like "1920x1080" or "1920x1080@60.00"
+            char *at_pos = strchr(line, '@');
+            if (at_pos) {
+              float rate = strtof(at_pos + 1, NULL);
+              if (rate > 0 && rate <= 1000) {
+                detected_rate = (uint32_t)(rate + 0.5f);
+                miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                           "PW Screen: Detected refresh rate from %s: %u Hz",
+                           modes_path, detected_rate);
+                fclose(fp);
+                closedir(drm_dir);
+                return detected_rate;
+              }
+            } else {
+              // No @rate, try to get it from status file
+              fclose(fp);
+
+              char status_path[256];
+              snprintf(status_path, sizeof(status_path),
+                       "/sys/class/drm/%s/status", entry->d_name);
+              fp = fopen(status_path, "r");
+              if (fp) {
+                char status[32];
+                if (fgets(status, sizeof(status), fp) &&
+                    strncmp(status, "connected", 9) == 0) {
+                  // This connector is active, try to get mode from
+                  // /sys/class/drm/card0/card0-*/modes
+                  fclose(fp);
+
+                  // Try reading from the main card modes
+                  FILE *card_fp = fopen("/proc/fb", "r");
+                  if (card_fp) {
+                    // Fallback: assume 60Hz for connected display
+                    detected_rate = 60;
+                    fclose(card_fp);
+                    closedir(drm_dir);
+                    miniav_log(
+                        MINIAV_LOG_LEVEL_INFO,
+                        "PW Screen: Connected display found, assuming %u Hz",
+                        detected_rate);
+                    return detected_rate;
+                  }
+                }
+                fclose(fp);
+              }
+            }
+          }
+          fclose(fp);
+        }
+      }
+    }
+    closedir(drm_dir);
+  }
+
+  // Method 2: Try xrandr with better parsing
+  FILE *fp = popen("xrandr 2>/dev/null | grep '\\*' | head -1", "r");
+  if (fp) {
+    char line[512];
+    if (fgets(line, sizeof(line), fp)) {
+      // Parse xrandr line like "   1920x1080     60.00*+  59.93    ..."
+      char *asterisk_pos = strchr(line, '*');
+      if (asterisk_pos) {
+        // Go backwards to find the refresh rate
+        char *rate_start = asterisk_pos;
+        while (rate_start > line && !isspace(*rate_start)) {
+          rate_start--;
+        }
+        if (rate_start > line) {
+          rate_start++; // Move past the space
+          float rate = strtof(rate_start, NULL);
+          if (rate > 0 && rate <= 1000) {
+            detected_rate = (uint32_t)(rate + 0.5f);
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "PW Screen: Detected refresh rate from xrandr: %u Hz",
+                       detected_rate);
+            pclose(fp);
+            return detected_rate;
+          }
+        }
+      }
+    }
+    pclose(fp);
+  }
+
+  // Method 3: Try Wayland compositor info (for Wayland sessions)
+  fp = popen("wlr-randr 2>/dev/null | grep -A5 'current' | grep -E "
+             "'[0-9]+\\.[0-9]+ Hz' | head -1",
+             "r");
+  if (fp) {
+    char line[256];
+    if (fgets(line, sizeof(line), fp)) {
+      // Parse wlr-randr line like "    60.00 Hz"
+      char *hz_pos = strstr(line, " Hz");
+      if (hz_pos) {
+        // Go backwards to find the rate
+        char *rate_start = hz_pos;
+        while (rate_start > line && !isspace(*rate_start)) {
+          rate_start--;
+        }
+        if (rate_start > line) {
+          float rate = strtof(rate_start, NULL);
+          if (rate > 0 && rate <= 1000) {
+            detected_rate = (uint32_t)(rate + 0.5f);
+            miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                       "PW Screen: Detected refresh rate from wlr-randr: %u Hz",
+                       detected_rate);
+            pclose(fp);
+            return detected_rate;
+          }
+        }
+      }
+    }
+    pclose(fp);
+  }
+
+  // Method 4: Check environment variable (for manual override)
+  const char *env_rate = getenv("MINIAV_DISPLAY_REFRESH_RATE");
+  if (env_rate) {
+    uint32_t env_rate_val = (uint32_t)strtoul(env_rate, NULL, 10);
+    if (env_rate_val > 0 && env_rate_val <= 1000) {
+      detected_rate = env_rate_val;
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW Screen: Using refresh rate from environment: %u Hz",
+                 detected_rate);
+      return detected_rate;
+    }
+  }
+
+  // Method 5: Try reading from X11 if available
+  fp = popen("xdpyinfo 2>/dev/null | grep 'dimensions:' -A5 | grep "
+             "'resolution:' | head -1",
+             "r");
+  if (fp) {
+    char line[256];
+    if (fgets(line, sizeof(line), fp)) {
+      // This doesn't give refresh rate directly, but confirms X11 is running
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW Screen: X11 detected, using fallback rate");
+    }
+    pclose(fp);
+  }
+
+  miniav_log(
+      MINIAV_LOG_LEVEL_WARN,
+      "PW Screen: Could not detect display refresh rate, defaulting to %u Hz. "
+      "You can override with: export MINIAV_DISPLAY_REFRESH_RATE=60",
+      detected_rate);
+  return detected_rate;
 }
 
 // --- Forward Declarations for Static Functions ---
@@ -817,41 +990,80 @@ pw_screen_configure_display(struct MiniAVScreenContext *ctx,
       display_id, &pctx->requested_video_format,
       (ctx->capture_audio_requested ? &pctx->requested_audio_format : NULL));
 
+  uint32_t display_refresh_rate = get_display_refresh_rate_hz();
+
   // Overlay user-provided video format specifics if they are valid
   if (video_format) {
     if (video_format->width > 0 && video_format->height > 0) {
       pctx->requested_video_format.width = video_format->width;
       pctx->requested_video_format.height = video_format->height;
     }
+
     if (video_format->pixel_format != MINIAV_PIXEL_FORMAT_UNKNOWN) {
       pctx->requested_video_format.pixel_format = video_format->pixel_format;
     }
+
     if (video_format->frame_rate_numerator > 0 &&
         video_format->frame_rate_denominator > 0) {
-      pctx->requested_video_format.frame_rate_numerator =
-          video_format->frame_rate_numerator;
-      pctx->requested_video_format.frame_rate_denominator =
-          video_format->frame_rate_denominator;
+
+      uint32_t requested_fps = video_format->frame_rate_numerator /
+                               video_format->frame_rate_denominator;
+      uint32_t capped_fps = requested_fps;
+
+      // Cap to display refresh rate + small margin
+      uint32_t max_reasonable_fps =
+          display_refresh_rate + (display_refresh_rate / 4); // 25% margin
+
+      if (requested_fps > max_reasonable_fps) {
+        capped_fps = display_refresh_rate;
+        miniav_log(
+            MINIAV_LOG_LEVEL_WARN,
+            "PW Screen: Requested FPS (%u) exceeds display refresh rate (%u "
+            "Hz) + margin. "
+            "Capping to %u FPS to avoid PipeWire format negotiation failure.",
+            requested_fps, display_refresh_rate, capped_fps);
+      } else if (requested_fps > display_refresh_rate) {
+        miniav_log(
+            MINIAV_LOG_LEVEL_INFO,
+            "PW Screen: Requested FPS (%u) slightly exceeds display refresh "
+            "rate (%u Hz). "
+            "Will attempt negotiation but may fall back to display rate.",
+            requested_fps, display_refresh_rate);
+      }
+
+      pctx->requested_video_format.frame_rate_numerator = capped_fps;
+      pctx->requested_video_format.frame_rate_denominator = 1;
+
     } else if (video_format->frame_rate_numerator > 0 &&
                pctx->requested_video_format.frame_rate_denominator == 0) {
-      // User provided numerator but not denominator, assume /1
-      pctx->requested_video_format.frame_rate_numerator =
-          video_format->frame_rate_numerator;
+      // User provided numerator but not denominator, assume /1 and validate
+      uint32_t requested_fps = video_format->frame_rate_numerator;
+      uint32_t max_reasonable_fps =
+          display_refresh_rate + (display_refresh_rate / 4);
+
+      if (requested_fps > max_reasonable_fps) {
+        pctx->requested_video_format.frame_rate_numerator =
+            display_refresh_rate;
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "PW Screen: Requested FPS (%u) exceeds display "
+                   "capabilities. Capped to %u FPS.",
+                   requested_fps, display_refresh_rate);
+      } else {
+        pctx->requested_video_format.frame_rate_numerator = requested_fps;
+      }
       pctx->requested_video_format.frame_rate_denominator = 1;
     }
-    pctx->requested_video_format.output_preference =
-        video_format->output_preference;
   }
 
   miniav_log(
       MINIAV_LOG_LEVEL_DEBUG,
       "PW Screen: ConfigureDisplay - Effective requested video format: %ux%u, "
-      "%s (%d), %u/%u FPS, Pref: %d",
+      "%s (%d), %u/%u FPS (display: %u Hz), Pref: %d",
       pctx->requested_video_format.width, pctx->requested_video_format.height,
       screen_pixel_format_to_string(pctx->requested_video_format.pixel_format),
       pctx->requested_video_format.pixel_format,
       pctx->requested_video_format.frame_rate_numerator,
-      pctx->requested_video_format.frame_rate_denominator,
+      pctx->requested_video_format.frame_rate_denominator, display_refresh_rate,
       pctx->requested_video_format.output_preference);
 
   pctx->capture_type = MINIAV_CAPTURE_TYPE_DISPLAY;
@@ -1737,6 +1949,13 @@ pw_screen_setup_pipewire_streams(PipeWireScreenPlatformContext *pctx) {
     struct spa_pod_frame frame_format;
     spa_pod_builder_push_object(&b, &frame_format, SPA_TYPE_OBJECT_Format,
                                 SPA_PARAM_EnumFormat);
+    uint32_t min_fps =
+        SPA_MIN(pctx->requested_video_format.frame_rate_numerator /
+                    pctx->requested_video_format.frame_rate_denominator,
+                30);
+    uint32_t max_fps = pctx->requested_video_format.frame_rate_numerator /
+                       pctx->requested_video_format.frame_rate_denominator;
+
     if (pctx->requested_video_format.output_preference ==
         MINIAV_OUTPUT_PREFERENCE_CPU) {
       spa_pod_builder_add(
@@ -1744,9 +1963,9 @@ pw_screen_setup_pipewire_streams(PipeWireScreenPlatformContext *pctx) {
           SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
           SPA_FORMAT_VIDEO_format, SPA_POD_Id(spa_fmt_req),
           SPA_FORMAT_VIDEO_maxFramerate,
-          SPA_POD_Fraction(&SPA_FRACTION(
-              pctx->requested_video_format.frame_rate_numerator,
-              pctx->requested_video_format.frame_rate_denominator)),
+          SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(max_fps, 1),  // preferred
+                                        &SPA_FRACTION(min_fps, 1),  // min
+                                        &SPA_FRACTION(max_fps, 1)), // max
           0);
     } else {
       spa_pod_builder_add(
@@ -1756,9 +1975,9 @@ pw_screen_setup_pipewire_streams(PipeWireScreenPlatformContext *pctx) {
           SPA_FORMAT_VIDEO_modifier,
           SPA_POD_CHOICE_FLAGS_Long(0 /* any modifier */),
           SPA_FORMAT_VIDEO_maxFramerate,
-          SPA_POD_Fraction(&SPA_FRACTION(
-              pctx->requested_video_format.frame_rate_numerator,
-              pctx->requested_video_format.frame_rate_denominator)),
+          SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(max_fps, 1),  // preferred
+                                        &SPA_FRACTION(min_fps, 1),  // min
+                                        &SPA_FRACTION(max_fps, 1)), // max
           0);
     }
     params[n_params++] = spa_pod_builder_pop(&b, &frame_format);
@@ -2854,7 +3073,8 @@ static void on_audio_stream_process(void *data) {
     }
     payload_alloc->handle_type = MINIAV_NATIVE_HANDLE_TYPE_AUDIO;
     payload_alloc->context_owner = pctx->parent_ctx;
-    payload_alloc->native_singular_resource_ptr = NULL; // No specific FD for audio
+    payload_alloc->native_singular_resource_ptr =
+        NULL; // No specific FD for audio
     miniav_buffer.internal_handle = payload_alloc;
 
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,

@@ -38,9 +38,7 @@ class MiniFFICameraPlatform implements MiniCameraPlatformInterface {
   }
 
   @override
-  Future<List<MiniAVVideoInfo>> getSupportedFormats(
-    String deviceId,
-  ) async {
+  Future<List<MiniAVVideoInfo>> getSupportedFormats(String deviceId) async {
     final deviceIdPtr = deviceId.toNativeUtf8();
     final formatsPtrPtr = calloc<ffi.Pointer<bindings.MiniAVVideoInfo>>();
     final countPtr = calloc<ffi.Uint32>();

@@ -161,12 +161,11 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
   @override
   Future<void> configureWindow(
     String windowId,
-    MiniAVVideoInfo format, { // This should be MiniAVVideoInfo
+    MiniAVVideoInfo format, {
     bool captureAudio = false,
   }) async {
     final windowIdPtr = windowId.toNativeUtf8();
-    final nativeFormatPtr =
-        calloc<bindings.MiniAVVideoInfo>(); // Correct type
+    final nativeFormatPtr = calloc<bindings.MiniAVVideoInfo>(); // Correct type
     try {
       VideoFormatInfoFFIToPlatform.copyToNative(
         format,

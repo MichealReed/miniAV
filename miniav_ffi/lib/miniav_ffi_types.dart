@@ -113,20 +113,18 @@ extension MiniAVBufferFFI on MiniAVBuffer {
     if (type == bindings.MiniAVBufferType.MINIAV_BUFFER_TYPE_VIDEO) {
       final video = native.data.video;
       final pixelFormat = bindings.MiniAVPixelFormat.fromValue(
-        video.pixel_formatAsInt,
+        video.info.pixel_formatAsInt,
       );
 
       // Planes and strides
       final numPlanes = 4; // Your struct has 4 planes/strides
       final strideBytes = List<int>.generate(
         numPlanes,
-        (i) => video.stride_bytes[i],
+        (i) => video.planes[i].stride_bytes,
       );
       final planes = List<Uint8List?>.generate(numPlanes, (i) {
-        final planePtr = video.planes[i];
+        final planePtr = video.planes[i].data_ptr;
         if (planePtr == ffi.nullptr) return null;
-        // You may need to know the plane size; here we use strideBytes[i] * height as a guess
-        // If you have plane sizes, use them instead!
         // final width = video.info.width;
         final height = video.info.height;
         final sizeGuess = strideBytes[i] * height;
@@ -136,6 +134,10 @@ extension MiniAVBufferFFI on MiniAVBuffer {
           return null;
         }
       });
+      final nativeHandles = List<Object?>.generate(numPlanes, (i) {
+        final handle = video.planes[i].data_ptr;
+        return handle.address != 0 ? handle : null;
+      });
 
       videoBuffer = MiniAVVideoBuffer(
         width: video.info.width,
@@ -143,10 +145,7 @@ extension MiniAVBufferFFI on MiniAVBuffer {
         pixelFormat: MiniAVPixelFormat.values[pixelFormat.value],
         strideBytes: strideBytes,
         planes: planes,
-        nativeHandle:
-            video.native_gpu_shared_handle.address != 0
-                ? video.native_gpu_shared_handle
-                : null,
+        nativeHandles: nativeHandles,
       );
     } else if (type == bindings.MiniAVBufferType.MINIAV_BUFFER_TYPE_AUDIO) {
       final audio = native.data.audio;
@@ -280,6 +279,52 @@ extension MiniAVPixelFormatX on bindings.MiniAVPixelFormat {
         return MiniAVPixelFormat.argb32;
       case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_ABGR32:
         return MiniAVPixelFormat.abgr32;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGBX32:
+        return MiniAVPixelFormat.rgbx32;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BGRX32:
+        return MiniAVPixelFormat.bgrx32;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_XRGB32:
+        return MiniAVPixelFormat.xrgb32;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_XBGR32:
+        return MiniAVPixelFormat.xbgr32;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_YV12:
+        return MiniAVPixelFormat.yv12;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGB30:
+        return MiniAVPixelFormat.rgb30;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGB48:
+        return MiniAVPixelFormat.rgb48;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGBA64:
+        return MiniAVPixelFormat.rgba64;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGBA64_HALF:
+        return MiniAVPixelFormat.rgba64Half;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGBA128_FLOAT:
+        return MiniAVPixelFormat.rgba128Float;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_YUV420_10BIT:
+        return MiniAVPixelFormat.yuv420_10bit;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_YUV422_10BIT:
+        return MiniAVPixelFormat.yuv422_10bit;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_YUV444_10BIT:
+        return MiniAVPixelFormat.yuv444_10bit;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_GRAY8:
+        return MiniAVPixelFormat.gray8;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_GRAY16:
+        return MiniAVPixelFormat.gray16;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_GRBG8:
+        return MiniAVPixelFormat.bayerGrbg8;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_RGGB8:
+        return MiniAVPixelFormat.bayerRggb8;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_BGGR8:
+        return MiniAVPixelFormat.bayerBggr8;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_GBRG8:
+        return MiniAVPixelFormat.bayerGbrg8;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_GRBG16:
+        return MiniAVPixelFormat.bayerGrbg16;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_RGGB16:
+        return MiniAVPixelFormat.bayerRggb16;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_BGGR16:
+        return MiniAVPixelFormat.bayerBggr16;
+      case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_GBRG16:
+        return MiniAVPixelFormat.bayerGbrg16;
       case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_MJPEG:
         return MiniAVPixelFormat.mjpeg;
       default:
@@ -311,6 +356,52 @@ extension MiniAVPixelFormatX on bindings.MiniAVPixelFormat {
         return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_ARGB32;
       case MiniAVPixelFormat.abgr32:
         return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_ABGR32;
+      case MiniAVPixelFormat.rgbx32:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGBX32;
+      case MiniAVPixelFormat.bgrx32:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BGRX32;
+      case MiniAVPixelFormat.xrgb32:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_XRGB32;
+      case MiniAVPixelFormat.xbgr32:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_XBGR32;
+      case MiniAVPixelFormat.yv12:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_YV12;
+      case MiniAVPixelFormat.rgb30:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGB30;
+      case MiniAVPixelFormat.rgb48:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGB48;
+      case MiniAVPixelFormat.rgba64:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGBA64;
+      case MiniAVPixelFormat.rgba64Half:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGBA64_HALF;
+      case MiniAVPixelFormat.rgba128Float:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_RGBA128_FLOAT;
+      case MiniAVPixelFormat.yuv420_10bit:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_YUV420_10BIT;
+      case MiniAVPixelFormat.yuv422_10bit:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_YUV422_10BIT;
+      case MiniAVPixelFormat.yuv444_10bit:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_YUV444_10BIT;
+      case MiniAVPixelFormat.gray8:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_GRAY8;
+      case MiniAVPixelFormat.gray16:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_GRAY16;
+      case MiniAVPixelFormat.bayerGrbg8:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_GRBG8;
+      case MiniAVPixelFormat.bayerRggb8:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_RGGB8;
+      case MiniAVPixelFormat.bayerBggr8:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_BGGR8;
+      case MiniAVPixelFormat.bayerGbrg8:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_GBRG8;
+      case MiniAVPixelFormat.bayerGrbg16:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_GRBG16;
+      case MiniAVPixelFormat.bayerRggb16:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_RGGB16;
+      case MiniAVPixelFormat.bayerBggr16:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_BGGR16;
+      case MiniAVPixelFormat.bayerGbrg16:
+        return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_BAYER_GBRG16;
       case MiniAVPixelFormat.mjpeg:
         return bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_MJPEG;
       default:
@@ -326,7 +417,7 @@ extension MiniAVOutputPreferenceX on bindings.MiniAVOutputPreference {
       case bindings.MiniAVOutputPreference.MINIAV_OUTPUT_PREFERENCE_CPU:
         return MiniAVOutputPreference.cpu;
       case bindings.MiniAVOutputPreference.MINIAV_OUTPUT_PREFERENCE_GPU:
-        return MiniAVOutputPreference.gpuIfAvailable;
+        return MiniAVOutputPreference.gpu;
     }
   }
 
@@ -336,7 +427,7 @@ extension MiniAVOutputPreferenceX on bindings.MiniAVOutputPreference {
     switch (p) {
       case MiniAVOutputPreference.cpu:
         return bindings.MiniAVOutputPreference.MINIAV_OUTPUT_PREFERENCE_CPU;
-      case MiniAVOutputPreference.gpuIfAvailable:
+      case MiniAVOutputPreference.gpu:
         return bindings.MiniAVOutputPreference.MINIAV_OUTPUT_PREFERENCE_GPU;
     }
   }

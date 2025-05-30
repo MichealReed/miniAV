@@ -5,23 +5,46 @@ import 'dart:typed_data';
 
 enum MiniAVPixelFormat {
   unknown,
-  i420,
-  nv12,
-  nv21,
-  yuy2,
-  uyvy,
   rgb24,
   bgr24,
   rgba32,
   bgra32,
   argb32,
   abgr32,
+  rgbx32,
+  bgrx32,
+  xrgb32,
+  xbgr32,
+  i420,
+  yv12,
+  nv12,
+  nv21,
+  yuy2,
+  uyvy,
+  rgb30,
+  rgb48,
+  rgba64,
+  rgba64Half,
+  rgba128Float,
+  yuv420_10bit,
+  yuv422_10bit,
+  yuv444_10bit,
+  gray8,
+  gray16,
+  bayerGrbg8,
+  bayerRggb8,
+  bayerBggr8,
+  bayerGbrg8,
+  bayerGrbg16,
+  bayerRggb16,
+  bayerBggr16,
+  bayerGbrg16,
   mjpeg,
 }
 
 enum MiniAVAudioFormat { unknown, u8, s16, s32, f32 }
 
-enum MiniAVOutputPreference { cpu, gpuIfAvailable }
+enum MiniAVOutputPreference { cpu, gpu }
 
 enum MiniAVBufferType { unknown, video, audio }
 
@@ -46,7 +69,7 @@ class MiniAVDeviceInfo {
   });
 }
 
-class MiniAVVideoFormatInfo {
+class MiniAVVideoInfo {
   final int width;
   final int height;
   final MiniAVPixelFormat pixelFormat;
@@ -54,7 +77,7 @@ class MiniAVVideoFormatInfo {
   final int frameRateDenominator;
   final MiniAVOutputPreference outputPreference;
 
-  MiniAVVideoFormatInfo({
+  MiniAVVideoInfo({
     required this.width,
     required this.height,
     required this.pixelFormat,
@@ -100,7 +123,7 @@ class MiniAVVideoBuffer {
   final MiniAVPixelFormat pixelFormat;
   final List<int> strideBytes;
   final List<Uint8List?> planes;
-  final Object? nativeHandle; // platform-specific GPU handle, if any
+  final List<Object?> nativeHandles; // platform-specific GPU handle, if any
 
   MiniAVVideoBuffer({
     required this.width,
@@ -108,7 +131,7 @@ class MiniAVVideoBuffer {
     required this.pixelFormat,
     required this.strideBytes,
     required this.planes,
-    this.nativeHandle,
+    this.nativeHandles = const [],
   });
 }
 
@@ -125,4 +148,4 @@ class MiniAVAudioBuffer {
 }
 
 typedef ScreenFormatDefaults =
-    (MiniAVVideoFormatInfo videoFormat, MiniAVAudioInfo? audioFormat);
+    (MiniAVVideoInfo videoFormat, MiniAVAudioInfo? audioFormat);

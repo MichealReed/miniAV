@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'package:test/test.dart';
 import 'package:miniav_platform_interface/miniav_platform_interface.dart';
-import 'package:miniav_ffi/miniav_ffi.dart'; // Imports your FFI implementation
+import 'package:miniav_ffi/miniav_ffi.dart';
 
 void main() {
   late MiniScreenPlatformInterface screen;
@@ -33,8 +33,6 @@ void main() {
         print(
           '- ID: ${window.deviceId}, Name: ${window.name}, Default: ${window.isDefault}',
         );
-        // Window IDs might be numeric handles, so isNotEmpty might not be the best check
-        // depending on your C implementation. Name should ideally be non-empty.
         expect(window.deviceId, isNotNull); // Or isNotEmpty if it's a string
         expect(window.name, isNotEmpty);
       }
@@ -132,7 +130,6 @@ void main() {
         final configured = await context.getConfiguredFormats();
         expect(configured.$1.width, defaultVideoFormat!.width);
         expect(configured.$1.height, defaultVideoFormat!.height);
-        // Add more checks for pixel format, etc. if necessary
       });
 
       test(
@@ -312,9 +309,6 @@ void main() {
                     'Timeout: No AUDIO screen frame received within 20 seconds.',
                   );
                 }
-                // Re-throw to make the test fail if not both are completed.
-                // The specific error will depend on which completer timed out first
-                // if Future.wait is used, or we can check individually.
                 throw TimeoutException(
                   'Timeout: Did not receive both video and audio frames within 20 seconds. Video Frames: $videoFrameCount, Audio Frames: $audioFrameCount',
                 );
@@ -337,10 +331,9 @@ void main() {
                 (videoFrameCount == 0 || audioFrameCount == 0)) {
               // Already handled by specific fails above.
             } else if (e is TimeoutException) {
-              // This case means both completers finished but the overall Future.wait timed out,
-              // which shouldn't happen if completers are the only await points.
-              // Or, one completed and the other didn't, leading to the timeout.
-              // The message in TimeoutException above should cover this.
+              fail(
+                'Timeout occurred while waiting for frames: $e. Video Frames: $videoFrameCount, Audio Frames: $audioFrameCount',
+              );
             } else {
               rethrow; // Rethrow other unexpected errors
             }

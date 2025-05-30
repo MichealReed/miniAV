@@ -4,7 +4,7 @@
 #ifdef __linux__ // Guard for Linux-specific code
 
 #include "../../../include/miniav_buffer.h" // For MiniAVBuffer
-#include "../../../include/miniav_types.h" // Ensure this is included for all types
+#include "../../../include/miniav_types.h"
 #include "../../common/miniav_logging.h"
 #include "../../common/miniav_time.h"  // For miniav_get_time_us
 #include "../../common/miniav_utils.h" // For miniav_calloc, miniav_free, etc.

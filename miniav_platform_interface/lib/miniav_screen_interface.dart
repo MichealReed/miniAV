@@ -20,14 +20,14 @@ abstract class MiniScreenContextPlatformInterface {
   /// Configure the screen context with a display and format.
   Future<void> configureDisplay(
     String screenId,
-    MiniAVVideoFormatInfo format, {
+    MiniAVVideoInfo format, {
     bool captureAudio = false,
   });
 
   /// Configure the screen context with a window and format.
   Future<void> configureWindow(
     String windowId,
-    MiniAVVideoFormatInfo format, {
+    MiniAVVideoInfo format, {
     bool captureAudio = false,
   });
 

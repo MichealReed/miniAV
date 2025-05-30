@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'package:miniav_platform_interface/miniav_platform_types.dart';
 import 'package:test/test.dart';
-import 'package:miniav_platform_interface/miniav_platform_interface.dart';
+import 'package:miniav_platform_interface/miniav_platform_interface.dart'
+    as platform;
 import 'package:miniav_ffi/miniav_ffi.dart';
 
 void main() {
-  late MiniCameraPlatformInterface camera;
+  late platform.MiniCameraPlatformInterface camera;
 
   setUpAll(() {
     // Use the registered FFI instance
@@ -15,7 +17,7 @@ void main() {
   group('MiniAV Camera Platform Interface Tests', () {
     test('Enumerate Camera Devices', () async {
       final devices = await camera.enumerateDevices();
-      expect(devices, isA<List<MiniAVDeviceInfo>>());
+      expect(devices, isA<List<platform.MiniAVDeviceInfo>>());
       print('Found ${devices.length} camera devices:');
       for (final device in devices) {
         print(
@@ -32,7 +34,7 @@ void main() {
         print('No camera devices found to get formats from.');
         return;
       }
-      final firstDevice = devices[1];
+      final firstDevice = devices[0];
       print(
         'Attempting to get formats for device: ${firstDevice.name} (${firstDevice.deviceId})',
       );
@@ -64,7 +66,7 @@ void main() {
           print('No camera devices found.');
           return;
         }
-        final firstDevice = devices[1];
+        final firstDevice = devices[0];
         final formats = await camera.getSupportedFormats(firstDevice.deviceId);
         if (formats.isEmpty) {
           print('No formats found for device ${firstDevice.deviceId}.');
@@ -90,7 +92,7 @@ void main() {
         print('No camera devices found.');
         return;
       }
-      final firstDevice = devices[1];
+      final firstDevice = devices[0];
       final formats = await camera.getSupportedFormats(firstDevice.deviceId);
       if (formats.isEmpty) {
         print('No formats found for device ${firstDevice.deviceId}.');
@@ -151,7 +153,7 @@ void main() {
         print('No camera devices found.');
         return;
       }
-      final firstDevice = devices[1];
+      final firstDevice = devices[0];
       final formats = await camera.getSupportedFormats(firstDevice.deviceId);
       if (formats.isEmpty) {
         print('No formats found for device ${firstDevice.deviceId}.');

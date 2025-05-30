@@ -693,7 +693,7 @@ static MiniAVResultCode mf_init_platform(MiniAVCameraContext *ctx) {
   HRESULT hr_mf_startup;
 
   hr_com_init =
-      CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+      CoInitializeEx(NULL, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
   if (FAILED(hr_com_init) && hr_com_init != RPC_E_CHANGED_MODE) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "MF: CoInitializeEx failed: 0x%X",
                hr_com_init);
@@ -814,7 +814,8 @@ static MiniAVResultCode mf_enumerate_devices(MiniAVDeviceInfo **devices_out,
 
   // Initialize COM for this function's scope if not already initialized
   HRESULT hr_com_init =
-      CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+      CoInitializeEx(NULL, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+
   if (SUCCEEDED(hr_com_init)) {
     if (hr_com_init == S_OK) { // S_OK means COM was initialized by this call
       com_initialized_here = TRUE;
@@ -978,7 +979,7 @@ static MiniAVResultCode mf_get_supported_formats(const char *device_id_utf8,
 
   // Initialize COM for this function's scope if not already initialized
   HRESULT hr_com_init =
-      CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+      CoInitializeEx(NULL, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
   if (SUCCEEDED(hr_com_init)) {
     if (hr_com_init == S_OK) { // S_OK means COM was initialized by this call
       com_initialized_here = TRUE;
@@ -1233,6 +1234,103 @@ error_exit:
   }
 
   return SUCCEEDED(hr) ? MINIAV_SUCCESS : MINIAV_ERROR_SYSTEM_CALL_FAILED;
+}
+
+static MiniAVResultCode mf_get_default_format(const char *device_id_utf8,
+                                              MiniAVVideoInfo *format_out) {
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "MF: Getting default format for device %s",
+             device_id_utf8);
+
+  if (!device_id_utf8 || !format_out) {
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+  memset(format_out, 0, sizeof(MiniAVVideoInfo));
+
+  // Get supported formats and pick the first reasonable one
+  MiniAVVideoInfo *formats = NULL;
+  uint32_t count = 0;
+  MiniAVResultCode res =
+      mf_get_supported_formats(device_id_utf8, &formats, &count);
+
+  if (res != MINIAV_SUCCESS || count == 0) {
+    miniav_log(
+        MINIAV_LOG_LEVEL_WARN,
+        "MF: Could not get supported formats for default. Using fallback.");
+    // Fallback to common format
+    format_out->width = 640;
+    format_out->height = 480;
+    format_out->frame_rate_numerator = 30;
+    format_out->frame_rate_denominator = 1;
+    format_out->pixel_format = MINIAV_PIXEL_FORMAT_YUY2;
+    format_out->output_preference = MINIAV_OUTPUT_PREFERENCE_CPU;
+    return MINIAV_SUCCESS;
+  }
+
+  // Find a good default format (prefer 720p30 or 1080p30, fallback to first)
+  MiniAVVideoInfo *selected = &formats[0]; // Default to first
+
+  for (uint32_t i = 0; i < count; i++) {
+    // Prefer 720p30
+    if (formats[i].width == 1280 && formats[i].height == 720 &&
+        formats[i].frame_rate_numerator == 30 &&
+        formats[i].frame_rate_denominator == 1) {
+      selected = &formats[i];
+      break;
+    }
+    // Or 1080p30
+    if (formats[i].width == 1920 && formats[i].height == 1080 &&
+        formats[i].frame_rate_numerator == 30 &&
+        formats[i].frame_rate_denominator == 1) {
+      selected = &formats[i];
+      break;
+    }
+    // Or any 30fps format
+    if (formats[i].frame_rate_numerator == 30 &&
+        formats[i].frame_rate_denominator == 1) {
+      selected = &formats[i];
+    }
+  }
+
+  *format_out = *selected;
+  miniav_free(formats);
+
+  miniav_log(MINIAV_LOG_LEVEL_INFO,
+             "MF: Default format for %s: %ux%u @ %u/%u FPS, Format=%d",
+             device_id_utf8, format_out->width, format_out->height,
+             format_out->frame_rate_numerator,
+             format_out->frame_rate_denominator, format_out->pixel_format);
+
+  return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode
+mf_get_configured_video_format(MiniAVCameraContext *ctx,
+                               MiniAVVideoInfo *format_out) {
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "MF: Getting configured video format.");
+
+  if (!ctx || !format_out) {
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+
+  // Check if context is configured
+  if (ctx->configured_video_format.width == 0 ||
+      ctx->configured_video_format.height == 0) {
+    miniav_log(
+        MINIAV_LOG_LEVEL_ERROR,
+        "MF: Camera context not configured - no video format available.");
+    return MINIAV_ERROR_NOT_INITIALIZED;
+  }
+
+  *format_out = ctx->configured_video_format;
+
+  miniav_log(
+      MINIAV_LOG_LEVEL_DEBUG,
+      "MF: Configured format: %ux%u @ %u/%u FPS, Format=%d, OutputPref=%d",
+      format_out->width, format_out->height, format_out->frame_rate_numerator,
+      format_out->frame_rate_denominator, format_out->pixel_format,
+      format_out->output_preference);
+
+  return MINIAV_SUCCESS;
 }
 
 static MiniAVResultCode mf_configure(
@@ -1911,10 +2009,12 @@ const CameraContextInternalOps g_camera_ops_win_mf = {
     .destroy_platform = mf_destroy_platform,
     .enumerate_devices = mf_enumerate_devices,
     .get_supported_formats = mf_get_supported_formats,
+    .get_default_format = mf_get_default_format,
     .configure = mf_configure,
     .start_capture = mf_start_capture,
     .stop_capture = mf_stop_capture,
-    .release_buffer = mf_release_buffer};
+    .release_buffer = mf_release_buffer,
+    .get_configured_video_format = mf_get_configured_video_format};
 
 MiniAVResultCode
 miniav_camera_context_platform_init_windows_mf(MiniAVCameraContext *ctx) {

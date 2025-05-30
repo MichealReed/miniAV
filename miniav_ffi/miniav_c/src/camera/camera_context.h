@@ -13,30 +13,18 @@ extern "C" {
 // Forward declaration of the main context structure
 typedef struct MiniAVCameraContext MiniAVCameraContext;
 
-// Structure defining the operations for a platform-specific camera implementation
+// Defines the operations for a platform-specific camera implementation
 typedef struct CameraContextInternalOps {
-    // Initializes platform-specific parts of the context. platform_ctx will be stored in MiniAVCameraContext.
-    MiniAVResultCode (*init_platform)(MiniAVCameraContext* ctx);
-    // Destroys platform-specific parts of the context.
-    MiniAVResultCode (*destroy_platform)(MiniAVCameraContext* ctx);
-    // Configures the camera device and format.
-    MiniAVResultCode (*configure)(MiniAVCameraContext* ctx, const char* device_id, const MiniAVVideoInfo* format);
-    // Starts the capture stream.
-    MiniAVResultCode (*start_capture)(MiniAVCameraContext* ctx);
-    // Stops the capture stream.
-    MiniAVResultCode (*stop_capture)(MiniAVCameraContext* ctx);
-    // Releases a specific buffer previously provided by the platform.
-    // native_buffer_payload is the MiniAVNativeBufferInternalPayload->native_singular_resource_ptr.
-    MiniAVResultCode (*release_buffer)(MiniAVCameraContext* ctx, void* native_buffer_payload);
-
-    // Static-like operations (don't take a full MiniAVCameraContext but might need some platform init)
-    MiniAVResultCode (*enumerate_devices)(MiniAVDeviceInfo** devices, uint32_t* count);
-    MiniAVResultCode (*get_supported_formats)(const char* device_id, MiniAVVideoInfo** formats, uint32_t* count);
-    MiniAVResultCode (*get_default_format)(const char* device_id, MiniAVVideoInfo* format_out); // New
-
-    // Context-specific operations
-    MiniAVResultCode (*get_configured_video_format)(MiniAVCameraContext* ctx, MiniAVVideoInfo* format_out); // New
-
+    MiniAVResultCode (*init_platform)(MiniAVCameraContext *ctx);
+    MiniAVResultCode (*destroy_platform)(MiniAVCameraContext *ctx);
+    MiniAVResultCode (*enumerate_devices)(MiniAVDeviceInfo **devices_out, uint32_t *count_out);
+    MiniAVResultCode (*get_supported_formats)(const char *device_id, MiniAVVideoInfo **formats_out, uint32_t *count_out);
+    MiniAVResultCode (*get_default_format)(const char *device_id, MiniAVVideoInfo *format_out);  // Add this line
+    MiniAVResultCode (*configure)(MiniAVCameraContext *ctx, const char *device_id, const MiniAVVideoInfo *format);
+    MiniAVResultCode (*start_capture)(MiniAVCameraContext *ctx);
+    MiniAVResultCode (*stop_capture)(MiniAVCameraContext *ctx);
+    MiniAVResultCode (*release_buffer)(MiniAVCameraContext *ctx, void *internal_handle_ptr);
+    MiniAVResultCode (*get_configured_video_format)(MiniAVCameraContext *ctx, MiniAVVideoInfo *format_out);
 } CameraContextInternalOps;
 
 // --- Camera Backend Entry Structure ---
@@ -66,21 +54,23 @@ struct MiniAVCameraContext {
     char selected_device_id[MINIAV_DEVICE_ID_MAX_LEN]; // Store the ID of the selected device
 };
 
-// Platform-specific initialization functions (to be implemented in platform files)
+// Platform-specific initialization functions
 // These will set up ctx->ops and call ops->init_platform
 #if defined(_WIN32)
-// This function will be pointed to by MiniAVCameraBackend's platform_init_for_selection
-// It should set ctx->ops = &g_camera_ops_win_mf (or similar) and do minimal setup.
-extern MiniAVResultCode miniav_camera_context_platform_init_windows_mf(MiniAVCameraContext* ctx); // Renamed for clarity
-extern const CameraContextInternalOps g_camera_ops_win_mf; // Ensure this is declared
+extern MiniAVResultCode miniav_camera_context_platform_init_windows_mf(MiniAVCameraContext* ctx);
+extern const CameraContextInternalOps g_camera_ops_win_mf;
+#include "windows/camera_context_win_mf.h"
 #elif defined(__APPLE__)
-// extern MiniAVResultCode miniav_camera_context_platform_init_macos_avf(MiniAVCameraContext* ctx);
-// extern const CameraContextInternalOps g_camera_ops_macos_avf;
+#include "macos/camera_context_macos_avf.h"
+extern const CameraContextInternalOps g_camera_ops_macos_avf;
+extern MiniAVResultCode
+miniav_camera_context_platform_init_macos_avf(MiniAVCameraContext* ctx);
 #elif defined(__linux__)
-// extern MiniAVResultCode miniav_camera_context_platform_init_linux_v4l2(MiniAVCameraContext* ctx);
-// extern const CameraContextInternalOps g_camera_ops_linux_v4l2;
-#else
-// Potentially a fallback or error
+#include "linux/camera_context_linux_pipewire.h" // You will need to create this header
+extern const CameraContextInternalOps
+    g_camera_ops_pipewire; // To be defined in your pipewire .c file
+extern MiniAVResultCode miniav_camera_context_platform_init_linux_pipewire(
+    MiniAVCameraContext *ctx); // To be defined in your pipewire .c file
 #endif
 
 

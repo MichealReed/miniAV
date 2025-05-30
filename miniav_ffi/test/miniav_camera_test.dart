@@ -144,6 +144,59 @@ void main() {
       await context.destroy();
       print('Camera context destroyed.');
     });
+
+    test('Capture with Default Format (end-to-end test)', () async {
+      final devices = await camera.enumerateDevices();
+      if (devices.isEmpty) {
+        print('No camera devices found.');
+        return;
+      }
+      final firstDevice = devices[1];
+      final defaultFormat = await camera.getDefaultFormat(firstDevice.deviceId);
+
+      print(
+        'Testing capture with default format: ${defaultFormat.width}x${defaultFormat.height} @ ${defaultFormat.frameRateNumerator}/${defaultFormat.frameRateDenominator}fps',
+      );
+
+      final context = await camera.createContext();
+      final frameReceivedCompleter = Completer<void>();
+      int frameCount = 0;
+
+      await context.configure(firstDevice.deviceId, defaultFormat);
+
+      await context.startCapture((buffer, userData) {
+        frameCount++;
+        print(
+          '[Default Format Test] Frame received! Count: $frameCount, Size: ${buffer.dataSizeBytes}',
+        );
+        if (!frameReceivedCompleter.isCompleted) {
+          frameReceivedCompleter.complete();
+        }
+      });
+
+      print('Camera capture started with default format. Waiting for frame...');
+      await frameReceivedCompleter.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () {
+          throw TimeoutException(
+            'Timeout: No frame received within 10 seconds using default format.',
+          );
+        },
+      );
+
+      expect(
+        frameCount,
+        greaterThan(0),
+        reason:
+            'Expected at least one frame to be received with default format.',
+      );
+      print(
+        'Default format capture test successful: Received $frameCount frames.',
+      );
+
+      await context.stopCapture();
+      await context.destroy();
+    });
   });
 
   group('MiniAV Camera Latency Test', () {

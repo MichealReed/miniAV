@@ -523,7 +523,8 @@ static void on_stream_process(void *userdata) {
         miniav_buffer->data.video.planes[0].subresource_index = 0;
 
         // U plane
-        miniav_buffer->data.video.planes[1].data_ptr = (uint8_t *)cpu_ptr + y_size;
+        miniav_buffer->data.video.planes[1].data_ptr =
+            (uint8_t *)cpu_ptr + y_size;
         miniav_buffer->data.video.planes[1].width = width / 2;
         miniav_buffer->data.video.planes[1].height = height / 2;
         miniav_buffer->data.video.planes[1].stride_bytes = width / 2;
@@ -1212,6 +1213,77 @@ format_enum_cleanup:
   return overall_res;
 }
 
+static MiniAVResultCode
+pw_get_default_format(const char *device_id,
+                            MiniAVVideoInfo *format_out) {
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "PipeWire: Getting default format for device %s", device_id);
+
+  if (!device_id || !format_out) {
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+  memset(format_out, 0, sizeof(MiniAVVideoInfo));
+
+  // Get supported formats and pick a reasonable default
+  MiniAVVideoInfo *formats = NULL;
+  uint32_t count = 0;
+  MiniAVResultCode res =
+      pipewire_get_supported_formats(device_id, &formats, &count);
+
+  if (res != MINIAV_SUCCESS || count == 0) {
+    // Fallback to common format
+    format_out->width = 640;
+    format_out->height = 480;
+    format_out->frame_rate_numerator = 30;
+    format_out->frame_rate_denominator = 1;
+    format_out->pixel_format = MINIAV_PIXEL_FORMAT_YUY2;
+    format_out->output_preference = MINIAV_OUTPUT_PREFERENCE_CPU;
+    return MINIAV_SUCCESS;
+  }
+
+  // Same selection logic
+  MiniAVVideoInfo *selected = &formats[0];
+
+  for (uint32_t i = 0; i < count; i++) {
+    if (formats[i].width == 1280 && formats[i].height == 720 &&
+        formats[i].frame_rate_numerator == 30 &&
+        formats[i].frame_rate_denominator == 1) {
+      selected = &formats[i];
+      break;
+    }
+    if (formats[i].width == 1920 && formats[i].height == 1080 &&
+        formats[i].frame_rate_numerator == 30 &&
+        formats[i].frame_rate_denominator == 1) {
+      selected = &formats[i];
+      break;
+    }
+    if (formats[i].frame_rate_numerator == 30 &&
+        formats[i].frame_rate_denominator == 1) {
+      selected = &formats[i];
+    }
+  }
+
+  *format_out = *selected;
+  miniav_free(formats);
+
+  return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode pw_get_configured_video_format(MiniAVCameraContext *ctx,
+                                                              MiniAVVideoInfo *format_out) {
+    if (!ctx || !format_out) {
+        return MINIAV_ERROR_INVALID_ARG;
+    }
+    
+    if (ctx->configured_video_format.width == 0 || 
+        ctx->configured_video_format.height == 0) {
+        return MINIAV_ERROR_NOT_INITIALIZED;
+    }
+    
+    *format_out = ctx->configured_video_format;
+    return MINIAV_SUCCESS;
+}
+
 static MiniAVResultCode pw_configure(MiniAVCameraContext *ctx,
                                      const char *device_id_str,
                                      const MiniAVVideoInfo *format) {
@@ -1502,10 +1574,12 @@ const CameraContextInternalOps g_camera_ops_pipewire = {
     .destroy_platform = pw_destroy_platform,
     .enumerate_devices = pw_enumerate_devices,
     .get_supported_formats = pw_get_supported_formats,
+    .get_default_format = pw_get_default_format,
     .configure = pw_configure,
     .start_capture = pw_start_capture,
     .stop_capture = pw_stop_capture,
     .release_buffer = pw_release_buffer,
+    .get_configured_video_format = pw_get_configured_video_format
 };
 
 MiniAVResultCode

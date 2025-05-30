@@ -6,24 +6,6 @@
 #include "camera_context.h"
 #include <string.h> // For memset, strcmp, strncpy
 
-// Platform-specific includes and extern declarations for backend table
-#if defined(_WIN32)
-// camera_context_win_mf.h should declare g_camera_ops_win_mf and
-// miniav_camera_context_platform_init_windows_mf
-#include "windows/camera_context_win_mf.h"
-#elif defined(__APPLE__)
-#include "macos/camera_context_macos_avf.h"
-extern const CameraContextInternalOps g_camera_ops_macos_avf;
-extern MiniAVResultCode
-miniav_camera_context_platform_init_macos_avf(MiniAVCameraContext* ctx);
-#elif defined(__linux__)
-#include "linux/camera_context_linux_pipewire.h" // You will need to create this header
-extern const CameraContextInternalOps
-    g_camera_ops_pipewire; // To be defined in your pipewire .c file
-extern MiniAVResultCode miniav_camera_context_platform_init_linux_pipewire(
-    MiniAVCameraContext *ctx); // To be defined in your pipewire .c file
-#endif
-
 // --- Backend Table ---
 // Order matters here for default preference.
 static const MiniAVCameraBackend g_camera_backends[] = {

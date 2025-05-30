@@ -196,6 +196,7 @@ extension MiniAVBufferFFI on MiniAVBuffer {
       timestampUs: timestampUs,
       data: videoBuffer ?? audioBuffer,
       dataSizeBytes: dataSizeBytes,
+      nativeHandle: native.internal_handle,
     );
   }
 }

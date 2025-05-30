@@ -105,16 +105,21 @@ class MiniAVBuffer {
   final MiniAVBufferType type;
   final MiniAVBufferContentType contentType;
   final int timestampUs;
-  final dynamic data; // MiniAVVideoBuffer or MiniAVAudioBuffer
+  final Object? data; // MiniAVVideoBuffer or MiniAVAudioBuffer
   final int dataSizeBytes;
+  final Object? _nativeHandle;
 
-  MiniAVBuffer({
+  const MiniAVBuffer({
     required this.type,
     required this.contentType,
     required this.timestampUs,
     required this.data,
     required this.dataSizeBytes,
-  });
+    Object? nativeHandle,
+  }) : _nativeHandle = nativeHandle;
+
+  // Add getter for native handle
+  Object? get nativeHandle => _nativeHandle;
 }
 
 class MiniAVVideoBuffer {

@@ -1,3 +1,5 @@
+import 'package:miniav_platform_interface/miniav_platform_types.dart';
+
 import 'modules/miniav_camera_interface.dart';
 import 'modules/miniav_screen_interface.dart';
 import 'modules/miniav_audio_input_interface.dart';
@@ -39,4 +41,5 @@ abstract class MiniAVPlatformInterface {
   String getVersionString();
   void setLogLevel(int level);
   void dispose();
+  Future<void> releaseBuffer(MiniAVBuffer buffer);
 }

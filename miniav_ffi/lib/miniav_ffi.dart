@@ -56,6 +56,19 @@ class MiniAVFFIPlatform extends MiniAVPlatformInterface {
   void dispose() {
     // Implement any necessary cleanup here
   }
+
+  @override
+  Future<void> releaseBuffer(MiniAVBuffer buffer) async {
+    final nativeHandle = buffer.nativeHandle;
+    if (nativeHandle != null && nativeHandle is ffi.Pointer) {
+      final result = bindings.MiniAV_ReleaseBuffer(
+        nativeHandle.cast<ffi.Void>(),
+      );
+      if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+        throw Exception('Failed to release buffer: $result');
+      }
+    }
+  }
 }
 
 MiniAVPlatformInterface registeredInstance() => MiniAVFFIPlatform();

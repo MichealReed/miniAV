@@ -1216,8 +1216,6 @@ typedef enum {
 | **BAYER_RGGB16** | ✗ | ✓ (pro cameras) | ✓ | ✓ | ✓ (RAW API) | ✗ |
 | **BAYER_BGGR16** | ✗ | ✓ (pro cameras) | ✓ | ✓ | ✓ (RAW API) | ✗ |
 | **BAYER_GBRG16** | ✗ | ✓ (pro cameras) | ✓ | ✓ | ✓ (RAW API) | ✗ |
-| **H264** | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) |
-| **H265** | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) | ✓ (future) |
 
 **Legend:**
 

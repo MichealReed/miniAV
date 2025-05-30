@@ -1,14 +1,17 @@
 import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart';
-import 'package:miniav_ffi/miniav_ffi_audio_input.dart';
-import 'package:miniav_ffi/miniav_ffi_loopback.dart';
+import 'package:miniav_ffi/modules/miniav_ffi_audio_input.dart';
+import 'package:miniav_ffi/modules/miniav_ffi_loopback.dart';
 import 'miniav_ffi_bindings.dart' as bindings;
-import 'miniav_ffi_camera.dart';
-import 'miniav_ffi_screen.dart';
+import 'modules/miniav_ffi_camera.dart';
+import 'modules/miniav_ffi_screen.dart';
 import 'package:miniav_platform_interface/miniav_platform_interface.dart';
 
 // Export camera FFI implementation for external use
-export 'miniav_ffi_camera.dart';
+export 'modules/miniav_ffi_camera.dart';
+export 'modules/miniav_ffi_screen.dart';
+export 'modules/miniav_ffi_audio_input.dart';
+export 'modules/miniav_ffi_loopback.dart';
 
 // --- Platform Implementation ---
 

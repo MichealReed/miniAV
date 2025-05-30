@@ -1,13 +1,13 @@
-import 'miniav_camera_interface.dart';
-import 'miniav_screen_interface.dart';
-import 'miniav_audio_input_interface.dart';
-import 'miniav_loopback_interface.dart';
+import 'modules/miniav_camera_interface.dart';
+import 'modules/miniav_screen_interface.dart';
+import 'modules/miniav_audio_input_interface.dart';
+import 'modules/miniav_loopback_interface.dart';
 
 export 'miniav_platform_types.dart';
-export 'miniav_camera_interface.dart';
-export 'miniav_screen_interface.dart';
-export 'miniav_audio_input_interface.dart';
-export 'miniav_loopback_interface.dart';
+export 'modules/miniav_camera_interface.dart';
+export 'modules/miniav_screen_interface.dart';
+export 'modules/miniav_audio_input_interface.dart';
+export 'modules/miniav_loopback_interface.dart';
 
 // Conditional import for platform-specific implementation
 import 'platform_stub/miniav_platform_stub.dart'

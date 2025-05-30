@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
+
 project(miniav_c LANGUAGES C CXX)
 
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
@@ -13,7 +14,19 @@ set(MINIAV_PLATFORM_LINUX FALSE)
 set(MINIAV_PLATFORM_ANDROID FALSE)
 set(MINIAV_PLATFORM_WEB FALSE)
 
-if(WIN32)
+# Debug platform detection
+message(STATUS "CMAKE_SYSTEM_NAME: ${CMAKE_SYSTEM_NAME}")
+message(STATUS "EMSCRIPTEN: ${EMSCRIPTEN}")
+message(STATUS "WIN32: ${WIN32}")
+message(STATUS "CMAKE_C_COMPILER: ${CMAKE_C_COMPILER}")
+message(STATUS "CMAKE_CXX_COMPILER: ${CMAKE_CXX_COMPILER}")
+
+# Check for Emscripten more thoroughly
+if(DEFINED EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR CMAKE_C_COMPILER_ID STREQUAL "Emscripten")
+    set(MINIAV_PLATFORM_WEB TRUE)
+    set(MINIAV_PLATFORM_NAME "Web")
+    message(STATUS "Detected Emscripten/Web platform")
+elseif(WIN32)
     set(MINIAV_PLATFORM_WINDOWS TRUE)
     set(MINIAV_PLATFORM_NAME "Windows")
 elseif(APPLE)
@@ -27,9 +40,6 @@ elseif(APPLE)
 elseif(ANDROID)
     set(MINIAV_PLATFORM_ANDROID TRUE)
     set(MINIAV_PLATFORM_NAME "Android")
-elseif(EMSCRIPTEN)
-    set(MINIAV_PLATFORM_WEB TRUE)
-    set(MINIAV_PLATFORM_NAME "Web")
 elseif(UNIX)
     set(MINIAV_PLATFORM_LINUX TRUE)
     set(MINIAV_PLATFORM_NAME "Linux")
@@ -41,8 +51,10 @@ message(STATUS "Configuring miniav_c for ${MINIAV_PLATFORM_NAME}")
 
 # --- Module Enable Options ---
 option(MINIAV_ENABLE_AUDIO "Enable Audio Module (miniaudio)" ON)
-option(MINIAV_ENABLE_CAMERA "Enable Camera Capture Module" ON)
-option(MINIAV_ENABLE_SCREEN "Enable Screen Capture Module" ON)
+if(NOT MINIAV_PLATFORM_WEB)
+    option(MINIAV_ENABLE_CAMERA "Enable Camera Capture Module" ON)
+    option(MINIAV_ENABLE_SCREEN "Enable Screen Capture Module" ON)
+endif()
 
 # Loopback is only supported on desktop platforms
 if(MINIAV_PLATFORM_WINDOWS OR MINIAV_PLATFORM_MACOS OR MINIAV_PLATFORM_LINUX)
@@ -92,7 +104,6 @@ endif()
 
 # Web Backends
 if(MINIAV_PLATFORM_WEB)
-    option(MINIAV_BACKEND_WEB_WEBRTC "Enable WebRTC APIs for web capture" ON)
 endif()
 
 # --- Standard & Settings ---
@@ -108,7 +119,26 @@ if(MINIAV_PLATFORM_MACOS OR MINIAV_PLATFORM_IOS)
 endif()
 
 # --- Library Target ---
-add_library(miniav_c SHARED)
+if(MINIAV_PLATFORM_WEB)
+    # For Emscripten, create a static library and an executable that exports functions
+    add_library(miniav_c STATIC)
+    
+    # Create an executable that will generate .js and .wasm files
+    add_executable(miniav_c_web include/miniav.h)
+    target_link_libraries(miniav_c_web PRIVATE miniav_c)
+    
+    # Emscripten-specific link flags for the web executable
+    target_link_options(miniav_c_web PRIVATE
+        "-sWASM=1"
+        "-sALLOW_MEMORY_GROWTH=1"
+        "-sEXPORTED_FUNCTIONS=['_malloc','_free']"
+        "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
+        "-sMODULARIZE=1"
+        "--emit-symbol-map"
+    )
+else()
+    add_library(miniav_c SHARED)
+endif()
 
 # --- Initialize Lists ---
 set(ALL_SOURCES "")
@@ -270,12 +300,6 @@ if(MINIAV_ENABLE_CAMERA)
             list(APPEND ALL_LINK_LIBS camera2ndk)
             list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_ANDROID_NDK_CAMERA_ENABLED")
         endif()
-        
-    elseif(MINIAV_PLATFORM_WEB AND MINIAV_BACKEND_WEB_WEBRTC)
-        message(STATUS "Web: Enabling WebRTC APIs for camera")
-        list(APPEND ALL_SOURCES "src/camera/web/camera_context_web_webrtc.c")
-        list(APPEND ALL_HEADERS "src/camera/web/camera_context_web_webrtc.h")
-        list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_WEB_WEBRTC_CAMERA_ENABLED")
     endif()
 else()
     message(STATUS "Camera module disabled")
@@ -366,12 +390,6 @@ if(MINIAV_ENABLE_SCREEN)
         list(APPEND ALL_HEADERS "src/screen/android/screen_context_android_mediaprojection.h")
         list(APPEND ALL_LINK_LIBS mediandk)
         list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_ANDROID_MEDIAPROJECTION_SCREEN_ENABLED")
-        
-    elseif(MINIAV_PLATFORM_WEB AND MINIAV_BACKEND_WEB_WEBRTC)
-        message(STATUS "Web: Enabling WebRTC APIs for screen capture")
-        list(APPEND ALL_SOURCES "src/screen/web/screen_context_web_webrtc.c")
-        list(APPEND ALL_HEADERS "src/screen/web/screen_context_web_webrtc.h")
-        list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_WEB_WEBRTC_SCREEN_ENABLED")
     endif()
 else()
     message(STATUS "Screen module disabled")
@@ -410,24 +428,6 @@ if(MINIAV_ENABLE_LOOPBACK)
     endif()
 else()
     message(STATUS "Loopback audio module disabled")
-endif()
-
-# --- Web-specific Setup ---
-if(MINIAV_PLATFORM_WEB)
-    # Emscripten-specific compile flags
-    list(APPEND ALL_COMPILE_OPTIONS
-        "-s" "USE_WEBGL2=1"
-        "-s" "WASM=1"
-        "--bind"
-    )
-    
-    # Emscripten-specific link flags
-    target_link_options(miniav_c PRIVATE
-        "-s" "USE_WEBGL2=1"
-        "-s" "WASM=1"
-        "-s" "ALLOW_MEMORY_GROWTH=1"
-        "--bind"
-    )
 endif()
 
 # --- Android-specific Setup ---

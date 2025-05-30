@@ -4,6 +4,9 @@
 #  else
 #    define MINIAV_API __declspec(dllimport)
 #  endif
+#elif defined(__EMSCRIPTEN__)
+#  include <emscripten.h>
+#  define MINIAV_API EMSCRIPTEN_KEEPALIVE
 #else
 #  define MINIAV_API
 #endif

@@ -83,8 +83,8 @@ MiniAVResultCode MiniAV_SetLogLevel(MiniAVLogLevel level) {
 
 MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
   if (!internal_handle_payload_ptr) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR, "MiniAV_ReleaseBuffer: NULL payload.");
-    return MINIAV_ERROR_INVALID_ARG;
+    //miniav_log(MINIAV_LOG_LEVEL_ERROR, "MiniAV_ReleaseBuffer: NULL payload.");
+    return MINIAV_SUCCESS;
   }
 
   MiniAVNativeBufferInternalPayload *payload =
@@ -118,7 +118,7 @@ MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
       res = MINIAV_ERROR_INVALID_HANDLE;
     }
   } else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_AUDIO) {
-    miniav_free(payload->native_singular_resource_ptr);
+    miniav_free(payload);
     res = MINIAV_SUCCESS;
   }
    else {

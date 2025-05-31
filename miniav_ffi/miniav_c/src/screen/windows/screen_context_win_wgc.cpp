@@ -1616,8 +1616,10 @@ static void wgc_on_frame_arrived(
           0; // GPU textures don't have stride
       buffer->data.video.planes[0].offset_bytes = 0;
       buffer->data.video.planes[0].subresource_index = 0;
-
-      buffer->data_size_bytes = 0; // GPU textures don't have size
+      //calculate data size based on width, height, and pixel format
+      buffer->data_size_bytes =  (buffer->data.video.info.width *
+                                      buffer->data.video.info.height *
+                                      4); // BGRA32 = 4 bytes per pixel
     }
 
     // --- Prepare Payloads and Call App ---

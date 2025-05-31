@@ -112,7 +112,7 @@ Future<void> setupScreenStream(Map<String, dynamic> contexts) async {
     final formats = await MiniScreen.getDefaultFormats(
       selectedDisplay.deviceId,
     );
-    final videoFormat = formats.$1; // Video format
+    var videoFormat = formats.$1; // Video format
     final audioFormat = formats.$2; // Audio format (may be null)
 
     print('🎯 Using display: ${selectedDisplay.name}');
@@ -127,9 +127,17 @@ Future<void> setupScreenStream(Map<String, dynamic> contexts) async {
 
     // Create and configure context
     final context = await MiniScreen.createContext();
+    MiniAVVideoInfo newFormat = MiniAVVideoInfo(
+      width: videoFormat.width,
+      height: videoFormat.height,
+      frameRateNumerator: videoFormat.frameRateNumerator,
+      frameRateDenominator: videoFormat.frameRateDenominator,
+      pixelFormat: videoFormat.pixelFormat,
+      outputPreference: MiniAVOutputPreference.gpu,
+    );
     await context.configureDisplay(
       selectedDisplay.deviceId,
-      videoFormat,
+      newFormat,
       captureAudio: audioFormat != null,
     );
     contexts['screen'] = context;
@@ -142,6 +150,10 @@ Future<void> setupScreenStream(Map<String, dynamic> contexts) async {
         screenFrameCount++;
         print(
           '🖥️  Screen frame #$screenFrameCount - ${buffer.dataSizeBytes} bytes - ${buffer.timestampUs}µs',
+        );
+        final rawData = (buffer.data as MiniAVVideoBuffer).planes[0];
+        print(
+          '  Raw data: ${rawData!.length} bytes, first 10 bytes: ${rawData.take(10).join(', ')}',
         );
         MiniAV.releaseBuffer(buffer); // Release video buffer after processing
       } else if (buffer.type == MiniAVBufferType.audio) {
@@ -197,13 +209,11 @@ Future<void> setupAudioInputStream(Map<String, dynamic> contexts) async {
     int bufferCount = 0;
     await context.startCapture((buffer, userData) {
       bufferCount++;
-      if (bufferCount % 50 == 0) {
-        // Log every 50 buffers
-        print(
-          '🎤 Audio buffer #$bufferCount - ${buffer.dataSizeBytes} bytes - ${buffer.timestampUs}µs',
-        );
-      }
-      //MiniAV.releaseBuffer(buffer); // Release buffer after processing
+
+      print(
+        '🎤 Audio buffer #$bufferCount - ${buffer.dataSizeBytes} bytes - ${buffer.timestampUs}µs',
+      );
+      MiniAV.releaseBuffer(buffer); // Release buffer after processing
     });
 
     print('✅ Audio input stream started');
@@ -251,12 +261,9 @@ Future<void> setupLoopbackStream(Map<String, dynamic> contexts) async {
     int bufferCount = 0;
     await context.startCapture((buffer, userData) {
       bufferCount++;
-      if (bufferCount % 50 == 0) {
-        // Log every 50 buffers
-        print(
-          '🔄 Loopback buffer #$bufferCount - ${buffer.dataSizeBytes} bytes - ${buffer.timestampUs}µs',
-        );
-      }
+      print(
+        '🔄 Loopback buffer #$bufferCount - ${buffer.dataSizeBytes} bytes - ${buffer.timestampUs}µs',
+      );
       //MiniAV.releaseBuffer(buffer); // Release buffer after processing
     });
 

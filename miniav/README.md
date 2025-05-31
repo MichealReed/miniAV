@@ -2,8 +2,6 @@
 
 A Flutter library for cross-platform audio and video capture with high-performance buffer management and GPU integration support.
 
-**Disclaimer: This library is experimental and supported at will, use in production at your own risk.**
-
 ## Three Things to Know
 
 1. Native assets compilation can take time, especially on first build. Run with -v to see build progress and errors.

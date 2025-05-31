@@ -51,37 +51,47 @@ void test_screen_buffer_callback(const MiniAVBuffer *buffer, void *user_data) {
   if (buffer->type == MINIAV_BUFFER_TYPE_VIDEO) {
     g_video_frame_count++;
     double delta_ms = 0.0;
-    if (last_video_timestamp_us != 0 && buffer->timestamp_us > last_video_timestamp_us) {
-      delta_ms = (double)(buffer->timestamp_us - last_video_timestamp_us) / 1000.0;
+    if (last_video_timestamp_us != 0 &&
+        buffer->timestamp_us > last_video_timestamp_us) {
+      delta_ms =
+          (double)(buffer->timestamp_us - last_video_timestamp_us) / 1000.0;
       printf("Video: +%.3f ms (Frame #%d, %ux%u, TS: %" PRIu64 "us)\n",
-             delta_ms, g_video_frame_count, buffer->data.video.info.width, buffer->data.video.info.height, buffer->timestamp_us);
+             delta_ms, g_video_frame_count, buffer->data.video.info.width,
+             buffer->data.video.info.height, buffer->timestamp_us);
     } else {
       printf("Video: First frame (Frame #%d, %ux%u, TS: %" PRIu64 "us)\n",
-             g_video_frame_count, buffer->data.video.info.width, buffer->data.video.info.height, buffer->timestamp_us);
+             g_video_frame_count, buffer->data.video.info.width,
+             buffer->data.video.info.height, buffer->timestamp_us);
     }
     last_video_timestamp_us = buffer->timestamp_us;
 
     if (buffer->content_type == MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE) {
-      printf("  GPU Buffer: Shared Handle = %p\n", buffer->data.video.planes[0].data_ptr);
+      printf("  GPU Buffer: Shared Handle = %p\n",
+             buffer->data.video.planes[0].data_ptr);
     }
 
     if (buffer->internal_handle) {
       MiniAV_ReleaseBuffer(buffer->internal_handle);
     } else {
-      fprintf(stderr, "ScreenTestCallback: Warning - Video buffer->internal_handle is NULL.\n");
+      fprintf(stderr, "ScreenTestCallback: Warning - Video "
+                      "buffer->internal_handle is NULL.\n");
       fflush(stderr);
     }
 
   } else if (buffer->type == MINIAV_BUFFER_TYPE_AUDIO) {
     g_audio_packet_count++;
     double delta_ms = 0.0;
-    if (last_audio_timestamp_us != 0 && buffer->timestamp_us > last_audio_timestamp_us) {
-      delta_ms = (double)(buffer->timestamp_us - last_audio_timestamp_us) / 1000.0;
+    if (last_audio_timestamp_us != 0 &&
+        buffer->timestamp_us > last_audio_timestamp_us) {
+      delta_ms =
+          (double)(buffer->timestamp_us - last_audio_timestamp_us) / 1000.0;
       printf("Audio: +%.3f ms (Packet #%d, Size: %zu, TS: %" PRIu64 "us)\n",
-             delta_ms, g_audio_packet_count, buffer->data_size_bytes, buffer->timestamp_us);
+             delta_ms, g_audio_packet_count, buffer->data_size_bytes,
+             buffer->timestamp_us);
     } else {
       printf("Audio: First packet (Packet #%d, Size: %zu, TS: %" PRIu64 "us)\n",
-             g_audio_packet_count, buffer->data_size_bytes, buffer->timestamp_us);
+             g_audio_packet_count, buffer->data_size_bytes,
+             buffer->timestamp_us);
     }
     last_audio_timestamp_us = buffer->timestamp_us;
 
@@ -89,15 +99,17 @@ void test_screen_buffer_callback(const MiniAVBuffer *buffer, void *user_data) {
 
       MiniAV_ReleaseBuffer(buffer->internal_handle);
     }
-    // else it might be normal for audio buffers not to have an internal_handle needing this specific release path
+    // else it might be normal for audio buffers not to have an internal_handle
+    // needing this specific release path
 
   } else {
     fprintf(stderr,
-            "ScreenTestCallback: Received buffer of unexpected type: %d, TS: %" PRIu64 "us\n",
+            "ScreenTestCallback: Received buffer of unexpected type: %d, TS: "
+            "%" PRIu64 "us\n",
             buffer->type, buffer->timestamp_us);
     fflush(stderr);
     if (buffer->internal_handle) {
-        MiniAV_ReleaseBuffer(buffer->internal_handle);
+      MiniAV_ReleaseBuffer(buffer->internal_handle);
     }
   }
   fflush(stdout); // Ensure immediate output of printf
@@ -138,6 +150,8 @@ const char *screen_pixel_format_to_string(MiniAVPixelFormat format) {
     return "ARGB32";
   case MINIAV_PIXEL_FORMAT_ABGR32:
     return "ABGR32";
+  case MINIAV_PIXEL_FORMAT_BGRX32:
+    return "BGRX32";
   case MINIAV_PIXEL_FORMAT_MJPEG:
     return "MJPEG";
   default:
@@ -154,8 +168,7 @@ int main() {
   printf("MiniAV Version String: %s\n", MiniAV_GetVersionString());
 
   MiniAV_SetLogCallback(test_screen_log_callback, NULL);
-  MiniAV_SetLogLevel(
-      MINIAV_LOG_LEVEL_DEBUG);
+  MiniAV_SetLogLevel(MINIAV_LOG_LEVEL_DEBUG);
 
   MiniAVDeviceInfo *displays = NULL;
   uint32_t display_count = 0;
@@ -225,8 +238,7 @@ int main() {
   printf("  Requested FPS: %u/%u\n", capture_format.frame_rate_numerator,
          capture_format.frame_rate_denominator);
   printf("  Requested Output Preference: %s\n",
-         capture_format.output_preference ==
-                 MINIAV_OUTPUT_PREFERENCE_GPU
+         capture_format.output_preference == MINIAV_OUTPUT_PREFERENCE_GPU
              ? "GPU_IF_AVAILABLE"
              : "CPU_ONLY");
 
@@ -243,7 +255,8 @@ int main() {
 
   MiniAVVideoInfo actual_format;
   MiniAVAudioInfo actual_audio_format;
-  MiniAV_Screen_GetConfiguredFormats(screen_ctx, &actual_format, &actual_audio_format);
+  MiniAV_Screen_GetConfiguredFormats(screen_ctx, &actual_format,
+                                     &actual_audio_format);
   printf("Screen capture configured successfully.\n");
   printf("  Actual Capture Resolution: %ux%u\n", actual_format.width,
          actual_format.height);
@@ -253,8 +266,7 @@ int main() {
   printf("  Actual FPS: %u/%u\n", actual_format.frame_rate_numerator,
          actual_format.frame_rate_denominator);
   printf("  Actual Output Preference: %s\n",
-         actual_format.output_preference ==
-                 MINIAV_OUTPUT_PREFERENCE_GPU
+         actual_format.output_preference == MINIAV_OUTPUT_PREFERENCE_GPU
              ? "GPU_IF_AVAILABLE"
          : actual_format.output_preference == MINIAV_OUTPUT_PREFERENCE_CPU
              ? "CPU_ONLY"
@@ -291,7 +303,8 @@ int main() {
     fprintf(stderr, "Failed to stop screen capture: %s\n",
             MiniAV_GetErrorString(res));
   }
-  printf("Screen capture stopped. Total video frames: %d, Total audio packets: %d\n",
+  printf("Screen capture stopped. Total video frames: %d, Total audio packets: "
+         "%d\n",
          g_video_frame_count, g_audio_packet_count);
 
   printf("\nDestroying screen context...\n");

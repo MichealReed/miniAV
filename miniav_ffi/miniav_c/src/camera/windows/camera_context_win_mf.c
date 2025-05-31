@@ -689,12 +689,20 @@ static MiniAVResultCode mf_init_platform(MiniAVCameraContext *ctx) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "MF: Initializing platform context (real). Thread ID: %lu",
              GetCurrentThreadId());
-  HRESULT hr_com_init;
   HRESULT hr_mf_startup;
 
-  hr_com_init =
+  HRESULT hr_com_init =
       CoInitializeEx(NULL, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
-  if (FAILED(hr_com_init) && hr_com_init != RPC_E_CHANGED_MODE) {
+  BOOL com_initialized_here = FALSE;
+
+  if (SUCCEEDED(hr_com_init)) {
+    com_initialized_here = (hr_com_init == S_OK);
+  } else if (hr_com_init == RPC_E_CHANGED_MODE) {
+    // Flutter already initialized COM in STA mode - that's fine
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "MF: Using existing STA COM mode from Flutter");
+    com_initialized_here = FALSE;
+  } else {
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "MF: CoInitializeEx failed: 0x%X",
                hr_com_init);
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
@@ -820,7 +828,13 @@ static MiniAVResultCode mf_enumerate_devices(MiniAVDeviceInfo **devices_out,
     if (hr_com_init == S_OK) { // S_OK means COM was initialized by this call
       com_initialized_here = TRUE;
     }
-    // If S_FALSE or RPC_E_CHANGED_MODE, COM was already initialized, proceed.
+    // If S_FALSE, COM was already initialized, proceed.
+  } else if (hr_com_init == RPC_E_CHANGED_MODE) {
+    // Flutter already initialized COM in STA mode - that's fine
+    miniav_log(
+        MINIAV_LOG_LEVEL_DEBUG,
+        "MF: Using existing STA COM mode from Flutter in enumerate_devices");
+    com_initialized_here = FALSE;
   } else {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "MF: CoInitializeEx failed in enumerate_devices: 0x%X",
@@ -984,7 +998,10 @@ static MiniAVResultCode mf_get_supported_formats(const char *device_id_utf8,
     if (hr_com_init == S_OK) { // S_OK means COM was initialized by this call
       com_initialized_here = TRUE;
     }
-    // If S_FALSE or RPC_E_CHANGED_MODE, COM was already initialized, proceed.
+    // If S_FALSE, COM was already initialized, proceed.
+  } else if (hr_com_init == RPC_E_CHANGED_MODE) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "MF: Using existing STA COM mode");
+    com_initialized_here = FALSE;
   } else {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "MF: CoInitializeEx failed in get_supported_formats: 0x%X",

@@ -5,7 +5,7 @@ version: 1.0.0
 # repository: https://github.com/my_org/my_repo
 
 environment:
-  sdk: ^3.8.0-133.0.dev
+  sdk: ^3.9.0-21.0.dev
   flutter: ">=1.20.0"
 
 # Add regular dependencies here.
@@ -15,7 +15,10 @@ dependencies:
   ffi: ^2.0.2
   miniav_platform_interface:
     path: ../miniav_platform_interface
-  native_toolchain_cmake: ^0.0.4
+  native_toolchain_cmake: ^0.0.6-dev.0
+  logging: ^1.3.0
+  hooks: ^0.19.0
+  code_assets: ^0.19.0
 
 dev_dependencies:
   lints: ^5.0.0

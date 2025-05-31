@@ -57,9 +57,9 @@ struct MiniAVCameraContext {
 // Platform-specific initialization functions
 // These will set up ctx->ops and call ops->init_platform
 #if defined(_WIN32)
+#include "windows/camera_context_win_mf.h"
 extern MiniAVResultCode miniav_camera_context_platform_init_windows_mf(MiniAVCameraContext* ctx);
 extern const CameraContextInternalOps g_camera_ops_win_mf;
-#include "windows/camera_context_win_mf.h"
 #elif defined(__APPLE__)
 #include "macos/camera_context_macos_avf.h"
 extern const CameraContextInternalOps g_camera_ops_macos_avf;

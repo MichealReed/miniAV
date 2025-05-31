@@ -1371,7 +1371,7 @@ static MiniAVResultCode mf_configure(
                          ? 0.0f
                          : (float)format->frame_rate_numerator /
                                format->frame_rate_denominator;
-  miniav_log(MINIAV_LOG_LEVEL_ERROR,
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "MF: Configuring device %s with format %ux%u @ %u/%u (approx "
              "%.2f) FPS, PixelFormat %d, OutputPref %d (real).",
              device_id_utf8 ? device_id_utf8
@@ -1410,10 +1410,6 @@ static MiniAVResultCode mf_configure(
   }
   mf_ctx->dxgi_manager_reset_token = 0;
 
-  // Corrected: Only set use_gpu_preference if a GPU preference is actually
-  // selected. If you add more specific GPU enums like
-  // _SHARED_TEXTURE_DXGI_REQUIRE or _FALLBACK_CPU, include them in this
-  // condition.
   bool use_gpu_preference =
       format->output_preference == MINIAV_OUTPUT_PREFERENCE_GPU;
 

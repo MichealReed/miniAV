@@ -1,7 +1,7 @@
 part of '../miniav_web.dart';
 
 /// Web implementation of [MiniAudioInputPlatformInterface]
-class AudioControllerWeb implements MiniAudioInputPlatformInterface {
+class MiniAVWebAudioInputPlatform implements MiniAudioInputPlatformInterface {
   @override
   Future<List<MiniAVDeviceInfo>> enumerateDevices() async {
     try {
@@ -73,12 +73,12 @@ class AudioControllerWeb implements MiniAudioInputPlatformInterface {
 
   @override
   Future<MiniAudioInputContextPlatformInterface> createContext() async {
-    return WebAudioInputContext();
+    return MiniAVWebAudioInputContext();
   }
 }
 
 /// Web implementation of [MiniAudioInputContextPlatformInterface]
-class WebAudioInputContext implements MiniAudioInputContextPlatformInterface {
+class MiniAVWebAudioInputContext implements MiniAudioInputContextPlatformInterface {
   web.MediaStream? _mediaStream;
   web.AudioContext? _audioContext;
   web.MediaStreamAudioSourceNode? _sourceNode;
@@ -237,7 +237,7 @@ class WebAudioInputContext implements MiniAudioInputContextPlatformInterface {
       _processorNode!.onaudioprocess = null;
     }
 
-    await _bufferController?.close();
+    _bufferController?.close();
     _bufferController = null;
     _onData = null;
     _userData = null;
@@ -245,8 +245,6 @@ class WebAudioInputContext implements MiniAudioInputContextPlatformInterface {
 
   @override
   Future<void> destroy() async {
-    await stopCapture();
-
     _mediaStream?.getTracks().toDart.forEach((track) => track.stop());
     _mediaStream = null;
 

@@ -12,33 +12,14 @@ part 'modules/miniav_web_audio_input.dart';
 part 'modules/miniav_web_loopback.dart';
 part './miniav_web_utils.dart';
 
-/// Registers the web implementation of MiniAV
-MiniAVPlatformInterface registeredInstance() => MiniAVWebImpl();
-
 /// Web implementation of MiniAV platform interface
-class MiniAVWebImpl extends MiniAVPlatformInterface {
-  static bool _isRegistered = false;
+class MiniAVWebPlatform extends MiniAVPlatformInterface {
+  MiniAVWebPlatform();
 
-  late final MiniCameraPlatformInterface _camera;
-  late final MiniScreenPlatformInterface _screen;
-  late final MiniAudioInputPlatformInterface _audioInput;
-  late final MiniLoopbackPlatformInterface _loopback;
-
-  MiniAVWebImpl() {
-    if (!_isRegistered) {
-      _register();
-      _isRegistered = true;
-    }
-
-    _camera = CameraControllerWeb();
-    _screen = ScreenControllerWeb();
-    _audioInput = AudioControllerWeb();
-    _loopback = LoopbackControllerWeb();
-  }
-
-  static void _register() {
-    MiniAVPlatformInterface.instance = MiniAVWebImpl();
-  }
+  final MiniCameraPlatformInterface _camera = MiniAVWebCameraPlatform();
+  final MiniScreenPlatformInterface _screen = MiniAVWebScreenPlatform();
+  final MiniAudioInputPlatformInterface _audioInput = MiniAVWebAudioInputPlatform();
+  final MiniLoopbackPlatformInterface _loopback = MiniAVWebLoopbackPlatform();
 
   @override
   MiniCameraPlatformInterface get camera => _camera;
@@ -63,4 +44,13 @@ class MiniAVWebImpl extends MiniAVPlatformInterface {
 
   @override
   void dispose() {}
+
+  @override
+  Future<void> releaseBuffer(MiniAVBuffer buffer) async {
+    // Web does not require explicit buffer release
+    // This can be a no-op or implement custom logic if needed
+  }
 }
+
+/// Registers the web implementation of MiniAV
+MiniAVPlatformInterface registeredInstance() => MiniAVWebPlatform();

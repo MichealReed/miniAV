@@ -342,7 +342,7 @@ dependencies {
 * **iOS SDK:** 13.0+ minimum deployment target
 * **Swift:** 5.7+ (for mixed Swift/Objective-C projects)
 
-#### System Frameworks (Automatically Linked)
+#### System Frameworks (iOS - Automatically Linked)
 
 * **Foundation.framework**
 * **AVFoundation.framework**

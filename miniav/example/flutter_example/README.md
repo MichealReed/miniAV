@@ -43,7 +43,7 @@ dart pub get
 ## Getting Started
 
 ```console
- git clone https://github.com/yourusername/miniav.git
+ git clone https://github.com/MichealReed/miniav.git
  dart --enable-experiment=native-assets test
 
  dart:
@@ -321,4 +321,4 @@ MiniAV.setLogCallback((level, message) {
 
 ## Funding
 
-If you are interested in funding further development of high-performance media capture libraries, please submit an inquiry.
+If you are interested in funding further development of high-performance media capture libraries, please submit an inquiry at [https://practicalxr.com](https://practicalxr.com).

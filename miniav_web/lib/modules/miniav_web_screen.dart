@@ -1,7 +1,7 @@
 part of '../miniav_web.dart';
 
 /// Web implementation of [MiniScreenPlatformInterface]
-class ScreenControllerWeb implements MiniScreenPlatformInterface {
+class MiniAVWebScreenPlatform implements MiniScreenPlatformInterface {
   @override
   Future<List<MiniAVDeviceInfo>> enumerateDisplays() async {
     // Web doesn't provide display enumeration
@@ -34,12 +34,12 @@ class ScreenControllerWeb implements MiniScreenPlatformInterface {
 
   @override
   Future<MiniScreenContextPlatformInterface> createContext() async {
-    return WebScreenContext();
+    return MiniAVWebScreenContext();
   }
 }
 
 /// Web implementation of [MiniScreenContextPlatformInterface]
-class WebScreenContext implements MiniScreenContextPlatformInterface {
+class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
   web.MediaStream? _mediaStream;
   web.HTMLVideoElement? _videoElement;
   web.HTMLCanvasElement? _canvas;
@@ -198,14 +198,12 @@ class WebScreenContext implements MiniScreenContextPlatformInterface {
     _captureTimer?.cancel();
     _captureTimer = null;
 
-    await _bufferController?.close();
+    _bufferController?.close();
     _bufferController = null;
   }
 
   @override
   Future<void> destroy() async {
-    await stopCapture();
-
     _mediaStream?.getTracks().toDart.forEach((track) => track.stop());
     _mediaStream = null;
     _videoElement = null;

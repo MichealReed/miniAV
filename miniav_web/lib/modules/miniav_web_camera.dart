@@ -1,7 +1,7 @@
 part of '../miniav_web.dart';
 
 /// Web implementation of [MiniCameraPlatformInterface]
-class CameraControllerWeb implements MiniCameraPlatformInterface {
+class MiniAVWebCameraPlatform implements MiniCameraPlatformInterface {
   @override
   Future<List<MiniAVDeviceInfo>> enumerateDevices() async {
     try {
@@ -76,12 +76,12 @@ class CameraControllerWeb implements MiniCameraPlatformInterface {
 
   @override
   Future<MiniCameraContextPlatformInterface> createContext() async {
-    return WebCameraContext();
+    return MiniAVWebCameraContext();
   }
 }
 
 /// Web implementation of [MiniCameraContextPlatformInterface]
-class WebCameraContext implements MiniCameraContextPlatformInterface {
+class MiniAVWebCameraContext implements MiniCameraContextPlatformInterface {
   web.MediaStream? _mediaStream;
   web.HTMLVideoElement? _videoElement;
   web.HTMLCanvasElement? _canvas;
@@ -229,13 +229,12 @@ class WebCameraContext implements MiniCameraContextPlatformInterface {
     _captureTimer?.cancel();
     _captureTimer = null;
 
-    await _bufferController?.close();
+    _bufferController?.close();
     _bufferController = null;
   }
 
   @override
   Future<void> destroy() async {
-    await stopCapture();
     _mediaStream?.getTracks().toDart.forEach((track) => track.stop());
     _mediaStream = null;
     _videoElement = null;

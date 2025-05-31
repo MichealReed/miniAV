@@ -1424,7 +1424,6 @@ static void wgc_on_frame_arrived(
     return;
   }
 
-  // ALLOCATE BUFFER ON HEAP - This is crucial!
   MiniAVBuffer *buffer = (MiniAVBuffer *)miniav_calloc(1, sizeof(MiniAVBuffer));
   if (!buffer) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "WGC: Failed to allocate MiniAVBuffer");

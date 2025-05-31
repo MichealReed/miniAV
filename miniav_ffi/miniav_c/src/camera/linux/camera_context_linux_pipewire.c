@@ -50,6 +50,13 @@ typedef struct PipeWireFormatEnumData {
   struct pw_node *node_proxy;
 } PipeWireFormatEnumData;
 
+typedef struct PipeWireStopRequest {
+  bool stop_requested;
+  bool stop_completed;
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+} PipeWireStopRequest;
+
 typedef struct PipeWirePlatformContext {
   MiniAVCameraContext *parent_ctx;
 
@@ -65,6 +72,8 @@ typedef struct PipeWirePlatformContext {
   pthread_t loop_thread;
   bool loop_running;
   int wakeup_pipe[2]; // Pipe to wake up the loop for shutdown
+
+  PipeWireStopRequest stop_request;
 
   // Configuration
   uint32_t target_node_id;
@@ -594,8 +603,14 @@ static void on_stream_state_changed(void *userdata, enum pw_stream_state old,
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW: Stream error: %s", error);
     pw_ctx->is_streaming = false; // Stop on error
     if (pw_ctx->loop_running && pw_ctx->loop) {
-      if (pw_ctx->wakeup_pipe[1] != -1)
-        write(pw_ctx->wakeup_pipe[1], "q", 1); // Wake loop to exit
+      if (pw_ctx->wakeup_pipe[1] != -1) {
+        ssize_t written =
+            write(pw_ctx->wakeup_pipe[1], "q", 1); // Wake loop to exit
+        if (written == -1 && errno != EAGAIN) {
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "PW: Failed to write quit signal: %s", strerror(errno));
+        }
+      }
     }
     return;
   }
@@ -605,8 +620,13 @@ static void on_stream_state_changed(void *userdata, enum pw_stream_state old,
   case PW_STREAM_STATE_ERROR:
     pw_ctx->is_streaming = false;
     if (pw_ctx->loop_running && pw_ctx->loop) {
-      if (pw_ctx->wakeup_pipe[1] != -1)
-        write(pw_ctx->wakeup_pipe[1], "q", 1);
+      if (pw_ctx->wakeup_pipe[1] != -1) {
+        ssize_t written = write(pw_ctx->wakeup_pipe[1], "q", 1);
+        if (written == -1 && errno != EAGAIN) {
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "PW: Failed to write quit signal: %s", strerror(errno));
+        }
+      }
     }
     break;
   case PW_STREAM_STATE_CONNECTING:
@@ -687,6 +707,64 @@ static void on_stream_param_changed(void *userdata, uint32_t id,
     if (pw_stream_set_active(pw_ctx->stream, true) < 0) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW: Failed to set stream active.");
     }
+  }
+}
+
+static void on_stop_request_event(void *data, int fd, uint32_t mask) {
+  PipeWirePlatformContext *ctx = (PipeWirePlatformContext *)data;
+  char buf[1];
+  ssize_t len = read(fd, buf, sizeof(buf));
+
+  if (len > 0 && buf[0] == 's') { // 's' for stop
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW: Processing stop request in loop context.");
+
+    pthread_mutex_lock(&ctx->stop_request.mutex);
+
+    if (ctx->stream) {
+      pw_stream_set_active(ctx->stream, false);
+      pw_stream_disconnect(ctx->stream);
+      spa_hook_remove(&ctx->stream_listener);
+      pw_stream_destroy(ctx->stream);
+      ctx->stream = NULL;
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW: Stream destroyed in loop context (stop signal).");
+    }
+
+    ctx->stop_request.stop_completed = true;
+    pthread_cond_signal(&ctx->stop_request.cond);
+    pthread_mutex_unlock(&ctx->stop_request.mutex);
+
+    pw_main_loop_quit(ctx->loop);
+  } else if (len > 0 &&
+             buf[0] == 'q') { // 'q' for quit, from pw_destroy_platform
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW: Quit signal received in loop context.");
+    // Perform stream cleanup similar to 's' path, if stream exists and loop is
+    // active. This ensures stream is cleaned up by the loop thread before loop
+    // quits.
+    if (ctx->stream) {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW: Cleaning up stream due to quit signal in loop context.");
+      pw_stream_set_active(ctx->stream, false);
+      pw_stream_disconnect(ctx->stream);
+      spa_hook_remove(&ctx->stream_listener); // Ensure listener is removed
+      pw_stream_destroy(ctx->stream);
+      ctx->stream = NULL;
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW: Stream destroyed in loop context (quit signal).");
+    }
+    pw_main_loop_quit(ctx->loop);
+  } else if (len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    // This is normal for non-blocking pipes
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Pipe read would block.");
+  } else if (len == 0) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Pipe EOF received.");
+    pw_main_loop_quit(ctx->loop); // Quit if pipe closes unexpectedly
+  } else if (len < 0) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW: Pipe read error: %s",
+               strerror(errno));
+    pw_main_loop_quit(ctx->loop); // Quit on error
   }
 }
 
@@ -782,62 +860,43 @@ static const struct pw_core_events core_sync_events = {
 
 // --- Platform Ops Implementation ---
 
-// Define the callback function for the wakeup pipe
-static void on_wakeup_pipe_event(void *data, int fd, uint32_t mask) {
-  PipeWirePlatformContext *ctx = (PipeWirePlatformContext *)data;
-  char buf[1];
-  ssize_t len = read(fd, buf, sizeof(buf)); // Store read result
-
-  if (len > 0 && buf[0] == 'q') {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Wakeup pipe received quit signal.");
-    pw_main_loop_quit(ctx->loop);
-  } else if (len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "PW: Wakeup pipe read would block (EAGAIN/EWOULDBLOCK).");
-  } else if (len == 0) {
-    // EOF - pipe closed from the other end unexpectedly?
-    miniav_log(MINIAV_LOG_LEVEL_WARN, "PW: Wakeup pipe read EOF.");
-  } else if (len < 0) {
-    // Actual read error
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "PW: Wakeup pipe read error: %s. Quitting loop.",
-               strerror(errno));
-    pw_main_loop_quit(ctx->loop); // Quit on error to prevent busy loop
-  }
-}
-
 static void *pipewire_loop_thread_func(void *arg) {
   PipeWirePlatformContext *pw_ctx = (PipeWirePlatformContext *)arg;
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: PipeWire loop thread started.");
+
+  struct pw_loop *loop = pw_main_loop_get_loop(pw_ctx->loop);
+  struct spa_source *wakeup_source = NULL;
+
+  // Set loop_running BEFORE adding the source
   pw_ctx->loop_running = true;
 
-  // Add wakeup_pipe's read end to the loop's sources
-  struct pw_loop *loop = pw_main_loop_get_loop(pw_ctx->loop);
-  struct spa_source *wakeup_source = NULL; // Initialize to NULL
-
-  if (pw_ctx->wakeup_pipe[0] != -1) { // Ensure pipe fd is valid
-    wakeup_source =
-        pw_loop_add_io(loop, pw_ctx->wakeup_pipe[0], SPA_IO_IN,
-                       true,                 // close fd on destroy source
-                       on_wakeup_pipe_event, // Use the static function here
-                       pw_ctx);
+  if (pw_ctx->wakeup_pipe[0] != -1) {
+    wakeup_source = pw_loop_add_io(loop, pw_ctx->wakeup_pipe[0], SPA_IO_IN,
+                                   true, on_stop_request_event, pw_ctx);
 
     if (!wakeup_source) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "PW: Failed to add wakeup_pipe IO source to loop. Loop may "
-                 "not exit cleanly.");
+                 "PW: Failed to add wakeup_pipe IO source to loop.");
+      pw_ctx->loop_running = false;
+      return NULL;
     }
-  } else {
-    miniav_log(
-        MINIAV_LOG_LEVEL_WARN,
-        "PW: Wakeup pipe read end is invalid. Loop may not exit cleanly.");
   }
 
   pw_main_loop_run(pw_ctx->loop);
 
-  if (wakeup_source) { // Only remove if successfully added
-    pw_loop_remove_source(loop, wakeup_source); // Clean up wakeup source
+  // CRITICAL: Remove the source IMMEDIATELY after loop exits, while we're still
+  // in the loop thread context
+  if (wakeup_source) {
+    pw_loop_remove_source(loop, wakeup_source);
+    wakeup_source = NULL;
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW: Removed wakeup source in loop thread.");
   }
+
+  pw_ctx->loop_running = false;
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: PipeWire loop thread ended.");
+  return NULL;
 }
 
 static MiniAVResultCode pw_init_platform(MiniAVCameraContext *ctx) {
@@ -853,9 +912,27 @@ static MiniAVResultCode pw_init_platform(MiniAVCameraContext *ctx) {
   pw_ctx->wakeup_pipe[0] = -1;
   pw_ctx->wakeup_pipe[1] = -1;
 
+  // Initialize stop request mechanism FIRST
+  if (pthread_mutex_init(&pw_ctx->stop_request.mutex, NULL) != 0) {
+    miniav_free(pw_ctx);
+    ctx->platform_ctx = NULL;
+    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+  }
+  if (pthread_cond_init(&pw_ctx->stop_request.cond, NULL) != 0) {
+    pthread_mutex_destroy(&pw_ctx->stop_request.mutex);
+    miniav_free(pw_ctx);
+    ctx->platform_ctx = NULL;
+    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+  }
+  pw_ctx->stop_request.stop_requested = false;
+  pw_ctx->stop_request.stop_completed = false;
+
+  // Create pipe
   if (pipe2(pw_ctx->wakeup_pipe, O_CLOEXEC | O_NONBLOCK) == -1) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW: Failed to create wakeup pipe: %s",
                strerror(errno));
+    pthread_cond_destroy(&pw_ctx->stop_request.cond);
+    pthread_mutex_destroy(&pw_ctx->stop_request.mutex);
     miniav_free(pw_ctx);
     ctx->platform_ctx = NULL;
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
@@ -898,6 +975,8 @@ error_cleanup:
     close(pw_ctx->wakeup_pipe[0]);
   if (pw_ctx->wakeup_pipe[1] != -1)
     close(pw_ctx->wakeup_pipe[1]);
+  pthread_cond_destroy(&pw_ctx->stop_request.cond);
+  pthread_mutex_destroy(&pw_ctx->stop_request.mutex);
   miniav_free(pw_ctx);
   ctx->platform_ctx = NULL;
   return MINIAV_ERROR_SYSTEM_CALL_FAILED;
@@ -906,44 +985,68 @@ error_cleanup:
 static MiniAVResultCode pw_destroy_platform(MiniAVCameraContext *ctx) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Destroying platform context.");
   if (!ctx || !ctx->platform_ctx) {
-    return MINIAV_SUCCESS; // Nothing to do
+    return MINIAV_SUCCESS;
   }
   PipeWirePlatformContext *pw_ctx =
       (PipeWirePlatformContext *)ctx->platform_ctx;
 
-  if (pw_ctx->is_streaming || pw_ctx->loop_running) {
-    pw_stop_capture(ctx); // Attempt to stop if still running
+  if (pw_ctx->loop_running && pw_ctx->wakeup_pipe[1] != -1) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW: Sending quit signal to loop for destruction. Loop thread "
+               "will handle stream cleanup.");
+    ssize_t written = write(pw_ctx->wakeup_pipe[1], "q", 1);
+    if (written == -1 && errno != EAGAIN &&
+        errno != EPIPE) { // EPIPE can happen if read end is already closed
+      miniav_log(MINIAV_LOG_LEVEL_WARN, "PW: Failed to write quit signal: %s",
+                 strerror(errno));
+    }
+  }
+
+  if (pw_ctx->loop_thread != 0) {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "PW: Waiting for loop thread to finish...");
+    pthread_join(pw_ctx->loop_thread, NULL);
+    pw_ctx->loop_thread = 0; // Mark thread as joined
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Loop thread finished and joined.");
   }
 
   if (pw_ctx->stream) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW: Stream object pointer is still non-NULL after loop thread "
+               "exit. This indicates a potential leak if the loop thread did "
+               "not clean it up as expected.");
+    // Fallback cleanup removed:
+    spa_hook_remove(&pw_ctx->stream_listener);
     pw_stream_destroy(pw_ctx->stream);
     pw_ctx->stream = NULL;
   }
-  if (pw_ctx->core) {
-    pw_core_disconnect(pw_ctx->core);
-    pw_ctx->core = NULL;
+
+  // Close pipes (safe to do after thread is joined and its wakeup_source
+  // removed)
+  if (pw_ctx->wakeup_pipe[0] != -1) {
+    close(pw_ctx->wakeup_pipe[0]);
+    pw_ctx->wakeup_pipe[0] = -1;
   }
+  if (pw_ctx->wakeup_pipe[1] != -1) {
+    close(pw_ctx->wakeup_pipe[1]);
+    pw_ctx->wakeup_pipe[1] = -1;
+  }
+
   if (pw_ctx->context) {
     pw_context_destroy(pw_ctx->context);
     pw_ctx->context = NULL;
+    pw_ctx->core = NULL;
   }
-  if (pw_ctx->loop) {
-    pw_main_loop_destroy(pw_ctx->loop);
-    pw_ctx->loop = NULL;
-  }
-  if (pw_ctx->wakeup_pipe[0] != -1)
-    close(pw_ctx->wakeup_pipe[0]);
-  if (pw_ctx->wakeup_pipe[1] != -1)
-    close(pw_ctx->wakeup_pipe[1]);
+  
+  // Clean up threading primitives for stop_request (used by pw_stop_capture)
+  pthread_cond_destroy(&pw_ctx->stop_request.cond);
+  pthread_mutex_destroy(&pw_ctx->stop_request.mutex);
 
   miniav_free(pw_ctx);
   ctx->platform_ctx = NULL;
-  // pw_deinit(); // Consider if this should be here or if multiple contexts
-  // can exist
   miniav_log(MINIAV_LOG_LEVEL_INFO, "PW: Platform context destroyed.");
   return MINIAV_SUCCESS;
 }
-
 static MiniAVResultCode pw_enumerate_devices(MiniAVDeviceInfo **devices_out,
                                              uint32_t *count_out) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Enumerating devices.");
@@ -1213,9 +1316,8 @@ format_enum_cleanup:
   return overall_res;
 }
 
-static MiniAVResultCode
-pw_get_default_format(const char *device_id,
-                            MiniAVVideoInfo *format_out) {
+static MiniAVResultCode pw_get_default_format(const char *device_id,
+                                              MiniAVVideoInfo *format_out) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PipeWire: Getting default format for device %s", device_id);
 
@@ -1227,8 +1329,7 @@ pw_get_default_format(const char *device_id,
   // Get supported formats and pick a reasonable default
   MiniAVVideoInfo *formats = NULL;
   uint32_t count = 0;
-  MiniAVResultCode res =
-      pw_get_supported_formats(device_id, &formats, &count);
+  MiniAVResultCode res = pw_get_supported_formats(device_id, &formats, &count);
 
   if (res != MINIAV_SUCCESS || count == 0) {
     // Fallback to common format
@@ -1269,19 +1370,20 @@ pw_get_default_format(const char *device_id,
   return MINIAV_SUCCESS;
 }
 
-static MiniAVResultCode pw_get_configured_video_format(MiniAVCameraContext *ctx,
-                                                              MiniAVVideoInfo *format_out) {
-    if (!ctx || !format_out) {
-        return MINIAV_ERROR_INVALID_ARG;
-    }
-    
-    if (ctx->configured_video_format.width == 0 || 
-        ctx->configured_video_format.height == 0) {
-        return MINIAV_ERROR_NOT_INITIALIZED;
-    }
-    
-    *format_out = ctx->configured_video_format;
-    return MINIAV_SUCCESS;
+static MiniAVResultCode
+pw_get_configured_video_format(MiniAVCameraContext *ctx,
+                               MiniAVVideoInfo *format_out) {
+  if (!ctx || !format_out) {
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+
+  if (ctx->configured_video_format.width == 0 ||
+      ctx->configured_video_format.height == 0) {
+    return MINIAV_ERROR_NOT_INITIALIZED;
+  }
+
+  *format_out = ctx->configured_video_format;
+  return MINIAV_SUCCESS;
 }
 
 static MiniAVResultCode pw_configure(MiniAVCameraContext *ctx,
@@ -1421,7 +1523,7 @@ static MiniAVResultCode pw_start_capture(MiniAVCameraContext *ctx) {
   return MINIAV_SUCCESS;
 }
 
-MiniAVResultCode pw_stop_capture(MiniAVCameraContext *ctx) {
+static MiniAVResultCode pw_stop_capture(MiniAVCameraContext *ctx) {
   if (!ctx || !ctx->platform_ctx)
     return MINIAV_ERROR_NOT_INITIALIZED;
   PipeWirePlatformContext *pw_ctx =
@@ -1432,39 +1534,59 @@ MiniAVResultCode pw_stop_capture(MiniAVCameraContext *ctx) {
                "PW: Capture not running or loop already stopped.");
     return MINIAV_SUCCESS;
   }
+
   miniav_log(MINIAV_LOG_LEVEL_INFO, "PW: Stopping capture.");
+  pw_ctx->is_streaming = false;
 
-  pw_ctx->is_streaming = false; // Signal callbacks to stop processing further
+  if (pw_ctx->loop_running && pw_ctx->loop_thread) {
+    pthread_mutex_lock(&pw_ctx->stop_request.mutex);
 
-  if (pw_ctx->stream) {
-    pw_stream_set_active(pw_ctx->stream, false);
-    pw_stream_disconnect(pw_ctx->stream);
-  }
+    // Only proceed if stop hasn't been requested yet
+    if (!pw_ctx->stop_request.stop_requested) {
+      // Request stop from loop thread
+      pw_ctx->stop_request.stop_requested = true;
+      pw_ctx->stop_request.stop_completed = false;
 
-  if (pw_ctx->loop_running && pw_ctx->loop) {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Signaling PipeWire loop to quit.");
-    if (pw_ctx->wakeup_pipe[1] != -1) {
-      if (write(pw_ctx->wakeup_pipe[1], "q", 1) == -1 && errno != EAGAIN) {
-        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "PW: Failed to write to wakeup pipe: %s", strerror(errno));
+      // Signal the loop thread to process stop request
+      if (pw_ctx->wakeup_pipe[1] != -1) {
+        ssize_t written = write(pw_ctx->wakeup_pipe[1], "s", 1);
+        if (written == -1 && errno != EAGAIN) {
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "PW: Failed to write stop signal to wakeup pipe: %s",
+                     strerror(errno));
+        }
       }
-    } else { // Fallback if pipe is not working
-      pw_main_loop_quit(pw_ctx->loop);
+
+      // Wait for stop to complete with timeout
+      struct timespec timeout;
+      clock_gettime(CLOCK_REALTIME, &timeout);
+      timeout.tv_sec += 5; // 5 second timeout
+
+      while (!pw_ctx->stop_request.stop_completed) {
+        int ret = pthread_cond_timedwait(&pw_ctx->stop_request.cond,
+                                         &pw_ctx->stop_request.mutex, &timeout);
+        if (ret == ETIMEDOUT) {
+          miniav_log(MINIAV_LOG_LEVEL_WARN, "PW: Stop request timed out.");
+          break;
+        }
+      }
     }
-  }
 
-  if (pw_ctx->loop_thread) {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Joining PipeWire loop thread.");
-    pthread_join(pw_ctx->loop_thread, NULL);
-    pw_ctx->loop_thread = 0; // Mark as joined
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: PipeWire loop thread joined.");
-  }
+    pthread_mutex_unlock(&pw_ctx->stop_request.mutex);
 
-  // Clean up stream post-loop
-  if (pw_ctx->stream) {
-    spa_hook_remove(&pw_ctx->stream_listener);
-    pw_stream_destroy(pw_ctx->stream);
-    pw_ctx->stream = NULL;
+    // Join the thread
+    if (pw_ctx->loop_running || pw_ctx->loop_thread != 0) {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: Joining PipeWire loop thread.");
+      pthread_join(pw_ctx->loop_thread, NULL);
+      pw_ctx->loop_thread = 0;
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW: PipeWire loop thread joined.");
+    }
+
+    // Reset stop request state for next time
+    pthread_mutex_lock(&pw_ctx->stop_request.mutex);
+    pw_ctx->stop_request.stop_requested = false;
+    pw_ctx->stop_request.stop_completed = false;
+    pthread_mutex_unlock(&pw_ctx->stop_request.mutex);
   }
 
   miniav_log(MINIAV_LOG_LEVEL_INFO, "PW: Capture stopped.");
@@ -1579,8 +1701,7 @@ const CameraContextInternalOps g_camera_ops_pipewire = {
     .start_capture = pw_start_capture,
     .stop_capture = pw_stop_capture,
     .release_buffer = pw_release_buffer,
-    .get_configured_video_format = pw_get_configured_video_format
-};
+    .get_configured_video_format = pw_get_configured_video_format};
 
 MiniAVResultCode
 miniav_camera_context_platform_init_linux_pipewire(MiniAVCameraContext *ctx) {

@@ -152,25 +152,28 @@ pw_loopback_destroy_platform(struct MiniAVLoopbackContext *ctx) {
   if (pw_ctx->is_streaming || pw_ctx->loop_running) {
     miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Loopback: Stream or loop running "
                                       "during destroy, attempting to stop.");
-    // Attempt to stop, similar to pw_loopback_stop_capture logic
-    if (pw_ctx->stream) {
-      pw_stream_disconnect(pw_ctx->stream);
-      pw_stream_destroy(pw_ctx->stream);
-      pw_ctx->stream = NULL;
+
+    // Signal the loop to quit (which will clean up the stream)
+    if (pw_ctx->loop_running && pw_ctx->wakeup_pipe[1] != -1) {
+      write(pw_ctx->wakeup_pipe[1], "q", 1); // Signal loop to quit and clean up
+    } else if (pw_ctx->loop) {
+      pw_main_loop_quit(pw_ctx->loop);
     }
-    if (pw_ctx->loop_running && pw_ctx->loop) {
-      if (pw_ctx->wakeup_pipe[1] != -1) {
-        write(pw_ctx->wakeup_pipe[1], "q", 1); // Signal loop to quit
-      } else {
-        pw_main_loop_quit(pw_ctx->loop);
-      }
-    }
+
+    // Wait for thread to finish
     if (pw_ctx->loop_thread) {
       pthread_join(pw_ctx->loop_thread, NULL);
       pw_ctx->loop_thread = 0;
     }
     pw_ctx->is_streaming = false;
     pw_ctx->loop_running = false;
+  }
+
+  // Don't clean up the stream here - let the loop thread handle it
+  if (pw_ctx->stream) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW Loopback: Stream still exists during destroy - should have "
+               "been cleaned by loop thread.");
   }
 
   if (pw_ctx->core) {
@@ -180,10 +183,6 @@ pw_loopback_destroy_platform(struct MiniAVLoopbackContext *ctx) {
   if (pw_ctx->context) {
     pw_context_destroy(pw_ctx->context);
     pw_ctx->context = NULL;
-  }
-  if (pw_ctx->loop) {
-    pw_main_loop_destroy(pw_ctx->loop);
-    pw_ctx->loop = NULL;
   }
 
   if (pw_ctx->wakeup_pipe[0] != -1)
@@ -483,9 +482,10 @@ pw_loopback_start_capture(struct MiniAVLoopbackContext *ctx,
 
   params[0] = spa_format_audio_raw_build(
       &b, SPA_PARAM_EnumFormat,
-      &SPA_AUDIO_INFO_RAW_INIT(.format = spa_fmt,
-                               .channels = pw_ctx->configured_video_format.channels,
-                               .rate = pw_ctx->configured_video_format.sample_rate));
+      &SPA_AUDIO_INFO_RAW_INIT(
+              .format = spa_fmt,
+              .channels = pw_ctx->configured_video_format.channels,
+              .rate = pw_ctx->configured_video_format.sample_rate));
 
   if (pw_stream_connect(
           pw_ctx->stream,
@@ -531,21 +531,13 @@ pw_loopback_stop_capture(struct MiniAVLoopbackContext *ctx) {
   }
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Loopback: Stopping capture.");
 
-  // Disconnect stream first
-  if (pw_ctx->stream) {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "PW Loopback: Disconnecting and destroying stream.");
-    pw_stream_disconnect(pw_ctx->stream); // This should trigger state changes
-    pw_stream_destroy(pw_ctx->stream);    // This will remove it from the loop
-    pw_ctx->stream = NULL;
-  }
-  pw_ctx->is_streaming =
-      false; // Set this regardless, state callback might also do it
+  pw_ctx->is_streaming = false; // Set this early
 
-  // Signal and join loop thread
+  // Signal the loop thread to clean up the stream and quit
   if (pw_ctx->loop_running && pw_ctx->loop) {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "PW Loopback: Signaling PipeWire loop to quit.");
+    miniav_log(
+        MINIAV_LOG_LEVEL_DEBUG,
+        "PW Loopback: Signaling PipeWire loop to quit and clean up stream.");
     if (pw_ctx->wakeup_pipe[1] != -1) {
       if (write(pw_ctx->wakeup_pipe[1], "q", 1) == -1 && errno != EAGAIN) {
         miniav_log(MINIAV_LOG_LEVEL_WARN,
@@ -557,6 +549,7 @@ pw_loopback_stop_capture(struct MiniAVLoopbackContext *ctx) {
     }
   }
 
+  // Wait for the loop thread to finish (it will clean up the stream)
   if (pw_ctx->loop_thread) { // Check if thread was actually created
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW Loopback: Joining PipeWire loop thread.");
@@ -564,6 +557,13 @@ pw_loopback_stop_capture(struct MiniAVLoopbackContext *ctx) {
     pw_ctx->loop_thread = 0; // Mark as joined
   }
   pw_ctx->loop_running = false; // Ensure this is false after join
+
+  // The stream should have been cleaned up by the loop thread
+  if (pw_ctx->stream) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Loopback: Stream still exists after "
+                                      "loop thread cleanup - potential leak.");
+    // Don't clean it up here to avoid "wrong context" errors
+  }
 
   miniav_log(MINIAV_LOG_LEVEL_INFO, "PW Loopback: Capture stopped.");
   return MINIAV_SUCCESS;
@@ -573,13 +573,18 @@ static MiniAVResultCode
 pw_loopback_release_buffer_platform(struct MiniAVLoopbackContext *ctx,
                                     void *native_buffer_payload_resource_ptr) {
   MINIAV_UNUSED(ctx);
-  MINIAV_UNUSED(native_buffer_payload_resource_ptr);
+
+  if (native_buffer_payload_resource_ptr) {
+    // Simply free the heap-allocated MiniAVBuffer structure
+    miniav_free(native_buffer_payload_resource_ptr);
+  }
+
   return MINIAV_SUCCESS;
 }
 
 static MiniAVResultCode
 pw_loopback_get_configured_video_format(struct MiniAVLoopbackContext *ctx,
-                                  MiniAVAudioInfo *format_out) {
+                                        MiniAVAudioInfo *format_out) {
   PipeWireLoopbackPlatformContext *pw_ctx =
       (PipeWireLoopbackPlatformContext *)ctx->platform_ctx;
   if (!pw_ctx->is_configured)
@@ -643,8 +648,23 @@ static void on_loopback_wakeup_pipe_event(void *data, int fd, uint32_t mask) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Loopback: Wakeup pipe read: %s",
                buf);
     if (strchr(buf, 'q')) { // Check if 'q' was in the read data
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Loopback: Quit signal received in "
-                                         "wakeup pipe. Quitting main loop.");
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "PW Loopback: Quit signal received in "
+                 "wakeup pipe. Cleaning up stream and quitting main loop.");
+
+      // Clean up stream in the correct thread context
+      if (pw_ctx->stream) {
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW Loopback: Disconnecting and destroying stream in loop "
+                   "context.");
+        pw_stream_disconnect(pw_ctx->stream);
+        spa_hook_remove(&pw_ctx->stream_listener);
+        pw_stream_destroy(pw_ctx->stream);
+        pw_ctx->stream = NULL;
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW Loopback: Stream cleaned up in loop context.");
+      }
+
       pw_main_loop_quit(pw_ctx->loop);
       return; // Exit once 'q' is processed
     }
@@ -885,10 +905,10 @@ static void on_stream_param_changed(void *data, uint32_t id,
 
 static void on_stream_process(void *data) {
   PipeWireLoopbackPlatformContext *pw_ctx =
-      (PipeWireLoopbackPlatformContext *)data; // Corrected cast
+      (PipeWireLoopbackPlatformContext *)data;
   struct pw_buffer *pw_buf;
 
-  if (!pw_ctx || !pw_ctx->app_callback) // Added null check for pw_ctx
+  if (!pw_ctx || !pw_ctx->app_callback)
     return;
 
   while ((pw_buf = pw_stream_dequeue_buffer(pw_ctx->stream)) != NULL) {
@@ -896,26 +916,30 @@ static void on_stream_process(void *data) {
     struct spa_data *spa_d = &spa_buf->datas[0]; // Assuming single plane audio
 
     if (spa_d->data && spa_d->chunk && spa_d->chunk->size > 0) {
-      MiniAVBuffer miniav_buffer = {0};
-      miniav_buffer.type = MINIAV_BUFFER_TYPE_AUDIO;
-      miniav_buffer.timestamp_us =
-          miniav_get_time_us(); // Or use pw_buf->time if available and relevant
-      miniav_buffer.user_data = pw_ctx->app_user_data;
+      // Allocate the MiniAVBuffer on the heap
+      MiniAVBuffer *buffer =
+          (MiniAVBuffer *)miniav_calloc(1, sizeof(MiniAVBuffer));
+      if (!buffer) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "PW Loopback: Failed to allocate MiniAVBuffer");
+        pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
+        continue;
+      }
 
-      // Populate audio specific data
-      // The format info should ideally come from the negotiated format stored
-      // in pw_ctx
-      miniav_buffer.data.audio.info =
-          pw_ctx->configured_video_format; // Use the format known at configure/start
+      // Initialize the buffer with direct pointer to PipeWire data
+      buffer->type = MINIAV_BUFFER_TYPE_AUDIO;
+      buffer->timestamp_us = miniav_get_time_us();
+      buffer->user_data = pw_ctx->app_user_data;
+      buffer->data_size_bytes = spa_d->chunk->size;
 
-      // If SPA_PARAM_Format changed and updated pw_ctx->configured_video_format, this
-      // will be the negotiated one. Otherwise, it's what we requested.
+      // Point directly to PipeWire's audio data (no copy needed)
+      buffer->data.audio.info = pw_ctx->configured_video_format;
+      buffer->data.audio.data = spa_d->data + spa_d->chunk->offset;
 
-      miniav_buffer.data.audio.data = spa_d->data + spa_d->chunk->offset;
-      miniav_buffer.data_size_bytes = spa_d->chunk->size;
-
-      pw_ctx->app_callback(&miniav_buffer, pw_ctx->app_user_data);
+      pw_ctx->app_callback(buffer, pw_ctx->app_user_data);
     }
+
+    // Return the PipeWire buffer immediately after callback
     pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
   }
 }

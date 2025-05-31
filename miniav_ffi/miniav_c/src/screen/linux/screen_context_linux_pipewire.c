@@ -738,124 +738,6 @@ pw_screen_init_platform(struct MiniAVScreenContext *ctx) {
 }
 
 static MiniAVResultCode
-pw_screen_destroy_platform(struct MiniAVScreenContext *ctx) {
-  PipeWireScreenPlatformContext *pctx =
-      (PipeWireScreenPlatformContext *)ctx->platform_ctx;
-  if (!pctx)
-    return MINIAV_SUCCESS;
-
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: Destroying platform context.");
-
-  if (pctx->cancellable) {
-    g_cancellable_cancel(pctx->cancellable); // Cancel any pending D-Bus calls
-    g_object_unref(pctx->cancellable);
-    pctx->cancellable = NULL;
-  }
-
-  // Ensure capture is stopped (also handles loop thread join)
-  if (pctx->video_stream)
-    pw_stream_set_active(pctx->video_stream, false);
-  if (pctx->audio_stream)
-    pw_stream_set_active(pctx->audio_stream, false);
-
-  if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
-    char buf = 'q';
-    ssize_t written = write(pctx->wakeup_pipe[1], &buf, 1);
-    if (written == -1 && errno != EAGAIN) {
-      miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "PW Screen: Failed to write to wakeup pipe in destroy: %s",
-                 strerror(errno));
-    }
-  }
-  if (pctx->loop_thread) {
-    pthread_join(pctx->loop_thread, NULL);
-    pctx->loop_thread = 0;
-  }
-  pctx->loop_running = false;
-
-  // Close portal session if active
-  if (pctx->portal_session_handle_str && pctx->dbus_conn) {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: Closing portal session: %s",
-               pctx->portal_session_handle_str);
-    GError *error = NULL;
-    // Use a new cancellable for this synchronous call or NULL
-    GCancellable *close_cancellable = g_cancellable_new();
-    g_dbus_connection_call_sync(
-        pctx->dbus_conn, XDP_BUS_NAME,
-        pctx->portal_session_handle_str, // Session object path
-        XDP_IFACE_SESSION, "Close",
-        NULL, // parameters
-        NULL, // reply_type
-        G_DBUS_CALL_FLAGS_NONE,
-        5000, // timeout 5s
-        close_cancellable, &error);
-    if (error) {
-      miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "PW Screen: Failed to close portal session %s: %s",
-                 pctx->portal_session_handle_str, error->message);
-      g_error_free(error);
-    }
-    g_object_unref(close_cancellable);
-    g_free(pctx->portal_session_handle_str);
-    pctx->portal_session_handle_str = NULL;
-  }
-  g_free(pctx->current_portal_request_token_str);
-  pctx->current_portal_request_token_str = NULL;
-  g_free(pctx->current_portal_request_object_path_str);
-  pctx->current_portal_request_object_path_str = NULL;
-  if (pctx->current_request_signal_subscription_id > 0 && pctx->dbus_conn) {
-    g_dbus_connection_signal_unsubscribe(
-        pctx->dbus_conn, pctx->current_request_signal_subscription_id);
-    pctx->current_request_signal_subscription_id = 0;
-  }
-  if (pctx->video_stream) {
-    pw_stream_destroy(pctx->video_stream);
-    pctx->video_stream = NULL;
-  }
-  if (pctx->audio_stream) {
-    pw_stream_destroy(pctx->audio_stream);
-    pctx->audio_stream = NULL;
-  }
-
-  if (pctx->core) {
-    pw_core_disconnect(pctx->core);
-    pctx->core = NULL;
-  }
-  if (pctx->context) {
-    pw_context_destroy(pctx->context);
-    pctx->context = NULL;
-  }
-  if (pctx->loop) {
-    pw_main_loop_destroy(pctx->loop);
-    pctx->loop = NULL;
-  }
-
-  if (pctx->wakeup_pipe[0] != -1)
-    close(pctx->wakeup_pipe[0]);
-  if (pctx->wakeup_pipe[1] != -1)
-    close(pctx->wakeup_pipe[1]);
-  pctx->wakeup_pipe[0] = pctx->wakeup_pipe[1] = -1;
-
-  for (int i = 0; i < PW_SCREEN_MAX_BUFFERS; ++i) {
-    if (pctx->video_dmabuf_fds[i] != -1) {
-      // Original FDs are owned by PipeWire, not closed here.
-      // Duplicated FDs are closed by release_buffer.
-      pctx->video_dmabuf_fds[i] = -1;
-    }
-  }
-
-  if (pctx->dbus_conn) {
-    g_object_unref(pctx->dbus_conn);
-    pctx->dbus_conn = NULL;
-  }
-
-  miniav_free(pctx);
-  ctx->platform_ctx = NULL;
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: Platform context destroyed.");
-  return MINIAV_SUCCESS;
-}
-
-static MiniAVResultCode
 pw_screen_get_default_formats(const char *device_id,
                               MiniAVVideoInfo *video_format_out,
                               MiniAVAudioInfo *audio_format_out) {
@@ -1687,6 +1569,7 @@ on_portal_session_closed(GDBusConnection *connection, const gchar *sender_name,
         MINIAV_LOG_LEVEL_WARN,
         "PW Screen: Unexpected parameters type %s in Session Closed signal.",
         ptype);
+    reason = 0;
   }
 
   miniav_log(MINIAV_LOG_LEVEL_INFO,
@@ -1695,22 +1578,24 @@ on_portal_session_closed(GDBusConnection *connection, const gchar *sender_name,
 
   if (pctx->portal_session_handle_str &&
       strcmp(pctx->portal_session_handle_str, object_path) == 0) {
+
+    // Clear the session handle first to prevent double cleanup
     g_free(pctx->portal_session_handle_str);
     pctx->portal_session_handle_str = NULL;
+
+    // Unsubscribe from the session closed signal
     if (pctx->session_closed_signal_subscription_id > 0) {
       g_dbus_connection_signal_unsubscribe(
           connection, pctx->session_closed_signal_subscription_id);
       pctx->session_closed_signal_subscription_id = 0;
     }
+
     if (pctx->parent_ctx->is_running) {
       miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Active capture session "
                                         "closed by portal. Stopping capture.");
       pctx->last_error = MINIAV_ERROR_PORTAL_CLOSED;
-      // Trigger a stop locally. The app might also call stop_capture.
-      if (pctx->video_stream)
-        pw_stream_set_active(pctx->video_stream, false);
-      if (pctx->audio_stream)
-        pw_stream_set_active(pctx->audio_stream, false);
+
+      // Signal the loop thread to stop
       if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
         write(pctx->wakeup_pipe[1], "q", 1);
       }
@@ -2106,98 +1991,72 @@ pw_screen_stop_capture(struct MiniAVScreenContext *ctx) {
                "PW Screen: Cancelling pending D-Bus operations.");
     g_cancellable_cancel(pctx->cancellable);
   }
-  // Reset pending callback info
+
   pctx->app_callback_pending = NULL;
   pctx->app_callback_user_data_pending = NULL;
 
   if (!pctx->loop_running && !pctx->video_stream_active &&
-      !pctx->audio_stream_active && !pctx->parent_ctx->is_running) {
+      !pctx->audio_stream_active) {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
                "PW Screen: Capture not running or already stopped.");
-    // Still ensure portal session is attempted to be closed if handle exists
-    if (pctx->portal_session_handle_str && pctx->dbus_conn) {
-      // Synchronous close attempt, similar to destroy_platform
-      GError *error = NULL;
-      GCancellable *close_cancellable =
-          g_cancellable_new(); // Fresh cancellable for this sync call
-      g_dbus_connection_call_sync(
-          pctx->dbus_conn, XDP_BUS_NAME, pctx->portal_session_handle_str,
-          XDP_IFACE_SESSION, "Close", NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 1000,
-          close_cancellable, &error); // Short timeout
-      if (error) {
-        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "PW Screen: Failed to close portal session during stop (was "
-                   "not running): %s",
-                   error->message);
-        g_error_free(error);
-      }
-      g_object_unref(close_cancellable);
-      g_free(pctx->portal_session_handle_str);
-      pctx->portal_session_handle_str = NULL;
-    }
     return MINIAV_SUCCESS;
   }
 
-  if (pctx->video_stream) {
-    pw_stream_set_active(pctx->video_stream,
-                         false); // Request stream to stop processing
-    pw_stream_disconnect(pctx->video_stream);
-  }
-  if (pctx->audio_stream) {
-    pw_stream_set_active(pctx->audio_stream, false);
-    pw_stream_disconnect(pctx->audio_stream);
-  }
-
-  pctx->video_stream_active = false;
-  pctx->audio_stream_active = false;
-
-  if (pctx->loop_running && pctx->loop) {
+  // Signal the loop thread to clean up streams and quit
+  if (pctx->loop_running && pctx->wakeup_pipe[1] != -1) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW Screen: Signaling PipeWire loop to quit.");
-    if (pctx->wakeup_pipe[1] != -1) {
-      char buf = 'q'; // quit signal
-      if (write(pctx->wakeup_pipe[1], &buf, 1) == -1 && errno != EAGAIN) {
-        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "PW Screen: Failed to write to wakeup pipe: %s",
-                   strerror(errno));
-      }
-    } else {
-      pw_main_loop_quit(pctx->loop); // Fallback if pipe not working
+    char buf = 'q'; // quit signal
+    if (write(pctx->wakeup_pipe[1], &buf, 1) == -1 && errno != EAGAIN) {
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "PW Screen: Failed to write to wakeup pipe: %s",
+                 strerror(errno));
     }
   }
 
-  if (pctx->loop_thread) { // Check if thread was actually created
+  // Wait for the loop thread to finish (it will clean up streams)
+  if (pctx->loop_thread) {
     pthread_join(pctx->loop_thread, NULL);
     pctx->loop_thread = 0;
   }
-  pctx->loop_running = false;
 
-  // Now destroy streams fully
-  if (pctx->video_stream) {
-    pw_stream_destroy(pctx->video_stream);
-    pctx->video_stream = NULL;
+  pctx->loop_running = false;
+  pctx->video_stream_active = false;
+  pctx->audio_stream_active = false;
+
+  // Streams should have been cleaned up by the loop thread
+  if (pctx->video_stream || pctx->audio_stream) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "PW Screen: Streams still exist after loop thread cleanup");
+    // Don't clean them up here to avoid context errors
   }
-  if (pctx->audio_stream) {
-    pw_stream_destroy(pctx->audio_stream);
-    pctx->audio_stream = NULL;
+
+  // Unsubscribe from D-Bus signals before closing session
+  if (pctx->current_request_signal_subscription_id > 0) {
+    g_dbus_connection_signal_unsubscribe(
+        pctx->dbus_conn, pctx->current_request_signal_subscription_id);
+    pctx->current_request_signal_subscription_id = 0;
+  }
+  if (pctx->session_closed_signal_subscription_id > 0) {
+    g_dbus_connection_signal_unsubscribe(
+        pctx->dbus_conn, pctx->session_closed_signal_subscription_id);
+    pctx->session_closed_signal_subscription_id = 0;
   }
 
   // Close portal session
   if (pctx->portal_session_handle_str && pctx->dbus_conn) {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "PW Screen: Closing portal session %s after capture stop.",
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: Closing portal session %s",
                pctx->portal_session_handle_str);
     GError *error = NULL;
     GCancellable *close_cancellable = g_cancellable_new();
     g_dbus_connection_call_sync(
         pctx->dbus_conn, XDP_BUS_NAME, pctx->portal_session_handle_str,
-        XDP_IFACE_SESSION, "Close", NULL, NULL, G_DBUS_CALL_FLAGS_NONE,
-        5000, // 5s timeout
+        XDP_IFACE_SESSION, "Close", NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 5000,
         close_cancellable, &error);
     if (error) {
       miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "PW Screen: Failed to close portal session %s: %s",
-                 pctx->portal_session_handle_str, error->message);
+                 "PW Screen: Failed to close portal session: %s",
+                 error->message);
       g_error_free(error);
     }
     g_object_unref(close_cancellable);
@@ -2205,8 +2064,111 @@ pw_screen_stop_capture(struct MiniAVScreenContext *ctx) {
     pctx->portal_session_handle_str = NULL;
   }
 
+  // Clean up portal request strings
+  if (pctx->current_portal_request_token_str) {
+    g_free(pctx->current_portal_request_token_str);
+    pctx->current_portal_request_token_str = NULL;
+  }
+  if (pctx->current_portal_request_object_path_str) {
+    g_free(pctx->current_portal_request_object_path_str);
+    pctx->current_portal_request_object_path_str = NULL;
+  }
+
   ctx->is_running = false;
   miniav_log(MINIAV_LOG_LEVEL_INFO, "PW Screen: Capture stopped.");
+  return MINIAV_SUCCESS;
+}
+
+static MiniAVResultCode
+pw_screen_destroy_platform(struct MiniAVScreenContext *ctx) {
+  PipeWireScreenPlatformContext *pctx =
+      (PipeWireScreenPlatformContext *)ctx->platform_ctx;
+  if (!pctx)
+    return MINIAV_SUCCESS;
+
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: Destroying platform context.");
+
+  // Stop capture if still running (this will clean up streams properly)
+  if (pctx->loop_running || pctx->video_stream_active ||
+      pctx->audio_stream_active) {
+    pw_screen_stop_capture(ctx);
+  }
+
+  // Clean up D-Bus subscriptions first
+  if (pctx->current_request_signal_subscription_id > 0) {
+    g_dbus_connection_signal_unsubscribe(
+        pctx->dbus_conn, pctx->current_request_signal_subscription_id);
+    pctx->current_request_signal_subscription_id = 0;
+  }
+  if (pctx->session_closed_signal_subscription_id > 0) {
+    g_dbus_connection_signal_unsubscribe(
+        pctx->dbus_conn, pctx->session_closed_signal_subscription_id);
+    pctx->session_closed_signal_subscription_id = 0;
+  }
+
+  // Cancel and cleanup cancellable
+  if (pctx->cancellable) {
+    if (!g_cancellable_is_cancelled(pctx->cancellable)) {
+      g_cancellable_cancel(pctx->cancellable);
+    }
+    g_object_unref(pctx->cancellable);
+    pctx->cancellable = NULL;
+  }
+
+  // Clean up remaining PipeWire objects
+  if (pctx->core) {
+    pw_core_disconnect(pctx->core);
+    pctx->core = NULL;
+  }
+  if (pctx->context) {
+    pw_context_destroy(pctx->context);
+    pctx->context = NULL;
+  }
+
+  // Close wakeup pipe
+  if (pctx->wakeup_pipe[0] != -1) {
+    close(pctx->wakeup_pipe[0]);
+    pctx->wakeup_pipe[0] = -1;
+  }
+  if (pctx->wakeup_pipe[1] != -1) {
+    close(pctx->wakeup_pipe[1]);
+    pctx->wakeup_pipe[1] = -1;
+  }
+
+  // Clean up D-Bus connection last
+  if (pctx->dbus_conn) {
+    g_object_unref(pctx->dbus_conn);
+    pctx->dbus_conn = NULL;
+  }
+
+  // Clean up portal strings
+  if (pctx->portal_session_handle_str) {
+    g_free(pctx->portal_session_handle_str);
+    pctx->portal_session_handle_str = NULL;
+  }
+  if (pctx->current_portal_request_token_str) {
+    g_free(pctx->current_portal_request_token_str);
+    pctx->current_portal_request_token_str = NULL;
+  }
+  if (pctx->current_portal_request_object_path_str) {
+    g_free(pctx->current_portal_request_object_path_str);
+    pctx->current_portal_request_object_path_str = NULL;
+  }
+
+  // Stop the GLib main loop thread
+  if (gloop) {
+    g_main_loop_quit(gloop);
+    if (gloop_thread) {
+      pthread_join(gloop_thread, NULL);
+      gloop_thread = 0;
+    }
+    g_main_loop_unref(gloop);
+    gloop = NULL;
+  }
+
+  miniav_free(pctx);
+  ctx->platform_ctx = NULL;
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: Platform context destroyed.");
   return MINIAV_SUCCESS;
 }
 
@@ -2301,8 +2263,14 @@ pw_screen_release_buffer(struct MiniAVScreenContext *ctx,
     return MINIAV_SUCCESS;
   } else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_AUDIO) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "PW Screen: Releasing audio buffer (no specific native resource "
-               "to free from payload).");
+               "PW Screen: Releasing audio buffer with copied data.");
+
+    // Free the copied audio data
+    if (payload->native_singular_resource_ptr) {
+      miniav_free(payload->native_singular_resource_ptr);
+      payload->native_singular_resource_ptr = NULL;
+    }
+
     if (payload->parent_miniav_buffer_ptr) {
       miniav_free(payload->parent_miniav_buffer_ptr);
       payload->parent_miniav_buffer_ptr = NULL;
@@ -2324,17 +2292,94 @@ pw_screen_release_buffer(struct MiniAVScreenContext *ctx,
 
 // --- PipeWire Thread and Event Handlers ---
 
+static void on_wakeup_pipe_event(void *data, int fd, uint32_t mask) {
+  PipeWireScreenPlatformContext *pctx = (PipeWireScreenPlatformContext *)data;
+  char buf[16];
+  ssize_t len;
+
+  while ((len = read(fd, buf, sizeof(buf) - 1)) > 0) {
+    buf[len] = '\0';
+    for (int i = 0; i < len; i++) {
+      switch (buf[i]) {
+      case 'q': // Quit signal
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "PW Screen: Quit signal received in loop thread");
+
+        // Clean up streams in the correct thread context
+        if (pctx->video_stream) {
+          pw_stream_set_active(pctx->video_stream, false);
+          pw_stream_disconnect(pctx->video_stream);
+          pw_stream_destroy(pctx->video_stream);
+          pctx->video_stream = NULL;
+        }
+        if (pctx->audio_stream) {
+          pw_stream_set_active(pctx->audio_stream, false);
+          pw_stream_disconnect(pctx->audio_stream);
+          pw_stream_destroy(pctx->audio_stream);
+          pctx->audio_stream = NULL;
+        }
+
+        pw_main_loop_quit(pctx->loop);
+        return;
+      case 'e': // Error signal
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: Error signal received");
+        pw_main_loop_quit(pctx->loop);
+        return;
+      case 's': // Stop signal (clean stop)
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG, "PW Screen: Stop signal received");
+        if (pctx->video_stream) {
+          pw_stream_set_active(pctx->video_stream, false);
+        }
+        if (pctx->audio_stream) {
+          pw_stream_set_active(pctx->audio_stream, false);
+        }
+        // Don't quit loop immediately, let streams finish cleanly
+        break;
+      }
+    }
+  }
+
+  if (len == 0) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN, "PW Screen: Wakeup pipe EOF");
+    pw_main_loop_quit(pctx->loop);
+  } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR, "PW Screen: Wakeup pipe read error: %s",
+               strerror(errno));
+    pw_main_loop_quit(pctx->loop);
+  }
+}
+
 static void *pw_screen_loop_thread_func(void *arg) {
   struct MiniAVScreenContext *ctx = (struct MiniAVScreenContext *)arg;
   PipeWireScreenPlatformContext *pctx =
       (PipeWireScreenPlatformContext *)ctx->platform_ctx;
+
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Screen: PipeWire loop thread started.");
   pctx->loop_running = true;
   ctx->is_running = true;
 
+  // Add wakeup pipe to the loop
+  struct pw_loop *loop_ptr = pw_main_loop_get_loop(pctx->loop);
+  struct spa_source *wakeup_source = NULL;
+
+  if (pctx->wakeup_pipe[0] != -1) {
+    wakeup_source = pw_loop_add_io(loop_ptr, pctx->wakeup_pipe[0], SPA_IO_IN,
+                                   false, on_wakeup_pipe_event, pctx);
+    if (!wakeup_source) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "PW Screen: Failed to add wakeup IO source");
+    }
+  }
+
   pw_main_loop_run(pctx->loop); // Blocks here
 
+  if (wakeup_source) {
+    pw_loop_remove_source(loop_ptr, wakeup_source);
+  }
+
+  pctx->loop_running = false;
+  ctx->is_running = false;
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "PW Screen: PipeWire loop thread finished.");
   return NULL;
@@ -3008,38 +3053,60 @@ static void on_audio_stream_process(void *data) {
       goto queue_audio_and_continue;
     }
 
-    MiniAVBuffer miniav_buffer = {0};
-    miniav_buffer.type = MINIAV_BUFFER_TYPE_AUDIO;
-    miniav_buffer.user_data = pctx->parent_ctx->app_callback_user_data;
+    // ALLOCATE AUDIO BUFFER ON HEAP - This was stack allocated!
+    MiniAVBuffer *miniav_buffer =
+        (MiniAVBuffer *)miniav_calloc(1, sizeof(MiniAVBuffer));
+    if (!miniav_buffer) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "PW Screen: Failed to allocate audio MiniAVBuffer");
+      goto queue_audio_and_continue;
+    }
+
+    miniav_buffer->type = MINIAV_BUFFER_TYPE_AUDIO;
+    miniav_buffer->user_data = pctx->parent_ctx->app_callback_user_data;
 
     if ((h = spa_buffer_find_meta_data(spa_buf, SPA_META_Header, sizeof(*h))) &&
         h->pts != SPA_ID_INVALID) {
-      miniav_buffer.timestamp_us = h->pts / 1000; // pts is usually nsec
+      miniav_buffer->timestamp_us = h->pts / 1000; // pts is usually nsec
     } else if (pw_buf->time !=
                SPA_ID_INVALID) { // pw_buf->time is uint64_t nsec
-      miniav_buffer.timestamp_us = pw_buf->time / 1000; // Convert nsec to usec
+      miniav_buffer->timestamp_us = pw_buf->time / 1000; // Convert nsec to usec
     } else {
-      miniav_buffer.timestamp_us = miniav_get_time_us();
+      miniav_buffer->timestamp_us = miniav_get_time_us();
     }
 
-    miniav_buffer.content_type =
+    miniav_buffer->content_type =
         MINIAV_BUFFER_CONTENT_TYPE_CPU; // Audio is always CPU for now
 
     if (pctx->parent_ctx) {
-      miniav_buffer.data.audio.info = pctx->parent_ctx->configured_audio_format;
+      miniav_buffer->data.audio.info =
+          pctx->parent_ctx->configured_audio_format;
     } else {
-      memset(&miniav_buffer.data.audio.info, 0, sizeof(MiniAVAudioInfo));
-      miniav_buffer.data.audio.info.format = MINIAV_AUDIO_FORMAT_UNKNOWN;
+      memset(&miniav_buffer->data.audio.info, 0, sizeof(MiniAVAudioInfo));
+      miniav_buffer->data.audio.info.format = MINIAV_AUDIO_FORMAT_UNKNOWN;
     }
 
-    miniav_buffer.data.audio.data =
-        (uint8_t *)spa_buf->datas[0].data + spa_buf->datas[0].chunk->offset;
-    miniav_buffer.data_size_bytes = spa_buf->datas[0].chunk->size;
+    // For audio, we need to copy the data since it's from PipeWire's buffer
+    uint8_t *audio_data_copy =
+        (uint8_t *)miniav_calloc(1, spa_buf->datas[0].chunk->size);
+    if (!audio_data_copy) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "PW Screen: Failed to allocate audio data copy");
+      miniav_free(miniav_buffer);
+      goto queue_audio_and_continue;
+    }
+
+    memcpy(audio_data_copy,
+           (uint8_t *)spa_buf->datas[0].data + spa_buf->datas[0].chunk->offset,
+           spa_buf->datas[0].chunk->size);
+
+    miniav_buffer->data.audio.data = audio_data_copy;
+    miniav_buffer->data_size_bytes = spa_buf->datas[0].chunk->size;
 
     // Calculate frame_count
     uint32_t bytes_per_sample_times_channels = 0;
     uint32_t bytes_per_sample = 0;
-    switch (miniav_buffer.data.audio.info.format) {
+    switch (miniav_buffer->data.audio.info.format) {
     case MINIAV_AUDIO_FORMAT_U8:
       bytes_per_sample = 1;
       break;
@@ -3055,13 +3122,13 @@ static void on_audio_stream_process(void *data) {
     default:
       break;
     }
-    if (miniav_buffer.data.audio.info.channels > 0 && bytes_per_sample > 0) {
+    if (miniav_buffer->data.audio.info.channels > 0 && bytes_per_sample > 0) {
       bytes_per_sample_times_channels =
-          miniav_buffer.data.audio.info.channels * bytes_per_sample;
-      miniav_buffer.data.audio.frame_count =
-          miniav_buffer.data_size_bytes / bytes_per_sample_times_channels;
+          miniav_buffer->data.audio.info.channels * bytes_per_sample;
+      miniav_buffer->data.audio.frame_count =
+          miniav_buffer->data_size_bytes / bytes_per_sample_times_channels;
     } else {
-      miniav_buffer.data.audio.frame_count = 0;
+      miniav_buffer->data.audio.frame_count = 0;
     }
 
     payload_alloc = (MiniAVNativeBufferInternalPayload *)miniav_calloc(
@@ -3069,25 +3136,35 @@ static void on_audio_stream_process(void *data) {
     if (!payload_alloc) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "PW Screen: Failed to allocate payload for audio buffer.");
+      miniav_free(audio_data_copy);
+      miniav_free(miniav_buffer);
       goto queue_audio_and_continue;
     }
     payload_alloc->handle_type = MINIAV_NATIVE_HANDLE_TYPE_AUDIO;
     payload_alloc->context_owner = pctx->parent_ctx;
     payload_alloc->native_singular_resource_ptr =
-        NULL; // No specific FD for audio
-    miniav_buffer.internal_handle = payload_alloc;
+        audio_data_copy; // Store the copied data
+    payload_alloc->parent_miniav_buffer_ptr =
+        miniav_buffer; // Store pointer to heap buffer
+    miniav_buffer->internal_handle = payload_alloc;
 
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                "PW Screen: Audio frame, size %u, frames %u, ts %" PRIu64 "us",
-               miniav_buffer.data_size_bytes,
-               miniav_buffer.data.audio.frame_count,
-               miniav_buffer.timestamp_us);
-    pctx->parent_ctx->app_callback(&miniav_buffer,
+               miniav_buffer->data_size_bytes,
+               miniav_buffer->data.audio.frame_count,
+               miniav_buffer->timestamp_us);
+    pctx->parent_ctx->app_callback(miniav_buffer,
                                    pctx->parent_ctx->app_callback_user_data);
     payload_alloc = NULL; // Callback owns it now
 
   queue_audio_and_continue:
     if (payload_alloc) { // If we allocated but didn't send to callback
+      if (payload_alloc->native_singular_resource_ptr) {
+        miniav_free(payload_alloc->native_singular_resource_ptr);
+      }
+      if (payload_alloc->parent_miniav_buffer_ptr) {
+        miniav_free(payload_alloc->parent_miniav_buffer_ptr);
+      }
       miniav_free(payload_alloc);
     }
     pw_stream_queue_buffer(pctx->audio_stream, pw_buf);

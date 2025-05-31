@@ -1228,7 +1228,7 @@ pw_get_default_format(const char *device_id,
   MiniAVVideoInfo *formats = NULL;
   uint32_t count = 0;
   MiniAVResultCode res =
-      pipewire_get_supported_formats(device_id, &formats, &count);
+      pw_get_supported_formats(device_id, &formats, &count);
 
   if (res != MINIAV_SUCCESS || count == 0) {
     // Fallback to common format

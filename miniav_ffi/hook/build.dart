@@ -58,13 +58,17 @@ Future<void> runBuild(
     sourceDir: sourceDir,
     generator: generator,
     defines: {},
+    appleArgs: const AppleBuilderArgs(
+      enableArc: false,
+      enableBitcode: false,
+      enableVisibility: true,
+    ),
   );
   await builder.run(
     input: input,
     output: output,
-    logger:
-        Logger('')
-          ..level = Level.ALL
-          ..onRecord.listen((record) => stderr.writeln(record)),
+    logger: Logger('')
+      ..level = Level.ALL
+      ..onRecord.listen((record) => stderr.writeln(record)),
   );
 }

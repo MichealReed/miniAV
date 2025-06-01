@@ -16,12 +16,14 @@ For dart, each run must contain the
 
 ### Platform Support
 
-- [x] Windows
-- [x] Linux  
-- [x] Mac
-- [x] Web
-- [ ] Android (Planned)
-- [ ] iOS (Planned)
+| Module | Windows | Linux | macOS | Web | Android | iOS |
+|--------|---------|-------|-------|-----|---------|-----|
+| **Camera** | ✅ | ✅ | ✅ | ✅ | 🚧 | 🚧 |
+| **Screen Capture** | ✅ | ✅ | ✅ | ✅ | 🚧 | 🚧 |
+| **Audio Input** | ✅ | ✅ | ✅ | ✅ | 🚧 | 🚧 |
+| **Audio Loopback** | ✅ | ✅ | ✅ 15+ | ❌ | ❌ | ❌ |
+
+**Legend:** ✅ Supported • ❌ Not Available • 🚧 Planned
 
 ### Installation
 
@@ -288,7 +290,7 @@ try {
 
 - **Windows**: Media Foundation, DirectX 11, WASAPI
 - **macOS**: AVFoundation, Core Graphics, Core Audio
-- **Linux**: PipeWire (preferred), V4L2, ALSA/PulseAudio
+- **Linux**: PipeWire
 
 ### Build Dependencies
 

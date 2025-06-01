@@ -130,7 +130,6 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
     }
 }
 
-// **ADD: Audio processing method**
 - (void)processAudioBuffer:(CMSampleBufferRef)sampleBuffer {
     if (!_cgCtx->parent_ctx->capture_audio_requested) {
         return; // Audio not requested
@@ -238,7 +237,6 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
 }
 
 - (void)processVideoFrame:(CVImageBufferRef)imageBuffer withTimestamp:(CMTime)timestamp {
-    // ALLOCATE BUFFER ON HEAP - crucial for consistency with WGC
     MiniAVBuffer* buffer = (MiniAVBuffer*)miniav_calloc(1, sizeof(MiniAVBuffer));
     if (!buffer) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "SCK: Failed to allocate MiniAVBuffer");
@@ -288,6 +286,7 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
                     buffer->data.video.planes[0].stride_bytes = 0;
                     buffer->data.video.planes[0].offset_bytes = 0;
                     buffer->data.video.planes[0].subresource_index = 0;
+                    buffer->data_size_bytes = [texture width] * [texture height] * 4;
                     
                     gpu_path_successful = true;
                     miniav_log(MINIAV_LOG_LEVEL_DEBUG, "SCK: GPU Path - Metal texture created from IOSurface.");
@@ -323,6 +322,7 @@ static MiniAVPixelFormat CGBitmapInfoToMiniAVPixelFormat(CGBitmapInfo bitmapInfo
         buffer->data.video.planes[0].stride_bytes = (uint32_t)CVPixelBufferGetBytesPerRow(imageBuffer);
         buffer->data.video.planes[0].offset_bytes = 0;
         buffer->data.video.planes[0].subresource_index = 0;
+        buffer->data_size_bytes = CVPixelBufferGetDataSize(imageBuffer);
         
         CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
     }

@@ -417,6 +417,7 @@ static void legacy_capture_timer_callback(void* info) {
     buffer->data.video.planes[0].stride_bytes = (uint32_t)bytesPerRow;
     buffer->data.video.planes[0].offset_bytes = 0;
     buffer->data.video.planes[0].subresource_index = 0;
+    buffer->data_size_bytes = (uint32_t)(bytesPerRow * height);
     
     buffer->user_data = cgCtx->app_callback_user_data_internal;
     

@@ -1125,19 +1125,23 @@ final class MiniAVLoopbackContext extends ffi.Opaque {}
 typedef MiniAVLoopbackContextHandle = ffi.Pointer<MiniAVLoopbackContext>;
 
 enum MiniAVLogLevel {
-  MINIAV_LOG_LEVEL_DEBUG(0),
-  MINIAV_LOG_LEVEL_INFO(1),
-  MINIAV_LOG_LEVEL_WARN(2),
-  MINIAV_LOG_LEVEL_ERROR(3);
+  MINIAV_LOG_LEVEL_TRACE(0),
+  MINIAV_LOG_LEVEL_DEBUG(1),
+  MINIAV_LOG_LEVEL_INFO(2),
+  MINIAV_LOG_LEVEL_WARN(3),
+  MINIAV_LOG_LEVEL_ERROR(4),
+  MINIAV_LOG_LEVEL_NONE(5);
 
   final int value;
   const MiniAVLogLevel(this.value);
 
   static MiniAVLogLevel fromValue(int value) => switch (value) {
-        0 => MINIAV_LOG_LEVEL_DEBUG,
-        1 => MINIAV_LOG_LEVEL_INFO,
-        2 => MINIAV_LOG_LEVEL_WARN,
-        3 => MINIAV_LOG_LEVEL_ERROR,
+        0 => MINIAV_LOG_LEVEL_TRACE,
+        1 => MINIAV_LOG_LEVEL_DEBUG,
+        2 => MINIAV_LOG_LEVEL_INFO,
+        3 => MINIAV_LOG_LEVEL_WARN,
+        4 => MINIAV_LOG_LEVEL_ERROR,
+        5 => MINIAV_LOG_LEVEL_NONE,
         _ => throw ArgumentError('Unknown value for MiniAVLogLevel: $value'),
       };
 }

@@ -55,7 +55,7 @@ enum MiniAVBufferContentType {
   gpuDmabufFd,
 }
 
-enum MiniAVLogLevel { debug, info, warn, error }
+enum MiniAVLogLevel { none, trace, debug, info, warn, error }
 
 class MiniAVDeviceInfo {
   final String deviceId;
@@ -152,5 +152,7 @@ class MiniAVAudioBuffer {
   });
 }
 
-typedef ScreenFormatDefaults =
-    (MiniAVVideoInfo videoFormat, MiniAVAudioInfo? audioFormat);
+typedef ScreenFormatDefaults = (
+  MiniAVVideoInfo videoFormat,
+  MiniAVAudioInfo? audioFormat,
+);

@@ -166,10 +166,12 @@ typedef struct MiniAVLoopbackContext *MiniAVLoopbackContextHandle;
 
 // --- Logging ---
 typedef enum {
-  MINIAV_LOG_LEVEL_DEBUG = 0,
+  MINIAV_LOG_LEVEL_TRACE = 0,
+  MINIAV_LOG_LEVEL_DEBUG,
   MINIAV_LOG_LEVEL_INFO,
   MINIAV_LOG_LEVEL_WARN,
-  MINIAV_LOG_LEVEL_ERROR
+  MINIAV_LOG_LEVEL_ERROR,
+  MINIAV_LOG_LEVEL_NONE
 } MiniAVLogLevel;
 
 typedef void (*MiniAVLogCallback)(MiniAVLogLevel level, const char *message,

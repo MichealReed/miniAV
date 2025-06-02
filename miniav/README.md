@@ -2,6 +2,8 @@
 
 A Flutter library for cross-platform audio and video capture with high-performance buffer management and GPU integration support.
 
+Try it out at [miniav.practicalxr.com](https://miniav.practicalxr.com)!
+
 ## Three Things to Know
 
 1. Native assets compilation can take time, especially on first build. Run with -v to see build progress and errors.
@@ -25,6 +27,12 @@ For dart, each run must contain the
 
 **Legend:** ✅ Supported • ❌ Not Available • 🚧 Planned
 
+### (Maybe) Planned Features
+
+- **Android/iOS**: Full support on mobile platforms
+- **GPU Interop**: Helpers to easily manage handles and shared fences for GPU processing
+- **Permission Management**: Simplified APIs for handling platform-specific permissions
+
 ### Installation
 
 Add the following to your `pubspec.yaml`:
@@ -43,7 +51,8 @@ dart pub get
 ## Getting Started
 
 ```console
- git clone https://github.com/yourusername/miniav.git
+ git clone https://github.com/practicalxr/miniav.git
+ cd miniav_ffi
  dart --enable-experiment=native-assets test
 
  dart:
@@ -304,7 +313,7 @@ try {
 
 **No devices found**: Check permissions and platform-specific requirements
 
-**Frame drops**: Ensure timely buffer release and avoid blocking operations in callbacks
+**Frame drops or freezes**: Ensure timely buffer release and avoid blocking operations in callbacks
 
 **Build failures**: Verify CMake version and platform dependencies are installed
 

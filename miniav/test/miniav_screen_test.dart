@@ -2,6 +2,7 @@ import 'package:miniav/miniav.dart';
 import 'package:test/test.dart';
 
 void main() {
+  MiniAV.setLogLevel(MiniAVLogLevel.none);
   group('MiniScreen Tests', () {
     group('Static Methods', () {
       test('should enumerate available display devices', () async {
@@ -378,6 +379,15 @@ void main() {
             display2Formats.$1,
           );
           final configuredFormats2 = await context.getConfiguredFormats();
+
+          print(
+            'Configured Display 1: ${displays[0].name} - '
+            'Resolution: ${configuredFormats1.$1.width}x${configuredFormats1.$1.height}',
+          );
+          print(
+            'Configured Display 2: ${displays[1].name} - '
+            'Resolution: ${configuredFormats2.$1.width}x${configuredFormats2.$1.height}',
+          );
 
           expect(configuredFormats1.$1.width, equals(display1Formats.$1.width));
           expect(configuredFormats2.$1.width, equals(display2Formats.$1.width));

@@ -4,6 +4,7 @@ import 'package:miniav/miniav.dart';
 import 'package:test/test.dart';
 
 void main() {
+  MiniAV.setLogLevel(MiniAVLogLevel.none);
   group('MiniAV Core Tests', () {
     group('Library Information', () {
       test('should return version string', () {

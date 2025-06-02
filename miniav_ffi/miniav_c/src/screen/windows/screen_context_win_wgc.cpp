@@ -255,16 +255,37 @@ wgc_get_default_formats(const char *device_id_utf8,
       MINIAV_OUTPUT_PREFERENCE_GPU; // Default preference
 
   if (target_type == WGC_TARGET_DISPLAY) {
-    MONITORINFOEXW mi;
-    mi.cbSize = sizeof(mi);
-    if (GetMonitorInfoW(hmonitor, &mi)) {
-      video_format_out->width = mi.rcMonitor.right - mi.rcMonitor.left;
-      video_format_out->height = mi.rcMonitor.bottom - mi.rcMonitor.top;
-    } else {
-      miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "WGC GetDefaultFormats: GetMonitorInfoW failed for %s",
-                 device_id_utf8);
-      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+    MONITORINFOEXW mi = {0};
+    mi.cbSize = sizeof(MONITORINFOEXW);
+
+    if (GetMonitorInfoW(hmonitor, (LPMONITORINFO)&mi)) {
+      // Get the device name
+      char device_name_utf8[256];
+      WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, device_name_utf8,
+                          sizeof(device_name_utf8), NULL, NULL);
+
+      // Use EnumDisplaySettings to get the ACTUAL resolution
+      DEVMODEW dev_mode = {0};
+      dev_mode.dmSize = sizeof(DEVMODEW);
+
+      if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dev_mode)) {
+        // Use the actual display resolution, not the virtual desktop
+        // coordinates
+        video_format_out->width = dev_mode.dmPelsWidth;
+        video_format_out->height = dev_mode.dmPelsHeight;
+
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "WGC GetDefaultFormats: Device %s - Virtual coords: "
+                   "(%ld,%ld,%ld,%ld) = %ldx%ld",
+                   device_name_utf8, mi.rcMonitor.left, mi.rcMonitor.top,
+                   mi.rcMonitor.right, mi.rcMonitor.bottom,
+                   mi.rcMonitor.right - mi.rcMonitor.left,
+                   mi.rcMonitor.bottom - mi.rcMonitor.top);
+        miniav_log(
+            MINIAV_LOG_LEVEL_DEBUG,
+            "WGC GetDefaultFormats: Device %s - Actual resolution: %lux%lu",
+            device_name_utf8, dev_mode.dmPelsWidth, dev_mode.dmPelsHeight);
+      }
     }
   } else { // WGC_TARGET_WINDOW
     RECT rc;
@@ -1615,10 +1636,10 @@ static void wgc_on_frame_arrived(
           0; // GPU textures don't have stride
       buffer->data.video.planes[0].offset_bytes = 0;
       buffer->data.video.planes[0].subresource_index = 0;
-      //calculate data size based on width, height, and pixel format
-      buffer->data_size_bytes =  (buffer->data.video.info.width *
-                                      buffer->data.video.info.height *
-                                      4); // BGRA32 = 4 bytes per pixel
+      // calculate data size based on width, height, and pixel format
+      buffer->data_size_bytes =
+          (buffer->data.video.info.width * buffer->data.video.info.height *
+           4); // BGRA32 = 4 bytes per pixel
     }
 
     // --- Prepare Payloads and Call App ---

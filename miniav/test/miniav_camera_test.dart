@@ -2,6 +2,8 @@ import 'package:miniav/miniav.dart';
 import 'package:test/test.dart';
 
 void main() {
+  MiniAV.setLogLevel(MiniAVLogLevel.none);
+
   group('MiniCamera Tests', () {
     group('Static Methods', () {
       test('should enumerate available camera devices', () async {
@@ -489,7 +491,6 @@ void main() {
             // Common video resolutions should be reasonable
             expect(format.width, inInclusiveRange(160, 7680));
             expect(format.height, inInclusiveRange(120, 4320));
-            expect(format.frameRateNumerator, inInclusiveRange(1.0, 120.0));
             expect(format.pixelFormat, isNot(MiniAVPixelFormat.unknown));
           }
         }

@@ -77,7 +77,7 @@ class MiniFFIScreenPlatform implements MiniScreenPlatformInterface {
 
     try {
       final result = bindings.MiniAV_Screen_GetDefaultFormats(
-        displayIdPtr.cast(),
+        displayIdPtr.cast<ffi.Char>(),
         videoFormatOutPtr,
         audioFormatOutPtr,
       );
@@ -88,15 +88,13 @@ class MiniFFIScreenPlatform implements MiniScreenPlatformInterface {
         );
       }
 
-      final videoFormat =
-          VideoFormatInfoFFIToPlatform.fromNative(
-            videoFormatOutPtr.ref,
-          ).toPlatformType();
+      final videoFormat = VideoFormatInfoFFIToPlatform.fromNative(
+        videoFormatOutPtr.ref,
+      ).toPlatformType();
       // Audio might not be supported or returned, check for zeroed struct or specific values if needed
-      final audioFormat =
-          AudioInfoFFIToPlatform.fromNative(
-            audioFormatOutPtr.ref,
-          ).toPlatformType();
+      final audioFormat = AudioInfoFFIToPlatform.fromNative(
+        audioFormatOutPtr.ref,
+      ).toPlatformType();
 
       // Determine if audioFormat is valid (e.g. sampleRate > 0 or format != UNKNOWN)
       // For simplicity, we'll assume if C API returns success, audioFormat might be valid or zeroed.
@@ -128,10 +126,34 @@ class MiniFFIScreenPlatform implements MiniScreenPlatformInterface {
 }
 
 class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
-  final bindings.MiniAVScreenContextHandle _context;
+  bindings.MiniAVScreenContextHandle? _context;
   ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>? _callbackHandle;
+  bool _isDestroyed = false;
+  late final Finalizer<bindings.MiniAVScreenContextHandle> _finalizer;
 
-  MiniFFIScreenContext(this._context);
+  MiniFFIScreenContext(bindings.MiniAVScreenContextHandle context)
+    : _context = context {
+    // Auto-cleanup if destroy() is never called
+    _finalizer = Finalizer<bindings.MiniAVScreenContextHandle>((handle) {
+      print(
+        'Warning: ScreenContext was garbage collected without calling destroy()',
+      );
+      bindings.MiniAV_Screen_DestroyContext(handle);
+    });
+    _finalizer.attach(this, context, detach: this);
+  }
+
+  /// Throws if the context has been destroyed
+  void _ensureNotDestroyed() {
+    if (_isDestroyed || _context == null) {
+      throw StateError(
+        'ScreenContext has been destroyed. Create a new context to continue using screen capture.',
+      );
+    }
+  }
+
+  /// Whether this context has been destroyed
+  bool get isDestroyed => _isDestroyed;
 
   @override
   Future<void> configureDisplay(
@@ -139,14 +161,16 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
     MiniAVVideoInfo format, {
     bool captureAudio = false,
   }) async {
+    _ensureNotDestroyed();
+
     final displayIdPtr = displayId.toNativeUtf8();
     final nativeFormatPtr = calloc<bindings.MiniAVVideoInfo>();
     try {
       VideoFormatInfoFFIToPlatform.copyToNative(format, nativeFormatPtr.ref);
       final result = bindings.MiniAV_Screen_ConfigureDisplay(
-        _context,
+        _context!,
         displayIdPtr.cast(),
-        nativeFormatPtr, // Pass the pointer directly
+        nativeFormatPtr,
         captureAudio,
       );
       if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
@@ -164,17 +188,16 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
     MiniAVVideoInfo format, {
     bool captureAudio = false,
   }) async {
+    _ensureNotDestroyed();
+
     final windowIdPtr = windowId.toNativeUtf8();
-    final nativeFormatPtr = calloc<bindings.MiniAVVideoInfo>(); // Correct type
+    final nativeFormatPtr = calloc<bindings.MiniAVVideoInfo>();
     try {
-      VideoFormatInfoFFIToPlatform.copyToNative(
-        format,
-        nativeFormatPtr.ref,
-      ); // Use Video helper
+      VideoFormatInfoFFIToPlatform.copyToNative(format, nativeFormatPtr.ref);
       final result = bindings.MiniAV_Screen_ConfigureWindow(
-        _context,
+        _context!,
         windowIdPtr.cast(),
-        nativeFormatPtr, // Pass the pointer directly
+        nativeFormatPtr,
         captureAudio,
       );
       if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
@@ -188,11 +211,13 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
 
   @override
   Future<ScreenFormatDefaults> getConfiguredFormats() async {
+    _ensureNotDestroyed();
+
     final videoFormatOutPtr = calloc<bindings.MiniAVVideoInfo>();
     final audioFormatOutPtr = calloc<bindings.MiniAVAudioInfo>();
     try {
       final result = bindings.MiniAV_Screen_GetConfiguredFormats(
-        _context.cast(),
+        _context!.cast(),
         videoFormatOutPtr,
         audioFormatOutPtr,
       );
@@ -201,14 +226,12 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
           'Failed to get configured screen formats: ${result.name}',
         );
       }
-      final videoFormat =
-          VideoFormatInfoFFIToPlatform.fromNative(
-            videoFormatOutPtr.ref,
-          ).toPlatformType();
-      final audioFormat =
-          AudioInfoFFIToPlatform.fromNative(
-            audioFormatOutPtr.ref,
-          ).toPlatformType();
+      final videoFormat = VideoFormatInfoFFIToPlatform.fromNative(
+        videoFormatOutPtr.ref,
+      ).toPlatformType();
+      final audioFormat = AudioInfoFFIToPlatform.fromNative(
+        audioFormatOutPtr.ref,
+      ).toPlatformType();
 
       final bool isAudioFormatValid =
           audioFormat.sampleRate > 0 && audioFormat.channels > 0;
@@ -225,60 +248,98 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
     void Function(MiniAVBuffer buffer, Object? userData) onFrame, {
     Object? userData,
   }) async {
+    _ensureNotDestroyed();
+
     await stopCapture(); // Ensure any previous capture is stopped
 
     void ffiCallback(
-      ffi.Pointer<bindings.MiniAVBuffer> bufferPtr, // Renamed for clarity
+      ffi.Pointer<bindings.MiniAVBuffer> bufferPtr,
       ffi.Pointer<ffi.Void> cbUserData,
     ) {
+      // Check if context was destroyed during callback
+      if (_isDestroyed) {
+        return; // Silently ignore if destroyed
+      }
+
       // Important: Check if bufferPtr is not null before dereferencing
       if (bufferPtr == ffi.nullptr) {
-        // Log error or handle appropriately
         print("FFI Callback received null buffer pointer");
         return;
       }
+
       final platformBuffer = MiniAVBufferFFI.fromPointer(bufferPtr);
-      onFrame(platformBuffer, userData); // Pass the Dart userData
+      try {
+        onFrame(platformBuffer, userData);
+      } catch (e, s) {
+        print('Error in screen capture user callback: $e\n$s');
+      }
     }
 
-    _callbackHandle = ffi.NativeCallable<
-      bindings.MiniAVBufferCallbackFunction
-    >.listener(
-      ffiCallback,
-      // exceptionalReturn: null, // Consider if you need an exceptional return value
-    );
+    _callbackHandle =
+        ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>.listener(
+          ffiCallback,
+        );
 
     final result = bindings.MiniAV_Screen_StartCapture(
-      _context,
+      _context!,
       _callbackHandle!.nativeFunction,
-      ffi.nullptr, // Passing Dart userData via closure, C API gets nullptr
+      ffi.nullptr,
     );
 
     if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
-      _callbackHandle?.close();
-      _callbackHandle = null;
+      await _cleanupCallback();
       throw Exception('Failed to start screen capture: ${result.name}');
     }
   }
 
-  @override
-  Future<void> stopCapture() async {
-    final result = bindings.MiniAV_Screen_StopCapture(_context);
+  Future<void> _cleanupCallback() async {
     _callbackHandle?.close();
     _callbackHandle = null;
+  }
+
+  @override
+  Future<void> stopCapture() async {
+    // Don't throw if context is destroyed - just clean up Dart resources
+    if (_isDestroyed || _context == null) {
+      await _cleanupCallback();
+      return;
+    }
+
+    // Don't throw if already stopped - this is idempotent
+    if (_callbackHandle == null) {
+      return; // Already stopped
+    }
+
+    final result = bindings.MiniAV_Screen_StopCapture(_context!);
+
+    await _cleanupCallback();
+
+    // Only warn on unexpected errors, not "already stopped" errors
     if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS &&
         result != bindings.MiniAVResultCode.MINIAV_ERROR_NOT_RUNNING) {
-      // MINIAV_ERROR_NOT_RUNNING might be an acceptable result if stop is called multiple times
-      throw Exception('Failed to stop screen capture: ${result.name}');
+      print('Warning: MiniAV_Screen_StopCapture failed: ${result.name}');
     }
   }
 
   @override
   Future<void> destroy() async {
-    await stopCapture(); // Ensure capture is stopped before destroying
-    final result = bindings.MiniAV_Screen_DestroyContext(_context);
-    if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
-      throw Exception('Failed to destroy screen context: ${result.name}');
+    // Idempotent - can be called multiple times safely
+    if (_isDestroyed) {
+      return; // Already destroyed
+    }
+
+    _isDestroyed = true; // Mark as destroyed first to prevent new operations
+
+    await stopCapture(); // Stop capture if running
+
+    if (_context != null) {
+      _finalizer.detach(this); // Prevent finalizer from running
+      final result = bindings.MiniAV_Screen_DestroyContext(_context!);
+      _context = null; // Clear the handle
+
+      if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+        throw Exception('Failed to destroy screen context: ${result.name}');
+      }
     }
   }
 }

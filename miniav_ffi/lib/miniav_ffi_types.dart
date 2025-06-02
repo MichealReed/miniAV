@@ -23,8 +23,6 @@ String _charArrayToUtf8String(ffi.Array<ffi.Char> charArray, int maxLength) {
     // Decode the list of UTF-8 bytes into a Dart string.
     return utf8.decode(bytes, allowMalformed: false);
   } catch (e) {
-    // Optional: Handle decoding errors, e.g., log and return a placeholder or allow malformed.
-    // print("UTF-8 decoding error: $e. Raw bytes: $bytes");
     return utf8.decode(bytes, allowMalformed: true);
   }
 }
@@ -82,11 +80,10 @@ class VideoFormatInfo {
     return VideoFormatInfo(
       width: nativeInfo.width,
       height: nativeInfo.height,
-      pixelFormat: nativeInfo.pixel_format, // Uses the getter from bindings
+      pixelFormat: nativeInfo.pixel_format,
       frameRateNumerator: nativeInfo.frame_rate_numerator,
       frameRateDenominator: nativeInfo.frame_rate_denominator,
-      outputPreference:
-          nativeInfo.output_preference, // Uses the getter from bindings
+      outputPreference: nativeInfo.output_preference,
     );
   }
 
@@ -245,12 +242,14 @@ extension VideoFormatInfoFFIToPlatform on VideoFormatInfo {
   ) {
     native.width = info.width;
     native.height = info.height;
-    native.pixel_formatAsInt =
-        MiniAVPixelFormatX.fromPlatformType(info.pixelFormat).value;
+    native.pixel_formatAsInt = MiniAVPixelFormatX.fromPlatformType(
+      info.pixelFormat,
+    ).value;
     native.frame_rate_numerator = info.frameRateNumerator;
     native.frame_rate_denominator = info.frameRateDenominator;
-    native.output_preferenceAsInt =
-        MiniAVOutputPreferenceX.fromPlatformType(info.outputPreference).value;
+    native.output_preferenceAsInt = MiniAVOutputPreferenceX.fromPlatformType(
+      info.outputPreference,
+    ).value;
   }
 }
 

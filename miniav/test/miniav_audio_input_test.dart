@@ -2,6 +2,8 @@ import 'package:miniav/miniav.dart';
 import 'package:test/test.dart';
 
 void main() {
+  MiniAV.setLogLevel(MiniAVLogLevel.none);
+
   group('MiniAudioInput Tests', () {
     group('Static Methods', () {
       test('should enumerate available audio input devices', () async {

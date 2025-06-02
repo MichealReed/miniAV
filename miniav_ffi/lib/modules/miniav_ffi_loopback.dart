@@ -93,13 +93,39 @@ class MiniAVFFILoopbackPlatform extends MiniLoopbackPlatformInterface {
 /// FFI implementation of [MiniLoopbackContextPlatformInterface].
 class MiniAVFFILoopbackContextPlatform
     extends MiniLoopbackContextPlatformInterface {
-  final bindings.MiniAVLoopbackContextHandle _contextHandle;
+  bindings.MiniAVLoopbackContextHandle? _contextHandle;
   ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>? _callbackHandle;
+  bool _isDestroyed = false;
+  late final Finalizer<bindings.MiniAVLoopbackContextHandle> _finalizer;
 
-  MiniAVFFILoopbackContextPlatform(this._contextHandle);
+  MiniAVFFILoopbackContextPlatform(bindings.MiniAVLoopbackContextHandle handle)
+    : _contextHandle = handle {
+    // Auto-cleanup if destroy() is never called
+    _finalizer = Finalizer<bindings.MiniAVLoopbackContextHandle>((handle) {
+      print(
+        'Warning: LoopbackContext was garbage collected without calling destroy()',
+      );
+      bindings.MiniAV_Loopback_DestroyContext(handle);
+    });
+    _finalizer.attach(this, handle, detach: this);
+  }
+
+  /// Throws if the context has been destroyed
+  void _ensureNotDestroyed() {
+    if (_isDestroyed || _contextHandle == null) {
+      throw StateError(
+        'LoopbackContext has been destroyed. Create a new context to continue using loopback.',
+      );
+    }
+  }
+
+  /// Whether this context has been destroyed
+  bool get isDestroyed => _isDestroyed;
 
   @override
   Future<void> configure(String deviceId, MiniAVAudioInfo format) async {
+    _ensureNotDestroyed();
+
     final deviceIdPtr = deviceId.toNativeUtf8();
     final formatCPtr = calloc<bindings.MiniAVAudioInfo>();
 
@@ -107,7 +133,7 @@ class MiniAVFFILoopbackContextPlatform
       AudioInfoFFIToPlatform.copyToNative(format, formatCPtr.ref);
 
       final res = bindings.MiniAV_Loopback_Configure(
-        _contextHandle,
+        _contextHandle!,
         deviceIdPtr.cast<ffi.Char>(),
         formatCPtr,
       );
@@ -125,10 +151,12 @@ class MiniAVFFILoopbackContextPlatform
 
   @override
   Future<MiniAVAudioInfo> getConfiguredFormat() async {
+    _ensureNotDestroyed();
+
     final formatOutPtr = calloc<bindings.MiniAVAudioInfo>();
     try {
       final res = bindings.MiniAV_Loopback_GetConfiguredFormat(
-        _contextHandle,
+        _contextHandle!,
         formatOutPtr,
       );
       if (res != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
@@ -149,22 +177,25 @@ class MiniAVFFILoopbackContextPlatform
     void Function(MiniAVBuffer buffer, Object? userData) onData, {
     Object? userData,
   }) async {
+    _ensureNotDestroyed();
+
     await stopCapture(); // Clean up any previous callback
 
     void ffiCallback(
       ffi.Pointer<bindings.MiniAVBuffer> buffer,
-      ffi.Pointer<ffi.Void> cbUserData, // This will be ffi.nullptr from C
+      ffi.Pointer<ffi.Void> cbUserData,
     ) {
+      // Check if context was destroyed during callback
+      if (_isDestroyed) {
+        return; // Silently ignore if destroyed
+      }
+
       final platformBuffer = MiniAVBufferFFI.fromPointer(buffer);
       try {
         onData(platformBuffer, userData);
       } catch (e, s) {
         print('Error in loopback user callback: $e\n$s');
       }
-      // If MiniAV_ReleaseBuffer is needed and buffer.ref.internal_handle is valid:
-      // if (buffer.ref.internal_handle != ffi.nullptr) {
-      //   _bindings.MiniAV_ReleaseBuffer(buffer.ref.internal_handle);
-      // }
     }
 
     _callbackHandle =
@@ -173,44 +204,65 @@ class MiniAVFFILoopbackContextPlatform
         );
 
     final res = bindings.MiniAV_Loopback_StartCapture(
-      _contextHandle,
+      _contextHandle!,
       _callbackHandle!.nativeFunction,
-      ffi.nullptr, // User data for C callback; Dart closure handles state
+      ffi.nullptr,
     );
 
     if (res != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
-      _callbackHandle?.close();
-      _callbackHandle = null;
+      await _cleanupCallback();
       throw Exception('Failed to start loopback capture: ${res.name}');
     }
   }
 
-  @override
-  Future<void> stopCapture() async {
-    // Only stop if context and callback were potentially active
-    if (_callbackHandle == null) {
-      return Future.value();
-    }
-    final res = bindings.MiniAV_Loopback_StopCapture(_contextHandle);
-
+  Future<void> _cleanupCallback() async {
     _callbackHandle?.close();
     _callbackHandle = null;
+  }
 
-    // MINIAV_ERROR_NOT_RUNNING is an acceptable "failure" if already stopped.
+  @override
+  Future<void> stopCapture() async {
+    // Don't throw if context is destroyed - just clean up Dart resources
+    if (_isDestroyed || _contextHandle == null) {
+      await _cleanupCallback();
+      return;
+    }
+
+    // Don't throw if already stopped - this is idempotent
+    if (_callbackHandle == null) {
+      return; // Already stopped
+    }
+
+    final res = bindings.MiniAV_Loopback_StopCapture(_contextHandle!);
+
+    await _cleanupCallback();
+
+    // Only warn on unexpected errors, not "already stopped" errors
     if (res != bindings.MiniAVResultCode.MINIAV_SUCCESS &&
         res != bindings.MiniAVResultCode.MINIAV_ERROR_NOT_RUNNING) {
-      // Log or throw based on strictness. Camera example throws.
       print('Warning: MiniAV_Loopback_StopCapture failed: ${res.name}');
-      // throw Exception('Failed to stop loopback capture: ${res.name}');
     }
   }
 
   @override
   Future<void> destroy() async {
-    await stopCapture(); // Ensures callback is closed
-    final res = bindings.MiniAV_Loopback_DestroyContext(_contextHandle);
-    if (res != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
-      throw Exception('Failed to destroy loopback context: ${res.name}');
+    // Idempotent - can be called multiple times safely
+    if (_isDestroyed) {
+      return; // Already destroyed
+    }
+
+    _isDestroyed = true; // Mark as destroyed first to prevent new operations
+
+    await stopCapture(); // Stop capture if running
+
+    if (_contextHandle != null) {
+      _finalizer.detach(this); // Prevent finalizer from running
+      final res = bindings.MiniAV_Loopback_DestroyContext(_contextHandle!);
+      _contextHandle = null; // Clear the handle
+
+      if (res != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+        throw Exception('Failed to destroy loopback context: ${res.name}');
+      }
     }
   }
 }

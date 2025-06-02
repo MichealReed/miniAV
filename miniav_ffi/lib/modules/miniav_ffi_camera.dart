@@ -111,24 +111,50 @@ class MiniFFICameraPlatform implements MiniCameraPlatformInterface {
 }
 
 class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
-  final bindings.MiniAVCameraContextHandle _context;
+  bindings.MiniAVCameraContextHandle? _context;
   ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>? _callbackHandle;
+  bool _isDestroyed = false;
+  late final Finalizer<bindings.MiniAVCameraContextHandle> _finalizer;
 
-  MiniFFICameraContext(this._context);
+  MiniFFICameraContext(bindings.MiniAVCameraContextHandle context)
+    : _context = context {
+    // Auto-cleanup if destroy() is never called
+    _finalizer = Finalizer<bindings.MiniAVCameraContextHandle>((handle) {
+      print(
+        'Warning: CameraContext was garbage collected without calling destroy()',
+      );
+      bindings.MiniAV_Camera_DestroyContext(handle);
+    });
+    _finalizer.attach(this, context, detach: this);
+  }
+
+  /// Throws if the context has been destroyed
+  void _ensureNotDestroyed() {
+    if (_isDestroyed || _context == null) {
+      throw StateError(
+        'CameraContext has been destroyed. Create a new context to continue using camera.',
+      );
+    }
+  }
+
+  /// Whether this context has been destroyed
+  bool get isDestroyed => _isDestroyed;
 
   @override
   Future<void> configure(String deviceId, MiniAVVideoInfo format) async {
+    _ensureNotDestroyed();
+
     final deviceIdPtr = deviceId.toNativeUtf8();
     final nativeFormatPtr = calloc<bindings.MiniAVVideoInfo>();
     try {
       VideoFormatInfoFFIToPlatform.copyToNative(format, nativeFormatPtr.ref);
       final result = bindings.MiniAV_Camera_Configure(
-        _context,
+        _context!,
         deviceIdPtr.cast(),
         nativeFormatPtr.cast(),
       );
       if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
-        throw Exception('Failed to configure camera');
+        throw Exception('Failed to configure camera: ${result.name}');
       }
     } finally {
       calloc.free(deviceIdPtr);
@@ -138,10 +164,12 @@ class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
 
   @override
   Future<MiniAVVideoInfo> getConfiguredFormat() async {
+    _ensureNotDestroyed();
+
     final formatOutPtr = calloc<bindings.MiniAVVideoInfo>();
     try {
       final result = bindings.MiniAV_Camera_GetConfiguredFormat(
-        _context,
+        _context!,
         formatOutPtr,
       );
       if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
@@ -162,17 +190,25 @@ class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
     void Function(MiniAVBuffer buffer, Object? userData) onFrame, {
     Object? userData,
   }) async {
-    // Clean up any previous callback
-    await stopCapture();
+    _ensureNotDestroyed();
+
+    await stopCapture(); // Clean up any previous callback
 
     void ffiCallback(
       ffi.Pointer<bindings.MiniAVBuffer> buffer,
       ffi.Pointer<ffi.Void> cbUserData,
     ) {
-      final platformBuffer = MiniAVBufferFFI.fromPointer(
-        buffer,
-      ); // You must implement this
-      onFrame(platformBuffer, userData);
+      // Check if context was destroyed during callback
+      if (_isDestroyed) {
+        return; // Silently ignore if destroyed
+      }
+
+      final platformBuffer = MiniAVBufferFFI.fromPointer(buffer);
+      try {
+        onFrame(platformBuffer, userData);
+      } catch (e, s) {
+        print('Error in camera user callback: $e\n$s');
+      }
     }
 
     _callbackHandle =
@@ -181,34 +217,65 @@ class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
         );
 
     final result = bindings.MiniAV_Camera_StartCapture(
-      _context,
+      _context!,
       _callbackHandle!.nativeFunction,
-      ffi.nullptr, // You can pass userData pointer if needed
+      ffi.nullptr,
     );
 
     if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
-      _callbackHandle?.close();
-      _callbackHandle = null;
-      throw Exception('Failed to start camera capture');
+      await _cleanupCallback();
+      throw Exception('Failed to start camera capture: ${result.name}');
     }
+  }
+
+  Future<void> _cleanupCallback() async {
+    _callbackHandle?.close();
+    _callbackHandle = null;
   }
 
   @override
   Future<void> stopCapture() async {
-    final result = bindings.MiniAV_Camera_StopCapture(_context);
-    _callbackHandle?.close();
-    _callbackHandle = null;
-    if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
-      throw Exception('Failed to stop camera capture');
+    // Don't throw if context is destroyed - just clean up Dart resources
+    if (_isDestroyed || _context == null) {
+      await _cleanupCallback();
+      return;
+    }
+
+    // Don't throw if already stopped - this is idempotent
+    if (_callbackHandle == null) {
+      return; // Already stopped
+    }
+
+    final result = bindings.MiniAV_Camera_StopCapture(_context!);
+
+    await _cleanupCallback();
+
+    // Only warn on unexpected errors, not "already stopped" errors
+    if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS &&
+        result != bindings.MiniAVResultCode.MINIAV_ERROR_NOT_RUNNING) {
+      print('Warning: MiniAV_Camera_StopCapture failed: ${result.name}');
     }
   }
 
   @override
   Future<void> destroy() async {
-    await stopCapture();
-    final result = bindings.MiniAV_Camera_DestroyContext(_context);
-    if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
-      throw Exception('Failed to destroy camera context');
+    // Idempotent - can be called multiple times safely
+    if (_isDestroyed) {
+      return; // Already destroyed
+    }
+
+    _isDestroyed = true; // Mark as destroyed first to prevent new operations
+
+    await stopCapture(); // Stop capture if running
+
+    if (_context != null) {
+      _finalizer.detach(this); // Prevent finalizer from running
+      final result = bindings.MiniAV_Camera_DestroyContext(_context!);
+      _context = null; // Clear the handle
+
+      if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+        throw Exception('Failed to destroy camera context: ${result.name}');
+      }
     }
   }
 }

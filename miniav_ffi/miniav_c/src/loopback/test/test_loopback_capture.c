@@ -73,6 +73,24 @@ void loopback_audio_buffer_callback(const MiniAVBuffer *buffer,
            g_loopback_buffer_count, data_size, buffer->timestamp_us,
            buffer_format_info->num_frames, buffer_format_info->format,
            buffer_format_info->channels, buffer_format_info->sample_rate);
+    if (buffer->data.audio.data) {
+      printf("Audio Data Pointer: %p\n", buffer->data.audio.data);
+      // print some bytes
+      const uint8_t *audio_data = (const uint8_t *)buffer->data.audio.data;
+      printf("First 16 bytes of audio data: ");
+      for (size_t i = 0; i < 16 && i < data_size; ++i) {
+        printf("%02X ", audio_data[i]);
+      }
+      // as floats
+      printf("\nFirst 16 audio samples as floats: ");
+      const float *audio_floats =
+          (const float *)buffer->data.audio.data;
+      for (size_t i = 0; i < 16 && i < data_size / sizeof(float); ++i) {
+        printf("%f ", audio_floats[i]);
+      }
+    } else {
+      printf("No audio data received.\n");
+    }
 
   } else {
     fprintf(stderr,
@@ -251,12 +269,13 @@ int main(int argc, char *argv[]) {
   }
 
   MiniAVAudioInfo configured_video_format;
-  res = MiniAV_Loopback_GetConfiguredFormat(loopback_ctx, &configured_video_format);
+  res = MiniAV_Loopback_GetConfiguredFormat(loopback_ctx,
+                                            &configured_video_format);
   if (res == MINIAV_SUCCESS) {
     printf("Loopback capture configured successfully.\n");
     printf("  Actual Configured Format - Channels: %u, Rate: %u, Format: %d\n",
-           configured_video_format.channels, configured_video_format.sample_rate,
-           configured_video_format.format);
+           configured_video_format.channels,
+           configured_video_format.sample_rate, configured_video_format.format);
   } else {
     fprintf(stderr, "Warning: Failed to get configured format: %s\n",
             MiniAV_GetErrorString(res));

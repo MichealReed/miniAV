@@ -5,8 +5,14 @@ class MiniAVWebCameraPlatform implements MiniCameraPlatformInterface {
   @override
   Future<List<MiniAVDeviceInfo>> enumerateDevices() async {
     try {
-      final devices =
-          await web.window.navigator.mediaDevices.enumerateDevices().toDart;
+      final constraints = web.MediaStreamConstraints(video: true.toJS);
+
+      // Request permission to access video devices
+      await web.window.navigator.mediaDevices.getUserMedia(constraints).toDart;
+
+      final devices = await web.window.navigator.mediaDevices
+          .enumerateDevices()
+          .toDart;
       final videoDevices = <MiniAVDeviceInfo>[];
 
       for (final device in devices.toDart) {
@@ -14,10 +20,9 @@ class MiniAVWebCameraPlatform implements MiniCameraPlatformInterface {
           videoDevices.add(
             MiniAVDeviceInfo(
               deviceId: device.deviceId,
-              name:
-                  device.label.isNotEmpty
-                      ? device.label
-                      : 'Camera ${videoDevices.length + 1}',
+              name: device.label.isNotEmpty
+                  ? device.label
+                  : 'Camera ${videoDevices.length + 1}',
               isDefault: videoDevices.isEmpty, // First device as default
             ),
           );
@@ -101,10 +106,9 @@ class MiniAVWebCameraContext implements MiniCameraContextPlatformInterface {
     );
 
     try {
-      _mediaStream =
-          await web.window.navigator.mediaDevices
-              .getUserMedia(constraints)
-              .toDart;
+      _mediaStream = await web.window.navigator.mediaDevices
+          .getUserMedia(constraints)
+          .toDart;
 
       // Create video element for capturing frames
       _videoElement =
@@ -114,10 +118,9 @@ class MiniAVWebCameraContext implements MiniCameraContextPlatformInterface {
             ..muted = true;
 
       // Create canvas for frame extraction
-      _canvas =
-          web.document.createElement('canvas') as web.HTMLCanvasElement
-            ..width = format.width
-            ..height = format.height;
+      _canvas = web.document.createElement('canvas') as web.HTMLCanvasElement
+        ..width = format.width
+        ..height = format.height;
       _context = _canvas!.getContext('2d') as web.CanvasRenderingContext2D;
 
       // Wait for video to be ready

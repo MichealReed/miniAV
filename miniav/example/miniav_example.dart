@@ -15,13 +15,13 @@ void main() async {
     await setupCameraStream(contexts);
 
     // 2. Screen Capture Stream
-   // await setupScreenStream(contexts);
+    // await setupScreenStream(contexts);
 
     // 3. Audio Input Stream
-   // await setupAudioInputStream(contexts);
+    // await setupAudioInputStream(contexts);
 
     // 4. Loopback Audio Stream
-  //  await setupLoopbackStream(contexts);
+    //  await setupLoopbackStream(contexts);
 
     print('\n✅ All streams started successfully!');
     print('🔄 Capturing for 10 seconds...\n');
@@ -262,7 +262,7 @@ Future<void> setupLoopbackStream(Map<String, dynamic> contexts) async {
     await context.startCapture((buffer, userData) {
       bufferCount++;
       print(
-        '🔄 Loopback buffer #$bufferCount - ${buffer.dataSizeBytes} bytes - ${buffer.timestampUs}µs',
+        '🔄 Loopback buffer #$bufferCount - ${buffer.dataSizeBytes} bytes - ${buffer.timestampUs}µs ',
       );
       //MiniAV.releaseBuffer(buffer); // Release buffer after processing
     });

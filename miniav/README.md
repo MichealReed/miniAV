@@ -39,7 +39,7 @@ Add the following to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  miniav: ^0.1.0
+  miniav: ^0.4.1
 ```
 
 Then run:

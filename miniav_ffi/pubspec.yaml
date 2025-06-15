@@ -1,20 +1,14 @@
-publish_to: none
 name: miniav_ffi
-description: A starting point for Dart libraries or applications.
-version: 0.1.0
-# repository: https://github.com/my_org/my_repo
+description: A Dart FFI library for the miniav project, providing bindings to the native miniav C library.
+version: 0.4.4
+repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_ffi
 
 environment:
   sdk: ^3.9.0-21.0.dev
-  flutter: ">=1.20.0"
 
-# Add regular dependencies here.
 dependencies:
-  flutter:
-    sdk: flutter
   ffi: ^2.0.2
-  miniav_platform_interface:
-    path: ../miniav_platform_interface
+  miniav_platform_interface: 0.4.4
   native_toolchain_cmake: ^0.0.6-dev.0
 
 dev_dependencies:

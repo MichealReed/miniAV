@@ -412,7 +412,7 @@ static void ma_data_callback(ma_device *pDevice, void *pOutput,
   }
 
   MiniAVBuffer buffer;
-  memset(&buffer, 0, sizeof(buffer)); // Important: Zero out buffer struct
+  memset(&buffer, 0, sizeof(MiniAVBuffer));
 
   buffer.type = MINIAV_BUFFER_TYPE_AUDIO;
   buffer.timestamp_us = miniav_get_time_us(); // Use utility for timestamp
@@ -428,6 +428,7 @@ static void ma_data_callback(ma_device *pDevice, void *pOutput,
 
   buffer.data.audio.frame_count = frameCount;
   buffer.data.audio.data = (void *)pInput;
+  buffer.data.audio.info.num_frames  = frameCount; 
 
   buffer.data_size_bytes =
       frameCount * ma_get_bytes_per_frame(pDevice->capture.format,

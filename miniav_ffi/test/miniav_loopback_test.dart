@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:test/test.dart';
 import 'package:miniav_platform_interface/miniav_platform_interface.dart';
 import 'package:miniav_ffi/miniav_ffi.dart'; // Assuming this exports MiniAVFFIPlatform
@@ -138,6 +139,11 @@ void main() {
             expect(audioBuffer, isNotNull);
             expect(audioBuffer.info.sampleRate, defaultFormat.sampleRate);
             expect(audioBuffer.info.channels, defaultFormat.channels);
+            expect(audioBuffer.data, isA<Uint8List>());
+            expect(audioBuffer.data.lengthInBytes, greaterThan(0));
+            print(audioBuffer.info.format);
+            print('audio buffer data: ${audioBuffer.data.take(10).join(', ')}');
+            expect(audioBuffer.data.lengthInBytes, greaterThan(0));
 
             if (!bufferReceivedCompleter.isCompleted) {
               bufferReceivedCompleter.complete();

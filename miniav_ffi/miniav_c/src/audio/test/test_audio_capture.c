@@ -39,6 +39,17 @@ void test_audio_buffer_callback(const MiniAVBuffer *buffer, void *user_data) {
            buffer->data.audio.info.channels,
            buffer->data.audio.frame_count,
            buffer->data_size_bytes);
+    // print to ensure data bytes are valid
+    if (buffer->data.audio.data) {
+        printf("Audio Data Pointer: %p\n", buffer->data.audio.data);
+        printf("First 16 bytes of audio data: ");
+        const float *audio_floats = (const float *)buffer->data.audio.data;
+        for (size_t i = 0; i < 16 && i < buffer->data_size_bytes / sizeof(float); ++i) {
+            printf("%f ", audio_floats[i]);
+        }
+    } else {
+        printf("No audio data received.\n");
+    }
 }
 
 // Helper to sleep cross-platform

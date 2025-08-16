@@ -224,7 +224,6 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
                  GetLastError());
       break;
     }
-    // Removed the WaitForMultipleObjects as only one event was actively used.
 
     hr = platform_ctx->capture_client->lpVtbl->GetNextPacketSize(
         platform_ctx->capture_client, &packet_length);
@@ -296,7 +295,6 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
                    "WASAPI: ReleaseBuffer failed: 0x%lx", hr);
         if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
           goto cleanup_thread; // Device lost, exit thread
-        // Other errors might be recoverable, but could indicate issues.
       }
 
       // Get the next packet size for the loop condition

@@ -5,8 +5,14 @@ class MiniAVWebAudioInputPlatform implements MiniAudioInputPlatformInterface {
   @override
   Future<List<MiniAVDeviceInfo>> enumerateDevices() async {
     try {
-      final devices =
-          await web.window.navigator.mediaDevices.enumerateDevices().toDart;
+      final constraints = web.MediaStreamConstraints(audio: true.toJS);
+
+      // Request permission to access audio devices
+      await web.window.navigator.mediaDevices.getUserMedia(constraints).toDart;
+
+      final devices = await web.window.navigator.mediaDevices
+          .enumerateDevices()
+          .toDart;
       final audioDevices = <MiniAVDeviceInfo>[];
 
       for (final device in devices.toDart) {
@@ -14,10 +20,9 @@ class MiniAVWebAudioInputPlatform implements MiniAudioInputPlatformInterface {
           audioDevices.add(
             MiniAVDeviceInfo(
               deviceId: device.deviceId,
-              name:
-                  device.label.isNotEmpty
-                      ? device.label
-                      : 'Microphone ${audioDevices.length + 1}',
+              name: device.label.isNotEmpty
+                  ? device.label
+                  : 'Microphone ${audioDevices.length + 1}',
               isDefault: audioDevices.isEmpty, // First device as default
             ),
           );
@@ -78,7 +83,8 @@ class MiniAVWebAudioInputPlatform implements MiniAudioInputPlatformInterface {
 }
 
 /// Web implementation of [MiniAudioInputContextPlatformInterface]
-class MiniAVWebAudioInputContext implements MiniAudioInputContextPlatformInterface {
+class MiniAVWebAudioInputContext
+    implements MiniAudioInputContextPlatformInterface {
   web.MediaStream? _mediaStream;
   web.AudioContext? _audioContext;
   web.MediaStreamAudioSourceNode? _sourceNode;
@@ -99,10 +105,9 @@ class MiniAVWebAudioInputContext implements MiniAudioInputContextPlatformInterfa
     );
 
     try {
-      _mediaStream =
-          await web.window.navigator.mediaDevices
-              .getUserMedia(constraints)
-              .toDart;
+      _mediaStream = await web.window.navigator.mediaDevices
+          .getUserMedia(constraints)
+          .toDart;
 
       _audioContext = web.AudioContext();
 

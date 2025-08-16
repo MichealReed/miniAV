@@ -1,13 +1,12 @@
 name: miniav_web
-description: A starting point for Dart libraries or applications.
-version: 0.1.0
+description: A web implementation of the miniav library.
+version: 0.4.5
 publish_to: none
-# repository: https://github.com/my_org/my_repo
+repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_web
 
 environment:
   sdk: ^3.9.0-21.0.dev
 
-# Add regular dependencies here.
 dependencies:
   miniav_platform_interface:
     path: ../miniav_platform_interface

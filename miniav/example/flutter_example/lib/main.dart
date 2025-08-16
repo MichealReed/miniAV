@@ -1,7 +1,10 @@
-import 'package:flutter/material.dart';
-import 'package:miniav/miniav.dart';
 import 'dart:async';
 import 'dart:math';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+
+import 'package:flutter/material.dart';
+import 'package:miniav/miniav.dart';
 
 void main() {
   runApp(const MiniAVBenchmarkApp());
@@ -9,7 +12,6 @@ void main() {
 
 class MiniAVBenchmarkApp extends StatelessWidget {
   const MiniAVBenchmarkApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -33,7 +35,6 @@ class MiniAVBenchmarkApp extends StatelessWidget {
 
 class BenchmarkDashboard extends StatefulWidget {
   const BenchmarkDashboard({super.key});
-
   @override
   State<BenchmarkDashboard> createState() => _BenchmarkDashboardState();
 }
@@ -47,7 +48,6 @@ class StreamConfiguration {
   bool isLoadingDevices = false;
   bool isLoadingFormats = false;
   String? error;
-
   void reset() {
     selectedDeviceId = null;
     selectedDevice = null;
@@ -76,10 +76,9 @@ class StreamStats {
   bool isStopping = false;
   String deviceName = '';
   String resolution = '';
-  double bandwidth = 0.0; // MB/s
-
+  double bandwidth = 0.0;
+  String? lastPreviewError;
   StreamStats(this.name, this.icon);
-
   void reset() {
     frameCount = 0;
     totalBytes = 0;
@@ -91,6 +90,7 @@ class StreamStats {
     lastFrameTime = null;
     startTime = DateTime.now();
     bandwidth = 0.0;
+    lastPreviewError = null;
   }
 
   void addFrame(int bytes, int timestampUs) {
@@ -98,67 +98,46 @@ class StreamStats {
     frameCount++;
     totalBytes += bytes;
     frameSizes.add(bytes);
-
-    // Calculate processing latency (time since last frame)
     double latency = 0.0;
     if (lastFrameTime != null) {
-      latency = now.difference(lastFrameTime!).inMicroseconds / 1000.0; // ms
+      latency = now.difference(lastFrameTime!).inMicroseconds / 1000.0;
     }
-
-    // Only add meaningful latency values (ignore first frame and outliers)
-    if (latency > 0 && latency < 1000) {
-      latencyHistory.add(latency);
-    }
-
-    // Calculate FPS
+    if (latency > 0 && latency < 1000) latencyHistory.add(latency);
     if (lastFrameTime != null) {
-      final timeDiff =
-          now.difference(lastFrameTime!).inMicroseconds / 1000000.0;
-      if (timeDiff > 0) {
-        final instantFps = 1.0 / timeDiff;
-        fpsHistory.add(instantFps);
-
-        if (fpsHistory.length > 30) {
-          fpsHistory.removeAt(0);
-        }
+      final dt = now.difference(lastFrameTime!).inMicroseconds / 1e6;
+      if (dt > 0) {
+        final inst = 1.0 / dt;
+        fpsHistory.add(inst);
+        if (fpsHistory.length > 30) fpsHistory.removeAt(0);
         currentFps = fpsHistory.reduce((a, b) => a + b) / fpsHistory.length;
       }
     }
-
-    // Rolling average of last 100 latency samples
-    if (latencyHistory.length > 100) {
-      latencyHistory.removeAt(0);
-    }
-
+    if (latencyHistory.length > 100) latencyHistory.removeAt(0);
     if (latencyHistory.isNotEmpty) {
       avgLatency =
           latencyHistory.reduce((a, b) => a + b) / latencyHistory.length;
     }
-
-    // Keep only last 1000 frame sizes for memory efficiency
-    if (frameSizes.length > 1000) {
-      frameSizes.removeAt(0);
-    }
-
-    // Calculate bandwidth (MB/s)
-    final elapsed = now.difference(startTime).inMicroseconds / 1000000.0;
-    if (elapsed > 0) {
-      bandwidth = (totalBytes / (1024 * 1024)) / elapsed;
-    }
-
+    if (frameSizes.length > 1000) frameSizes.removeAt(0);
+    final elapsed = now.difference(startTime).inMicroseconds / 1e6;
+    if (elapsed > 0) bandwidth = (totalBytes / (1024 * 1024)) / elapsed;
     lastFrameTime = now;
   }
 
-  double get avgFrameSize =>
-      frameSizes.isEmpty
-          ? 0
-          : frameSizes.reduce((a, b) => a + b) / frameSizes.length;
+  double get avgFrameSize => frameSizes.isEmpty
+      ? 0
+      : frameSizes.reduce((a, b) => a + b) / frameSizes.length;
   double get fpsEfficiency =>
       targetFps > 0 ? (currentFps / targetFps) * 100 : 0;
   double get minLatency =>
       latencyHistory.isEmpty ? 0 : latencyHistory.reduce(min);
   double get maxLatency =>
       latencyHistory.isEmpty ? 0 : latencyHistory.reduce(max);
+}
+
+class _FramePixels {
+  final Uint8List bytes;
+  final bool isBGRA;
+  _FramePixels(this.bytes, this.isBGRA);
 }
 
 class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
@@ -168,26 +147,29 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
   Timer? _uiUpdateTimer;
   bool _showConfig = false;
 
+  // Preview state
+  final ValueNotifier<ui.Image?> _cameraPreview = ValueNotifier(null);
+  final ValueNotifier<ui.Image?> _screenPreview = ValueNotifier(null);
+  bool _buildingCameraImage = false;
+  bool _buildingScreenImage = false;
+  int _cameraFrameSkip = 0;
+  int _screenFrameSkip = 0;
+  bool _loggedPreviewInfo = false;
+  bool _debugLoggedChrome = false;
+
   @override
   void initState() {
     super.initState();
     MiniAV.setLogLevel(MiniAVLogLevel.warn);
-
-    // Initialize stats and configs
     _stats['camera'] = StreamStats('Camera', '📹');
     _stats['screen'] = StreamStats('Screen', '🖥️');
     _stats['audioInput'] = StreamStats('Audio Input', '🎤');
     _stats['loopback'] = StreamStats('Loopback', '🔄');
-
     _configs['camera'] = StreamConfiguration();
     _configs['screen'] = StreamConfiguration();
     _configs['audioInput'] = StreamConfiguration();
     _configs['loopback'] = StreamConfiguration();
-
-    // Load initial device lists
     _loadAllDevices();
-
-    // Update UI every 100ms for smooth statistics
     _uiUpdateTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
       if (mounted) setState(() {});
     });
@@ -197,6 +179,10 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
   void dispose() {
     _uiUpdateTimer?.cancel();
     _stopAllStreams();
+    _cameraPreview.value?.dispose();
+    _screenPreview.value?.dispose();
+    _cameraPreview.dispose();
+    _screenPreview.dispose();
     super.dispose();
   }
 
@@ -211,12 +197,10 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
 
   Future<void> _loadDevices(String streamKey) async {
     final config = _configs[streamKey]!;
-
     setState(() {
       config.isLoadingDevices = true;
       config.error = null;
     });
-
     try {
       List<MiniAVDeviceInfo> devices;
       switch (streamKey) {
@@ -235,21 +219,17 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
         default:
           devices = [];
       }
-
       setState(() {
         config.availableDevices = devices;
         if (devices.isNotEmpty) {
-          // Auto-select reasonable defaults
           if (streamKey == 'camera' && devices.length > 1) {
-            config.selectedDevice = devices[1]; // Often the better camera
+            config.selectedDevice = devices[1];
           } else if (streamKey == 'loopback' && devices.length > 4) {
-            config.selectedDevice = devices[4]; // Often speakers
+            config.selectedDevice = devices[4];
           } else {
             config.selectedDevice = devices.first;
           }
           config.selectedDeviceId = config.selectedDevice!.deviceId;
-
-          // Load formats for selected device
           _loadFormats(streamKey);
         }
       });
@@ -267,11 +247,9 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
   Future<void> _loadFormats(String streamKey) async {
     final config = _configs[streamKey]!;
     if (config.selectedDeviceId == null) return;
-
     setState(() {
       config.isLoadingFormats = true;
     });
-
     try {
       List<dynamic> formats;
       switch (streamKey) {
@@ -279,34 +257,58 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
           formats = await MiniCamera.getSupportedFormats(
             config.selectedDeviceId!,
           );
+          // Force CPU output preference if possible by cloning objects (if plugin respects it)
+          formats = formats.map((f) {
+            if (f is MiniAVVideoInfo &&
+                f.outputPreference != MiniAVOutputPreference.cpu) {
+              return MiniAVVideoInfo(
+                width: f.width,
+                height: f.height,
+                pixelFormat: f.pixelFormat,
+                frameRateNumerator: f.frameRateNumerator,
+                frameRateDenominator: f.frameRateDenominator,
+                outputPreference: MiniAVOutputPreference.cpu,
+              );
+            }
+            return f;
+          }).toList();
           break;
         case 'screen':
           final result = await MiniScreen.getDefaultFormats(
             config.selectedDeviceId!,
           );
-          formats = [result.$1]; // Just video format for now
+          // result.$1 is video format
+          final f = result.$1;
+          final cpuF = (f.outputPreference == MiniAVOutputPreference.cpu)
+              ? f
+              : MiniAVVideoInfo(
+                  width: f.width,
+                  height: f.height,
+                  pixelFormat: f.pixelFormat,
+                  frameRateNumerator: f.frameRateNumerator,
+                  frameRateDenominator: f.frameRateDenominator,
+                  outputPreference: MiniAVOutputPreference.cpu,
+                );
+          formats = [cpuF];
           break;
         case 'audioInput':
           final defaultFormat = await MiniAudioInput.getDefaultFormat(
             config.selectedDeviceId!,
           );
-          formats = [defaultFormat]; // Just default for now
+          formats = [defaultFormat];
           break;
         case 'loopback':
           final defaultFormat = await MiniLoopback.getDefaultFormat(
             config.selectedDeviceId!,
           );
-          formats = [defaultFormat]; // Just default for now
+          formats = [defaultFormat];
           break;
         default:
           formats = [];
       }
-
       setState(() {
         config.availableFormats = formats;
-        if (formats.isNotEmpty) {
-          config.selectedFormat = formats.first;
-        }
+        if (formats.isNotEmpty) config.selectedFormat = formats.first;
       });
     } catch (e) {
       setState(() {
@@ -329,47 +331,39 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
   }
 
   Future<void> _stopAllStreams() async {
-    final activeTasks = <Future>[];
-
-    for (final key in _stats.keys) {
-      if (_stats[key]!.isActive) {
-        activeTasks.add(_toggleStream(key));
-      }
+    final futures = <Future>[];
+    for (final k in _stats.keys) {
+      if (_stats[k]!.isActive) futures.add(_toggleStream(k));
     }
-
-    await Future.wait(activeTasks);
+    await Future.wait(futures);
   }
 
-  Future<void> _toggleStream(String streamKey) async {
-    final stats = _stats[streamKey]!;
-
-    if (stats.isActive) {
-      await _stopStream(streamKey);
+  Future<void> _toggleStream(String key) async {
+    final s = _stats[key]!;
+    if (s.isActive) {
+      await _stopStream(key);
     } else {
-      await _startStream(streamKey);
+      await _startStream(key);
     }
   }
 
-  Future<void> _startStream(String streamKey) async {
-    final stats = _stats[streamKey]!;
-    final config = _configs[streamKey]!;
-
-    if (config.selectedDevice == null || config.selectedFormat == null) {
+  Future<void> _startStream(String key) async {
+    final stats = _stats[key]!;
+    final cfg = _configs[key]!;
+    if (cfg.selectedDevice == null || cfg.selectedFormat == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Please select device and format for $streamKey'),
+          content: Text('Select device/format for $key'),
           backgroundColor: Colors.orange,
         ),
       );
       return;
     }
-
     setState(() {
       stats.isStarting = true;
     });
-
     try {
-      switch (streamKey) {
+      switch (key) {
         case 'camera':
           await _setupCamera();
           break;
@@ -384,11 +378,10 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
           break;
       }
     } catch (e) {
-      print('Error starting $streamKey: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Failed to start $streamKey: $e'),
+            content: Text('Failed to start $key: $e'),
             backgroundColor: Colors.red,
           ),
         );
@@ -400,35 +393,25 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     }
   }
 
-  Future<void> _stopStream(String streamKey) async {
-    final stats = _stats[streamKey]!;
-    final context = _contexts[streamKey];
-
-    if (context == null) return;
-
+  Future<void> _stopStream(String key) async {
+    final stats = _stats[key]!;
+    final ctx = _contexts[key];
+    if (ctx == null) return;
     setState(() {
       stats.isStopping = true;
     });
-
     try {
-      if (context is MiniCameraContext) {
-        await context.stopCapture();
-        await context.destroy();
-      } else if (context is MiniScreenContext) {
-        await context.stopCapture();
-        await context.destroy();
-      } else if (context is MiniAudioInputContext) {
-        await context.stopCapture();
-        await context.destroy();
-      } else if (context is MiniLoopbackContext) {
-        await context.stopCapture();
-        await context.destroy();
+      if (ctx is MiniCameraContext ||
+          ctx is MiniScreenContext ||
+          ctx is MiniAudioInputContext ||
+          ctx is MiniLoopbackContext) {
+        await ctx.stopCapture();
+        await ctx.destroy();
       }
-
-      _contexts.remove(streamKey);
+      _contexts.remove(key);
       stats.isActive = false;
-    } catch (e) {
-      print('Error stopping $streamKey: $e');
+    } catch (_) {
+      // ignore
     } finally {
       setState(() {
         stats.isStopping = false;
@@ -437,104 +420,489 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
   }
 
   Future<void> _setupCamera() async {
-    final config = _configs['camera']!;
-    final format = config.selectedFormat as MiniAVVideoInfo;
-
-    final context = await MiniCamera.createContext();
-    await context.configure(config.selectedDeviceId!, format);
-    _contexts['camera'] = context;
-
+    final cfg = _configs['camera']!;
+    final format = cfg.selectedFormat as MiniAVVideoInfo;
+    final ctx = await MiniCamera.createContext();
+    await ctx.configure(cfg.selectedDeviceId!, format);
+    _contexts['camera'] = ctx;
     final stats = _stats['camera']!;
     stats.reset();
-    stats.deviceName = config.selectedDevice!.name;
+    stats.deviceName = cfg.selectedDevice!.name;
     stats.resolution = '${format.width}x${format.height}';
     stats.targetFps = format.frameRateNumerator / format.frameRateDenominator;
     stats.isActive = true;
     stats.startTime = DateTime.now();
 
-    await context.startCapture((buffer, userData) {
-      stats.addFrame(buffer.dataSizeBytes, buffer.timestampUs);
+    await ctx.startCapture((buffer, userData) {
+      if (buffer.type == MiniAVBufferType.video) {
+        stats.addFrame(buffer.dataSizeBytes, buffer.timestampUs);
+        _trySchedulePreview(
+          streamKey: 'camera',
+          buffer: buffer,
+          preview: _cameraPreview,
+          buildingFlag: () => _buildingCameraImage,
+          setBuildingFlag: (v) => _buildingCameraImage = v,
+          frameSkipCounter: () => _cameraFrameSkip++,
+        );
+      }
       MiniAV.releaseBuffer(buffer);
     });
   }
 
   Future<void> _setupScreen() async {
-    final config = _configs['screen']!;
-    final format = config.selectedFormat as MiniAVVideoInfo;
-
-    final context = await MiniScreen.createContext();
-    await context.configureDisplay(
-      config.selectedDeviceId!,
+    final cfg = _configs['screen']!;
+    final format = cfg.selectedFormat as MiniAVVideoInfo;
+    final ctx = await MiniScreen.createContext();
+    await ctx.configureDisplay(
+      cfg.selectedDeviceId!,
       format,
       captureAudio: false,
     );
-    _contexts['screen'] = context;
-
+    _contexts['screen'] = ctx;
     final stats = _stats['screen']!;
     stats.reset();
-    stats.deviceName = config.selectedDevice!.name;
+    stats.deviceName = cfg.selectedDevice!.name;
     stats.resolution = '${format.width}x${format.height}';
     stats.targetFps = format.frameRateNumerator / format.frameRateDenominator;
     stats.isActive = true;
     stats.startTime = DateTime.now();
 
-    await context.startCapture((buffer, userData) {
+    await ctx.startCapture((buffer, userData) {
       if (buffer.type == MiniAVBufferType.video) {
         stats.addFrame(buffer.dataSizeBytes, buffer.timestampUs);
-        MiniAV.releaseBuffer(buffer);
+        _trySchedulePreview(
+          streamKey: 'screen',
+          buffer: buffer,
+          preview: _screenPreview,
+          buildingFlag: () => _buildingScreenImage,
+          setBuildingFlag: (v) => _buildingScreenImage = v,
+          frameSkipCounter: () => _screenFrameSkip++,
+        );
       }
+      MiniAV.releaseBuffer(buffer);
     });
   }
 
   Future<void> _setupAudioInput() async {
-    final config = _configs['audioInput']!;
-    final format = config.selectedFormat as MiniAVAudioInfo;
-
-    final context = await MiniAudioInput.createContext();
-    await context.configure(config.selectedDeviceId!, format);
-    _contexts['audioInput'] = context;
-
+    final cfg = _configs['audioInput']!;
+    final format = cfg.selectedFormat as MiniAVAudioInfo;
+    final ctx = await MiniAudioInput.createContext();
+    await ctx.configure(cfg.selectedDeviceId!, format);
+    _contexts['audioInput'] = ctx;
     final stats = _stats['audioInput']!;
     stats.reset();
-    stats.deviceName = config.selectedDevice!.name;
+    stats.deviceName = cfg.selectedDevice!.name;
     stats.resolution = '${format.channels}ch ${format.sampleRate}Hz';
     stats.targetFps = format.sampleRate / format.numFrames;
     stats.isActive = true;
     stats.startTime = DateTime.now();
-
-    await context.startCapture((buffer, userData) {
-      stats.addFrame(buffer.dataSizeBytes, buffer.timestampUs);
+    await ctx.startCapture((buffer, userData) {
+      if (buffer.type == MiniAVBufferType.audio) {
+        stats.addFrame(buffer.dataSizeBytes, buffer.timestampUs);
+      }
       MiniAV.releaseBuffer(buffer);
     });
   }
 
   Future<void> _setupLoopback() async {
-    final config = _configs['loopback']!;
-    final format = config.selectedFormat as MiniAVAudioInfo;
-
-    final context = await MiniLoopback.createContext();
-    await context.configure(config.selectedDeviceId!, format);
-    _contexts['loopback'] = context;
-
+    final cfg = _configs['loopback']!;
+    final format = cfg.selectedFormat as MiniAVAudioInfo;
+    final ctx = await MiniLoopback.createContext();
+    await ctx.configure(cfg.selectedDeviceId!, format);
+    _contexts['loopback'] = ctx;
     final stats = _stats['loopback']!;
     stats.reset();
-    stats.deviceName = config.selectedDevice!.name;
+    stats.deviceName = cfg.selectedDevice!.name;
     stats.resolution = '${format.channels}ch ${format.sampleRate}Hz';
     stats.targetFps = format.sampleRate / format.numFrames;
     stats.isActive = true;
     stats.startTime = DateTime.now();
-
-    await context.startCapture((buffer, userData) {
-      stats.addFrame(buffer.dataSizeBytes, buffer.timestampUs);
-      // Note: Not releasing loopback buffers as per original example
+    await ctx.startCapture((buffer, userData) {
+      if (buffer.type == MiniAVBufferType.audio) {
+        stats.addFrame(buffer.dataSizeBytes, buffer.timestampUs);
+      }
+      // (Loopback not released previously; but release to avoid leaks)
+      MiniAV.releaseBuffer(buffer);
     });
+  }
+
+  void _trySchedulePreview({
+    required String streamKey,
+    required MiniAVBuffer buffer,
+    required ValueNotifier<ui.Image?> preview,
+    required bool Function() buildingFlag,
+    required void Function(bool) setBuildingFlag,
+    required int Function() frameSkipCounter,
+  }) {
+    if (buildingFlag()) return;
+    final skipIndex = frameSkipCounter();
+    if ((skipIndex & 1) == 1) return;
+
+    if (buffer.contentType != MiniAVBufferContentType.cpu) {
+      _stats[streamKey]!.lastPreviewError ??=
+          'Preview skipped: non-CPU buffer (${buffer.contentType})';
+      return;
+    }
+
+    MiniAVVideoBuffer video;
+    try {
+      video = buffer.data as MiniAVVideoBuffer;
+    } catch (_) {
+      _stats[streamKey]!.lastPreviewError = 'Data cast failed';
+      return;
+    }
+
+    final framePixels = _convertVideoToRgba(video);
+    if (framePixels == null) {
+      _stats[streamKey]!.lastPreviewError ??=
+          'Unsupported pixel format: ${video.pixelFormat}';
+      return;
+    }
+
+    // Prepare RGBA NOW (synchronous) before releasing native buffer.
+    final Uint8List rgba = framePixels.isBGRA
+        ? _bgraToRgbaInPlaceCopy(framePixels.bytes)
+        : framePixels.bytes;
+
+    // Optional: simple luminance / first-bytes debug once per stream
+    if (!_debugLoggedChrome) {
+      _debugLoggedChrome = true;
+      double sum = 0;
+      int samples = 0;
+      for (int i = 0; i < min(rgba.length, 64 * 4); i += 4) {
+        final r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
+        sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        samples++;
+      }
+      final avgLum = samples == 0 ? 0 : sum / samples;
+      debugPrint(
+        '[MiniAV][$streamKey] first-frame pixelFormat=${video.pixelFormat} '
+        'size=${video.width}x${video.height} avgLum=${avgLum.toStringAsFixed(1)} '
+        'first16=${_firstBytesHex(rgba, 16)}',
+      );
+    }
+
+    setBuildingFlag(true);
+    // Build image immediately (no microtask) to avoid web HTML renderer races.
+    _decodeRgbaToImage(rgba, video.width, video.height)
+        .then((img) {
+          // Detect black frame despite non-zero luminance bytes
+          if (preview.value == null && _looksAllBlack(rgba)) {
+            _stats[streamKey]!.lastPreviewError ??=
+                'Chrome black frame (renderer) – try: flutter run -d chrome --web-renderer canvaskit';
+          }
+          final old = preview.value;
+          preview.value = img;
+          old?.dispose();
+        })
+        .catchError((e) {
+          _stats[streamKey]!.lastPreviewError = 'Image build error: $e';
+        })
+        .whenComplete(() => setBuildingFlag(false));
+  }
+
+  String _firstBytesHex(Uint8List data, int count) {
+    final b = <String>[];
+    final n = min(count, data.length);
+    for (int i = 0; i < n; i++) {
+      b.add(data[i].toRadixString(16).padLeft(2, '0'));
+    }
+    return b.join(' ');
+  }
+
+  bool _looksAllBlack(Uint8List rgba) {
+    final n = min(rgba.length, 2000);
+    for (int i = 0; i < n; i += 4) {
+      if (rgba[i] != 0 || rgba[i + 1] != 0 || rgba[i + 2] != 0) return false;
+    }
+    return true;
+  }
+
+  Future<ui.Image> _decodeRgbaToImage(Uint8List rgba, int w, int h) {
+    final c = Completer<ui.Image>();
+    try {
+      ui.decodeImageFromPixels(
+        rgba,
+        w,
+        h,
+        ui.PixelFormat.rgba8888,
+        (img) => c.complete(img),
+      );
+    } catch (e) {
+      // Fallback
+      ui.ImmutableBuffer.fromUint8List(rgba)
+          .then((imm) async {
+            final desc = ui.ImageDescriptor.raw(
+              imm,
+              width: w,
+              height: h,
+              pixelFormat: ui.PixelFormat.rgba8888,
+            );
+            final codec = await desc.instantiateCodec();
+            final frame = await codec.getNextFrame();
+            c.complete(frame.image);
+          })
+          .catchError(c.completeError);
+    }
+    return c.future;
+  }
+
+  Uint8List _bgraToRgbaCopy(Uint8List bgra) => _bgraToRgbaInPlaceCopy(bgra);
+
+  _FramePixels? _convertVideoToRgba(MiniAVVideoBuffer video) {
+    final planes = video.planes;
+    if (planes.isEmpty || planes[0] == null) return null;
+    final pf = video.pixelFormat;
+    try {
+      switch (pf) {
+        case MiniAVPixelFormat.rgba32:
+          return _FramePixels(
+            _copyPacked(
+              planes[0]!,
+              video.width,
+              video.height,
+              4,
+              _stride(video, 0, 4, video.width),
+            ),
+            false,
+          );
+        case MiniAVPixelFormat.bgra32:
+          return _FramePixels(
+            _copyPacked(
+              planes[0]!,
+              video.width,
+              video.height,
+              4,
+              _stride(video, 0, 4, video.width),
+            ),
+            true,
+          );
+        case MiniAVPixelFormat.rgb24:
+          return _FramePixels(
+            _expandRgbToRgba(
+              _copyPacked(
+                planes[0]!,
+                video.width,
+                video.height,
+                3,
+                _stride(video, 0, 3, video.width),
+              ),
+            ),
+            false,
+          );
+        case MiniAVPixelFormat.bgr24:
+          return _FramePixels(
+            _bgr24ToRgba(
+              _copyPacked(
+                planes[0]!,
+                video.width,
+                video.height,
+                3,
+                _stride(video, 0, 3, video.width),
+              ),
+            ),
+            false,
+          );
+        case MiniAVPixelFormat.nv12:
+          if (planes.length < 2 || planes[1] == null) return null;
+          return _FramePixels(
+            _nv12ToRgba(
+              y: planes[0]!,
+              uv: planes[1]!,
+              width: video.width,
+              height: video.height,
+              yStride: _stride(video, 0, 1, video.width),
+              uvStride: _stride(video, 1, 2, video.width),
+            ),
+            false,
+          );
+        case MiniAVPixelFormat.i420:
+          if (planes.length < 3 || planes[1] == null || planes[2] == null)
+            return null;
+          return _FramePixels(
+            _i420ToRgba(
+              y: planes[0]!,
+              u: planes[1]!,
+              v: planes[2]!,
+              width: video.width,
+              height: video.height,
+              yStride: _stride(video, 0, 1, video.width),
+              uStride: _stride(video, 1, 1, video.width ~/ 2),
+              vStride: _stride(video, 2, 1, video.width ~/ 2),
+            ),
+            false,
+          );
+        default:
+          return null;
+      }
+    } catch (_) {
+      return null;
+    }
+  }
+
+  int _stride(MiniAVVideoBuffer v, int i, int bpp, int logicalWidth) {
+    if (i < v.strideBytes.length && v.strideBytes[i] > 0) {
+      return v.strideBytes[i];
+    }
+    return logicalWidth * bpp;
+  }
+
+  Future<ui.Image> _rgbaBytesToImage(
+    Uint8List data,
+    int w,
+    int h,
+    bool isBGRA,
+  ) async {
+    // Always feed RGBA to avoid bgra8888 issues on Chrome.
+    final Uint8List rgba = isBGRA
+        ? _bgraToRgbaInPlaceCopy(data)
+        : data; // copy only if needed
+    final immutable = await ui.ImmutableBuffer.fromUint8List(rgba);
+    ui.ImageDescriptor desc = ui.ImageDescriptor.raw(
+      immutable,
+      width: w,
+      height: h,
+      pixelFormat: ui.PixelFormat.rgba8888,
+    );
+    final codec = await desc.instantiateCodec();
+    final frame = await codec.getNextFrame();
+    return frame.image;
+  }
+
+  Uint8List _bgraToRgbaInPlaceCopy(Uint8List bgra) {
+    final out = Uint8List(bgra.length);
+    for (int i = 0; i < bgra.length; i += 4) {
+      out[i] = bgra[i + 2]; // R
+      out[i + 1] = bgra[i + 1]; // G
+      out[i + 2] = bgra[i]; // B
+      out[i + 3] = bgra[i + 3]; // A
+    }
+    return out;
+  }
+
+  Uint8List _copyPacked(Uint8List src, int w, int h, int bpp, int strideBytes) {
+    final rowBytes = w * bpp;
+    final out = Uint8List(rowBytes * h);
+    if (strideBytes == rowBytes) {
+      out.setRange(0, out.length, src);
+      return out;
+    }
+    int si = 0, di = 0;
+    for (int y = 0; y < h; y++) {
+      out.setRange(di, di + rowBytes, src, si);
+      si += strideBytes;
+      di += rowBytes;
+    }
+    return out;
+  }
+
+  Uint8List _expandRgbToRgba(Uint8List rgb) {
+    final n = rgb.length ~/ 3;
+    final out = Uint8List(n * 4);
+    int ri = 0, oi = 0;
+    while (ri < rgb.length) {
+      out[oi++] = rgb[ri++];
+      out[oi++] = rgb[ri++];
+      out[oi++] = rgb[ri++];
+      out[oi++] = 0xFF;
+    }
+    return out;
+  }
+
+  Uint8List _bgr24ToRgba(Uint8List bgr) {
+    final n = bgr.length ~/ 3;
+    final out = Uint8List(n * 4);
+    int bi = 0, oi = 0;
+    while (bi < bgr.length) {
+      final b = bgr[bi++];
+      final g = bgr[bi++];
+      final r = bgr[bi++];
+      out[oi++] = r;
+      out[oi++] = g;
+      out[oi++] = b;
+      out[oi++] = 0xFF;
+    }
+    return out;
+  }
+
+  Uint8List _nv12ToRgba({
+    required Uint8List y,
+    required Uint8List uv,
+    required int width,
+    required int height,
+    required int yStride,
+    required int uvStride,
+  }) {
+    final out = Uint8List(width * height * 4);
+    int o = 0;
+    for (int row = 0; row < height; row++) {
+      final yRow = row * yStride;
+      final uvRow = (row >> 1) * uvStride;
+      for (int col = 0; col < width; col++) {
+        final Y = y[yRow + col];
+        final uvIndex = uvRow + (col & ~1);
+        final U = uv[uvIndex];
+        final V = uv[uvIndex + 1];
+        _yuvToRgba(Y, U, V, out, o);
+        o += 4;
+      }
+    }
+    return out;
+  }
+
+  Uint8List _i420ToRgba({
+    required Uint8List y,
+    required Uint8List u,
+    required Uint8List v,
+    required int width,
+    required int height,
+    required int yStride,
+    required int uStride,
+    required int vStride,
+  }) {
+    final out = Uint8List(width * height * 4);
+    int o = 0;
+    for (int row = 0; row < height; row++) {
+      final yRow = row * yStride;
+      final uvRow = row >> 1;
+      for (int col = 0; col < width; col++) {
+        final Y = y[yRow + col];
+        final uIdx = uvRow * uStride + (col >> 1);
+        final vIdx = uvRow * vStride + (col >> 1);
+        final U = u[uIdx];
+        final V = v[vIdx];
+        _yuvToRgba(Y, U, V, out, o);
+        o += 4;
+      }
+    }
+    return out;
+  }
+
+  void _yuvToRgba(int Y, int U, int V, Uint8List out, int o) {
+    // Auto-handle potential full-range YUV: if Y < 16 treat as full-range.
+    final bool fullRange = Y < 16;
+    final yv = fullRange ? Y : (Y - 16).clamp(0, 255);
+    final u = U - 128;
+    final v = V - 128;
+    int r = (1.164 * yv + 1.596 * v).round();
+    int g = (1.164 * yv - 0.392 * u - 0.813 * v).round();
+    int b = (1.164 * yv + 2.017 * u).round();
+    if (r < 0) r = 0;
+    if (r > 255) r = 255;
+    if (g < 0) g = 0;
+    if (g > 255) g = 255;
+    if (b < 0) b = 0;
+    if (b > 255) b = 255;
+    out[o] = r;
+    out[o + 1] = g;
+    out[o + 2] = b;
+    out[o + 3] = 0xFF;
   }
 
   @override
   Widget build(BuildContext context) {
     final activeStreams = _stats.values.where((s) => s.isActive).length;
     final hasActiveStreams = activeStreams > 0;
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('🎥 MiniAV Benchmark Dashboard'),
@@ -563,31 +931,24 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
         padding: const EdgeInsets.all(16.0),
         child: Column(
           children: [
-            // Configuration Panel
             if (_showConfig) ...[
               _buildConfigurationPanel(),
               const SizedBox(height: 16),
             ],
-
-            // Overall System Stats
             _buildSystemStatsCard(),
             const SizedBox(height: 16),
-
-            // Individual Stream Stats with Controls
             Expanded(
               child: GridView.builder(
                 gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
                   crossAxisCount: 2,
                   crossAxisSpacing: 16,
                   mainAxisSpacing: 16,
-                  childAspectRatio: 0.75,
+                  childAspectRatio: 0.78,
                 ),
                 itemCount: _stats.length,
                 itemBuilder: (context, index) {
                   final entry = _stats.entries.elementAt(index);
-                  final streamKey = entry.key;
-                  final stats = entry.value;
-                  return _buildStreamStatsCard(streamKey, stats);
+                  return _buildStreamStatsCard(entry.key, entry.value);
                 },
               ),
             ),
@@ -600,7 +961,7 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
   Widget _buildConfigurationPanel() {
     return Card(
       child: Padding(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -620,16 +981,13 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
               child: ListView.builder(
                 scrollDirection: Axis.horizontal,
                 itemCount: _configs.length,
-                itemBuilder: (context, index) {
-                  final entry = _configs.entries.elementAt(index);
-                  final streamKey = entry.key;
-                  final config = entry.value;
-                  final stats = _stats[streamKey]!;
-
+                itemBuilder: (context, i) {
+                  final e = _configs.entries.elementAt(i);
+                  final stats = _stats[e.key]!;
                   return Container(
                     width: 280,
                     margin: const EdgeInsets.only(right: 16),
-                    child: _buildStreamConfigCard(streamKey, stats, config),
+                    child: _buildStreamConfigCard(e.key, stats, e.value),
                   );
                 },
               ),
@@ -641,14 +999,14 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
   }
 
   Widget _buildStreamConfigCard(
-    String streamKey,
+    String key,
     StreamStats stats,
-    StreamConfiguration config,
+    StreamConfiguration cfg,
   ) {
     return Card(
       color: Theme.of(context).colorScheme.surface.withOpacity(0.7),
       child: Padding(
-        padding: const EdgeInsets.all(12.0),
+        padding: const EdgeInsets.all(12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -666,15 +1024,13 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
               ],
             ),
             const SizedBox(height: 12),
-
-            // Device Selection
             Text(
               'Device:',
               style: TextStyle(fontSize: 10, color: Colors.grey[400]),
             ),
-            if (config.isLoadingDevices)
+            if (cfg.isLoadingDevices)
               const LinearProgressIndicator(minHeight: 2)
-            else if (config.availableDevices.isEmpty)
+            else if (cfg.availableDevices.isEmpty)
               Text(
                 'No devices',
                 style: TextStyle(fontSize: 10, color: Colors.red[300]),
@@ -682,42 +1038,40 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
             else
               DropdownButton<String>(
                 isExpanded: true,
-                value: config.selectedDeviceId,
+                value: cfg.selectedDeviceId,
                 style: const TextStyle(fontSize: 10),
-                items:
-                    config.availableDevices.map((device) {
-                      return DropdownMenuItem<String>(
-                        value: device.deviceId,
+                items: cfg.availableDevices
+                    .map(
+                      (d) => DropdownMenuItem(
+                        value: d.deviceId,
                         child: Text(
-                          device.name,
+                          d.name,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(fontSize: 10),
                         ),
-                      );
-                    }).toList(),
-                onChanged:
-                    stats.isActive
-                        ? null
-                        : (value) {
-                          setState(() {
-                            config.selectedDeviceId = value;
-                            config.selectedDevice = config.availableDevices
-                                .firstWhere((d) => d.deviceId == value);
-                          });
-                          _loadFormats(streamKey);
-                        },
+                      ),
+                    )
+                    .toList(),
+                onChanged: stats.isActive
+                    ? null
+                    : (v) {
+                        setState(() {
+                          cfg.selectedDeviceId = v;
+                          cfg.selectedDevice = cfg.availableDevices.firstWhere(
+                            (d) => d.deviceId == v,
+                          );
+                        });
+                        _loadFormats(key);
+                      },
               ),
-
             const SizedBox(height: 8),
-
-            // Format Selection
             Text(
               'Format:',
               style: TextStyle(fontSize: 10, color: Colors.grey[400]),
             ),
-            if (config.isLoadingFormats)
+            if (cfg.isLoadingFormats)
               const LinearProgressIndicator(minHeight: 2)
-            else if (config.availableFormats.isEmpty)
+            else if (cfg.availableFormats.isEmpty)
               Text(
                 'No formats',
                 style: TextStyle(fontSize: 10, color: Colors.red[300]),
@@ -725,57 +1079,47 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
             else
               DropdownButton<dynamic>(
                 isExpanded: true,
-                value: config.selectedFormat,
+                value: cfg.selectedFormat,
                 style: const TextStyle(fontSize: 10),
-                items:
-                    config.availableFormats.map((format) {
-                      String displayText;
-                      if (format is MiniAVVideoInfo) {
-                        final fps =
-                            format.frameRateNumerator /
-                            format.frameRateDenominator;
-                        displayText =
-                            '${format.width}x${format.height} @${fps.toStringAsFixed(0)}fps';
-                      } else if (format is MiniAVAudioInfo) {
-                        displayText =
-                            '${format.channels}ch ${format.sampleRate}Hz';
-                      } else {
-                        displayText = format.toString();
-                      }
-
-                      return DropdownMenuItem<dynamic>(
-                        value: format,
-                        child: Text(
-                          displayText,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 10),
-                        ),
-                      );
-                    }).toList(),
-                onChanged:
-                    stats.isActive
-                        ? null
-                        : (value) {
-                          setState(() {
-                            config.selectedFormat = value;
-                          });
-                        },
+                items: cfg.availableFormats.map((f) {
+                  String label;
+                  if (f is MiniAVVideoInfo) {
+                    final fps = f.frameRateNumerator / f.frameRateDenominator;
+                    label =
+                        '${f.width}x${f.height} @${fps.toStringAsFixed(0)}fps';
+                  } else if (f is MiniAVAudioInfo) {
+                    label = '${f.channels}ch ${f.sampleRate}Hz';
+                  } else {
+                    label = f.toString();
+                  }
+                  return DropdownMenuItem(
+                    value: f,
+                    child: Text(
+                      label,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 10),
+                    ),
+                  );
+                }).toList(),
+                onChanged: stats.isActive
+                    ? null
+                    : (v) {
+                        setState(() {
+                          cfg.selectedFormat = v;
+                        });
+                      },
               ),
-
-            // Error Display
-            if (config.error != null)
+            if (cfg.error != null)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
                 child: Text(
-                  config.error!,
+                  cfg.error!,
                   style: TextStyle(fontSize: 9, color: Colors.red[300]),
                 ),
               ),
-
-            // Refresh Button
             const Spacer(),
             TextButton.icon(
-              onPressed: stats.isActive ? null : () => _loadDevices(streamKey),
+              onPressed: stats.isActive ? null : () => _loadDevices(key),
               icon: const Icon(Icons.refresh, size: 12),
               label: const Text('Refresh', style: TextStyle(fontSize: 10)),
             ),
@@ -786,24 +1130,20 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
   }
 
   Widget _buildSystemStatsCard() {
-    final totalFrames = _stats.values.fold(
-      0,
-      (sum, stats) => sum + stats.frameCount,
-    );
+    final totalFrames = _stats.values.fold(0, (sum, s) => sum + s.frameCount);
     final totalBandwidth = _stats.values.fold(
       0.0,
-      (sum, stats) => sum + stats.bandwidth,
+      (sum, s) => sum + s.bandwidth,
     );
-    final activeStreams = _stats.values.where((stats) => stats.isActive).length;
+    final active = _stats.values.where((s) => s.isActive).length;
     final avgLatency =
         _stats.values
             .where((s) => s.isActive && s.latencyHistory.isNotEmpty)
-            .fold(0.0, (sum, stats) => sum + stats.avgLatency) /
-        max(1, activeStreams);
-
+            .fold(0.0, (sum, s) => sum + s.avgLatency) /
+        max(1, active);
     return Card(
       child: Padding(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -822,11 +1162,11 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
                     vertical: 4,
                   ),
                   decoration: BoxDecoration(
-                    color: activeStreams > 0 ? Colors.green : Colors.grey,
+                    color: active > 0 ? Colors.green : Colors.grey,
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: Text(
-                    activeStreams > 0 ? 'LIVE ($activeStreams)' : 'STOPPED',
+                    active > 0 ? 'LIVE ($active)' : 'STOPPED',
                     style: const TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.bold,
@@ -839,11 +1179,7 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceAround,
               children: [
-                _buildStatItem(
-                  'Active Streams',
-                  '$activeStreams/4',
-                  Icons.stream,
-                ),
+                _buildStatItem('Active Streams', '$active/4', Icons.stream),
                 _buildStatItem(
                   'Total Frames',
                   _formatNumber(totalFrames),
@@ -867,27 +1203,50 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     );
   }
 
-  Widget _buildStreamStatsCard(String streamKey, StreamStats stats) {
-    final config = _configs[streamKey]!;
+  Widget _buildStreamStatsCard(String key, StreamStats stats) {
+    final cfg = _configs[key]!;
     final efficiency = stats.fpsEfficiency;
-    final efficiencyColor =
-        efficiency > 90
-            ? Colors.green
-            : efficiency > 70
-            ? Colors.orange
-            : Colors.red;
-
+    final efficiencyColor = efficiency > 90
+        ? Colors.green
+        : efficiency > 70
+        ? Colors.orange
+        : Colors.red;
     final isLoading = stats.isStarting || stats.isStopping;
-    final canStart =
-        config.selectedDevice != null && config.selectedFormat != null;
+    final canStart = cfg.selectedDevice != null && cfg.selectedFormat != null;
+    final preview = (key == 'camera' || key == 'screen')
+        ? ValueListenableBuilder<ui.Image?>(
+            valueListenable: key == 'camera' ? _cameraPreview : _screenPreview,
+            builder: (_, img, __) {
+              if (!stats.isActive) {
+                return _previewContainer(
+                  child: Text(
+                    'Idle',
+                    style: TextStyle(fontSize: 10, color: Colors.grey[500]),
+                  ),
+                );
+              }
+              if (img == null) {
+                return _previewContainer(
+                  child: Text(
+                    stats.lastPreviewError ?? 'Waiting frame...',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 9, color: Colors.grey[500]),
+                  ),
+                );
+              }
+              return _previewContainer(
+                child: RawImage(image: img, fit: BoxFit.cover),
+              );
+            },
+          )
+        : const SizedBox.shrink();
 
     return Card(
       child: Padding(
-        padding: const EdgeInsets.all(12.0),
+        padding: const EdgeInsets.all(12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Header with Controls
             Row(
               children: [
                 Text(stats.icon, style: const TextStyle(fontSize: 20)),
@@ -915,67 +1274,56 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
                     ],
                   ),
                 ),
-                // Start/Stop Button
                 SizedBox(
                   width: 32,
                   height: 32,
-                  child:
-                      isLoading
-                          ? const Padding(
-                            padding: EdgeInsets.all(6.0),
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                          : IconButton(
-                            padding: EdgeInsets.zero,
-                            onPressed:
-                                canStart
-                                    ? () => _toggleStream(streamKey)
-                                    : null,
-                            icon: Icon(
-                              stats.isActive ? Icons.stop : Icons.play_arrow,
-                              size: 16,
-                              color:
-                                  stats.isActive
-                                      ? Colors.red
-                                      : canStart
-                                      ? Colors.green
-                                      : Colors.grey,
-                            ),
-                            tooltip:
-                                stats.isActive
-                                    ? 'Stop ${stats.name}'
-                                    : canStart
-                                    ? 'Start ${stats.name}'
-                                    : 'Configure device/format first',
+                  child: isLoading
+                      ? const Padding(
+                          padding: EdgeInsets.all(6),
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : IconButton(
+                          padding: EdgeInsets.zero,
+                          onPressed: canStart ? () => _toggleStream(key) : null,
+                          icon: Icon(
+                            stats.isActive ? Icons.stop : Icons.play_arrow,
+                            size: 16,
+                            color: stats.isActive
+                                ? Colors.red
+                                : canStart
+                                ? Colors.green
+                                : Colors.grey,
                           ),
+                          tooltip: stats.isActive
+                              ? 'Stop ${stats.name}'
+                              : canStart
+                              ? 'Start ${stats.name}'
+                              : 'Configure device/format first',
+                        ),
                 ),
               ],
             ),
             const SizedBox(height: 8),
-
-            // Status Indicator
             Container(
               width: double.infinity,
               padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
               decoration: BoxDecoration(
-                color:
-                    stats.isActive
-                        ? Colors.green.withOpacity(0.2)
-                        : isLoading
-                        ? Colors.orange.withOpacity(0.2)
-                        : canStart
-                        ? Colors.grey.withOpacity(0.2)
-                        : Colors.red.withOpacity(0.2),
+                color: stats.isActive
+                    ? Colors.green.withOpacity(0.2)
+                    : isLoading
+                    ? Colors.orange.withOpacity(0.2)
+                    : canStart
+                    ? Colors.grey.withOpacity(0.2)
+                    : Colors.red.withOpacity(0.2),
                 borderRadius: BorderRadius.circular(8),
                 border: Border.all(
-                  color:
-                      stats.isActive
-                          ? Colors.green
-                          : isLoading
-                          ? Colors.orange
-                          : canStart
-                          ? Colors.grey
-                          : Colors.red,
+                  color: stats.isActive
+                      ? Colors.green
+                      : isLoading
+                      ? Colors.orange
+                      : canStart
+                      ? Colors.grey
+                      : Colors.red,
                   width: 1,
                 ),
               ),
@@ -992,21 +1340,20 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
                 style: TextStyle(
                   fontSize: 10,
                   fontWeight: FontWeight.bold,
-                  color:
-                      stats.isActive
-                          ? Colors.green
-                          : isLoading
-                          ? Colors.orange
-                          : canStart
-                          ? Colors.grey
-                          : Colors.red,
+                  color: stats.isActive
+                      ? Colors.green
+                      : isLoading
+                      ? Colors.orange
+                      : canStart
+                      ? Colors.grey
+                      : Colors.red,
                 ),
                 textAlign: TextAlign.center,
               ),
             ),
-            const SizedBox(height: 8),
-
-            // Key Metrics
+            const SizedBox(height: 6),
+            preview,
+            const SizedBox(height: 6),
             Expanded(
               child: Column(
                 children: [
@@ -1034,11 +1381,22 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
                   ),
                   if (stats.resolution.isNotEmpty)
                     _buildMetricRow('Resolution', stats.resolution),
+                  if (stats.lastPreviewError != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Text(
+                        stats.lastPreviewError!,
+                        style: const TextStyle(
+                          fontSize: 9,
+                          color: Colors.orangeAccent,
+                        ),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
                 ],
               ),
             ),
-
-            // Latency Range
             if (stats.latencyHistory.isNotEmpty) ...[
               const Divider(height: 8),
               Text(
@@ -1048,6 +1406,16 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
             ],
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _previewContainer({required Widget child}) {
+    return AspectRatio(
+      aspectRatio: 16 / 9,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(6),
+        child: ColoredBox(color: Colors.black, child: child),
       ),
     );
   }

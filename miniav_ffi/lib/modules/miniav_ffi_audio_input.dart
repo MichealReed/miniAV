@@ -6,7 +6,7 @@ import 'package:miniav_platform_interface/modules/miniav_audio_input_interface.d
 import 'package:miniav_platform_interface/miniav_platform_types.dart';
 
 import '../miniav_ffi_bindings.dart' as bindings;
-import '../miniav_ffi_types.dart'; // For ...FFIToPlatform and MiniAVBufferFFI
+import '../miniav_ffi_types.dart';
 
 /// FFI implementation of [MiniAudioInputPlatformInterface].
 class MiniAVFFIAudioInputPlatform extends MiniAudioInputPlatformInterface {
@@ -242,7 +242,6 @@ class MiniAVFFIAudioInputContextPlatform
       } catch (e, s) {
         print('Error in audio input user callback: $e\n$s');
       }
-      // Buffer release handled by C layer automatically
     }
 
     _callbackHandle =

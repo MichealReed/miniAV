@@ -183,6 +183,9 @@ void main() {
             expect(audioBuffer.data, isNotNull);
             expect(audioBuffer.info.sampleRate, defaultFormat.sampleRate);
             expect(audioBuffer.info.channels, defaultFormat.channels);
+            print(audioBuffer.info.format);
+            print('audio buffer data: ${audioBuffer.data.take(10).join(', ')}');
+            expect(audioBuffer.data.lengthInBytes, greaterThan(0));
 
             if (!bufferReceivedCompleter.isCompleted) {
               bufferReceivedCompleter.complete();

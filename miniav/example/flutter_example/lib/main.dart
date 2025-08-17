@@ -732,6 +732,17 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
             ),
             false,
           );
+        case MiniAVPixelFormat.yuy2:
+          // YUY2 = Y0 U Y1 V (4 bytes for 2 pixels) => 2 bytes per pixel
+          return _FramePixels(
+            _yuy2ToRgba(
+              planes[0]!,
+              video.width,
+              video.height,
+              _stride(video, 0, 2, video.width), // stride in bytes
+            ),
+            false,
+          );
         default:
           return null;
       }
@@ -897,6 +908,29 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     out[o + 1] = g;
     out[o + 2] = b;
     out[o + 3] = 0xFF;
+  }
+
+  Uint8List _yuy2ToRgba(Uint8List yuy2, int width, int height, int stride) {
+    final out = Uint8List(width * height * 4);
+    int o = 0;
+    for (int row = 0; row < height; row++) {
+      final rowStart = row * stride;
+      for (int col = 0; col < width; col += 2) {
+        final idx = rowStart + col * 2;
+        if (idx + 3 >= yuy2.length) break;
+        final y0 = yuy2[idx];
+        final u = yuy2[idx + 1];
+        final y1 = (col + 1 < width) ? yuy2[idx + 2] : y0;
+        final v = yuy2[idx + 3];
+        _yuvToRgba(y0, u, v, out, o);
+        o += 4;
+        if (col + 1 < width) {
+          _yuvToRgba(y1, u, v, out, o);
+          o += 4;
+        }
+      }
+    }
+    return out;
   }
 
   @override

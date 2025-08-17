@@ -39,29 +39,53 @@ static std::atomic<int> g_wgc_init_count = 0;
 static winrt::Windows::System::DispatcherQueueController
     g_dispatcher_queue_controller{nullptr};
 static std::mutex g_wgc_init_mutex;
+// NEW: track whether we actually initialized the apartment
+static bool g_wgc_initialized_apartment = false;
 
 MiniAVResultCode init_winrt_for_wgc() {
   std::lock_guard<std::mutex> lock(g_wgc_init_mutex);
   if (g_wgc_init_count == 0) {
     try {
+      // Attempt MTA init. If apartment already initialized differently, handle gracefully.
       winrt::init_apartment(winrt::apartment_type::multi_threaded);
-
-      // Assign the created DispatcherQueueController to the global variable
-      g_dispatcher_queue_controller = winrt::Windows::System::
-          DispatcherQueueController::CreateOnDedicatedThread();
-
+      g_wgc_initialized_apartment = true;
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WGC: WinRT apartment initialized (MTA).");
+    } catch (winrt::hresult_error const &ex) {
+      if (ex.code() == RPC_E_CHANGED_MODE) {
+        // Already initialized with different model; continue without re-initializing.
+        g_wgc_initialized_apartment = false;
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "WGC: WinRT apartment already initialized with different threading model (0x%08X). Continuing.",
+                   ex.code().value);
+      } else {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "WGC: WinRT initialization failed: %ls (0x%08X)",
+                   ex.message().c_str(), ex.code().value);
+        return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+      }
+    }
+    try {
+      g_dispatcher_queue_controller = winrt::Windows::System::DispatcherQueueController::CreateOnDedicatedThread();
       if (!g_dispatcher_queue_controller) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR,
                    "WGC: Failed to create DispatcherQueueController.");
-        winrt::uninit_apartment();
+        if (g_wgc_initialized_apartment) {
+          winrt::uninit_apartment();
+          g_wgc_initialized_apartment = false;
+        }
         return MINIAV_ERROR_SYSTEM_CALL_FAILED;
       }
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "WGC: WinRT and DispatcherQueue initialized.");
+                 "WGC: DispatcherQueue initialized.");
     } catch (winrt::hresult_error const &ex) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "WGC: WinRT initialization failed: %ls (0x%08X)",
+                 "WGC: DispatcherQueue creation failed: %ls (0x%08X)",
                  ex.message().c_str(), ex.code().value);
+      if (g_wgc_initialized_apartment) {
+        winrt::uninit_apartment();
+        g_wgc_initialized_apartment = false;
+      }
       return MINIAV_ERROR_SYSTEM_CALL_FAILED;
     }
   }
@@ -75,11 +99,8 @@ void shutdown_winrt_for_wgc() {
   if (g_wgc_init_count == 0) {
     if (g_dispatcher_queue_controller) {
       try {
-        // Asynchronously shut down the dispatcher queue.
-        // This requires waiting for the shutdown to complete.
-        auto async_shutdown =
-            g_dispatcher_queue_controller.ShutdownQueueAsync();
-        async_shutdown.get(); // Block until shutdown is complete
+        auto async_shutdown = g_dispatcher_queue_controller.ShutdownQueueAsync();
+        async_shutdown.get();
         g_dispatcher_queue_controller = nullptr;
         miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                    "WGC: DispatcherQueueController shut down.");
@@ -89,8 +110,14 @@ void shutdown_winrt_for_wgc() {
                    ex.message().c_str());
       }
     }
-    winrt::uninit_apartment();
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: WinRT uninitialized.");
+    if (g_wgc_initialized_apartment) {
+      winrt::uninit_apartment();
+      g_wgc_initialized_apartment = false;
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: WinRT apartment uninitialized.");
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "WGC: Skipped uninit_apartment (not initialized here).");
+    }
   }
 }
 
@@ -104,13 +131,14 @@ typedef enum WGCCaptureTargetType {
 // Payload for releasing WGC frame resources
 typedef struct WGCFrameReleasePayload {
   MiniAVOutputPreference original_output_preference;
+  MiniAVOutputPreference actual_output_preference;
   ID3D11Texture2D
       *gpu_texture_to_release; // AddRef'd texture (original or shared copy)
   HANDLE gpu_shared_handle_to_close; // Handle given to app (app should close,
                                      // but we track)
 
   ID3D11Texture2D *cpu_staging_texture_to_unmap_release; // AddRef'd
-  ID3D11DeviceContext *d3d_context_for_unmap;            // Not AddRef'd
+  ID3D11DeviceContext *d3d_context_for_unmap;            // AddRef'd if non-null
   UINT subresource_for_unmap;
 
 } WGCFrameReleasePayload;
@@ -1179,11 +1207,7 @@ static MiniAVResultCode wgc_release_buffer(MiniAVScreenContext *ctx,
       if (frame_payload) {
         if (frame_payload->original_output_preference ==
                 MINIAV_OUTPUT_PREFERENCE_CPU ||
-            (frame_payload->original_output_preference ==
-                 MINIAV_OUTPUT_PREFERENCE_GPU &&
-             frame_payload
-                 ->cpu_staging_texture_to_unmap_release) // Fallback to CPU case
-        ) {
+            (frame_payload->cpu_staging_texture_to_unmap_release)) {
           if (frame_payload->d3d_context_for_unmap &&
               frame_payload->cpu_staging_texture_to_unmap_release) {
             frame_payload->d3d_context_for_unmap->Unmap(
@@ -1199,31 +1223,29 @@ static MiniAVResultCode wgc_release_buffer(MiniAVScreenContext *ctx,
                        "WGC: Released CPU staging texture. Ref count: %lu",
                        ref_count);
           }
-        } else if (frame_payload->original_output_preference ==
+          if (frame_payload->d3d_context_for_unmap) {
+            frame_payload->d3d_context_for_unmap->Release();
+            frame_payload->d3d_context_for_unmap = nullptr;
+          }
+        } else if (frame_payload->actual_output_preference ==
                    MINIAV_OUTPUT_PREFERENCE_GPU) {
-          // GPU path
           if (frame_payload->gpu_texture_to_release) {
-            ULONG ref_count = frame_payload->gpu_texture_to_release
-                                  ->Release(); // Release our AddRef
+            ULONG ref_count = frame_payload->gpu_texture_to_release->Release();
             miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                        "WGC: Released GPU texture for payload. Ref count: %lu",
                        ref_count);
           }
           if (frame_payload->gpu_shared_handle_to_close) {
-            // The application is responsible for closing the handle it
-            // received. We just log that we are aware of it.
-            // CloseHandle(frame_payload->gpu_shared_handle_to_close); // DO NOT
-            // DO THIS HERE
             miniav_log(
                 MINIAV_LOG_LEVEL_DEBUG,
                 "WGC: App is responsible for closing GPU shared handle %p.",
                 frame_payload->gpu_shared_handle_to_close);
           }
         } else {
-          miniav_log(
-              MINIAV_LOG_LEVEL_WARN,
-              "WGC: Unknown original_output_preference in release_buffer: %d",
-              frame_payload->original_output_preference);
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "WGC: Unexpected preference (orig=%d actual=%d)",
+                     frame_payload->original_output_preference,
+                     frame_payload->actual_output_preference);
         }
 
         miniav_free(frame_payload);
@@ -1656,15 +1678,20 @@ static void wgc_on_frame_arrived(
 
     frame_payload_app->original_output_preference = desired_output_pref;
     if (processed_as_gpu) {
+      frame_payload_app->actual_output_preference =
+          MINIAV_OUTPUT_PREFERENCE_GPU;
       frame_payload_app->gpu_texture_to_release =
-          texture_for_payload_ref_com.detach(); // Transfer ownership
-      frame_payload_app->gpu_shared_handle_to_close =
-          shared_handle_for_app; // App owns closing this
-    } else {                     // CPU
+          texture_for_payload_ref_com.detach();
+      frame_payload_app->gpu_shared_handle_to_close = shared_handle_for_app;
+    } else {
+      frame_payload_app->actual_output_preference =
+          MINIAV_OUTPUT_PREFERENCE_CPU;
       frame_payload_app->cpu_staging_texture_to_unmap_release =
-          texture_for_payload_ref_com.detach(); // Transfer ownership
-      frame_payload_app->d3d_context_for_unmap =
-          wgc_ctx->d3d_context.get(); // Not AddRef'd
+          texture_for_payload_ref_com.detach();
+      frame_payload_app->d3d_context_for_unmap = wgc_ctx->d3d_context.get();
+      if (frame_payload_app->d3d_context_for_unmap) {
+        frame_payload_app->d3d_context_for_unmap->AddRef();
+      }
       frame_payload_app->subresource_for_unmap = 0;
     }
 

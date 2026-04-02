@@ -1,7 +1,19 @@
 # minigpu_ffi CHANGELOG
 
-## 0.4.5-WIP
+## 0.5.0-WIP
 
+- adding input support
+
+## 0.4.7
+
+- fix loopback crackles
+## 0.4.6
+
+- fix build hook null
+- update cmake toolchain
+## 0.4.5
+
+- fixed windows screen cpu path
 ## 0.4.4
 
 ## 0.4.3

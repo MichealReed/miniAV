@@ -826,6 +826,92 @@ MiniAVResultCode MiniAV_Loopback_StopCapture(
       context,
     ));
 
+@ffi.Native<
+    ffi.Int Function(ffi.Pointer<ffi.Pointer<MiniAVDeviceInfo>>,
+        ffi.Pointer<ffi.Uint32>)>(symbol: 'MiniAV_Input_EnumerateGamepads')
+external int _MiniAV_Input_EnumerateGamepads(
+  ffi.Pointer<ffi.Pointer<MiniAVDeviceInfo>> devices,
+  ffi.Pointer<ffi.Uint32> count,
+);
+
+MiniAVResultCode MiniAV_Input_EnumerateGamepads(
+  ffi.Pointer<ffi.Pointer<MiniAVDeviceInfo>> devices,
+  ffi.Pointer<ffi.Uint32> count,
+) =>
+    MiniAVResultCode.fromValue(_MiniAV_Input_EnumerateGamepads(
+      devices,
+      count,
+    ));
+
+@ffi.Native<ffi.Int Function(ffi.Pointer<MiniAVInputContextHandle>)>(
+    symbol: 'MiniAV_Input_CreateContext')
+external int _MiniAV_Input_CreateContext(
+  ffi.Pointer<MiniAVInputContextHandle> context,
+);
+
+MiniAVResultCode MiniAV_Input_CreateContext(
+  ffi.Pointer<MiniAVInputContextHandle> context,
+) =>
+    MiniAVResultCode.fromValue(_MiniAV_Input_CreateContext(
+      context,
+    ));
+
+@ffi.Native<ffi.Int Function(MiniAVInputContextHandle)>(
+    symbol: 'MiniAV_Input_DestroyContext')
+external int _MiniAV_Input_DestroyContext(
+  MiniAVInputContextHandle context,
+);
+
+MiniAVResultCode MiniAV_Input_DestroyContext(
+  MiniAVInputContextHandle context,
+) =>
+    MiniAVResultCode.fromValue(_MiniAV_Input_DestroyContext(
+      context,
+    ));
+
+@ffi.Native<
+    ffi.Int Function(MiniAVInputContextHandle,
+        ffi.Pointer<MiniAVInputConfig>)>(symbol: 'MiniAV_Input_Configure')
+external int _MiniAV_Input_Configure(
+  MiniAVInputContextHandle context,
+  ffi.Pointer<MiniAVInputConfig> config,
+);
+
+MiniAVResultCode MiniAV_Input_Configure(
+  MiniAVInputContextHandle context,
+  ffi.Pointer<MiniAVInputConfig> config,
+) =>
+    MiniAVResultCode.fromValue(_MiniAV_Input_Configure(
+      context,
+      config,
+    ));
+
+@ffi.Native<ffi.Int Function(MiniAVInputContextHandle)>(
+    symbol: 'MiniAV_Input_StartCapture')
+external int _MiniAV_Input_StartCapture(
+  MiniAVInputContextHandle context,
+);
+
+MiniAVResultCode MiniAV_Input_StartCapture(
+  MiniAVInputContextHandle context,
+) =>
+    MiniAVResultCode.fromValue(_MiniAV_Input_StartCapture(
+      context,
+    ));
+
+@ffi.Native<ffi.Int Function(MiniAVInputContextHandle)>(
+    symbol: 'MiniAV_Input_StopCapture')
+external int _MiniAV_Input_StopCapture(
+  MiniAVInputContextHandle context,
+);
+
+MiniAVResultCode MiniAV_Input_StopCapture(
+  MiniAVInputContextHandle context,
+) =>
+    MiniAVResultCode.fromValue(_MiniAV_Input_StopCapture(
+      context,
+    ));
+
 enum MiniAVResultCode {
   MINIAV_SUCCESS(0),
   MINIAV_ERROR_UNKNOWN(-1),
@@ -1123,6 +1209,196 @@ typedef MiniAVAudioContextHandle = ffi.Pointer<MiniAVAudioContext>;
 final class MiniAVLoopbackContext extends ffi.Opaque {}
 
 typedef MiniAVLoopbackContextHandle = ffi.Pointer<MiniAVLoopbackContext>;
+
+final class MiniAVInputContext extends ffi.Opaque {}
+
+typedef MiniAVInputContextHandle = ffi.Pointer<MiniAVInputContext>;
+
+enum MiniAVInputType {
+  MINIAV_INPUT_TYPE_KEYBOARD(1),
+  MINIAV_INPUT_TYPE_MOUSE(2),
+  MINIAV_INPUT_TYPE_GAMEPAD(4);
+
+  final int value;
+  const MiniAVInputType(this.value);
+
+  static MiniAVInputType fromValue(int value) => switch (value) {
+        1 => MINIAV_INPUT_TYPE_KEYBOARD,
+        2 => MINIAV_INPUT_TYPE_MOUSE,
+        4 => MINIAV_INPUT_TYPE_GAMEPAD,
+        _ => throw ArgumentError('Unknown value for MiniAVInputType: $value'),
+      };
+}
+
+enum MiniAVKeyAction {
+  MINIAV_KEY_ACTION_DOWN(0),
+  MINIAV_KEY_ACTION_UP(1);
+
+  final int value;
+  const MiniAVKeyAction(this.value);
+
+  static MiniAVKeyAction fromValue(int value) => switch (value) {
+        0 => MINIAV_KEY_ACTION_DOWN,
+        1 => MINIAV_KEY_ACTION_UP,
+        _ => throw ArgumentError('Unknown value for MiniAVKeyAction: $value'),
+      };
+}
+
+enum MiniAVMouseAction {
+  MINIAV_MOUSE_ACTION_MOVE(0),
+  MINIAV_MOUSE_ACTION_BUTTON_DOWN(1),
+  MINIAV_MOUSE_ACTION_BUTTON_UP(2),
+  MINIAV_MOUSE_ACTION_WHEEL(3);
+
+  final int value;
+  const MiniAVMouseAction(this.value);
+
+  static MiniAVMouseAction fromValue(int value) => switch (value) {
+        0 => MINIAV_MOUSE_ACTION_MOVE,
+        1 => MINIAV_MOUSE_ACTION_BUTTON_DOWN,
+        2 => MINIAV_MOUSE_ACTION_BUTTON_UP,
+        3 => MINIAV_MOUSE_ACTION_WHEEL,
+        _ => throw ArgumentError('Unknown value for MiniAVMouseAction: $value'),
+      };
+}
+
+enum MiniAVMouseButton {
+  MINIAV_MOUSE_BUTTON_NONE(0),
+  MINIAV_MOUSE_BUTTON_LEFT(1),
+  MINIAV_MOUSE_BUTTON_RIGHT(2),
+  MINIAV_MOUSE_BUTTON_MIDDLE(3),
+  MINIAV_MOUSE_BUTTON_X1(4),
+  MINIAV_MOUSE_BUTTON_X2(5);
+
+  final int value;
+  const MiniAVMouseButton(this.value);
+
+  static MiniAVMouseButton fromValue(int value) => switch (value) {
+        0 => MINIAV_MOUSE_BUTTON_NONE,
+        1 => MINIAV_MOUSE_BUTTON_LEFT,
+        2 => MINIAV_MOUSE_BUTTON_RIGHT,
+        3 => MINIAV_MOUSE_BUTTON_MIDDLE,
+        4 => MINIAV_MOUSE_BUTTON_X1,
+        5 => MINIAV_MOUSE_BUTTON_X2,
+        _ => throw ArgumentError('Unknown value for MiniAVMouseButton: $value'),
+      };
+}
+
+final class MiniAVKeyboardEvent extends ffi.Struct {
+  @ffi.Uint64()
+  external int timestamp_us;
+
+  @ffi.Uint32()
+  external int key_code;
+
+  @ffi.Uint32()
+  external int scan_code;
+
+  @ffi.UnsignedInt()
+  external int actionAsInt;
+
+  MiniAVKeyAction get action => MiniAVKeyAction.fromValue(actionAsInt);
+}
+
+final class MiniAVMouseEvent extends ffi.Struct {
+  @ffi.Uint64()
+  external int timestamp_us;
+
+  @ffi.Int32()
+  external int x;
+
+  @ffi.Int32()
+  external int y;
+
+  @ffi.Int32()
+  external int delta_x;
+
+  @ffi.Int32()
+  external int delta_y;
+
+  @ffi.Int32()
+  external int wheel_delta;
+
+  @ffi.UnsignedInt()
+  external int actionAsInt;
+
+  MiniAVMouseAction get action => MiniAVMouseAction.fromValue(actionAsInt);
+
+  @ffi.UnsignedInt()
+  external int buttonAsInt;
+
+  MiniAVMouseButton get button => MiniAVMouseButton.fromValue(buttonAsInt);
+}
+
+final class MiniAVGamepadEvent extends ffi.Struct {
+  @ffi.Uint64()
+  external int timestamp_us;
+
+  @ffi.Uint32()
+  external int gamepad_index;
+
+  @ffi.Uint16()
+  external int buttons;
+
+  @ffi.Int16()
+  external int left_stick_x;
+
+  @ffi.Int16()
+  external int left_stick_y;
+
+  @ffi.Int16()
+  external int right_stick_x;
+
+  @ffi.Int16()
+  external int right_stick_y;
+
+  @ffi.Uint8()
+  external int left_trigger;
+
+  @ffi.Uint8()
+  external int right_trigger;
+
+  @ffi.Bool()
+  external bool connected;
+}
+
+typedef MiniAVKeyboardCallbackFunction = ffi.Void Function(
+    ffi.Pointer<MiniAVKeyboardEvent> event, ffi.Pointer<ffi.Void> user_data);
+typedef DartMiniAVKeyboardCallbackFunction = void Function(
+    ffi.Pointer<MiniAVKeyboardEvent> event, ffi.Pointer<ffi.Void> user_data);
+typedef MiniAVKeyboardCallback
+    = ffi.Pointer<ffi.NativeFunction<MiniAVKeyboardCallbackFunction>>;
+typedef MiniAVMouseCallbackFunction = ffi.Void Function(
+    ffi.Pointer<MiniAVMouseEvent> event, ffi.Pointer<ffi.Void> user_data);
+typedef DartMiniAVMouseCallbackFunction = void Function(
+    ffi.Pointer<MiniAVMouseEvent> event, ffi.Pointer<ffi.Void> user_data);
+typedef MiniAVMouseCallback
+    = ffi.Pointer<ffi.NativeFunction<MiniAVMouseCallbackFunction>>;
+typedef MiniAVGamepadCallbackFunction = ffi.Void Function(
+    ffi.Pointer<MiniAVGamepadEvent> event, ffi.Pointer<ffi.Void> user_data);
+typedef DartMiniAVGamepadCallbackFunction = void Function(
+    ffi.Pointer<MiniAVGamepadEvent> event, ffi.Pointer<ffi.Void> user_data);
+typedef MiniAVGamepadCallback
+    = ffi.Pointer<ffi.NativeFunction<MiniAVGamepadCallbackFunction>>;
+
+final class MiniAVInputConfig extends ffi.Struct {
+  @ffi.Uint32()
+  external int input_types;
+
+  @ffi.Uint32()
+  external int mouse_throttle_hz;
+
+  @ffi.Uint32()
+  external int gamepad_poll_hz;
+
+  external MiniAVKeyboardCallback keyboard_callback;
+
+  external MiniAVMouseCallback mouse_callback;
+
+  external MiniAVGamepadCallback gamepad_callback;
+
+  external ffi.Pointer<ffi.Void> user_data;
+}
 
 enum MiniAVLogLevel {
   MINIAV_LOG_LEVEL_TRACE(0),

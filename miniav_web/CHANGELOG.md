@@ -1,7 +1,19 @@
 # miniav_web CHANGELOG
 
-## 0.4.5-WIP
+## 0.5.0-WIP
 
+- adding input support
+
+## 0.4.7
+
+- fix loopback crackles
+## 0.4.6
+
+- fix build hook null
+- update cmake toolchain
+## 0.4.5
+
+- fixed black rendering on chrome
 ## 0.4.4
 
 ## 0.4.3

@@ -64,6 +64,14 @@ else()
     message(STATUS "Loopback audio disabled: not supported on ${MINIAV_PLATFORM_NAME}")
 endif()
 
+# Input capture is only supported on desktop platforms
+if(MINIAV_PLATFORM_WINDOWS OR MINIAV_PLATFORM_MACOS OR MINIAV_PLATFORM_LINUX)
+    option(MINIAV_ENABLE_INPUT "Enable Input Capture Module" ON)
+else()
+    set(MINIAV_ENABLE_INPUT OFF CACHE BOOL "Input capture not supported on mobile/web platforms" FORCE)
+    message(STATUS "Input capture disabled: not supported on ${MINIAV_PLATFORM_NAME}")
+endif()
+
 # --- Backend Options ---
 # Windows Backends
 if(MINIAV_PLATFORM_WINDOWS)
@@ -71,6 +79,7 @@ if(MINIAV_PLATFORM_WINDOWS)
     option(MINIAV_BACKEND_WIN_DXGI "Enable DXGI for Windows screen capture" ON)
     option(MINIAV_BACKEND_WIN_MF "Enable Media Foundation for Windows camera" ON)
     option(MINIAV_BACKEND_WIN_WASAPI "Enable WASAPI for Windows loopback audio" ON)
+    option(MINIAV_BACKEND_WIN_HOOKS_XINPUT "Enable low-level hooks + XInput for Windows input capture" ON)
 endif()
 
 # macOS Backends
@@ -430,6 +439,24 @@ else()
     message(STATUS "Loopback audio module disabled")
 endif()
 
+# --- Input Capture Module (Desktop Only) ---
+if(MINIAV_ENABLE_INPUT)
+    message(STATUS "Input capture module enabled")
+    list(APPEND ALL_DEFINITIONS "MINIAV_MODULE_INPUT_ENABLED")
+    list(APPEND ALL_SOURCES "src/input/input_api.c")
+    list(APPEND ALL_PRIVATE_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src/input")
+
+    if(MINIAV_PLATFORM_WINDOWS AND MINIAV_BACKEND_WIN_HOOKS_XINPUT)
+        message(STATUS "Windows: Enabling low-level hooks + XInput for input capture")
+        list(APPEND ALL_SOURCES "src/input/windows/input_context_win_rawinput.c")
+        list(APPEND ALL_HEADERS "src/input/windows/input_context_win_rawinput.h")
+        list(APPEND ALL_LINK_LIBS user32 xinput)
+        list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_WIN_HOOKS_XINPUT_ENABLED")
+    endif()
+else()
+    message(STATUS "Input capture module disabled")
+endif()
+
 # --- Android-specific Setup ---
 if(MINIAV_PLATFORM_ANDROID)
     # Android NDK API level
@@ -498,6 +525,15 @@ if(MINIAV_PLATFORM_WINDOWS OR MINIAV_PLATFORM_MACOS OR MINIAV_PLATFORM_LINUX)
         add_executable(test_loopback_capture src/loopback/test/test_loopback_capture.c)
         target_link_libraries(test_loopback_capture PRIVATE miniav_c)
         target_include_directories(test_loopback_capture PRIVATE ${TEST_INCLUDE_DIRS})
+    endif()
+
+    if(MINIAV_ENABLE_INPUT)
+        add_executable(test_input_capture src/input/test/test_input_capture.c)
+        target_link_libraries(test_input_capture PRIVATE miniav_c)
+        target_include_directories(test_input_capture PRIVATE ${TEST_INCLUDE_DIRS})
+        if(MINIAV_PLATFORM_WINDOWS)
+            target_link_libraries(test_input_capture PRIVATE user32 xinput)
+        endif()
     endif()
 else()
     message(STATUS "Test executables disabled on ${MINIAV_PLATFORM_NAME}")

@@ -146,6 +146,21 @@ MiniAV_Loopback_StartCapture(MiniAVLoopbackContextHandle context,
 MINIAV_API MiniAVResultCode
 MiniAV_Loopback_StopCapture(MiniAVLoopbackContextHandle context);
 
+// --- Input Capture API ---
+MINIAV_API MiniAVResultCode
+MiniAV_Input_EnumerateGamepads(MiniAVDeviceInfo **devices, uint32_t *count);
+MINIAV_API MiniAVResultCode
+MiniAV_Input_CreateContext(MiniAVInputContextHandle *context);
+MINIAV_API MiniAVResultCode
+MiniAV_Input_DestroyContext(MiniAVInputContextHandle context);
+MINIAV_API MiniAVResultCode
+MiniAV_Input_Configure(MiniAVInputContextHandle context,
+                       const MiniAVInputConfig *config);
+MINIAV_API MiniAVResultCode
+MiniAV_Input_StartCapture(MiniAVInputContextHandle context);
+MINIAV_API MiniAVResultCode
+MiniAV_Input_StopCapture(MiniAVInputContextHandle context);
+
 // --- Property APIs (TBD) ---
 // MiniAV_Camera_GetPropertyInfo(...)
 // MiniAV_Camera_GetProperty(...)

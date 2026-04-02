@@ -2,6 +2,7 @@ import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart';
 import 'package:miniav_ffi/modules/miniav_ffi_audio_input.dart';
 import 'package:miniav_ffi/modules/miniav_ffi_loopback.dart';
+import 'package:miniav_ffi/modules/miniav_ffi_input.dart';
 import 'miniav_ffi_bindings.dart' as bindings;
 import 'modules/miniav_ffi_camera.dart';
 import 'modules/miniav_ffi_screen.dart';
@@ -12,6 +13,7 @@ export 'modules/miniav_ffi_camera.dart';
 export 'modules/miniav_ffi_screen.dart';
 export 'modules/miniav_ffi_audio_input.dart';
 export 'modules/miniav_ffi_loopback.dart';
+export 'modules/miniav_ffi_input.dart';
 
 // --- Platform Implementation ---
 
@@ -22,6 +24,7 @@ class MiniAVFFIPlatform extends MiniAVPlatformInterface {
   final MiniFFIScreenPlatform _screen = MiniFFIScreenPlatform();
   final MiniAVFFILoopbackPlatform _loopback = MiniAVFFILoopbackPlatform();
   final MiniAVFFIAudioInputPlatform _audioInput = MiniAVFFIAudioInputPlatform();
+  final MiniAVFFIInputPlatform _input = MiniAVFFIInputPlatform();
 
   @override
   MiniCameraPlatformInterface get camera => _camera;
@@ -34,6 +37,9 @@ class MiniAVFFIPlatform extends MiniAVPlatformInterface {
 
   @override
   MiniLoopbackPlatformInterface get loopback => _loopback;
+
+  @override
+  MiniInputPlatformInterface get input => _input;
 
   @override
   String getVersionString() {

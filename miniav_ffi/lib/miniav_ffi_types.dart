@@ -524,3 +524,64 @@ extension AudioInfoFFIToPlatform on AudioInfo {
     native.num_frames = info.numFrames;
   }
 }
+
+// --- Input Capture Type Conversions ---
+
+/// Convert native MiniAVKeyboardEvent to platform type.
+MiniAVKeyboardEvent keyboardEventFromNative(
+  bindings.MiniAVKeyboardEvent native,
+) {
+  return MiniAVKeyboardEvent(
+    timestampUs: native.timestamp_us,
+    keyCode: native.key_code,
+    scanCode: native.scan_code,
+    action: MiniAVKeyAction.fromValue(native.actionAsInt),
+  );
+}
+
+/// Convert native MiniAVMouseEvent to platform type.
+MiniAVMouseEvent mouseEventFromNative(bindings.MiniAVMouseEvent native) {
+  return MiniAVMouseEvent(
+    timestampUs: native.timestamp_us,
+    x: native.x,
+    y: native.y,
+    deltaX: native.delta_x,
+    deltaY: native.delta_y,
+    wheelDelta: native.wheel_delta,
+    action: MiniAVMouseAction.fromValue(native.actionAsInt),
+    button: MiniAVMouseButton.fromValue(native.buttonAsInt),
+  );
+}
+
+/// Convert native MiniAVGamepadEvent to platform type.
+MiniAVGamepadEvent gamepadEventFromNative(bindings.MiniAVGamepadEvent native) {
+  return MiniAVGamepadEvent(
+    timestampUs: native.timestamp_us,
+    gamepadIndex: native.gamepad_index,
+    buttons: native.buttons,
+    leftStickX: native.left_stick_x,
+    leftStickY: native.left_stick_y,
+    rightStickX: native.right_stick_x,
+    rightStickY: native.right_stick_y,
+    leftTrigger: native.left_trigger,
+    rightTrigger: native.right_trigger,
+    connected: native.connected,
+  );
+}
+
+/// Copy MiniAVInputConfig to a native struct, setting callback pointers.
+void copyInputConfigToNative(
+  MiniAVInputConfig config,
+  bindings.MiniAVInputConfig native, {
+  required bindings.MiniAVKeyboardCallback keyboardCb,
+  required bindings.MiniAVMouseCallback mouseCb,
+  required bindings.MiniAVGamepadCallback gamepadCb,
+}) {
+  native.input_types = config.inputTypes;
+  native.mouse_throttle_hz = config.mouseThrottleHz;
+  native.gamepad_poll_hz = config.gamepadPollHz;
+  native.keyboard_callback = keyboardCb;
+  native.mouse_callback = mouseCb;
+  native.gamepad_callback = gamepadCb;
+  native.user_data = ffi.nullptr;
+}

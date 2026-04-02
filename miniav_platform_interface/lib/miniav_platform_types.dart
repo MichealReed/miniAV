@@ -156,3 +156,142 @@ typedef ScreenFormatDefaults = (
   MiniAVVideoInfo videoFormat,
   MiniAVAudioInfo? audioFormat,
 );
+
+// --- Input Capture Types ---
+
+enum MiniAVInputType {
+  keyboard(0x01),
+  mouse(0x02),
+  gamepad(0x04);
+
+  final int value;
+  const MiniAVInputType(this.value);
+}
+
+enum MiniAVKeyAction {
+  down(0),
+  up(1);
+
+  final int value;
+  const MiniAVKeyAction(this.value);
+
+  static MiniAVKeyAction fromValue(int value) => switch (value) {
+    0 => down,
+    1 => up,
+    _ => throw ArgumentError('Unknown MiniAVKeyAction value: $value'),
+  };
+}
+
+enum MiniAVMouseAction {
+  move(0),
+  buttonDown(1),
+  buttonUp(2),
+  wheel(3);
+
+  final int value;
+  const MiniAVMouseAction(this.value);
+
+  static MiniAVMouseAction fromValue(int value) => switch (value) {
+    0 => move,
+    1 => buttonDown,
+    2 => buttonUp,
+    3 => wheel,
+    _ => throw ArgumentError('Unknown MiniAVMouseAction value: $value'),
+  };
+}
+
+enum MiniAVMouseButton {
+  none(0),
+  left(1),
+  right(2),
+  middle(3),
+  x1(4),
+  x2(5);
+
+  final int value;
+  const MiniAVMouseButton(this.value);
+
+  static MiniAVMouseButton fromValue(int value) => switch (value) {
+    0 => none,
+    1 => left,
+    2 => right,
+    3 => middle,
+    4 => x1,
+    5 => x2,
+    _ => throw ArgumentError('Unknown MiniAVMouseButton value: $value'),
+  };
+}
+
+class MiniAVKeyboardEvent {
+  final int timestampUs;
+  final int keyCode;
+  final int scanCode;
+  final MiniAVKeyAction action;
+
+  MiniAVKeyboardEvent({
+    required this.timestampUs,
+    required this.keyCode,
+    required this.scanCode,
+    required this.action,
+  });
+}
+
+class MiniAVMouseEvent {
+  final int timestampUs;
+  final int x;
+  final int y;
+  final int deltaX;
+  final int deltaY;
+  final int wheelDelta;
+  final MiniAVMouseAction action;
+  final MiniAVMouseButton button;
+
+  MiniAVMouseEvent({
+    required this.timestampUs,
+    required this.x,
+    required this.y,
+    required this.deltaX,
+    required this.deltaY,
+    required this.wheelDelta,
+    required this.action,
+    required this.button,
+  });
+}
+
+class MiniAVGamepadEvent {
+  final int timestampUs;
+  final int gamepadIndex;
+  final int buttons;
+  final int leftStickX;
+  final int leftStickY;
+  final int rightStickX;
+  final int rightStickY;
+  final int leftTrigger;
+  final int rightTrigger;
+  final bool connected;
+
+  MiniAVGamepadEvent({
+    required this.timestampUs,
+    required this.gamepadIndex,
+    required this.buttons,
+    required this.leftStickX,
+    required this.leftStickY,
+    required this.rightStickX,
+    required this.rightStickY,
+    required this.leftTrigger,
+    required this.rightTrigger,
+    required this.connected,
+  });
+}
+
+class MiniAVInputConfig {
+  final int inputTypes;
+  final int mouseThrottleHz;
+  final int gamepadPollHz;
+
+  MiniAVInputConfig({
+    required this.inputTypes,
+    this.mouseThrottleHz = 60,
+    this.gamepadPollHz = 60,
+  });
+}

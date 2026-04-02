@@ -1,6 +1,17 @@
 # miniav_platform_interface CHANGELOG
 
-## 0.4.5-WIP
+## 0.5.0-WIP
+
+- adding input support
+
+## 0.4.7
+
+- fix loopback crackles
+## 0.4.6
+
+- fix build hook null
+- update cmake toolchain
+## 0.4.5
 
 ## 0.4.4
 

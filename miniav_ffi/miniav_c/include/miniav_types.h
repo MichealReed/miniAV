@@ -163,6 +163,93 @@ typedef struct MiniAVCameraContext *MiniAVCameraContextHandle;
 typedef struct MiniAVScreenContext *MiniAVScreenContextHandle;
 typedef struct MiniAVAudioContext *MiniAVAudioContextHandle;
 typedef struct MiniAVLoopbackContext *MiniAVLoopbackContextHandle;
+typedef struct MiniAVInputContext *MiniAVInputContextHandle;
+
+// --- Input Capture Types ---
+
+// Input type bitmask for selecting which inputs to capture
+typedef enum {
+  MINIAV_INPUT_TYPE_KEYBOARD = 0x01,
+  MINIAV_INPUT_TYPE_MOUSE = 0x02,
+  MINIAV_INPUT_TYPE_GAMEPAD = 0x04,
+} MiniAVInputType;
+
+// Keyboard action
+typedef enum {
+  MINIAV_KEY_ACTION_DOWN = 0,
+  MINIAV_KEY_ACTION_UP = 1,
+} MiniAVKeyAction;
+
+// Mouse action
+typedef enum {
+  MINIAV_MOUSE_ACTION_MOVE = 0,
+  MINIAV_MOUSE_ACTION_BUTTON_DOWN = 1,
+  MINIAV_MOUSE_ACTION_BUTTON_UP = 2,
+  MINIAV_MOUSE_ACTION_WHEEL = 3,
+} MiniAVMouseAction;
+
+// Mouse button identifiers
+typedef enum {
+  MINIAV_MOUSE_BUTTON_NONE = 0,
+  MINIAV_MOUSE_BUTTON_LEFT = 1,
+  MINIAV_MOUSE_BUTTON_RIGHT = 2,
+  MINIAV_MOUSE_BUTTON_MIDDLE = 3,
+  MINIAV_MOUSE_BUTTON_X1 = 4,
+  MINIAV_MOUSE_BUTTON_X2 = 5,
+} MiniAVMouseButton;
+
+// Keyboard event
+typedef struct {
+  uint64_t timestamp_us;
+  uint32_t key_code;      // Platform virtual key code
+  uint32_t scan_code;     // Hardware scan code
+  MiniAVKeyAction action;
+} MiniAVKeyboardEvent;
+
+// Mouse event
+typedef struct {
+  uint64_t timestamp_us;
+  int32_t x;              // Absolute screen X
+  int32_t y;              // Absolute screen Y
+  int32_t delta_x;        // Relative movement X
+  int32_t delta_y;        // Relative movement Y
+  int32_t wheel_delta;    // Scroll wheel delta
+  MiniAVMouseAction action;
+  MiniAVMouseButton button;
+} MiniAVMouseEvent;
+
+// Gamepad event
+typedef struct {
+  uint64_t timestamp_us;
+  uint32_t gamepad_index;
+  uint16_t buttons;       // Bitmask of pressed buttons
+  int16_t left_stick_x;
+  int16_t left_stick_y;
+  int16_t right_stick_x;
+  int16_t right_stick_y;
+  uint8_t left_trigger;
+  uint8_t right_trigger;
+  bool connected;
+} MiniAVGamepadEvent;
+
+// Typed input callbacks
+typedef void (*MiniAVKeyboardCallback)(const MiniAVKeyboardEvent *event,
+                                       void *user_data);
+typedef void (*MiniAVMouseCallback)(const MiniAVMouseEvent *event,
+                                    void *user_data);
+typedef void (*MiniAVGamepadCallback)(const MiniAVGamepadEvent *event,
+                                      void *user_data);
+
+// Input configuration
+typedef struct {
+  uint32_t input_types;         // Bitmask of MiniAVInputType
+  uint32_t mouse_throttle_hz;   // 0 = no throttle, default = 60
+  uint32_t gamepad_poll_hz;     // 0 = default (60)
+  MiniAVKeyboardCallback keyboard_callback;
+  MiniAVMouseCallback mouse_callback;
+  MiniAVGamepadCallback gamepad_callback;
+  void *user_data;
+} MiniAVInputConfig;
 
 // --- Logging ---
 typedef enum {

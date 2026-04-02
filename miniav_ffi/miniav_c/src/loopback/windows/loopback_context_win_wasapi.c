@@ -200,27 +200,33 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
   UINT64 qpc_position;    // This is the key timestamp from WASAPI
 
   HANDLE wait_array[2] = {platform_ctx->stop_event_handle,
-                          NULL}; // wait_array[1] was never set
-  DWORD wait_count = 1;          // Only waiting on stop_event or timeout
+                          platform_ctx->buffer_event_handle};
+  DWORD wait_count = platform_ctx->event_driven_capture ? 2 : 1;
 
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WASAPI: Capture thread started.");
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+             "WASAPI: Capture thread started (mode: %s).",
+             platform_ctx->event_driven_capture ? "event-driven" : "polling");
 
   while (TRUE) {
-    // Using a fixed timeout for polling, can be adjusted.
-    // Consider using event-driven mode if supported and desired for lower
-    // latency, but polling is simpler for loopback.
-    DWORD wait_result = WaitForSingleObject(platform_ctx->stop_event_handle,
-                                            10); // Poll every 10ms
+    DWORD wait_result;
+    if (platform_ctx->event_driven_capture) {
+      wait_result = WaitForMultipleObjects(wait_count, wait_array, FALSE,
+                                           2000); // 2s safety timeout
+    } else {
+      wait_result = WaitForSingleObject(platform_ctx->stop_event_handle,
+                                        5); // Poll every 5ms
+    }
 
     if (wait_result == WAIT_OBJECT_0) {
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "WASAPI: Capture thread received stop event.");
       break;
-    } else if (wait_result == WAIT_TIMEOUT) {
-      // Polling interval expired, proceed to check for data
+    } else if (wait_result == WAIT_OBJECT_0 + 1 ||
+               wait_result == WAIT_TIMEOUT) {
+      // Buffer event signaled or timeout — drain available packets
     } else if (wait_result == WAIT_FAILED) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "WASAPI: Capture thread WaitForSingleObject failed: %lu",
+                 "WASAPI: Capture thread wait failed: %lu",
                  GetLastError());
       break;
     }
@@ -264,23 +270,23 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
         buffer.type = MINIAV_BUFFER_TYPE_AUDIO;
         buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
 
-        // Convert QPC position to microseconds
+        // Convert QPC to us
         if (platform_ctx->qpc_frequency.QuadPart != 0) {
           buffer.timestamp_us =
               (qpc_position * 1000000) / platform_ctx->qpc_frequency.QuadPart;
         } else {
-          buffer.timestamp_us =
-              miniav_get_time_us(); // Fallback, though qpc_frequency should
-                                    // always be valid
-          miniav_log(MINIAV_LOG_LEVEL_WARN,
-                     "WASAPI: QPC frequency is zero in capture thread, using "
-                     "fallback timestamp.");
+          buffer.timestamp_us = miniav_get_time_us();
         }
 
-        buffer.data.audio.data =
-            data_ptr; // Can be NULL if AUDCLNT_BUFFERFLAGS_SILENT and no data
-        buffer.data_size_bytes =
-            num_frames_available * platform_ctx->capture_format->nBlockAlign;
+        // If silent, provide size=0 or a zeroed scratch buffer to avoid NULL data_ptr surprises
+        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+          buffer.data.audio.data = NULL;
+          buffer.data_size_bytes = 0; // consumer must synthesize silence if needed
+        } else {
+          buffer.data.audio.data = data_ptr;
+          buffer.data_size_bytes =
+              num_frames_available * platform_ctx->capture_format->nBlockAlign;
+        }
 
         buffer.data.audio.info = ctx->configured_video_format;
         buffer.data.audio.info.num_frames = num_frames_available;
@@ -354,6 +360,18 @@ MiniAVResultCode wasapi_init_platform(MiniAVLoopbackContext *ctx) {
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
   }
 
+  platform_ctx->buffer_event_handle = CreateEvent(
+      NULL, FALSE, FALSE, NULL); // Auto-reset, initially non-signaled
+  if (platform_ctx->buffer_event_handle == NULL) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "WASAPI: CreateEvent for buffer_event failed: %lu",
+               GetLastError());
+    CloseHandle(platform_ctx->stop_event_handle);
+    miniav_free(platform_ctx);
+    ctx->platform_ctx = NULL;
+    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+  }
+
   HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
   if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "WASAPI: CoInitializeEx failed: 0x%lx",
@@ -407,6 +425,10 @@ MiniAVResultCode wasapi_destroy_platform(MiniAVLoopbackContext *ctx) {
   if (platform_ctx->stop_event_handle) {
     CloseHandle(platform_ctx->stop_event_handle);
     platform_ctx->stop_event_handle = NULL;
+  }
+  if (platform_ctx->buffer_event_handle) {
+    CloseHandle(platform_ctx->buffer_event_handle);
+    platform_ctx->buffer_event_handle = NULL;
   }
 
   miniav_free(platform_ctx);
@@ -1216,10 +1238,36 @@ MiniAVResultCode wasapi_configure_loopback(
     }
     memcpy(platform_ctx->capture_format, platform_ctx->mix_format,
            sizeof(WAVEFORMATEX) + platform_ctx->mix_format->cbSize);
+
+    // Log the actual WASAPI mix format to avoid decode mismatches.
+    if (platform_ctx->mix_format->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+      const WAVEFORMATEXTENSIBLE *ext = (const WAVEFORMATEXTENSIBLE *)platform_ctx->mix_format;
+      miniav_log(MINIAV_LOG_LEVEL_INFO,
+        "WASAPI Cfg: MixFormat: EXTENSIBLE, %u ch, %lu Hz, wBits=%u, validBits=%u, "
+        "float=%s, nBlockAlign=%u, nAvgBps=%lu, cbSize=%u, chMask=0x%08lx",
+        platform_ctx->mix_format->nChannels,
+        platform_ctx->mix_format->nSamplesPerSec,
+        platform_ctx->mix_format->wBitsPerSample,
+        ext->Samples.wValidBitsPerSample,
+        IsEqualGUID(&ext->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) ? "yes" : "no",
+        platform_ctx->mix_format->nBlockAlign,
+        platform_ctx->mix_format->nAvgBytesPerSec,
+        platform_ctx->mix_format->cbSize,
+        ext->dwChannelMask);
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_INFO,
+        "WASAPI Cfg: MixFormat: tag=%u, %u ch, %lu Hz, wBits=%u, nBlockAlign=%u, nAvgBps=%lu",
+        platform_ctx->mix_format->wFormatTag,
+        platform_ctx->mix_format->nChannels,
+        platform_ctx->mix_format->nSamplesPerSec,
+        platform_ctx->mix_format->wBitsPerSample,
+        platform_ctx->mix_format->nBlockAlign,
+        platform_ctx->mix_format->nAvgBytesPerSec);
+    }
   }
 
-  // Initialize IAudioClient if IAudioClient3 path wasn't taken or failed and
-  // fell back to IAudioClient The IAudioClient3 path calls
+  // Initialize IAudioClient if IAudioClient3 path wasn't taken or
+  // failed and fell back to IAudioClient The IAudioClient3 path calls
   // InitializeSharedAudioStream which is its form of Initialize. So, only
   // call Initialize if platform_ctx->audio_client is an IAudioClient that
   // hasn't been initialized yet. A simple way to check: if it's not an
@@ -1230,20 +1278,87 @@ MiniAVResultCode wasapi_configure_loopback(
                                     // path wasn't taken or failed before its
                                     // assignment to platform_ctx->audio_client
     REFERENCE_TIME hns_requested_duration = 0;
+
+    // Try event-driven mode first (LOOPBACK | EVENTCALLBACK)
+    DWORD event_flags = stream_flags | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
     hr = platform_ctx->audio_client->lpVtbl->Initialize(
-        platform_ctx->audio_client, AUDCLNT_SHAREMODE_SHARED, stream_flags,
+        platform_ctx->audio_client, AUDCLNT_SHAREMODE_SHARED, event_flags,
         hns_requested_duration, 0, platform_ctx->capture_format, NULL);
-    if (FAILED(hr)) {
-      miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "WASAPI Cfg: IAudioClient::Initialize failed: 0x%lx", hr);
-      if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                   "WASAPI Cfg: Format not supported by endpoint for "
-                   "IAudioClient::Initialize.");
+
+    if (SUCCEEDED(hr)) {
+      hr = platform_ctx->audio_client->lpVtbl->SetEventHandle(
+          platform_ctx->audio_client, platform_ctx->buffer_event_handle);
+      if (SUCCEEDED(hr)) {
+        platform_ctx->event_driven_capture = TRUE;
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "WASAPI Cfg: Event-driven capture mode enabled.");
+      } else {
+        // SetEventHandle failed — must re-create client for polling fallback
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "WASAPI Cfg: SetEventHandle failed: 0x%lx. "
+                   "Re-creating client for polling mode.",
+                   hr);
+        platform_ctx->audio_client->lpVtbl->Release(
+            platform_ctx->audio_client);
+        platform_ctx->audio_client = NULL;
+        hr = platform_ctx->audio_device->lpVtbl->Activate(
+            platform_ctx->audio_device, &IID_IAudioClient, CLSCTX_ALL, NULL,
+            (void **)&platform_ctx->audio_client);
+        if (FAILED(hr)) {
+          miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                     "WASAPI Cfg: Re-Activate IAudioClient failed: 0x%lx",
+                     hr);
+          mres = hresult_to_miniavresult(hr);
+          goto config_cleanup;
+        }
+        hr = platform_ctx->audio_client->lpVtbl->Initialize(
+            platform_ctx->audio_client, AUDCLNT_SHAREMODE_SHARED, stream_flags,
+            hns_requested_duration, 0, platform_ctx->capture_format, NULL);
+        if (FAILED(hr)) {
+          miniav_log(
+              MINIAV_LOG_LEVEL_ERROR,
+              "WASAPI Cfg: Polling-mode Initialize failed: 0x%lx", hr);
+          mres = hresult_to_miniavresult(hr);
+          goto config_cleanup;
+        }
+        platform_ctx->event_driven_capture = FALSE;
       }
-      mres = hresult_to_miniavresult(hr);
-      goto config_cleanup;
+    } else {
+      // Event-driven Initialize failed — fall back to polling.
+      // IAudioClient::Initialize can only be called once, so re-activate.
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "WASAPI Cfg: Event-driven Initialize failed: 0x%lx. "
+                 "Falling back to polling.",
+                 hr);
+      platform_ctx->audio_client->lpVtbl->Release(platform_ctx->audio_client);
+      platform_ctx->audio_client = NULL;
+      hr = platform_ctx->audio_device->lpVtbl->Activate(
+          platform_ctx->audio_device, &IID_IAudioClient, CLSCTX_ALL, NULL,
+          (void **)&platform_ctx->audio_client);
+      if (FAILED(hr)) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "WASAPI Cfg: Re-Activate IAudioClient failed: 0x%lx", hr);
+        mres = hresult_to_miniavresult(hr);
+        goto config_cleanup;
+      }
+      hr = platform_ctx->audio_client->lpVtbl->Initialize(
+          platform_ctx->audio_client, AUDCLNT_SHAREMODE_SHARED, stream_flags,
+          hns_requested_duration, 0, platform_ctx->capture_format, NULL);
+      if (FAILED(hr)) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "WASAPI Cfg: IAudioClient::Initialize failed: 0x%lx", hr);
+        if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
+          miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                     "WASAPI Cfg: Format not supported by endpoint.");
+        }
+        mres = hresult_to_miniavresult(hr);
+        goto config_cleanup;
+      }
+      platform_ctx->event_driven_capture = FALSE;
     }
+  } else if (audio_client3) {
+    // IAudioClient3 path — polling mode (event callback not used)
+    platform_ctx->event_driven_capture = FALSE;
   }
 
   waveformat_to_miniav_audio_format(platform_ctx->capture_format,

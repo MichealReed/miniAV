@@ -1,12 +1,14 @@
 import 'package:miniav_platform_interface/miniav_platform_interface.dart';
 import './src/miniav_audio_input.dart';
 import './src/miniav_camera.dart';
+import './src/miniav_input.dart';
 import './src/miniav_loopback.dart';
 import './src/miniav_screen.dart';
 
 export 'package:miniav_platform_interface/miniav_platform_interface.dart';
 export './src/miniav_audio_input.dart';
 export './src/miniav_camera.dart';
+export './src/miniav_input.dart';
 export './src/miniav_loopback.dart';
 export './src/miniav_screen.dart';
 
@@ -26,6 +28,9 @@ class MiniAV {
 
   /// Loopback (system audio) capture functionality
   static MiniLoopback get loopback => MiniLoopback();
+
+  /// Input capture (keyboard, mouse, gamepad) functionality
+  static MiniInput get input => MiniInput();
 
   /// Get the version string of the MiniAV library
   static String getVersion() => _platform.getVersionString();

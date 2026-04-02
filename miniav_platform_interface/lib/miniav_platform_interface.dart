@@ -4,12 +4,14 @@ import 'modules/miniav_camera_interface.dart';
 import 'modules/miniav_screen_interface.dart';
 import 'modules/miniav_audio_input_interface.dart';
 import 'modules/miniav_loopback_interface.dart';
+import 'modules/miniav_input_interface.dart';
 
 export 'miniav_platform_types.dart';
 export 'modules/miniav_camera_interface.dart';
 export 'modules/miniav_screen_interface.dart';
 export 'modules/miniav_audio_input_interface.dart';
 export 'modules/miniav_loopback_interface.dart';
+export 'modules/miniav_input_interface.dart';
 
 // Conditional import for platform-specific implementation
 import 'platform_stub/miniav_platform_stub.dart'
@@ -37,6 +39,7 @@ abstract class MiniAVPlatformInterface {
   MiniScreenPlatformInterface get screen;
   MiniAudioInputPlatformInterface get audioInput;
   MiniLoopbackPlatformInterface get loopback;
+  MiniInputPlatformInterface get input;
 
   String getVersionString();
   void setLogLevel(int level);

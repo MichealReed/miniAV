@@ -1,6 +1,6 @@
 # miniav_web CHANGELOG
 
-## 0.5.0-WIP
+## 0.5.0
 
 - adding input support
 

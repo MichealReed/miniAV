@@ -80,11 +80,31 @@ class MiniAVWebAudioInputPlatform implements MiniAudioInputPlatformInterface {
   Future<MiniAudioInputContextPlatformInterface> createContext() async {
     return MiniAVWebAudioInputContext();
   }
+
+  static final _WebDeviceChangeWatcher _watcher = _WebDeviceChangeWatcher(
+    kind: 'audioinput',
+    deviceFactory: (info, isDefault) => MiniAVDeviceInfo(
+      deviceId: info.deviceId,
+      name: info.label.isNotEmpty ? info.label : 'Microphone',
+      isDefault: isDefault,
+    ),
+  );
+
+  @override
+  void Function() addDeviceChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => _watcher.add(listener);
 }
 
 /// Web implementation of [MiniAudioInputContextPlatformInterface]
 class MiniAVWebAudioInputContext
     implements MiniAudioInputContextPlatformInterface {
+  @override
+  void Function() addLostListener(MiniAVContextLostListener listener) {
+    // Web microphones can be revoked but we don't currently propagate that.
+    return () {};
+  }
+
   web.MediaStream? _mediaStream;
   web.AudioContext? _audioContext;
   web.MediaStreamAudioSourceNode? _sourceNode;

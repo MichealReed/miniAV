@@ -10,7 +10,9 @@ part 'modules/miniav_web_camera.dart';
 part 'modules/miniav_web_screen.dart';
 part 'modules/miniav_web_audio_input.dart';
 part 'modules/miniav_web_loopback.dart';
+part 'modules/miniav_web_input.dart';
 part './miniav_web_utils.dart';
+part './miniav_web_subscriptions.dart';
 
 /// Web implementation of MiniAV platform interface
 class MiniAVWebPlatform extends MiniAVPlatformInterface {
@@ -18,8 +20,10 @@ class MiniAVWebPlatform extends MiniAVPlatformInterface {
 
   final MiniCameraPlatformInterface _camera = MiniAVWebCameraPlatform();
   final MiniScreenPlatformInterface _screen = MiniAVWebScreenPlatform();
-  final MiniAudioInputPlatformInterface _audioInput = MiniAVWebAudioInputPlatform();
+  final MiniAudioInputPlatformInterface _audioInput =
+      MiniAVWebAudioInputPlatform();
   final MiniLoopbackPlatformInterface _loopback = MiniAVWebLoopbackPlatform();
+  final MiniInputPlatformInterface _input = MiniAVWebInputPlatform();
 
   @override
   MiniCameraPlatformInterface get camera => _camera;
@@ -32,6 +36,9 @@ class MiniAVWebPlatform extends MiniAVPlatformInterface {
 
   @override
   MiniLoopbackPlatformInterface get loopback => _loopback;
+
+  @override
+  MiniInputPlatformInterface get input => _input;
 
   @override
   String getVersionString() => '1.0.0-web';

@@ -113,11 +113,19 @@ extension MiniAVBufferFFI on MiniAVBuffer {
         video.info.pixel_formatAsInt,
       );
 
-      // Planes and strides
+      // Planes, strides, dmabuf fds, and drm modifiers
       final numPlanes = 4; // Your struct has 4 planes/strides
       final strideBytes = List<int>.generate(
         numPlanes,
         (i) => video.planes[i].stride_bytes,
+      );
+      final dmabufFds = List<int>.generate(
+        numPlanes,
+        (i) => video.planes[i].dmabuf_fd,
+      );
+      final drmFormatModifiers = List<int>.generate(
+        numPlanes,
+        (i) => video.planes[i].drm_format_modifier,
       );
       final planes = List<Uint8List?>.generate(numPlanes, (i) {
         final planePtr = video.planes[i].data_ptr;
@@ -143,6 +151,8 @@ extension MiniAVBufferFFI on MiniAVBuffer {
         strideBytes: strideBytes,
         planes: planes,
         nativeHandles: nativeHandles,
+        dmabufFds: dmabufFds,
+        drmFormatModifiers: drmFormatModifiers,
       );
     } else if (type == bindings.MiniAVBufferType.MINIAV_BUFFER_TYPE_AUDIO) {
       final audio = native.data.audio;
@@ -194,6 +204,12 @@ extension MiniAVBufferFFI on MiniAVBuffer {
       data: videoBuffer ?? audioBuffer,
       dataSizeBytes: dataSizeBytes,
       nativeHandle: native.internal_handle,
+      nativeFence: MiniAVNativeFence(
+        syncFd: native.native_fence.sync_fd,
+        d3d11FencePtr: native.native_fence.d3d11_fence.address,
+        metalSharedEventPtr: native.native_fence.metal_shared_event.address,
+        metalFenceValue: native.native_fence.metal_fence_value,
+      ),
     );
   }
 }

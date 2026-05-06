@@ -1,10 +1,21 @@
 import 'package:miniav_platform_interface/miniav_platform_interface.dart';
+import '../miniav_ffi_subscriptions.dart';
 import '../miniav_ffi_types.dart';
 import '../miniav_ffi_bindings.dart' as bindings;
 import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart';
 
 class MiniFFICameraPlatform implements MiniCameraPlatformInterface {
+  static final FFIDeviceChangeRegistry _deviceChangeRegistry =
+      FFIDeviceChangeRegistry(
+        setCallback: bindings.MiniAV_Camera_SetDeviceChangeCallback,
+      );
+
+  @override
+  void Function() addDeviceChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => _deviceChangeRegistry.add(listener);
+
   @override
   Future<List<MiniAVDeviceInfo>> enumerateDevices() async {
     final devicesPtrPtr = calloc<ffi.Pointer<bindings.MiniAVDeviceInfo>>();
@@ -113,6 +124,7 @@ class MiniFFICameraPlatform implements MiniCameraPlatformInterface {
 class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
   bindings.MiniAVCameraContextHandle? _context;
   ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>? _callbackHandle;
+  FFIContextLostRegistry<bindings.MiniAVCameraContextHandle>? _lostRegistry;
   bool _isDestroyed = false;
   late final Finalizer<bindings.MiniAVCameraContextHandle> _finalizer;
 
@@ -268,6 +280,9 @@ class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
 
     await stopCapture(); // Stop capture if running
 
+    _lostRegistry?.dispose();
+    _lostRegistry = null;
+
     if (_context != null) {
       _finalizer.detach(this); // Prevent finalizer from running
       final result = bindings.MiniAV_Camera_DestroyContext(_context!);
@@ -277,5 +292,18 @@ class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
         throw Exception('Failed to destroy camera context: ${result.name}');
       }
     }
+  }
+
+  @override
+  void Function() addLostListener(MiniAVContextLostListener listener) {
+    if (_isDestroyed || _context == null) {
+      throw StateError('Cannot add lost listener on a destroyed context.');
+    }
+    _lostRegistry ??=
+        FFIContextLostRegistry<bindings.MiniAVCameraContextHandle>(
+          context: _context!,
+          setCallback: bindings.MiniAV_Camera_SetContextLostCallback,
+        );
+    return _lostRegistry!.add(listener);
   }
 }

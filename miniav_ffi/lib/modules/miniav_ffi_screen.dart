@@ -1,10 +1,30 @@
 import 'package:miniav_platform_interface/miniav_platform_interface.dart';
+import '../miniav_ffi_subscriptions.dart';
 import '../miniav_ffi_types.dart';
 import '../miniav_ffi_bindings.dart' as bindings;
 import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart';
 
 class MiniFFIScreenPlatform implements MiniScreenPlatformInterface {
+  static final FFIDeviceChangeRegistry _displayChangeRegistry =
+      FFIDeviceChangeRegistry(
+        setCallback: bindings.MiniAV_Screen_SetDisplayChangeCallback,
+      );
+  static final FFIDeviceChangeRegistry _windowChangeRegistry =
+      FFIDeviceChangeRegistry(
+        setCallback: bindings.MiniAV_Screen_SetWindowChangeCallback,
+      );
+
+  @override
+  void Function() addDisplayChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => _displayChangeRegistry.add(listener);
+
+  @override
+  void Function() addWindowChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => _windowChangeRegistry.add(listener);
+
   @override
   Future<List<MiniAVDeviceInfo>> enumerateDisplays() async {
     final displaysPtrPtr = calloc<ffi.Pointer<bindings.MiniAVDeviceInfo>>();
@@ -128,6 +148,7 @@ class MiniFFIScreenPlatform implements MiniScreenPlatformInterface {
 class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
   bindings.MiniAVScreenContextHandle? _context;
   ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>? _callbackHandle;
+  FFIContextLostRegistry<bindings.MiniAVScreenContextHandle>? _lostRegistry;
   bool _isDestroyed = false;
   late final Finalizer<bindings.MiniAVScreenContextHandle> _finalizer;
 
@@ -332,6 +353,9 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
 
     await stopCapture(); // Stop capture if running
 
+    _lostRegistry?.dispose();
+    _lostRegistry = null;
+
     if (_context != null) {
       _finalizer.detach(this); // Prevent finalizer from running
       final result = bindings.MiniAV_Screen_DestroyContext(_context!);
@@ -341,5 +365,18 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
         throw Exception('Failed to destroy screen context: ${result.name}');
       }
     }
+  }
+
+  @override
+  void Function() addLostListener(MiniAVContextLostListener listener) {
+    if (_isDestroyed || _context == null) {
+      throw StateError('Cannot add lost listener on a destroyed context.');
+    }
+    _lostRegistry ??=
+        FFIContextLostRegistry<bindings.MiniAVScreenContextHandle>(
+          context: _context!,
+          setCallback: bindings.MiniAV_Screen_SetContextLostCallback,
+        );
+    return _lostRegistry!.add(listener);
   }
 }

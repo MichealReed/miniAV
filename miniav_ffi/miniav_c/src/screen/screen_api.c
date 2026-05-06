@@ -1,3 +1,4 @@
+#include "../common/miniav_device_watcher.h"
 #include "../common/miniav_logging.h"
 #include "../common/miniav_utils.h" // For miniav_calloc, miniav_free
 #include "screen_context.h"
@@ -484,4 +485,44 @@ MiniAVResultCode MiniAV_Screen_StopCapture(MiniAVScreenContext *ctx) {
                "Failed to stop screen capture, code: %d", res);
   }
   return res;
+}
+
+// --- Display/window change subscriptions (uses generic polling watcher) ---
+
+static MiniAVDeviceWatcher *g_screen_display_watcher = NULL;
+static MiniAVDeviceWatcher *g_screen_window_watcher = NULL;
+
+static MiniAVResultCode screen_displays_enum_adapter(
+    MiniAVDeviceInfo **devices_out, uint32_t *count_out, void *ud) {
+  (void)ud;
+  return MiniAV_Screen_EnumerateDisplays(devices_out, count_out);
+}
+static MiniAVResultCode screen_windows_enum_adapter(
+    MiniAVDeviceInfo **devices_out, uint32_t *count_out, void *ud) {
+  (void)ud;
+  return MiniAV_Screen_EnumerateWindows(devices_out, count_out);
+}
+
+MiniAVResultCode MiniAV_Screen_SetDisplayChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data) {
+  return miniav_device_watcher_set(&g_screen_display_watcher,
+                                   screen_displays_enum_adapter, NULL,
+                                   callback, user_data, 1500);
+}
+MiniAVResultCode MiniAV_Screen_SetWindowChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data) {
+  // Heavier polling; use a longer interval to limit EnumWindows cost.
+  return miniav_device_watcher_set(&g_screen_window_watcher,
+                                   screen_windows_enum_adapter, NULL,
+                                   callback, user_data, 2500);
+}
+
+MiniAVResultCode MiniAV_Screen_SetContextLostCallback(
+    MiniAVScreenContextHandle context_handle, MiniAVContextLostCallback callback,
+    void *user_data) {
+  MiniAVScreenContext *ctx = (MiniAVScreenContext *)context_handle;
+  if (!ctx) return MINIAV_ERROR_INVALID_ARG;
+  ctx->lost_cb = callback;
+  ctx->lost_cb_user_data = user_data;
+  return MINIAV_SUCCESS;
 }

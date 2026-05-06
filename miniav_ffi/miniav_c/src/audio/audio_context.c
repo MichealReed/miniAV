@@ -7,6 +7,7 @@
 
 // Internal headers for this module
 #include "../common/miniav_context_base.h"
+#include "../common/miniav_device_watcher.h"
 #include "../common/miniav_logging.h"
 #include "../common/miniav_utils.h"
 #include "../common/miniav_time.h"
@@ -62,6 +63,10 @@ struct MiniAVAudioContext {
   MiniAVBufferCallback callback;
   void *callback_user_data;
   int has_ma_context; // Flag to track ma_context initialization
+
+  // Set via MiniAV_Audio_SetContextLostCallback. May be NULL.
+  MiniAVContextLostCallback lost_cb;
+  void *lost_cb_user_data;
 };
 
 // Helper: Convert miniaudio device info to MiniAVDeviceInfo
@@ -437,6 +442,32 @@ static void ma_data_callback(ma_device *pDevice, void *pOutput,
   ctx->callback(&buffer, ctx->callback_user_data);
 }
 
+// Miniaudio notification callback. Used to detect device loss (mic unplugged,
+// disabled, etc.) so we can notify the application instead of silently going
+// quiet.
+static void
+miniav_audio_ma_notification_callback(const ma_device_notification *pNotification) {
+  if (!pNotification || !pNotification->pDevice) return;
+  MiniAVAudioContext *ctx =
+      (MiniAVAudioContext *)pNotification->pDevice->pUserData;
+  if (!ctx) return;
+  switch (pNotification->type) {
+  case ma_device_notification_type_stopped:
+    // miniaudio fires "stopped" when the device is removed or the audio
+    // stack invalidates the endpoint. If we haven't been asked to stop,
+    // treat this as device-lost.
+    if (ctx->is_running) {
+      ctx->is_running = 0;
+      if (ctx->lost_cb) {
+        ctx->lost_cb((int)MINIAV_ERROR_DEVICE_LOST, ctx->lost_cb_user_data);
+      }
+    }
+    break;
+  default:
+    break;
+  }
+}
+
 MiniAVResultCode MiniAV_Audio_StartCapture(MiniAVAudioContextHandle context,
                                            MiniAVBufferCallback callback,
                                            void *user_data) {
@@ -461,6 +492,7 @@ MiniAVResultCode MiniAV_Audio_StartCapture(MiniAVAudioContextHandle context,
   deviceConfig.capture.channels = ctx->format_info.channels;
   deviceConfig.sampleRate = ctx->format_info.sample_rate;
   deviceConfig.dataCallback = ma_data_callback;
+  deviceConfig.notificationCallback = miniav_audio_ma_notification_callback;
   deviceConfig.pUserData = ctx;
   deviceConfig.playback.format = ma_format_unknown;
   deviceConfig.playback.channels = 0;
@@ -504,5 +536,31 @@ MiniAVResultCode MiniAV_Audio_StopCapture(MiniAVAudioContextHandle context) {
   ctx->callback_user_data = NULL;
 
   miniav_log(MINIAV_LOG_LEVEL_INFO, "Audio capture stopped.");
+  return MINIAV_SUCCESS;
+}
+
+// --- Audio device change / context-lost subscriptions ---
+
+static MiniAVDeviceWatcher *g_audio_watcher = NULL;
+
+static MiniAVResultCode audio_enum_adapter(
+    MiniAVDeviceInfo **devices_out, uint32_t *count_out, void *ud) {
+  (void)ud;
+  return MiniAV_Audio_EnumerateDevices(devices_out, count_out);
+}
+
+MiniAVResultCode MiniAV_Audio_SetDeviceChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data) {
+  return miniav_device_watcher_set(&g_audio_watcher, audio_enum_adapter, NULL,
+                                   callback, user_data, 1500);
+}
+
+MiniAVResultCode MiniAV_Audio_SetContextLostCallback(
+    MiniAVAudioContextHandle context_handle, MiniAVContextLostCallback callback,
+    void *user_data) {
+  MiniAVAudioContext *ctx = (MiniAVAudioContext *)context_handle;
+  if (!ctx) return MINIAV_ERROR_INVALID_ARG;
+  ctx->lost_cb = callback;
+  ctx->lost_cb_user_data = user_data;
   return MINIAV_SUCCESS;
 }

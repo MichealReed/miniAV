@@ -16,6 +16,12 @@ class MiniInput {
     final context = await _platform.createContext();
     return MiniInputContext._(context);
   }
+
+  /// Subscribe to gamepad add/remove notifications.
+  /// Returns a disposer that must be called to unsubscribe.
+  static void Function() addGamepadChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => _platform.addGamepadChangeListener(listener);
 }
 
 /// Input capture context for configuration and capture operations

@@ -1,0 +1,582 @@
+/// Native bindings to the `miniav_tools_ffmpeg_shim` code asset, built by
+/// `hook/build.dart` against `tool/shim_c/shim.c`.
+///
+/// The shim exposes AVCodecContext fields (`hw_device_ctx`, `hw_frames_ctx`)
+/// that FFmpeg's AVOption API does not surface, plus a few struct field
+/// setters needed by the Stage B zero-copy hardware encode path.
+///
+/// If the shim asset is unavailable on the current platform (e.g. the
+/// build hook skipped it because the FFmpeg auto-download failed) the
+/// runtime calls below will throw — guard usage with [FfmpegShim.tryLoad].
+@DefaultAsset('package:miniav_tools_ffmpeg/ffmpeg_shim.dart')
+library;
+
+import 'dart:ffi';
+import 'dart:io';
+
+// =============================================================================
+// External shim entry points (resolved via the native asset registered by
+// hook/build.dart with the name `miniav_tools_ffmpeg_shim`).
+// =============================================================================
+
+@Native<Void Function(Pointer<Void>, Pointer<Void>)>(
+  symbol: 'miniav_shim_set_hw_device_ctx',
+)
+external void _setHwDeviceCtx(Pointer<Void> ctx, Pointer<Void> ref);
+
+@Native<Void Function(Pointer<Void>, Pointer<Void>)>(
+  symbol: 'miniav_shim_set_hw_frames_ctx',
+)
+external void _setHwFramesCtx(Pointer<Void> ctx, Pointer<Void> ref);
+
+@Native<Pointer<Void> Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_hwframes_data',
+)
+external Pointer<Void> _hwFramesData(Pointer<Void> ref);
+
+@Native<Void Function(Pointer<Void>, Int32, Int32, Int32, Int32, Int32)>(
+  symbol: 'miniav_shim_hwframes_set_params',
+)
+external void _hwFramesSetParams(
+  Pointer<Void> ctx,
+  int format,
+  int swFormat,
+  int width,
+  int height,
+  int initialPoolSize,
+);
+
+@Native<Pointer<Void> Function(Pointer<Void>)>(symbol: 'miniav_shim_hwdev_data')
+external Pointer<Void> _hwDevData(Pointer<Void> ref);
+
+/// Windows-only. Symbol is missing from POSIX shim builds; never call
+/// outside `Platform.isWindows`.
+@Native<Void Function(Pointer<Void>, Pointer<Void>)>(
+  symbol: 'miniav_shim_d3d11_dev_set_device',
+)
+external void _d3d11SetDevice(
+  Pointer<Void> hwdevCtx,
+  Pointer<Void> id3d11Device,
+);
+
+@Native<Pointer<Void> Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_d3d11_dev_get_device',
+)
+external Pointer<Void> _d3d11GetDevice(Pointer<Void> hwdevCtx);
+
+@Native<Pointer<Void> Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_d3d11_dev_get_context',
+)
+external Pointer<Void> _d3d11GetContext(Pointer<Void> hwdevCtx);
+
+@Native<Pointer<Void> Function(Pointer<Void>, Pointer<Void>)>(
+  symbol: 'miniav_shim_d3d11_open_shared_handle',
+)
+external Pointer<Void> _d3d11OpenSharedHandle(
+  Pointer<Void> id3d11Device,
+  Pointer<Void> ntHandle,
+);
+
+@Native<
+  Void Function(
+    Pointer<Void>,
+    Pointer<Void>,
+    Pointer<Void>,
+    Uint32,
+    Pointer<Void>,
+    Uint32,
+  )
+>(symbol: 'miniav_shim_d3d11_copy_resource')
+external void _d3d11CopyResource(
+  Pointer<Void> device,
+  Pointer<Void> immediateContext,
+  Pointer<Void> dstTex,
+  int dstSubresource,
+  Pointer<Void> srcTex,
+  int srcSubresource,
+);
+
+@Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_d3d11_release')
+external void _d3d11Release(Pointer<Void> iunknown);
+
+// ---- Test-only helpers (Windows; safe no-op linkage on POSIX) ----------
+//
+// These produce an NT-shared BGRA D3D11 texture without depending on miniav.
+// Used by `test/d3d11_hw_encoder_test.dart`. Calling them on a non-Windows
+// or non-shim build will throw at lookup time; guard with `Platform.isWindows`
+// + `FfmpegShim.tryLoad`.
+
+@Native<Pointer<Void> Function(Uint32, Uint32)>(
+  symbol: 'miniav_shim_test_create_shared_bgra',
+)
+external Pointer<Void> _testCreateSharedBgra(int width, int height);
+
+@Native<Pointer<Void> Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_test_texture_handle',
+)
+external Pointer<Void> _testTextureHandle(Pointer<Void> t);
+
+@Native<Int32 Function(Pointer<Void>, Uint32)>(
+  symbol: 'miniav_shim_test_fill_bgra',
+)
+external int _testFillBgra(Pointer<Void> t, int tag);
+
+@Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_test_destroy')
+external void _testDestroy(Pointer<Void> t);
+
+// ---- macOS / iOS: VideoToolbox interop ----------------------------------
+//
+// Bound on every platform (as opaque symbols) but only callable on Apple
+// targets — the shim only exports them under `__APPLE__`. Callers must
+// guard with `Platform.isMacOS || Platform.isIOS` AND `FfmpegShim.tryLoad`.
+
+@Native<Int32 Function(Pointer<Void>, Pointer<Void>, Int32, Int32)>(
+  symbol: 'miniav_shim_vt_attach_pixelbuffer',
+)
+external int _vtAttachPixelbuffer(
+  Pointer<Void> avframe,
+  Pointer<Void> cvpixelbuf,
+  int width,
+  int height,
+);
+
+@Native<Pointer<Void> Function(Pointer<Void>, Uint32)>(
+  symbol: 'miniav_shim_vt_pixbuf_from_iosurface',
+)
+external Pointer<Void> _vtPixbufFromIosurface(
+  Pointer<Void> iosurface,
+  int osTypePixfmt,
+);
+
+@Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_vt_pixbuf_release')
+external void _vtPixbufRelease(Pointer<Void> cvpixelbuf);
+
+@Native<Uint32 Function(Pointer<Void>)>(symbol: 'miniav_shim_vt_pixbuf_width')
+external int _vtPixbufWidth(Pointer<Void> cvpixelbuf);
+
+@Native<Uint32 Function(Pointer<Void>)>(symbol: 'miniav_shim_vt_pixbuf_height')
+external int _vtPixbufHeight(Pointer<Void> cvpixelbuf);
+
+@Native<Uint32 Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_vt_pixbuf_pixel_format',
+)
+external int _vtPixbufPixelFormat(Pointer<Void> cvpixelbuf);
+
+// ---- Linux: VAAPI / DRM-PRIME interop -----------------------------------
+
+@Native<
+  Int32 Function(
+    Pointer<Void>,
+    Pointer<Int32>,
+    Int32,
+    Pointer<Int64>,
+    Pointer<Int64>,
+    Pointer<Int64>,
+    Int32,
+    Int32,
+    Uint32,
+    Uint64,
+    Pointer<Void>,
+  )
+>(symbol: 'miniav_shim_vaapi_map_dmabuf')
+external int _vaapiMapDmabuf(
+  Pointer<Void> vaapiHwframesRef,
+  Pointer<Int32> fds,
+  int nbFds,
+  Pointer<Int64> sizes,
+  Pointer<Int64> offsets,
+  Pointer<Int64> pitches,
+  int width,
+  int height,
+  int drmFourcc,
+  int modifier,
+  Pointer<Void> outVaapiFrame,
+);
+
+// ---- Android: AHardwareBuffer interop -----------------------------------
+
+@Native<Pointer<Void> Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_ahb_lock_read',
+)
+external Pointer<Void> _ahbLockRead(Pointer<Void> ahb);
+
+@Native<Pointer<Void> Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_ahb_lock_address',
+)
+external Pointer<Void> _ahbLockAddress(Pointer<Void> lock);
+
+@Native<Uint32 Function(Pointer<Void>)>(symbol: 'miniav_shim_ahb_lock_stride')
+external int _ahbLockStride(Pointer<Void> lock);
+
+@Native<Uint32 Function(Pointer<Void>)>(symbol: 'miniav_shim_ahb_lock_width')
+external int _ahbLockWidth(Pointer<Void> lock);
+
+@Native<Uint32 Function(Pointer<Void>)>(symbol: 'miniav_shim_ahb_lock_height')
+external int _ahbLockHeight(Pointer<Void> lock);
+
+@Native<Uint32 Function(Pointer<Void>)>(symbol: 'miniav_shim_ahb_lock_format')
+external int _ahbLockFormat(Pointer<Void> lock);
+
+@Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_ahb_unlock')
+external void _ahbUnlock(Pointer<Void> lock);
+
+// ---- Audio encoder helpers (cross-platform) -----------------------------
+
+@Native<Int32 Function(Pointer<Void>, Int32, Int32, Int32, Int64)>(
+  symbol: 'miniav_shim_codec_set_audio_params',
+)
+external int _codecSetAudioParams(
+  Pointer<Void> ctx,
+  int sampleFmt,
+  int sampleRate,
+  int channels,
+  int bitRate,
+);
+
+@Native<Int32 Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_codec_get_frame_size',
+)
+external int _codecGetFrameSize(Pointer<Void> ctx);
+
+@Native<Int32 Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_codec_pick_sample_fmt',
+)
+external int _codecPickSampleFmt(Pointer<Void> codec);
+
+@Native<Int32 Function(Pointer<Void>, Int32)>(
+  symbol: 'miniav_shim_codec_supports_sample_fmt',
+)
+external int _codecSupportsSampleFmt(Pointer<Void> codec, int sampleFmt);
+
+@Native<Int32 Function(Pointer<Void>, Int32, Int32, Int32, Int32)>(
+  symbol: 'miniav_shim_audio_frame_setup',
+)
+external int _audioFrameSetup(
+  Pointer<Void> frame,
+  int sampleFmt,
+  int sampleRate,
+  int channels,
+  int nbSamples,
+);
+
+@Native<Void Function(Pointer<Void>, Int64)>(
+  symbol: 'miniav_shim_audio_frame_set_pts',
+)
+external void _audioFrameSetPts(Pointer<Void> frame, int pts);
+
+@Native<Uint32 Function()>(symbol: 'miniav_shim_avcodec_version')
+external int _avcodecVersion();
+
+@Native<Uint32 Function()>(symbol: 'miniav_shim_abi_version')
+external int _abiVersion();
+
+// =============================================================================
+// Public façade
+// =============================================================================
+
+/// Façade around the native shim. Use [tryLoad] to obtain an instance —
+/// returns `null` if the shim asset isn't bundled (Stage B unavailable).
+class FfmpegShim {
+  FfmpegShim._();
+
+  /// Currently expected shim ABI. Bump in lock-step with `shim.c`.
+  static const int kExpectedAbiVersion = 7;
+
+  static FfmpegShim? _instance;
+  static bool _attemptedLoad = false;
+
+  /// Returns the shim if the native asset is loadable and ABI-compatible,
+  /// otherwise `null`. Cached after the first call.
+  static FfmpegShim? tryLoad() {
+    if (_instance != null) return _instance;
+    if (_attemptedLoad) return null;
+    _attemptedLoad = true;
+    try {
+      final abi = _abiVersion();
+      if (abi != kExpectedAbiVersion) {
+        stderr.writeln(
+          'miniav_tools_ffmpeg: shim reports ABI $abi, expected '
+          '$kExpectedAbiVersion. Rebuild with `dart pub get` (or '
+          '`flutter clean && flutter pub get`) to refresh the build hook.',
+        );
+        return null;
+      }
+      return _instance = FfmpegShim._();
+    } catch (_) {
+      // Native asset not loadable — Stage B simply unavailable.
+      return null;
+    }
+  }
+
+  /// True if [tryLoad] has succeeded.
+  static bool get isAvailable => _instance != null;
+
+  /// Test hook.
+  static void resetForTests() {
+    _instance = null;
+    _attemptedLoad = false;
+  }
+
+  // ---- Wrappers -------------------------------------------------------------
+
+  void setHwDeviceCtx(Pointer<Void> ctx, Pointer<Void> ref) =>
+      _setHwDeviceCtx(ctx, ref);
+
+  void setHwFramesCtx(Pointer<Void> ctx, Pointer<Void> ref) =>
+      _setHwFramesCtx(ctx, ref);
+
+  Pointer<Void> hwFramesData(Pointer<Void> ref) => _hwFramesData(ref);
+
+  void hwFramesSetParams(
+    Pointer<Void> ctx, {
+    required int format,
+    required int swFormat,
+    required int width,
+    required int height,
+    required int initialPoolSize,
+  }) =>
+      _hwFramesSetParams(ctx, format, swFormat, width, height, initialPoolSize);
+
+  Pointer<Void> hwDevData(Pointer<Void> ref) => _hwDevData(ref);
+
+  /// Windows-only. Asserts on other platforms — call sites should already
+  /// guard with `Platform.isWindows`.
+  void d3d11SetDevice(Pointer<Void> hwdevCtx, Pointer<Void> id3d11Device) {
+    assert(Platform.isWindows, 'd3d11SetDevice is Windows-only');
+    _d3d11SetDevice(hwdevCtx, id3d11Device);
+  }
+
+  /// Returns the ID3D11Device* that FFmpeg either accepted (via setter)
+  /// or allocated when `av_hwdevice_ctx_init` was called with a NULL
+  /// device. Windows-only.
+  Pointer<Void> d3d11GetDevice(Pointer<Void> hwdevCtx) {
+    assert(Platform.isWindows, 'd3d11GetDevice is Windows-only');
+    return _d3d11GetDevice(hwdevCtx);
+  }
+
+  /// Returns the ID3D11DeviceContext* (immediate context) belonging to
+  /// the FFmpeg-owned D3D11Device. Windows-only.
+  Pointer<Void> d3d11GetContext(Pointer<Void> hwdevCtx) {
+    assert(Platform.isWindows, 'd3d11GetContext is Windows-only');
+    return _d3d11GetContext(hwdevCtx);
+  }
+
+  /// Opens a process-shared DXGI NT HANDLE on `id3d11Device`. Returns the
+  /// opened ID3D11Texture2D* or `nullptr` on failure. Caller MUST release
+  /// the returned pointer with [d3d11Release]. Windows-only.
+  Pointer<Void> d3d11OpenSharedHandle(
+    Pointer<Void> id3d11Device,
+    Pointer<Void> ntHandle,
+  ) {
+    assert(Platform.isWindows, 'd3d11OpenSharedHandle is Windows-only');
+    return _d3d11OpenSharedHandle(id3d11Device, ntHandle);
+  }
+
+  /// GPU-only `ID3D11DeviceContext::CopySubresourceRegion` followed by a
+  /// `D3D11_QUERY_EVENT` fence + Flush + bounded poll, ensuring the copy
+  /// has actually executed on the GPU before returning. This is mandatory
+  /// before handing the destination texture to NVENC/AMF/QSV — those
+  /// engines do NOT serialise with the calling immediate context.
+  ///
+  /// Use explicit subresources because FFmpeg's D3D11VA hwframes pool is a
+  /// `Texture2DArray` (one texture, ArraySize = pool size); the slice
+  /// index lives in `AVFrame::data[1]` cast through `intptr_t`. All
+  /// arguments belong to the same FFmpeg-owned D3D11 device. Windows-only.
+  void d3d11CopyResource(
+    Pointer<Void> device,
+    Pointer<Void> immediateContext,
+    Pointer<Void> dstTex,
+    int dstSubresource,
+    Pointer<Void> srcTex,
+    int srcSubresource,
+  ) {
+    assert(Platform.isWindows, 'd3d11CopyResource is Windows-only');
+    _d3d11CopyResource(
+      device,
+      immediateContext,
+      dstTex,
+      dstSubresource,
+      srcTex,
+      srcSubresource,
+    );
+  }
+
+  /// `IUnknown::Release(p)`. Windows-only.
+  void d3d11Release(Pointer<Void> p) {
+    assert(Platform.isWindows, 'd3d11Release is Windows-only');
+    _d3d11Release(p);
+  }
+
+  /// **Test-only** — create a producer-side ID3D11Device + a BGRA
+  /// NT-shareable Texture2D (1 mip, 1 slice). Returns an opaque handle to
+  /// the test-texture struct, or `nullptr` on failure. Caller MUST pair
+  /// every successful call with [testDestroyTexture]. Windows-only.
+  Pointer<Void> testCreateSharedBgra(int width, int height) {
+    assert(Platform.isWindows, 'testCreateSharedBgra is Windows-only');
+    return _testCreateSharedBgra(width, height);
+  }
+
+  /// **Test-only** — returns the duplicated NT HANDLE (as `Pointer<Void>`)
+  /// for the texture created via [testCreateSharedBgra]. The handle is
+  /// owned by the test-texture struct — do NOT call CloseHandle on it.
+  Pointer<Void> testTextureHandle(Pointer<Void> t) {
+    assert(Platform.isWindows, 'testTextureHandle is Windows-only');
+    return _testTextureHandle(t);
+  }
+
+  /// **Test-only** — fill the test texture with a deterministic BGRA
+  /// pattern parameterised by [tag] (used as the red channel of checker
+  /// squares; lets a test verify per-frame uniqueness). Returns 0 on
+  /// success, negative on failure.
+  int testFillBgra(Pointer<Void> t, int tag) {
+    assert(Platform.isWindows, 'testFillBgra is Windows-only');
+    return _testFillBgra(t, tag);
+  }
+
+  /// **Test-only** — release the test texture, its device, immediate
+  /// context, and the duplicated NT HANDLE.
+  void testDestroyTexture(Pointer<Void> t) {
+    assert(Platform.isWindows, 'testDestroyTexture is Windows-only');
+    _testDestroy(t);
+  }
+
+  // ---- VideoToolbox (macOS / iOS) -----------------------------------------
+
+  /// Attach a `CVPixelBufferRef` to an `AVFrame` as `AV_PIX_FMT_VIDEOTOOLBOX`.
+  /// The frame retains its own reference; the caller can release theirs
+  /// after this call. Returns 0 on success. Apple-only.
+  int vtAttachPixelbuffer(
+    Pointer<Void> avframe,
+    Pointer<Void> cvpixelbuf, {
+    required int width,
+    required int height,
+  }) {
+    assert(
+      Platform.isMacOS || Platform.isIOS,
+      'vtAttachPixelbuffer is Apple-only',
+    );
+    return _vtAttachPixelbuffer(avframe, cvpixelbuf, width, height);
+  }
+
+  /// Wrap an existing `IOSurfaceRef` in a fresh `CVPixelBufferRef`
+  /// (zero-copy). Caller owns one retain — release with [vtPixbufRelease]
+  /// or hand to [vtAttachPixelbuffer] (which retains internally).
+  Pointer<Void> vtPixbufFromIosurface(
+    Pointer<Void> iosurface, {
+    int osTypePixfmt = 0,
+  }) {
+    assert(
+      Platform.isMacOS || Platform.isIOS,
+      'vtPixbufFromIosurface is Apple-only',
+    );
+    return _vtPixbufFromIosurface(iosurface, osTypePixfmt);
+  }
+
+  void vtPixbufRelease(Pointer<Void> cvpixelbuf) {
+    assert(Platform.isMacOS || Platform.isIOS, 'vtPixbufRelease is Apple-only');
+    _vtPixbufRelease(cvpixelbuf);
+  }
+
+  int vtPixbufWidth(Pointer<Void> cvpixelbuf) => _vtPixbufWidth(cvpixelbuf);
+  int vtPixbufHeight(Pointer<Void> cvpixelbuf) => _vtPixbufHeight(cvpixelbuf);
+  int vtPixbufPixelFormat(Pointer<Void> cvpixelbuf) =>
+      _vtPixbufPixelFormat(cvpixelbuf);
+
+  // ---- VAAPI / DRM-PRIME (Linux) ------------------------------------------
+
+  /// Import up to 4 dmabuf FDs into a VAAPI hwframe via DRM-PRIME direct
+  /// mapping (no GPU copy). Populates [outVaapiFrame] which is then ready
+  /// for `avcodec_send_frame`. Returns 0 on success, negative AVERROR
+  /// otherwise. Linux-only (non-Android).
+  int vaapiMapDmabuf({
+    required Pointer<Void> vaapiHwframesRef,
+    required Pointer<Int32> fds,
+    required int nbFds,
+    required Pointer<Int64> sizes,
+    required Pointer<Int64> offsets,
+    required Pointer<Int64> pitches,
+    required int width,
+    required int height,
+    required int drmFourcc,
+    required int modifier,
+    required Pointer<Void> outVaapiFrame,
+  }) {
+    assert(Platform.isLinux, 'vaapiMapDmabuf is Linux-only (non-Android)');
+    return _vaapiMapDmabuf(
+      vaapiHwframesRef,
+      fds,
+      nbFds,
+      sizes,
+      offsets,
+      pitches,
+      width,
+      height,
+      drmFourcc,
+      modifier,
+      outVaapiFrame,
+    );
+  }
+
+  // ---- AHardwareBuffer (Android) ------------------------------------------
+
+  /// Lock an `AHardwareBuffer*` for CPU read; returns an opaque lock
+  /// handle, or `nullptr` on failure. Must be paired with [ahbUnlock].
+  /// Android-only (API 26+).
+  Pointer<Void> ahbLockRead(Pointer<Void> ahb) {
+    assert(Platform.isAndroid, 'ahbLockRead is Android-only');
+    return _ahbLockRead(ahb);
+  }
+
+  Pointer<Void> ahbLockAddress(Pointer<Void> lock) => _ahbLockAddress(lock);
+  int ahbLockStride(Pointer<Void> lock) => _ahbLockStride(lock);
+  int ahbLockWidth(Pointer<Void> lock) => _ahbLockWidth(lock);
+  int ahbLockHeight(Pointer<Void> lock) => _ahbLockHeight(lock);
+  int ahbLockFormat(Pointer<Void> lock) => _ahbLockFormat(lock);
+
+  void ahbUnlock(Pointer<Void> lock) {
+    assert(Platform.isAndroid, 'ahbUnlock is Android-only');
+    _ahbUnlock(lock);
+  }
+
+  int avcodecVersion() => _avcodecVersion();
+  int abiVersion() => _abiVersion();
+
+  // ---- Audio encoder helpers (cross-platform) -----------------------------
+
+  /// Configure sample_fmt + sample_rate + ch_layout (default mask) +
+  /// bit_rate on an AVCodecContext. Returns 0 on success, negative
+  /// AVERROR on failure.
+  int codecSetAudioParams(
+    Pointer<Void> ctx, {
+    required int sampleFmt,
+    required int sampleRate,
+    required int channels,
+    required int bitRate,
+  }) => _codecSetAudioParams(ctx, sampleFmt, sampleRate, channels, bitRate);
+
+  /// Read the encoder's required samples-per-channel per frame after
+  /// `avcodec_open2`. Returns 0 if the codec has no fixed frame size.
+  int codecGetFrameSize(Pointer<Void> ctx) => _codecGetFrameSize(ctx);
+
+  /// Returns the encoder's preferred sample format (the first entry in
+  /// `codec->sample_fmts`), or -1 if unavailable.
+  int codecPickSampleFmt(Pointer<Void> codec) => _codecPickSampleFmt(codec);
+
+  /// Returns true if the codec lists `sampleFmt` in its supported set.
+  bool codecSupportsSampleFmt(Pointer<Void> codec, int sampleFmt) =>
+      _codecSupportsSampleFmt(codec, sampleFmt) != 0;
+
+  /// Configure an audio AVFrame and call `av_frame_get_buffer`. Returns 0
+  /// on success.
+  int audioFrameSetup(
+    Pointer<Void> frame, {
+    required int sampleFmt,
+    required int sampleRate,
+    required int channels,
+    required int nbSamples,
+  }) => _audioFrameSetup(frame, sampleFmt, sampleRate, channels, nbSamples);
+
+  /// Set just `AVFrame::pts`.
+  void audioFrameSetPts(Pointer<Void> frame, int pts) =>
+      _audioFrameSetPts(frame, pts);
+}

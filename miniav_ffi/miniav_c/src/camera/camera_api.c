@@ -1,6 +1,7 @@
 #include "../../include/miniav_buffer.h" // For MiniAVNativeBufferInternalPayload
 #include "../../include/miniav_capture.h"
 #include "../../include/miniav_types.h"
+#include "../common/miniav_device_watcher.h"
 #include "../common/miniav_logging.h"
 #include "../common/miniav_utils.h" // For miniav_calloc, miniav_free, miniav_strlcpy
 #include "camera_context.h"
@@ -442,4 +443,32 @@ MiniAV_Camera_StopCapture(MiniAVCameraContextHandle context_handle) {
   ctx->app_callback = NULL;
   ctx->app_callback_user_data = NULL;
   return res;
+}
+
+// --- Device change subscription (uses generic polling watcher) ---
+
+static MiniAVDeviceWatcher *g_camera_watcher = NULL;
+
+static MiniAVResultCode camera_watcher_enumerate_adapter(
+    MiniAVDeviceInfo **devices_out, uint32_t *count_out, void *user_data) {
+  (void)user_data;
+  return MiniAV_Camera_EnumerateDevices(devices_out, count_out);
+}
+
+MiniAVResultCode MiniAV_Camera_SetDeviceChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data) {
+  return miniav_device_watcher_set(&g_camera_watcher,
+                                   camera_watcher_enumerate_adapter, NULL,
+                                   callback, user_data, 1500);
+}
+
+MiniAVResultCode MiniAV_Camera_SetContextLostCallback(
+    MiniAVCameraContextHandle context_handle, MiniAVContextLostCallback callback,
+    void *user_data) {
+  MiniAVCameraContext *ctx = (MiniAVCameraContext *)context_handle;
+  if (!ctx)
+    return MINIAV_ERROR_INVALID_ARG;
+  ctx->lost_cb = callback;
+  ctx->lost_cb_user_data = user_data;
+  return MINIAV_SUCCESS;
 }

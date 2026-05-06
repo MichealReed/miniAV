@@ -7,6 +7,11 @@ abstract class MiniInputPlatformInterface {
 
   /// Create an input capture context.
   Future<MiniInputContextPlatformInterface> createContext();
+
+  /// Subscribe to gamepad add/remove notifications.
+  void Function() addGamepadChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => throw UnsupportedError('Gamepad-change subscription not supported.');
 }
 
 /// Abstract input context for configuring and capturing input events.

@@ -1,0 +1,22 @@
+name: miniav_recorder
+description: High-level multi-source A/V recorder built on miniav + miniav_tools. Sync screen/camera/mic/loopback into MP4/MKV files or chunked streams.
+version: 0.1.0
+repository: https://github.com/PracticalXR/miniav_tools/tree/master/miniav_recorder
+
+environment:
+  sdk: ^3.11.4
+
+dependencies:
+  miniav: ^0.5.0
+  miniav_platform_interface: ^0.5.0
+  miniav_tools: ^0.1.0
+  miniav_tools_ffmpeg: ^0.1.0
+  miniav_tools_platform_interface: ^0.1.0
+  # Optional GPU runtime used for the zero-copy screen path. Pulled in
+  # unconditionally so the recorder can lazily request a shared D3D11
+  # device on Windows; on other platforms it just sits unused.
+  minigpu: ^1.2.4
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.31.0

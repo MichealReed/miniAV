@@ -5,11 +5,22 @@ import 'package:miniav_platform_interface/modules/miniav_input_interface.dart';
 import 'package:miniav_platform_interface/miniav_platform_types.dart';
 
 import '../miniav_ffi_bindings.dart' as bindings;
+import '../miniav_ffi_subscriptions.dart';
 import '../miniav_ffi_types.dart';
 
 /// FFI implementation of [MiniInputPlatformInterface].
 class MiniAVFFIInputPlatform extends MiniInputPlatformInterface {
   MiniAVFFIInputPlatform();
+
+  static final FFIDeviceChangeRegistry _gamepadChangeRegistry =
+      FFIDeviceChangeRegistry(
+        setCallback: bindings.MiniAV_Input_SetGamepadChangeCallback,
+      );
+
+  @override
+  void Function() addGamepadChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => _gamepadChangeRegistry.add(listener);
 
   @override
   Future<List<MiniAVDeviceInfo>> enumerateGamepads() async {

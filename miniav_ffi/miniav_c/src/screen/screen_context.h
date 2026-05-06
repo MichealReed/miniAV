@@ -69,6 +69,10 @@ typedef struct MiniAVScreenContext {
 
   bool capture_audio_requested; // Whether the user requested audio capture
 
+  // Set via MiniAV_Screen_SetContextLostCallback. May be NULL.
+  MiniAVContextLostCallback lost_cb;
+  void *lost_cb_user_data;
+
 } MiniAVScreenContext;
 
 typedef struct {

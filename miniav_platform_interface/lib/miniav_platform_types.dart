@@ -53,6 +53,7 @@ enum MiniAVBufferContentType {
   gpuD3D11Handle,
   gpuMetalTexture,
   gpuDmabufFd,
+  gpuAHardwareBuffer, // Android: planes[0].nativeHandle is AHardwareBuffer*
 }
 
 enum MiniAVLogLevel { none, trace, debug, info, warn, error }
@@ -68,6 +69,30 @@ class MiniAVDeviceInfo {
     required this.isDefault,
   });
 }
+
+/// Type of device-change event reported via device-change listeners.
+enum MiniAVDeviceChangeEvent { added, removed, defaultChanged }
+
+/// A single device-change notification.
+class MiniAVDeviceChangeNotification {
+  final MiniAVDeviceChangeEvent event;
+  final MiniAVDeviceInfo device;
+
+  const MiniAVDeviceChangeNotification(this.event, this.device);
+
+  @override
+  String toString() =>
+      'MiniAVDeviceChangeNotification($event, ${device.deviceId})';
+}
+
+/// Listener type for device-change events. Always invoked on the platform's
+/// background watcher thread on native; on web, on the main isolate.
+typedef MiniAVDeviceChangeListener =
+    void Function(MiniAVDeviceChangeNotification notification);
+
+/// Listener type for per-context device-lost events. The integer is a
+/// `MiniAVResultCode`-compatible reason code.
+typedef MiniAVContextLostListener = void Function(int reason);
 
 class MiniAVVideoInfo {
   final int width;
@@ -101,6 +126,28 @@ class MiniAVAudioInfo {
   });
 }
 
+/// GPU sync fence information for zero-copy buffer handoff.
+class MiniAVNativeFence {
+  /// Linux/Android: sync_file fd, or -1 if none.
+  final int syncFd;
+
+  /// Windows: ID3D11Fence* as integer address, or 0 if none.
+  final int d3d11FencePtr;
+
+  /// macOS/iOS: id<MTLSharedEvent> as integer address, or 0 if none.
+  final int metalSharedEventPtr;
+
+  /// macOS/iOS: signaled fence value.
+  final int metalFenceValue;
+
+  const MiniAVNativeFence({
+    this.syncFd = -1,
+    this.d3d11FencePtr = 0,
+    this.metalSharedEventPtr = 0,
+    this.metalFenceValue = 0,
+  });
+}
+
 class MiniAVBuffer {
   final MiniAVBufferType type;
   final MiniAVBufferContentType contentType;
@@ -108,6 +155,7 @@ class MiniAVBuffer {
   final Object? data; // MiniAVVideoBuffer or MiniAVAudioBuffer
   final int dataSizeBytes;
   final Object? _nativeHandle;
+  final MiniAVNativeFence nativeFence;
 
   const MiniAVBuffer({
     required this.type,
@@ -116,6 +164,7 @@ class MiniAVBuffer {
     required this.data,
     required this.dataSizeBytes,
     Object? nativeHandle,
+    this.nativeFence = const MiniAVNativeFence(),
   }) : _nativeHandle = nativeHandle;
 
   // Add getter for native handle
@@ -129,6 +178,11 @@ class MiniAVVideoBuffer {
   final List<int> strideBytes;
   final List<Uint8List?> planes;
   final List<Object?> nativeHandles; // platform-specific GPU handle, if any
+  /// Per-plane DMA-BUF file descriptors (-1 if not applicable).
+  final List<int> dmabufFds;
+
+  /// Per-plane DRM format modifiers (0 = LINEAR).
+  final List<int> drmFormatModifiers;
 
   MiniAVVideoBuffer({
     required this.width,
@@ -137,6 +191,8 @@ class MiniAVVideoBuffer {
     required this.strideBytes,
     required this.planes,
     this.nativeHandles = const [],
+    this.dmabufFds = const [],
+    this.drmFormatModifiers = const [],
   });
 }
 

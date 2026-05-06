@@ -202,6 +202,7 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
   HANDLE wait_array[2] = {platform_ctx->stop_event_handle,
                           platform_ctx->buffer_event_handle};
   DWORD wait_count = platform_ctx->event_driven_capture ? 2 : 1;
+  BOOL device_invalidated = FALSE;
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "WASAPI: Capture thread started (mode: %s).",
@@ -236,8 +237,10 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
     if (FAILED(hr)) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "WASAPI: GetNextPacketSize failed: 0x%lx", hr);
-      if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
+      if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+        device_invalidated = TRUE;
         break;   // Device lost, exit thread
+      }
       Sleep(20); // Wait a bit before retrying on other errors
       continue;
     }
@@ -250,8 +253,10 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
       if (FAILED(hr)) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "WASAPI: GetBuffer failed: 0x%lx",
                    hr);
-        if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
+        if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+          device_invalidated = TRUE;
           goto cleanup_thread; // Device lost, exit thread
+        }
         break; // Break from inner loop, outer loop will retry GetNextPacketSize
       }
 
@@ -299,8 +304,10 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
       if (FAILED(hr)) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR,
                    "WASAPI: ReleaseBuffer failed: 0x%lx", hr);
-        if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
+        if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+          device_invalidated = TRUE;
           goto cleanup_thread; // Device lost, exit thread
+        }
       }
 
       // Get the next packet size for the loop condition
@@ -309,8 +316,10 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
       if (FAILED(hr)) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR,
                    "WASAPI: GetNextPacketSize (in loop) failed: 0x%lx", hr);
-        if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
+        if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+          device_invalidated = TRUE;
           goto cleanup_thread; // Device lost, exit thread
+        }
         packet_length = 0;     // Ensure loop terminates on error
       }
     }
@@ -318,6 +327,14 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
 
 cleanup_thread:
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WASAPI: Capture thread exiting.");
+  if (device_invalidated) {
+    // Mark capture as no longer running so subsequent stop/destroy is a no-op
+    // on the WASAPI side, then notify the application.
+    ctx->is_running = false;
+    if (ctx->lost_cb) {
+      ctx->lost_cb((int)MINIAV_ERROR_DEVICE_LOST, ctx->lost_cb_user_data);
+    }
+  }
   return 0;
 }
 

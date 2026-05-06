@@ -13,6 +13,16 @@ abstract class MiniScreenPlatformInterface {
 
   /// Create a screen capture context (for capture/configuration).
   Future<MiniScreenContextPlatformInterface> createContext();
+
+  /// Subscribe to display add/remove notifications.
+  void Function() addDisplayChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => throw UnsupportedError('Display-change subscription not supported.');
+
+  /// Subscribe to window add/remove notifications.
+  void Function() addWindowChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => throw UnsupportedError('Window-change subscription not supported.');
 }
 
 /// Abstract screen context for configuring and capturing from a screen or window.
@@ -45,4 +55,9 @@ abstract class MiniScreenContextPlatformInterface {
 
   /// Destroy this screen context and release resources.
   Future<void> destroy();
+
+  /// Subscribe to a one-shot lost notification (e.g. the captured display
+  /// was disconnected or the captured window was closed).
+  void Function() addLostListener(MiniAVContextLostListener listener) =>
+      throw UnsupportedError('Context-lost subscription not supported.');
 }

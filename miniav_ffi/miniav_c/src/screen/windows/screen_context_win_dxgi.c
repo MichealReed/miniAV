@@ -1073,8 +1073,20 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
         dxgi_ctx->is_streaming = FALSE;
       }
       LeaveCriticalSection(&dxgi_ctx->critical_section);
-      if (!dxgi_ctx->is_streaming)
+      if (!dxgi_ctx->is_streaming) {
+        // Notify application that the captured display has been lost
+        // permanently this session. Mark the parent context as not running so
+        // subsequent calls (StopCapture / DestroyContext) are well-behaved.
+        MiniAVScreenContext *parent = dxgi_ctx->parent_ctx;
+        if (parent) {
+          parent->is_running = false;
+          if (parent->lost_cb) {
+            parent->lost_cb((int)MINIAV_ERROR_DEVICE_LOST,
+                            parent->lost_cb_user_data);
+          }
+        }
         break;
+      }
       continue;
     }
     if (FAILED(hr) || !desktop_resource_handle) {
@@ -1179,6 +1191,40 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
                                                  DXGI_SHARED_RESOURCE_READ,
                                                  NULL, &shared_handle_for_app);
           if (SUCCEEDED(hr)) {
+            // CRITICAL: synchronise the producer (this device) before exposing
+            // the shared NT handle to a consumer on a *different* D3D11 device
+            // (e.g. an FFmpeg encoder). Without this, any pending GPU work on
+            // texture_to_share (the desktop-duplication blit, or our own
+            // CopyResource into a shareable copy above) may not have committed
+            // by the time the consumer reads, producing black / undefined
+            // contents. Insert a D3D11_QUERY_EVENT fence, flush, and poll until
+            // the GPU signals completion. ~0.5-2ms per frame typical.
+            {
+              D3D11_QUERY_DESC fence_desc;
+              ZeroMemory(&fence_desc, sizeof(fence_desc));
+              fence_desc.Query = D3D11_QUERY_EVENT;
+              fence_desc.MiscFlags = 0;
+              ID3D11Query *copy_done = NULL;
+              HRESULT q_hr = ID3D11Device_CreateQuery(
+                  dxgi_ctx->d3d_device, &fence_desc, &copy_done);
+              if (SUCCEEDED(q_hr) && copy_done) {
+                ID3D11DeviceContext_End(
+                    dxgi_ctx->d3d_context, (ID3D11Asynchronous *)copy_done);
+                ID3D11DeviceContext_Flush(dxgi_ctx->d3d_context);
+                ULONGLONG poll_start = GetTickCount64();
+                while (ID3D11DeviceContext_GetData(
+                           dxgi_ctx->d3d_context,
+                           (ID3D11Asynchronous *)copy_done, NULL, 0, 0) ==
+                       S_FALSE) {
+                  if (GetTickCount64() - poll_start > 5) break;
+                  YieldProcessor();
+                }
+                ID3D11Query_Release(copy_done);
+              } else {
+                ID3D11DeviceContext_Flush(dxgi_ctx->d3d_context);
+              }
+            }
+
             ID3D11Texture2D_AddRef(texture_to_share);
             texture_for_payload_ref = texture_to_share;
             processed_as_gpu = TRUE;

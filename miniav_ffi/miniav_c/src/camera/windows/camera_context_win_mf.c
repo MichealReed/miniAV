@@ -629,14 +629,56 @@ request_next_sample:
           NULL, NULL, NULL, NULL);
       if (FAILED(hr_read)) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                   "MF: Failed to request next sample: 0x%X", hr_read);
+                   "MF: Failed to request next sample: 0x%X. Treating as "
+                   "device lost.",
+                   hr_read);
         mf_ctx->is_streaming = FALSE;
+        parent_ctx->is_running = 0;
+        if (parent_ctx->lost_cb) {
+          parent_ctx->lost_cb((int)MINIAV_ERROR_DEVICE_LOST,
+                              parent_ctx->lost_cb_user_data);
+        }
       }
     } else {
+      // hrStatus / processing failed. Decide if this was a terminal
+      // device-loss type failure (camera unplugged, preempted, etc.) and if
+      // so, stop streaming and notify the application instead of silently
+      // dropping into a no-callback state.
+      BOOL terminal = (hr == E_FAIL ||
+                       hr == MF_E_HW_MFT_FAILED_START_STREAMING ||
+                       hr == MF_E_INVALIDREQUEST ||
+                       hr == HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED) ||
+                       hr == HRESULT_FROM_WIN32(ERROR_DEVICE_REMOVED));
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "MF: Not requesting next sample due to error in current "
-                 "sample processing: 0x%X",
-                 hr);
+                 "MF: Not requesting next sample due to error 0x%X "
+                 "(terminal=%d).",
+                 hr, (int)terminal);
+      if (terminal) {
+        mf_ctx->is_streaming = FALSE;
+        parent_ctx->is_running = 0;
+        if (parent_ctx->lost_cb) {
+          parent_ctx->lost_cb((int)MINIAV_ERROR_DEVICE_LOST,
+                              parent_ctx->lost_cb_user_data);
+        }
+      } else {
+        // Non-terminal: try to keep the stream alive by re-arming.
+        HRESULT hr_read = IMFSourceReader_ReadSample(
+            mf_ctx->source_reader,
+            (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, NULL, NULL, NULL,
+            NULL);
+        if (FAILED(hr_read)) {
+          miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                     "MF: Re-arm after non-terminal error failed: 0x%X. "
+                     "Treating as device lost.",
+                     hr_read);
+          mf_ctx->is_streaming = FALSE;
+          parent_ctx->is_running = 0;
+          if (parent_ctx->lost_cb) {
+            parent_ctx->lost_cb((int)MINIAV_ERROR_DEVICE_LOST,
+                                parent_ctx->lost_cb_user_data);
+          }
+        }
+      }
     }
   }
 

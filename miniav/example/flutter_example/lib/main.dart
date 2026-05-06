@@ -5,6 +5,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:miniav/miniav.dart';
+import 'package:minigpu_view/minigpu_view.dart';
 
 void main() {
   runApp(const MiniAVBenchmarkApp());
@@ -195,6 +196,9 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
   // Preview state
   final ValueNotifier<ui.Image?> _cameraPreview = ValueNotifier(null);
   final ValueNotifier<ui.Image?> _screenPreview = ValueNotifier(null);
+  // GPU zero-copy preview controllers (Windows D3D11 / Web GPUCanvasContext).
+  final MiniavPreviewController _cameraPreviewCtrl = MiniavPreviewController();
+  final MiniavPreviewController _screenPreviewCtrl = MiniavPreviewController();
   bool _buildingCameraImage = false;
   bool _buildingScreenImage = false;
   int _cameraFrameSkip = 0;
@@ -229,6 +233,8 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     _screenPreview.value?.dispose();
     _cameraPreview.dispose();
     _screenPreview.dispose();
+    _cameraPreviewCtrl.dispose();
+    _screenPreviewCtrl.dispose();
     super.dispose();
   }
 
@@ -303,39 +309,12 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
           formats = await MiniCamera.getSupportedFormats(
             config.selectedDeviceId!,
           );
-          // Force CPU output preference if possible by cloning objects (if plugin respects it)
-          formats = formats.map((f) {
-            if (f is MiniAVVideoInfo &&
-                f.outputPreference != MiniAVOutputPreference.cpu) {
-              return MiniAVVideoInfo(
-                width: f.width,
-                height: f.height,
-                pixelFormat: f.pixelFormat,
-                frameRateNumerator: f.frameRateNumerator,
-                frameRateDenominator: f.frameRateDenominator,
-                outputPreference: MiniAVOutputPreference.cpu,
-              );
-            }
-            return f;
-          }).toList();
           break;
         case 'screen':
           final result = await MiniScreen.getDefaultFormats(
             config.selectedDeviceId!,
           );
-          // result.$1 is video format
-          final f = result.$1;
-          final cpuF = (f.outputPreference == MiniAVOutputPreference.cpu)
-              ? f
-              : MiniAVVideoInfo(
-                  width: f.width,
-                  height: f.height,
-                  pixelFormat: f.pixelFormat,
-                  frameRateNumerator: f.frameRateNumerator,
-                  frameRateDenominator: f.frameRateDenominator,
-                  outputPreference: MiniAVOutputPreference.cpu,
-                );
-          formats = [cpuF];
+          formats = [result.$1];
           break;
         case 'audioInput':
           final defaultFormat = await MiniAudioInput.getDefaultFormat(
@@ -488,6 +467,7 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
           streamKey: 'camera',
           buffer: buffer,
           preview: _cameraPreview,
+          previewController: _cameraPreviewCtrl,
           buildingFlag: () => _buildingCameraImage,
           setBuildingFlag: (v) => _buildingCameraImage = v,
           frameSkipCounter: () => _cameraFrameSkip++,
@@ -522,6 +502,7 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
           streamKey: 'screen',
           buffer: buffer,
           preview: _screenPreview,
+          previewController: _screenPreviewCtrl,
           buildingFlag: () => _buildingScreenImage,
           setBuildingFlag: (v) => _buildingScreenImage = v,
           frameSkipCounter: () => _screenFrameSkip++,
@@ -761,6 +742,7 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     required String streamKey,
     required MiniAVBuffer buffer,
     required ValueNotifier<ui.Image?> preview,
+    MiniavPreviewController? previewController,
     required bool Function() buildingFlag,
     required void Function(bool) setBuildingFlag,
     required int Function() frameSkipCounter,
@@ -768,6 +750,19 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     if (buildingFlag()) return;
     final skipIndex = frameSkipCounter();
     if ((skipIndex & 1) == 1) return;
+
+    // GPU zero-copy path (Windows D3D11 / other native GPU handles).
+    if (buffer.contentType != MiniAVBufferContentType.cpu &&
+        previewController != null) {
+      final source = buffer.asPreviewSource();
+      if (source != null) {
+        previewController.present(source).catchError((e) {
+          _stats[streamKey]!.lastPreviewError = 'GPU preview error: $e';
+        });
+        return;
+      }
+      // Unknown GPU handle type — fall through to CPU path.
+    }
 
     if (buffer.contentType != MiniAVBufferContentType.cpu) {
       _stats[streamKey]!.lastPreviewError ??=
@@ -1491,31 +1486,7 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     final isLoading = stats.isStarting || stats.isStopping;
     final canStart = cfg.selectedDevice != null && cfg.selectedFormat != null;
     final preview = (key == 'camera' || key == 'screen')
-        ? ValueListenableBuilder<ui.Image?>(
-            valueListenable: key == 'camera' ? _cameraPreview : _screenPreview,
-            builder: (_, img, __) {
-              if (!stats.isActive) {
-                return _previewContainer(
-                  child: Text(
-                    'Idle',
-                    style: TextStyle(fontSize: 10, color: Colors.grey[500]),
-                  ),
-                );
-              }
-              if (img == null) {
-                return _previewContainer(
-                  child: Text(
-                    stats.lastPreviewError ?? 'Waiting frame...',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 9, color: Colors.grey[500]),
-                  ),
-                );
-              }
-              return _previewContainer(
-                child: RawImage(image: img, fit: BoxFit.cover),
-              );
-            },
-          )
+        ? _buildPreviewWidget(key, stats)
         : const SizedBox.shrink();
 
     return Card(
@@ -1694,6 +1665,53 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
         borderRadius: BorderRadius.circular(6),
         child: ColoredBox(color: Colors.black, child: child),
       ),
+    );
+  }
+
+  /// Builds the preview widget for camera/screen streams.
+  ///
+  /// Shows [MiniavGpuPreview] when a GPU frame has been presented (Windows
+  /// D3D11 zero-copy path); otherwise falls back to the CPU [RawImage] path.
+  Widget _buildPreviewWidget(String key, StreamStats stats) {
+    final ctrl = key == 'camera' ? _cameraPreviewCtrl : _screenPreviewCtrl;
+    final cpuPreview = key == 'camera' ? _cameraPreview : _screenPreview;
+
+    if (!stats.isActive) {
+      return _previewContainer(
+        child: Text(
+          'Idle',
+          style: TextStyle(fontSize: 10, color: Colors.grey[500]),
+        ),
+      );
+    }
+
+    // GPU path: controller has a registered textureId.
+    if (ctrl.textureId != null) {
+      return _previewContainer(
+        child: AnimatedBuilder(
+          animation: ctrl,
+          builder: (_, __) => MiniavGpuPreview(controller: ctrl),
+        ),
+      );
+    }
+
+    // CPU fallback path.
+    return ValueListenableBuilder<ui.Image?>(
+      valueListenable: cpuPreview,
+      builder: (_, img, __) {
+        if (img == null) {
+          return _previewContainer(
+            child: Text(
+              stats.lastPreviewError ?? 'Waiting frame...',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 9, color: Colors.grey[500]),
+            ),
+          );
+        }
+        return _previewContainer(
+          child: RawImage(image: img, fit: BoxFit.cover),
+        );
+      },
     );
   }
 

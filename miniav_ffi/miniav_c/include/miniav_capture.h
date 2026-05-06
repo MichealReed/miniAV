@@ -16,6 +16,41 @@ extern "C" {
 typedef void (*MiniAVBufferCallback)(const MiniAVBuffer *buffer,
                                      void *user_data);
 
+// --- Device Change Notification API ---
+//
+// All MiniAV_*_SetDeviceChangeCallback / SetDisplayChangeCallback /
+// SetWindowChangeCallback / SetGamepadChangeCallback functions follow the
+// same contract:
+//   - Pass a non-NULL callback to subscribe.
+//   - Pass NULL to unsubscribe (and tear down any background watcher).
+//   - Calling subscribe again replaces the previous callback.
+//   - Implementation may be polling-based; events typically arrive within
+//     1-2 seconds of the underlying OS change.
+//   - The callback runs on a background thread; do not call back into MiniAV
+//     APIs that may block waiting for the same thread.
+typedef enum {
+  MINIAV_DEVICE_CHANGE_ADDED = 0,
+  MINIAV_DEVICE_CHANGE_REMOVED = 1,
+  MINIAV_DEVICE_CHANGE_DEFAULT_CHANGED = 2,
+} MiniAVDeviceChangeEvent;
+
+typedef void (*MiniAVDeviceChangeCallback)(MiniAVDeviceChangeEvent event,
+                                           const MiniAVDeviceInfo *device,
+                                           void *user_data);
+
+// --- Per-Context Device-Lost Callback ---
+//
+// Fires when the device a capture context is currently using becomes
+// unavailable mid-stream (unplugged, disabled, format renegotiation failed,
+// GPU reset, etc.). Capture is automatically stopped and the context becomes
+// unusable; the application should call MiniAV_*_DestroyContext and
+// reconfigure if needed.
+//
+// The callback runs on the capture or watcher thread; treat it like any
+// other capture-thread callback.
+typedef void (*MiniAVContextLostCallback)(int /*MiniAVResultCode*/ reason,
+                                          void *user_data);
+
 // --- Common / Utility API ---
 MINIAV_API MiniAVResultCode MiniAV_GetVersion(uint32_t *major, uint32_t *minor,
                                               uint32_t *patch);
@@ -55,6 +90,14 @@ MiniAV_Camera_StartCapture(MiniAVCameraContextHandle context,
 MINIAV_API MiniAVResultCode
 MiniAV_Camera_StopCapture(MiniAVCameraContextHandle context);
 
+// Device change subscription. Pass NULL callback to unsubscribe.
+MINIAV_API MiniAVResultCode MiniAV_Camera_SetDeviceChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data);
+// Per-context lost notification. Pass NULL callback to unsubscribe.
+MINIAV_API MiniAVResultCode MiniAV_Camera_SetContextLostCallback(
+    MiniAVCameraContextHandle context, MiniAVContextLostCallback callback,
+    void *user_data);
+
 // --- Screen Capture API ---
 MINIAV_API MiniAVResultCode
 MiniAV_Screen_CreateContext(MiniAVScreenContextHandle *context);
@@ -87,6 +130,20 @@ MiniAV_Screen_StartCapture(MiniAVScreenContextHandle context,
 MINIAV_API MiniAVResultCode
 MiniAV_Screen_StopCapture(MiniAVScreenContextHandle context);
 
+// Subscribe for display add/remove notifications. Pass NULL to unsubscribe.
+MINIAV_API MiniAVResultCode MiniAV_Screen_SetDisplayChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data);
+// Subscribe for window add/remove notifications. Pass NULL to unsubscribe.
+// Polling is comparatively heavy on Windows because EnumWindows must run
+// each cycle; subscribe sparingly.
+MINIAV_API MiniAVResultCode MiniAV_Screen_SetWindowChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data);
+// Per-context lost notification. Fires e.g. when a captured display is
+// disconnected or the captured window is closed.
+MINIAV_API MiniAVResultCode MiniAV_Screen_SetContextLostCallback(
+    MiniAVScreenContextHandle context, MiniAVContextLostCallback callback,
+    void *user_data);
+
 // --- Audio Capture API ---
 MINIAV_API MiniAVResultCode
 MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices, uint32_t *count);
@@ -108,6 +165,15 @@ MiniAV_Audio_StartCapture(MiniAVAudioContextHandle context,
                           MiniAVBufferCallback callback, void *user_data);
 MINIAV_API MiniAVResultCode
 MiniAV_Audio_StopCapture(MiniAVAudioContextHandle context);
+
+// Subscribe for audio capture device add/remove notifications.
+MINIAV_API MiniAVResultCode MiniAV_Audio_SetDeviceChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data);
+// Per-context lost notification (microphone unplugged, format renegotiation
+// failed, etc.).
+MINIAV_API MiniAVResultCode MiniAV_Audio_SetContextLostCallback(
+    MiniAVAudioContextHandle context, MiniAVContextLostCallback callback,
+    void *user_data);
 
 // --- Loopback Audio Capture API ---
 MINIAV_API MiniAVResultCode MiniAV_Loopback_EnumerateTargets(
@@ -146,6 +212,17 @@ MiniAV_Loopback_StartCapture(MiniAVLoopbackContextHandle context,
 MINIAV_API MiniAVResultCode
 MiniAV_Loopback_StopCapture(MiniAVLoopbackContextHandle context);
 
+// Subscribe for loopback target add/remove notifications. The watcher emits
+// for the default system-audio target type; use MiniAV_Loopback_EnumerateTargets
+// to inspect the current full list at any time.
+MINIAV_API MiniAVResultCode MiniAV_Loopback_SetDeviceChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data);
+// Per-context lost notification (e.g. WASAPI returned AUDCLNT_E_DEVICE_INVALIDATED
+// because the captured render endpoint was unplugged).
+MINIAV_API MiniAVResultCode MiniAV_Loopback_SetContextLostCallback(
+    MiniAVLoopbackContextHandle context, MiniAVContextLostCallback callback,
+    void *user_data);
+
 // --- Input Capture API ---
 MINIAV_API MiniAVResultCode
 MiniAV_Input_EnumerateGamepads(MiniAVDeviceInfo **devices, uint32_t *count);
@@ -160,6 +237,10 @@ MINIAV_API MiniAVResultCode
 MiniAV_Input_StartCapture(MiniAVInputContextHandle context);
 MINIAV_API MiniAVResultCode
 MiniAV_Input_StopCapture(MiniAVInputContextHandle context);
+
+// Subscribe for gamepad add/remove notifications.
+MINIAV_API MiniAVResultCode MiniAV_Input_SetGamepadChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data);
 
 // --- Property APIs (TBD) ---
 // MiniAV_Camera_GetPropertyInfo(...)

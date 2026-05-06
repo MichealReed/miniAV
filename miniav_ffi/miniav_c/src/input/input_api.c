@@ -1,5 +1,6 @@
 #include "../../include/miniav_capture.h"
 #include "../../include/miniav_types.h"
+#include "../common/miniav_device_watcher.h"
 #include "../common/miniav_logging.h"
 #include "../common/miniav_utils.h"
 #include "input_context.h"
@@ -281,4 +282,21 @@ MiniAV_Input_StopCapture(MiniAVInputContextHandle context_handle) {
                "Failed to stop input capture, code: %d", res);
   }
   return res;
+}
+
+// --- Subscriptions ---
+
+static MiniAVDeviceWatcher *g_input_gamepad_watcher = NULL;
+
+static MiniAVResultCode input_gamepad_watcher_enumerate_adapter(
+    MiniAVDeviceInfo **devices_out, uint32_t *count_out, void *user_data) {
+  (void)user_data;
+  return MiniAV_Input_EnumerateGamepads(devices_out, count_out);
+}
+
+MiniAVResultCode MiniAV_Input_SetGamepadChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data) {
+  return miniav_device_watcher_set(&g_input_gamepad_watcher,
+                                   input_gamepad_watcher_enumerate_adapter,
+                                   NULL, callback, user_data, 1500);
 }

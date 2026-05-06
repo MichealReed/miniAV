@@ -24,6 +24,18 @@ class MiniScreen {
     final context = await _platform.createContext();
     return MiniScreenContext._(context);
   }
+
+  /// Subscribe to display add/remove notifications.
+  /// Returns a disposer that must be called to unsubscribe.
+  static void Function() addDisplayChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => _platform.addDisplayChangeListener(listener);
+
+  /// Subscribe to window add/remove notifications.
+  /// Returns a disposer that must be called to unsubscribe.
+  static void Function() addWindowChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => _platform.addWindowChangeListener(listener);
 }
 
 /// Screen capture context for configuration and capture operations
@@ -62,4 +74,11 @@ class MiniScreenContext {
 
   /// Destroy the context and release resources
   Future<void> destroy() => _context.destroy();
+
+  /// Subscribe to a context-lost notification (e.g. captured display
+  /// disconnected, captured window closed). Fired from a capture thread; do
+  /// NOT call [destroy] synchronously from inside the listener. Returns a
+  /// disposer that must be called to unsubscribe.
+  void Function() addLostListener(MiniAVContextLostListener listener) =>
+      _context.addLostListener(listener);
 }

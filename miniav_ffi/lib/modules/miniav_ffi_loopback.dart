@@ -6,11 +6,22 @@ import 'package:miniav_platform_interface/modules/miniav_loopback_interface.dart
 import 'package:miniav_platform_interface/miniav_platform_types.dart';
 
 import '../miniav_ffi_bindings.dart' as bindings;
+import '../miniav_ffi_subscriptions.dart';
 import '../miniav_ffi_types.dart'; // For ...FFIToPlatform and MiniAVBufferFFI
 
 /// FFI implementation of [MiniLoopbackPlatformInterface].
 class MiniAVFFILoopbackPlatform extends MiniLoopbackPlatformInterface {
   MiniAVFFILoopbackPlatform();
+
+  static final FFIDeviceChangeRegistry _deviceChangeRegistry =
+      FFIDeviceChangeRegistry(
+        setCallback: bindings.MiniAV_Loopback_SetDeviceChangeCallback,
+      );
+
+  @override
+  void Function() addDeviceChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) => _deviceChangeRegistry.add(listener);
 
   @override
   Future<List<MiniAVDeviceInfo>> enumerateDevices() async {
@@ -95,6 +106,7 @@ class MiniAVFFILoopbackContextPlatform
     extends MiniLoopbackContextPlatformInterface {
   bindings.MiniAVLoopbackContextHandle? _contextHandle;
   ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>? _callbackHandle;
+  FFIContextLostRegistry<bindings.MiniAVLoopbackContextHandle>? _lostRegistry;
   bool _isDestroyed = false;
   late final Finalizer<bindings.MiniAVLoopbackContextHandle> _finalizer;
 
@@ -255,6 +267,9 @@ class MiniAVFFILoopbackContextPlatform
 
     await stopCapture(); // Stop capture if running
 
+    _lostRegistry?.dispose();
+    _lostRegistry = null;
+
     if (_contextHandle != null) {
       _finalizer.detach(this); // Prevent finalizer from running
       final res = bindings.MiniAV_Loopback_DestroyContext(_contextHandle!);
@@ -264,5 +279,18 @@ class MiniAVFFILoopbackContextPlatform
         throw Exception('Failed to destroy loopback context: ${res.name}');
       }
     }
+  }
+
+  @override
+  void Function() addLostListener(MiniAVContextLostListener listener) {
+    if (_isDestroyed || _contextHandle == null) {
+      throw StateError('Cannot add lost listener on a destroyed context.');
+    }
+    _lostRegistry ??=
+        FFIContextLostRegistry<bindings.MiniAVLoopbackContextHandle>(
+          context: _contextHandle!,
+          setCallback: bindings.MiniAV_Loopback_SetContextLostCallback,
+        );
+    return _lostRegistry!.add(listener);
   }
 }

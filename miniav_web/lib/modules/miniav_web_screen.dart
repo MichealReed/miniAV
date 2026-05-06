@@ -33,10 +33,30 @@ class MiniAVWebScreenPlatform implements MiniScreenPlatformInterface {
   Future<MiniScreenContextPlatformInterface> createContext() async {
     return MiniAVWebScreenContext();
   }
+
+  @override
+  void Function() addDisplayChangeListener(
+    MiniAVDeviceChangeListener listener,
+  ) {
+    // Web has no display hot-plug API; the single 'screen' device is fixed.
+    return () {};
+  }
+
+  @override
+  void Function() addWindowChangeListener(MiniAVDeviceChangeListener listener) {
+    // Web does not enumerate windows.
+    return () {};
+  }
 }
 
 /// Web implementation of [MiniScreenContextPlatformInterface]
 class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
+  @override
+  void Function() addLostListener(MiniAVContextLostListener listener) {
+    // Web getDisplayMedia tracks ending is not currently propagated.
+    return () {};
+  }
+
   // Media
   web.MediaStream? _mediaStream;
   web.HTMLVideoElement? _video;

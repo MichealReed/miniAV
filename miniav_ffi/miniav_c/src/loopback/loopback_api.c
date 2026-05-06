@@ -1,3 +1,4 @@
+#include "../common/miniav_device_watcher.h"
 #include "../common/miniav_logging.h"
 #include "../common/miniav_utils.h" // For miniav_calloc, miniav_free, miniav_strdup
 #include "loopback_context.h"
@@ -541,4 +542,30 @@ MiniAV_Loopback_GetConfiguredFormat(MiniAVLoopbackContextHandle context_handle,
       MINIAV_LOG_LEVEL_ERROR,
       "Cannot get configured format: context not configured or op missing.");
   return MINIAV_ERROR_NOT_INITIALIZED;
+}
+// --- Loopback device change / context-lost subscriptions ---
+
+static MiniAVDeviceWatcher *g_loopback_watcher = NULL;
+
+static MiniAVResultCode loopback_enum_adapter(
+    MiniAVDeviceInfo **devices_out, uint32_t *count_out, void *ud) {
+  (void)ud;
+  return MiniAV_Loopback_EnumerateTargets(MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO,
+                                          devices_out, count_out);
+}
+
+MiniAVResultCode MiniAV_Loopback_SetDeviceChangeCallback(
+    MiniAVDeviceChangeCallback callback, void *user_data) {
+  return miniav_device_watcher_set(&g_loopback_watcher, loopback_enum_adapter,
+                                   NULL, callback, user_data, 1500);
+}
+
+MiniAVResultCode MiniAV_Loopback_SetContextLostCallback(
+    MiniAVLoopbackContextHandle context_handle,
+    MiniAVContextLostCallback callback, void *user_data) {
+  MiniAVLoopbackContext *ctx = (MiniAVLoopbackContext *)context_handle;
+  if (!ctx) return MINIAV_ERROR_INVALID_ARG;
+  ctx->lost_cb = callback;
+  ctx->lost_cb_user_data = user_data;
+  return MINIAV_SUCCESS;
 }

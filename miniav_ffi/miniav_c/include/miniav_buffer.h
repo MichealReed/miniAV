@@ -36,6 +36,8 @@ typedef enum {
   MINIAV_BUFFER_CONTENT_TYPE_GPU_DMABUF_FD, // Video:
                                             // data.video.native_gpu_dmabuf_fd
                                             // is a DMA-BUF file descriptor
+  MINIAV_BUFFER_CONTENT_TYPE_GPU_AHARDWAREBUFFER, // Android: planes[0].data_ptr
+                                                  // is AHardwareBuffer*
 } MiniAVBufferContentType;
 
 typedef struct {
@@ -48,6 +50,9 @@ typedef struct {
                          // subresource)
   uint32_t
       subresource_index; // GPU: D3D11 subresource, Vulkan image aspect, etc.
+  // Linux DMA-BUF extended info (zero/−1 on other platforms)
+  int      dmabuf_fd;            // Per-plane DMA-BUF file descriptor (-1 if n/a)
+  uint64_t drm_format_modifier;  // DRM format modifier (DRM_FORMAT_MOD_LINEAR=0)
 } MiniAVVideoPlane;
 
 typedef struct {
@@ -75,6 +80,15 @@ typedef struct {
   size_t data_size_bytes;
   void *user_data;
   void *internal_handle;
+
+  // Optional native fence for GPU synchronization (zero-init = no fence).
+  // Consumers must wait on this fence before reading the GPU resource.
+  struct {
+    int   sync_fd;             // Linux/Android: sync_file fd (-1 if none)
+    void *d3d11_fence;         // Windows: ID3D11Fence* (NULL if none)
+    void *metal_shared_event;  // macOS/iOS: id<MTLSharedEvent> bridged (NULL if none)
+    uint64_t metal_fence_value;// macOS/iOS: signaled value on metal_shared_event
+  } native_fence;
 } MiniAVBuffer;
 
 typedef struct MiniAVNativeBufferInternalPayload {

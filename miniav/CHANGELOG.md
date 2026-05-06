@@ -1,5 +1,11 @@
 # miniav CHANGELOG
 
+## 0.5.2
+
+- adds shared textures
+## 0.5.1
+
+- adds subscriptions and fixes lost device crashes
 ## 0.5.0
 
 - adding input support

@@ -305,15 +305,22 @@ static void setup_gpu_planes_for_format(MiniAVBuffer *buffer,
                                         MiniAVPixelFormat format,
                                         uint32_t width, uint32_t height,
                                         int dmabuf_fd, size_t total_size) {
+// Helper: set both legacy data_ptr cast and new typed dmabuf_fd field
+#define PW_SET_PLANE_DMABUF(buf, idx, fd) \
+  do { \
+    (buf)->data.video.planes[(idx)].data_ptr = (void *)(intptr_t)(fd); \
+    (buf)->data.video.planes[(idx)].dmabuf_fd = (fd); \
+    (buf)->data.video.planes[(idx)].drm_format_modifier = 0; /* DRM_FORMAT_MOD_LINEAR */ \
+  } while (0)
+
   switch (format) {
   case MINIAV_PIXEL_FORMAT_BGRA32:
   case MINIAV_PIXEL_FORMAT_RGBA32:
   case MINIAV_PIXEL_FORMAT_ARGB32:
   case MINIAV_PIXEL_FORMAT_ABGR32:
   case MINIAV_PIXEL_FORMAT_BGRX32: {
-    // Single-plane RGB formats
     buffer->data.video.num_planes = 1;
-    buffer->data.video.planes[0].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    PW_SET_PLANE_DMABUF(buffer, 0, dmabuf_fd);
     buffer->data.video.planes[0].width = width;
     buffer->data.video.planes[0].height = height;
     buffer->data.video.planes[0].stride_bytes = width * 4;
@@ -324,9 +331,8 @@ static void setup_gpu_planes_for_format(MiniAVBuffer *buffer,
 
   case MINIAV_PIXEL_FORMAT_RGB24:
   case MINIAV_PIXEL_FORMAT_BGR24: {
-    // Single-plane RGB formats
     buffer->data.video.num_planes = 1;
-    buffer->data.video.planes[0].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    PW_SET_PLANE_DMABUF(buffer, 0, dmabuf_fd);
     buffer->data.video.planes[0].width = width;
     buffer->data.video.planes[0].height = height;
     buffer->data.video.planes[0].stride_bytes = width * 3;
@@ -336,29 +342,25 @@ static void setup_gpu_planes_for_format(MiniAVBuffer *buffer,
   }
 
   case MINIAV_PIXEL_FORMAT_I420: {
-    // Three-plane YUV format - all using same DMA-BUF FD with different offsets
     buffer->data.video.num_planes = 3;
     uint32_t y_size = width * height;
     uint32_t uv_size = (width / 2) * (height / 2);
 
-    // Y plane
-    buffer->data.video.planes[0].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    PW_SET_PLANE_DMABUF(buffer, 0, dmabuf_fd);
     buffer->data.video.planes[0].width = width;
     buffer->data.video.planes[0].height = height;
     buffer->data.video.planes[0].stride_bytes = width;
     buffer->data.video.planes[0].offset_bytes = 0;
     buffer->data.video.planes[0].subresource_index = 0;
 
-    // U plane
-    buffer->data.video.planes[1].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    PW_SET_PLANE_DMABUF(buffer, 1, dmabuf_fd);
     buffer->data.video.planes[1].width = width / 2;
     buffer->data.video.planes[1].height = height / 2;
     buffer->data.video.planes[1].stride_bytes = width / 2;
     buffer->data.video.planes[1].offset_bytes = y_size;
     buffer->data.video.planes[1].subresource_index = 1;
 
-    // V plane
-    buffer->data.video.planes[2].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    PW_SET_PLANE_DMABUF(buffer, 2, dmabuf_fd);
     buffer->data.video.planes[2].width = width / 2;
     buffer->data.video.planes[2].height = height / 2;
     buffer->data.video.planes[2].stride_bytes = width / 2;
@@ -368,20 +370,17 @@ static void setup_gpu_planes_for_format(MiniAVBuffer *buffer,
   }
 
   case MINIAV_PIXEL_FORMAT_NV12: {
-    // Two-plane YUV format
     buffer->data.video.num_planes = 2;
     uint32_t y_size = width * height;
 
-    // Y plane
-    buffer->data.video.planes[0].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    PW_SET_PLANE_DMABUF(buffer, 0, dmabuf_fd);
     buffer->data.video.planes[0].width = width;
     buffer->data.video.planes[0].height = height;
     buffer->data.video.planes[0].stride_bytes = width;
     buffer->data.video.planes[0].offset_bytes = 0;
     buffer->data.video.planes[0].subresource_index = 0;
 
-    // UV plane
-    buffer->data.video.planes[1].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    PW_SET_PLANE_DMABUF(buffer, 1, dmabuf_fd);
     buffer->data.video.planes[1].width = width / 2;
     buffer->data.video.planes[1].height = height / 2;
     buffer->data.video.planes[1].stride_bytes = width;
@@ -391,9 +390,8 @@ static void setup_gpu_planes_for_format(MiniAVBuffer *buffer,
   }
 
   default: {
-    // Unknown format - assume single plane
     buffer->data.video.num_planes = 1;
-    buffer->data.video.planes[0].data_ptr = (void *)(intptr_t)dmabuf_fd;
+    PW_SET_PLANE_DMABUF(buffer, 0, dmabuf_fd);
     buffer->data.video.planes[0].width = width;
     buffer->data.video.planes[0].height = height;
     buffer->data.video.planes[0].stride_bytes = width * 4;
@@ -406,6 +404,8 @@ static void setup_gpu_planes_for_format(MiniAVBuffer *buffer,
     break;
   }
   }
+
+#undef PW_SET_PLANE_DMABUF
 }
 
 static uint32_t get_display_refresh_rate_hz(void) {

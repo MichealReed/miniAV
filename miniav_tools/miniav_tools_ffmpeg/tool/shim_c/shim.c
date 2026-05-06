@@ -1,0 +1,866 @@
+/*
+ * miniav_tools_ffmpeg shim — exposes AVCodecContext fields that FFmpeg's
+ * AVOption system does not surface (`hw_device_ctx`, `hw_frames_ctx`) plus
+ * a few struct field setters we need from Dart but cannot reach via FFI
+ * pointer arithmetic safely.
+ *
+ * Built once per machine by `dart run miniav_tools_ffmpeg:build_shim`
+ * against the FFmpeg dev distribution that the package's auto-downloader
+ * already cached. The compiled shim DLL/so/dylib is dropped next to the
+ * cached FFmpeg shared libraries so it loads transparently.
+ *
+ * ABI: stable across FFmpeg majors 7 and 8 (same struct layouts for the
+ * fields we touch). If FFmpeg breaks one of these structs in a future
+ * major bump, miniav_shim_abi_version() lets the Dart side detect it.
+ */
+
+#include <libavcodec/avcodec.h>
+#include <libavutil/buffer.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/pixfmt.h>
+#include <libavutil/samplefmt.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+  #define COBJMACROS
+  #include <initguid.h>
+  #include <d3d11.h>
+  #include <d3d11_1.h>
+  #include <dxgi1_2.h>
+  #include <libavutil/hwcontext_d3d11va.h>
+  #include <windows.h>
+  #define MIO_API __declspec(dllexport)
+#else
+  #define MIO_API __attribute__((visibility("default")))
+#endif
+
+#if defined(__APPLE__)
+  #include <CoreFoundation/CoreFoundation.h>
+  #include <CoreVideo/CoreVideo.h>
+  #include <IOSurface/IOSurfaceRef.h>
+  #include <libavutil/hwcontext_videotoolbox.h>
+#endif
+
+#if defined(__linux__) && !defined(__ANDROID__)
+  /* hwcontext_vaapi.h is present in any FFmpeg build that enabled --enable-vaapi.
+   * The BtbN gpl-shared Linux build does. We also pull hwcontext_drm.h for the
+   * DRM_PRIME frame descriptor used by dmabuf import. */
+  #include <libavutil/hwcontext_drm.h>
+  #include <libavutil/hwcontext_vaapi.h>
+  #include <stdint.h>
+  #include <unistd.h>
+#endif
+
+#if defined(__ANDROID__)
+  #include <android/hardware_buffer.h>
+  #include <stdint.h>
+  #if __ANDROID_API__ >= 26
+    #define MIO_HAS_AHARDWAREBUFFER 1
+  #endif
+#endif
+
+/* --- AVCodecContext field setters ------------------------------------- */
+
+MIO_API void miniav_shim_set_hw_device_ctx(AVCodecContext* ctx,
+                                           AVBufferRef* ref) {
+    if (!ctx) return;
+    if (ctx->hw_device_ctx) av_buffer_unref(&ctx->hw_device_ctx);
+    ctx->hw_device_ctx = ref ? av_buffer_ref(ref) : NULL;
+}
+
+MIO_API void miniav_shim_set_hw_frames_ctx(AVCodecContext* ctx,
+                                           AVBufferRef* ref) {
+    if (!ctx) return;
+    if (ctx->hw_frames_ctx) av_buffer_unref(&ctx->hw_frames_ctx);
+    ctx->hw_frames_ctx = ref ? av_buffer_ref(ref) : NULL;
+}
+
+/* --- AVHWFramesContext access ----------------------------------------- */
+
+MIO_API AVHWFramesContext* miniav_shim_hwframes_data(AVBufferRef* ref) {
+    if (!ref) return NULL;
+    return (AVHWFramesContext*)ref->data;
+}
+
+MIO_API void miniav_shim_hwframes_set_params(AVHWFramesContext* ctx,
+                                             int format, int sw_format,
+                                             int width, int height,
+                                             int initial_pool_size) {
+    if (!ctx) return;
+    ctx->format = (enum AVPixelFormat)format;
+    ctx->sw_format = (enum AVPixelFormat)sw_format;
+    ctx->width = width;
+    ctx->height = height;
+    ctx->initial_pool_size = initial_pool_size;
+}
+
+/* --- AVHWDeviceContext access ----------------------------------------- */
+
+MIO_API AVHWDeviceContext* miniav_shim_hwdev_data(AVBufferRef* ref) {
+    if (!ref) return NULL;
+    return (AVHWDeviceContext*)ref->data;
+}
+
+#ifdef _WIN32
+/* Helper: AVBufferRef -> AVHWDeviceContext -> AVD3D11VADeviceContext.
+ * Returns NULL if any link is missing. */
+static AVD3D11VADeviceContext* _miniav_d3d11_ctx_from_ref(AVBufferRef* ref) {
+    if (!ref || !ref->data) return NULL;
+    AVHWDeviceContext* hwdev_ctx = (AVHWDeviceContext*)ref->data;
+    if (!hwdev_ctx->hwctx) return NULL;
+    return (AVD3D11VADeviceContext*)hwdev_ctx->hwctx;
+}
+
+/* Set the ID3D11Device pointer on a D3D11VA device context allocated by
+ * av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA). The caller must NOT
+ * have called av_hwdevice_ctx_init() yet. Pass the AVBufferRef* returned
+ * by alloc; the shim dereferences to the inner AVD3D11VADeviceContext.
+ *
+ * The device is AddRef'd here so that FFmpeg's eventual Release (via
+ * av_buffer_unref) does not consume the caller's reference. This matches
+ * the contract of FFmpeg's own helpers and lets the caller safely retry
+ * on multiple vendors with the same device pointer. */
+MIO_API void miniav_shim_d3d11_dev_set_device(AVBufferRef* ref,
+                                              void* id3d11device) {
+    AVD3D11VADeviceContext* d = _miniav_d3d11_ctx_from_ref(ref);
+    if (!d || !id3d11device) return;
+    ID3D11Device* dev = (ID3D11Device*)id3d11device;
+    dev->lpVtbl->AddRef(dev);
+    d->device = dev;
+}
+
+/* Read back the ID3D11Device that FFmpeg either accepted via the setter
+ * above OR allocated itself when av_hwdevice_ctx_init() was called with
+ * a NULL device. Stage B uses the second mode (let FFmpeg pick adapter 0)
+ * and then fetches the device here so we can open shared NT handles on it. */
+MIO_API void* miniav_shim_d3d11_dev_get_device(AVBufferRef* ref) {
+    AVD3D11VADeviceContext* d = _miniav_d3d11_ctx_from_ref(ref);
+    return d ? (void*)d->device : NULL;
+}
+
+MIO_API void* miniav_shim_d3d11_dev_get_context(AVBufferRef* ref) {
+    AVD3D11VADeviceContext* d = _miniav_d3d11_ctx_from_ref(ref);
+    return d ? (void*)d->device_context : NULL;
+}
+
+/* Open a process-shared DXGI NT HANDLE on the supplied D3D11 device. The
+ * returned ID3D11Texture2D* must be released by the caller. Returns NULL
+ * on failure. Stage B per-frame: open the handle miniav placed in
+ * MiniAVBuffer.nativeHandles[0], CopyResource into a hwframe pool tex,
+ * release the opened texture. */
+MIO_API void* miniav_shim_d3d11_open_shared_handle(void* id3d11device,
+                                                   void* nt_handle) {
+    if (!id3d11device || !nt_handle) return NULL;
+    ID3D11Device1* dev1 = NULL;
+    HRESULT hr = ((ID3D11Device*)id3d11device)->lpVtbl->QueryInterface(
+        (ID3D11Device*)id3d11device, &IID_ID3D11Device1, (void**)&dev1);
+    if (FAILED(hr) || !dev1) {
+        fprintf(stderr,
+            "[shim] QueryInterface(IID_ID3D11Device1) FAILED hr=0x%08lX\n",
+            (unsigned long)hr);
+        return NULL;
+    }
+    /* Diagnostic: report the D3D11 device's DXGI adapter LUID and whether
+     * the NT handle is still valid, before attempting the open. */
+    {
+        IDXGIDevice* dxgiDev = NULL;
+        LUID luid = {0, 0};
+        if (SUCCEEDED(((ID3D11Device*)id3d11device)->lpVtbl->QueryInterface(
+                (ID3D11Device*)id3d11device, &IID_IDXGIDevice, (void**)&dxgiDev))) {
+            IDXGIAdapter* ada = NULL;
+            if (SUCCEEDED(dxgiDev->lpVtbl->GetAdapter(dxgiDev, &ada))) {
+                DXGI_ADAPTER_DESC adesc;
+                if (SUCCEEDED(ada->lpVtbl->GetDesc(ada, &adesc)))
+                    luid = adesc.AdapterLuid;
+                ada->lpVtbl->Release(ada);
+            }
+            dxgiDev->lpVtbl->Release(dxgiDev);
+        }
+        DWORD hflags = 0;
+        BOOL hvalid = GetHandleInformation((HANDLE)nt_handle, &hflags);
+        fprintf(stderr,
+            "[shim] OpenSharedResource1: device=%p luid=%08lX:%08lX "
+            "handle=%p valid=%d\n",
+            id3d11device,
+            (unsigned long)luid.HighPart, (unsigned long)luid.LowPart,
+            nt_handle, (int)hvalid);
+    }
+    ID3D11Texture2D* tex = NULL;
+    hr = dev1->lpVtbl->OpenSharedResource1(dev1, (HANDLE)nt_handle,
+                                           &IID_ID3D11Texture2D, (void**)&tex);
+    dev1->lpVtbl->Release(dev1);
+    if (FAILED(hr)) {
+        fprintf(stderr,
+            "[shim] OpenSharedResource1 FAILED hr=0x%08lX handle=%p\n",
+            (unsigned long)hr, nt_handle);
+        return NULL;
+    }
+    return (void*)tex;
+}
+
+/* GPU-only copy from one D3D11 texture into another, both bound to the
+ * same device (the destination's device, which is the FFmpeg-owned one).
+ * No CPU staging \u2014 this is a single CopyResource on the immediate context.
+ *
+ * After the copy we insert a D3D11_QUERY_EVENT fence, Flush() the queue,
+ * and poll until the GPU signals completion. This is REQUIRED because
+ * NVENC / AMF / QSV all consume the destination texture through their
+ * own engines (NVENC via NvEncRegisterResource + DirectX interop, etc.)
+ * which do NOT serialise with the calling immediate context. Skipping the
+ * fence yields black / undefined frames on the encoder.
+ *
+ * Cost: ~0.5\u20132ms per frame; with the producer pipelined this still
+ * sustains 60fps at 5K on a discrete GPU. */
+MIO_API void miniav_shim_d3d11_copy_resource(void* id3d11_device,
+                                             void* id3d11_immediate_context,
+                                             void* dst_tex,
+                                             unsigned dst_subresource,
+                                             void* src_tex,
+                                             unsigned src_subresource) {
+    if (!id3d11_device || !id3d11_immediate_context || !dst_tex || !src_tex) {
+        return;
+    }
+    ID3D11Device* dev = (ID3D11Device*)id3d11_device;
+    ID3D11DeviceContext* ctx = (ID3D11DeviceContext*)id3d11_immediate_context;
+
+    /* If the source texture was created with D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
+     * (e.g. minigpu's SharedOutputTexture so Dawn can synchronise its D3D12
+     * compute submission with us), we MUST AcquireSync(0) before reading and
+     * ReleaseSync(0) after — otherwise the D3D11 read races Dawn's D3D12
+     * queue and we get undefined contents (typically all-zero / black).
+     *
+     * Dawn signals key 0 on EndAccess after its queue has consumed the
+     * compute work, so AcquireSync(0, INFINITE) blocks until the GPU side
+     * is genuinely done. We re-release with key 0 so Dawn can re-acquire
+     * for the next frame. */
+    IDXGIKeyedMutex* km = NULL;
+    HRESULT khr = ((ID3D11Resource*)src_tex)->lpVtbl->QueryInterface(
+        (ID3D11Resource*)src_tex, &IID_IDXGIKeyedMutex, (void**)&km);
+    if (SUCCEEDED(khr) && km) {
+        HRESULT ahr = km->lpVtbl->AcquireSync(km, 0, INFINITE);
+        if (FAILED(ahr)) {
+            fprintf(stderr,
+                "[shim] IDXGIKeyedMutex::AcquireSync(0) FAILED hr=0x%08lX\n",
+                (unsigned long)ahr);
+            km->lpVtbl->Release(km);
+            km = NULL;
+        }
+    } else {
+        km = NULL; /* not a keyed-mutex texture; nothing to sync via mutex */
+    }
+
+    /* CopySubresourceRegion with NULL source box copies the entire
+     * subresource. This is mandatory because FFmpeg's D3D11VA hwframes
+     * pool is a single Texture2DArray with ArraySize == pool size, and
+     * `frame->data[0]` + `(intptr_t)frame->data[1]` give the array slice.
+     * Plain CopyResource would no-op (different array sizes / descs). */
+    ctx->lpVtbl->CopySubresourceRegion(
+        ctx,
+        (ID3D11Resource*)dst_tex, dst_subresource,
+        0, 0, 0,
+        (ID3D11Resource*)src_tex, src_subresource,
+        NULL);
+
+    D3D11_QUERY_DESC qd;
+    qd.Query = D3D11_QUERY_EVENT;
+    qd.MiscFlags = 0;
+    ID3D11Query* fence = NULL;
+    HRESULT hr = dev->lpVtbl->CreateQuery(dev, &qd, &fence);
+    if (SUCCEEDED(hr) && fence) {
+        ctx->lpVtbl->End(ctx, (ID3D11Asynchronous*)fence);
+        ctx->lpVtbl->Flush(ctx);
+        ULONGLONG t0 = GetTickCount64();
+        for (;;) {
+            HRESULT gd = ctx->lpVtbl->GetData(
+                ctx, (ID3D11Asynchronous*)fence, NULL, 0, 0);
+            if (gd == S_OK) break;
+            if (gd != S_FALSE) break;
+            if (GetTickCount64() - t0 > 50) break; /* 50ms watchdog */
+            YieldProcessor();
+        }
+        fence->lpVtbl->Release(fence);
+    } else {
+        /* Best effort: at least submit the queue. */
+        ctx->lpVtbl->Flush(ctx);
+    }
+
+    /* Release the keyed mutex (if any) so the producer can re-acquire it
+     * for the next frame. We do this AFTER the fence so that Dawn won't
+     * start writing again until the GPU has actually finished the read. */
+    if (km) {
+        km->lpVtbl->ReleaseSync(km, 0);
+        km->lpVtbl->Release(km);
+    }
+}
+
+/* Release any IUnknown-derived COM object (ID3D11Texture2D*, etc.). */
+MIO_API void miniav_shim_d3d11_release(void* iunknown) {
+    if (!iunknown) return;
+    ((IUnknown*)iunknown)->lpVtbl->Release((IUnknown*)iunknown);
+}
+
+/* --- Test-only helpers ----------------------------------------------------
+ *
+ * The functions below let unit tests synthesise an NT-shared BGRA texture
+ * without depending on miniav (or any capture pipeline). They allocate an
+ * independent producer ID3D11Device, create a 1-slice BGRA texture with
+ * D3D11_RESOURCE_MISC_SHARED_NTHANDLE, fill it via Map/memcpy, and return
+ * the duplicated NT HANDLE that the encoder side can OpenSharedResource1.
+ *
+ * Keep these compiled in: they're cheap and very useful for debugging the
+ * Stage B pipeline on a developer machine. They are NOT used by the
+ * production code path.
+ */
+
+typedef struct MiniavTestTexture {
+    ID3D11Device*        device;
+    ID3D11DeviceContext* context;
+    ID3D11Texture2D*     texture;
+    void*                shared_handle; /* NT HANDLE */
+    unsigned             width;
+    unsigned             height;
+} MiniavTestTexture;
+
+/* Create an independent D3D11 device + a BGRA NT-shareable texture. The
+ * texture content is undefined; call miniav_shim_test_fill_bgra to write
+ * a pattern. Returns NULL on failure. */
+MIO_API MiniavTestTexture* miniav_shim_test_create_shared_bgra(unsigned width,
+                                                               unsigned height) {
+    if (width == 0 || height == 0) return NULL;
+    MiniavTestTexture* t = (MiniavTestTexture*)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+
+    D3D_FEATURE_LEVEL got = (D3D_FEATURE_LEVEL)0;
+    static const D3D_FEATURE_LEVEL fls[] = {
+        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0,
+    };
+    HRESULT hr = D3D11CreateDevice(
+        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        fls, (UINT)(sizeof(fls)/sizeof(fls[0])),
+        D3D11_SDK_VERSION,
+        &t->device, &got, &t->context);
+    if (FAILED(hr) || !t->device || !t->context) {
+        free(t);
+        return NULL;
+    }
+
+    D3D11_TEXTURE2D_DESC td;
+    ZeroMemory(&td, sizeof(td));
+    td.Width = width;
+    td.Height = height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.SampleDesc.Quality = 0;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags = 0;
+    /* NT HANDLE share, no keyed mutex (matches miniav DXGI capture). */
+    td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE
+                 | D3D11_RESOURCE_MISC_SHARED;
+    hr = t->device->lpVtbl->CreateTexture2D(t->device, &td, NULL, &t->texture);
+    if (FAILED(hr) || !t->texture) {
+        if (t->context) t->context->lpVtbl->Release(t->context);
+        if (t->device)  t->device->lpVtbl->Release(t->device);
+        free(t);
+        return NULL;
+    }
+
+    /* Acquire NT shared handle. */
+    IDXGIResource1* res1 = NULL;
+    hr = t->texture->lpVtbl->QueryInterface(t->texture, &IID_IDXGIResource1,
+                                            (void**)&res1);
+    if (SUCCEEDED(hr) && res1) {
+        HANDLE h = NULL;
+        hr = res1->lpVtbl->CreateSharedHandle(
+            res1, NULL,
+            DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+            NULL, &h);
+        res1->lpVtbl->Release(res1);
+        if (SUCCEEDED(hr)) t->shared_handle = (void*)h;
+    }
+    if (!t->shared_handle) {
+        t->texture->lpVtbl->Release(t->texture);
+        t->context->lpVtbl->Release(t->context);
+        t->device->lpVtbl->Release(t->device);
+        free(t);
+        return NULL;
+    }
+
+    t->width = width;
+    t->height = height;
+    return t;
+}
+
+/* Field accessors so Dart doesn't need to mirror the struct layout. */
+MIO_API void* miniav_shim_test_texture_handle(MiniavTestTexture* t) {
+    return t ? t->shared_handle : NULL;
+}
+
+/* Fill the texture with a BGRA pattern via UpdateSubresource. Pattern:
+ * 32x32 checker of (R=tag, G=x*4, B=y*4) over white. */
+MIO_API int miniav_shim_test_fill_bgra(MiniavTestTexture* t, unsigned tag) {
+    if (!t || !t->texture || !t->context) return -1;
+    /* Build the pattern in CPU memory then UpdateSubresource into the
+     * default-usage texture. UpdateSubresource is a real GPU upload; we
+     * follow with a fence/Flush so the encoder's OpenSharedResource1
+     * sees committed pixels (the texture is backed by the same VRAM
+     * across processes/devices via the NT handle). */
+    const unsigned w = t->width, h = t->height;
+    const unsigned stride = w * 4;
+    unsigned char* buf = (unsigned char*)malloc((size_t)stride * h);
+    if (!buf) return -2;
+    for (unsigned y = 0; y < h; ++y) {
+        for (unsigned x = 0; x < w; ++x) {
+            unsigned char* p = buf + y * stride + x * 4;
+            int checker = ((x >> 5) ^ (y >> 5)) & 1;
+            if (checker) {
+                p[0] = (unsigned char)(y & 0xff); /* B */
+                p[1] = (unsigned char)(x & 0xff); /* G */
+                p[2] = (unsigned char)(tag & 0xff); /* R */
+                p[3] = 0xff;
+            } else {
+                p[0] = 0xff; p[1] = 0xff; p[2] = 0xff; p[3] = 0xff;
+            }
+        }
+    }
+    t->context->lpVtbl->UpdateSubresource(
+        t->context, (ID3D11Resource*)t->texture, 0, NULL, buf, stride, 0);
+    free(buf);
+
+    /* Fence so cross-device readers see the result. */
+    D3D11_QUERY_DESC qd; qd.Query = D3D11_QUERY_EVENT; qd.MiscFlags = 0;
+    ID3D11Query* fence = NULL;
+    if (SUCCEEDED(t->device->lpVtbl->CreateQuery(t->device, &qd, &fence))
+            && fence) {
+        t->context->lpVtbl->End(t->context, (ID3D11Asynchronous*)fence);
+        t->context->lpVtbl->Flush(t->context);
+        ULONGLONG t0 = GetTickCount64();
+        for (;;) {
+            HRESULT gd = t->context->lpVtbl->GetData(
+                t->context, (ID3D11Asynchronous*)fence, NULL, 0, 0);
+            if (gd == S_OK) break;
+            if (gd != S_FALSE) break;
+            if (GetTickCount64() - t0 > 50) break;
+            YieldProcessor();
+        }
+        fence->lpVtbl->Release(fence);
+    } else {
+        t->context->lpVtbl->Flush(t->context);
+    }
+    return 0;
+}
+
+MIO_API void miniav_shim_test_destroy(MiniavTestTexture* t) {
+    if (!t) return;
+    if (t->shared_handle) CloseHandle((HANDLE)t->shared_handle);
+    if (t->texture) t->texture->lpVtbl->Release(t->texture);
+    if (t->context) t->context->lpVtbl->Release(t->context);
+    if (t->device)  t->device->lpVtbl->Release(t->device);
+    free(t);
+}
+#endif
+
+/* ====================================================================== *
+ *  macOS / iOS \u2014 VideoToolbox zero-copy interop
+ * ====================================================================== *
+ *
+ * VideoToolbox encoders consume AVFrames whose:
+ *   - frame->format    == AV_PIX_FMT_VIDEOTOOLBOX
+ *   - frame->data[3]   == CVPixelBufferRef (NOT retained by FFmpeg \u2014 the
+ *                         AVFrame's buf[0] must own a reference and release
+ *                         it via av_buffer_unref).
+ *
+ * miniAV's macOS screen / camera capture wraps an IOSurface inside a
+ * CVPixelBuffer (the IOSurface lives inside a CVMetalTexture). For true
+ * zero-copy we either:
+ *   (a) take the existing CVPixelBufferRef directly (preferred \u2014 single
+ *       CFRetain), or
+ *   (b) build a fresh CVPixelBuffer that wraps the same IOSurface (one
+ *       extra CV object, still zero-copy at the GPU level).
+ *
+ * These helpers cover both modes and the AVFrame attachment.
+ */
+#if defined(__APPLE__)
+
+/* Free callback for the AVBufferRef that owns the CVPixelBuffer reference.
+ * Called by FFmpeg when the AVFrame is unreffed. */
+static void _miniav_vt_pixbuf_free(void* opaque, uint8_t* data) {
+    (void)opaque;
+    if (data) {
+        CVPixelBufferRef pb = (CVPixelBufferRef)(void*)data;
+        CFRelease(pb);
+    }
+}
+
+/* Attach a CVPixelBufferRef to an AVFrame as an AV_PIX_FMT_VIDEOTOOLBOX
+ * payload. The frame takes ownership of one retain; the caller can
+ * CFRelease their copy after this call. Returns 0 on success. */
+MIO_API int miniav_shim_vt_attach_pixelbuffer(AVFrame* frame,
+                                              void* cvpixelbuf,
+                                              int width,
+                                              int height) {
+    if (!frame || !cvpixelbuf) return -1;
+    /* Drop any previous payload. */
+    av_frame_unref(frame);
+    frame->format = AV_PIX_FMT_VIDEOTOOLBOX;
+    frame->width  = width;
+    frame->height = height;
+
+    /* Retain so the frame owns its own ref. */
+    CFRetain((CVPixelBufferRef)cvpixelbuf);
+
+    AVBufferRef* bref = av_buffer_create(
+        (uint8_t*)cvpixelbuf, sizeof(void*),
+        _miniav_vt_pixbuf_free, NULL, 0);
+    if (!bref) {
+        CFRelease((CVPixelBufferRef)cvpixelbuf);
+        return -2;
+    }
+    frame->buf[0]  = bref;
+    frame->data[3] = (uint8_t*)cvpixelbuf;
+    return 0;
+}
+
+/* Wrap an existing IOSurfaceRef in a fresh CVPixelBufferRef without
+ * copying pixels. Returns NULL on failure. Caller owns one retain and
+ * must CFRelease (or hand to attach_pixelbuffer above which retains). */
+MIO_API void* miniav_shim_vt_pixbuf_from_iosurface(void* iosurface,
+                                                   unsigned os_type_pixfmt) {
+    if (!iosurface) return NULL;
+    CVPixelBufferRef pb = NULL;
+    /* Empty attribs dict \u2014 inherit IOSurface size + format. */
+    OSStatus s = CVPixelBufferCreateWithIOSurface(
+        kCFAllocatorDefault,
+        (IOSurfaceRef)iosurface,
+        NULL,
+        &pb);
+    (void)os_type_pixfmt; /* OSType is read from the IOSurface itself. */
+    if (s != kCVReturnSuccess || !pb) return NULL;
+    return (void*)pb;
+}
+
+MIO_API void miniav_shim_vt_pixbuf_release(void* cvpixelbuf) {
+    if (cvpixelbuf) CFRelease((CVPixelBufferRef)cvpixelbuf);
+}
+
+MIO_API unsigned miniav_shim_vt_pixbuf_width(void* cvpixelbuf) {
+    if (!cvpixelbuf) return 0;
+    return (unsigned)CVPixelBufferGetWidth((CVPixelBufferRef)cvpixelbuf);
+}
+
+MIO_API unsigned miniav_shim_vt_pixbuf_height(void* cvpixelbuf) {
+    if (!cvpixelbuf) return 0;
+    return (unsigned)CVPixelBufferGetHeight((CVPixelBufferRef)cvpixelbuf);
+}
+
+MIO_API unsigned miniav_shim_vt_pixbuf_pixel_format(void* cvpixelbuf) {
+    if (!cvpixelbuf) return 0;
+    return (unsigned)CVPixelBufferGetPixelFormatType((CVPixelBufferRef)cvpixelbuf);
+}
+
+#endif /* __APPLE__ */
+
+/* ====================================================================== *
+ *  Linux \u2014 VAAPI / DRM-PRIME zero-copy interop
+ * ====================================================================== *
+ *
+ * VAAPI encoders consume AVFrames bound to an AV_HWFRAMES_CTX whose
+ * format is AV_PIX_FMT_VAAPI. The fast path on Linux is:
+ *
+ *   miniAV capture \u2192 dmabuf FD(s)
+ *     \u2193  build AV_PIX_FMT_DRM_PRIME frame descriptor
+ *     \u2193  av_hwframe_map(vaapi_frame, drm_frame, AV_HWFRAME_MAP_DIRECT)
+ *   VAAPI frame ready for avcodec_send_frame
+ *
+ * No GPU copy, no CPU staging \u2014 the dmabuf is imported into VAAPI as a
+ * surface alias.
+ */
+#if defined(__linux__) && !defined(__ANDROID__)
+
+/* Build a DRM_PRIME AVFrame from up to 4 dmabuf FDs and hand it to
+ * av_hwframe_map for VAAPI import. On success [out_vaapi_frame] is
+ * populated and owns a reference into the VAAPI hwframes pool.
+ *
+ * Inputs:
+ *   vaapi_hwframes_ref : AVBufferRef* of the destination VAAPI hwframes ctx
+ *   fds[]              : up to 4 dmabuf file descriptors
+ *   nb_fds             : number of FDs (1..4)
+ *   sizes[],
+ *   offsets[],
+ *   pitches[]          : per-FD plane geometry
+ *   width, height      : frame geometry
+ *   drm_fourcc         : DRM_FORMAT_* code (e.g. DRM_FORMAT_NV12)
+ *   modifier           : DRM format modifier (DRM_FORMAT_MOD_LINEAR for the
+ *                        common case, DRM_FORMAT_MOD_INVALID to leave it
+ *                        unset)
+ *   out_vaapi_frame    : caller-allocated AVFrame to populate
+ *
+ * Returns 0 on success, negative AVERROR on failure. The caller retains
+ * ownership of the dmabuf FDs (they are dup'd by the kernel during
+ * VA-API import). */
+MIO_API int miniav_shim_vaapi_map_dmabuf(AVBufferRef* vaapi_hwframes_ref,
+                                         int* fds, int nb_fds,
+                                         int64_t* sizes,
+                                         int64_t* offsets,
+                                         int64_t* pitches,
+                                         int width, int height,
+                                         uint32_t drm_fourcc,
+                                         uint64_t modifier,
+                                         AVFrame* out_vaapi_frame) {
+    if (!vaapi_hwframes_ref || !fds || nb_fds <= 0 || nb_fds > 4
+        || !sizes || !offsets || !pitches || !out_vaapi_frame) {
+        return AVERROR(EINVAL);
+    }
+
+    /* Build a transient DRM_PRIME source frame on the stack. */
+    AVDRMFrameDescriptor desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.nb_objects = nb_fds;
+    for (int i = 0; i < nb_fds; ++i) {
+        desc.objects[i].fd = fds[i];
+        desc.objects[i].size = (size_t)sizes[i];
+        desc.objects[i].format_modifier = modifier;
+    }
+    desc.nb_layers = 1;
+    desc.layers[0].format = drm_fourcc;
+    desc.layers[0].nb_planes = nb_fds;
+    for (int i = 0; i < nb_fds; ++i) {
+        desc.layers[0].planes[i].object_index = i;
+        desc.layers[0].planes[i].offset = (ptrdiff_t)offsets[i];
+        desc.layers[0].planes[i].pitch  = (ptrdiff_t)pitches[i];
+    }
+
+    AVFrame* src = av_frame_alloc();
+    if (!src) return AVERROR(ENOMEM);
+    src->format = AV_PIX_FMT_DRM_PRIME;
+    src->width  = width;
+    src->height = height;
+    src->data[0] = (uint8_t*)&desc;
+
+    /* Allocate destination VAAPI frame from the pool. */
+    av_frame_unref(out_vaapi_frame);
+    out_vaapi_frame->format = AV_PIX_FMT_VAAPI;
+    out_vaapi_frame->width  = width;
+    out_vaapi_frame->height = height;
+    int err = av_hwframe_get_buffer(vaapi_hwframes_ref, out_vaapi_frame, 0);
+    if (err < 0) {
+        av_frame_free(&src);
+        return err;
+    }
+
+    /* Direct map: VAAPI imports the dmabuf as a surface alias. */
+    err = av_hwframe_map(out_vaapi_frame, src, AV_HWFRAME_MAP_DIRECT);
+    av_frame_free(&src);
+    if (err < 0) {
+        av_frame_unref(out_vaapi_frame);
+        return err;
+    }
+    return 0;
+}
+
+#endif /* __linux__ && !__ANDROID__ */
+
+/* ====================================================================== *
+ *  Android \u2014 AHardwareBuffer interop
+ * ====================================================================== *
+ *
+ * Android's MediaCodec encoders accept either:
+ *   - an InputSurface (Surface texture) for GPU producers, or
+ *   - raw YUV byte buffers for CPU producers.
+ *
+ * FFmpeg's `*_mediacodec` codecs are decoders; for encoding on Android
+ * the recommended path goes through the AMediaCodec NDK API. While we
+ * wire that into a future Stage B, the shim provides the common helper
+ * needed by both paths: lock an AHardwareBuffer for read and return the
+ * mapped CPU pointer + stride so callers can either upload via
+ * MediaCodec input buffer or fall back to FFmpeg software encoding.
+ */
+#if defined(__ANDROID__) && defined(MIO_HAS_AHARDWAREBUFFER)
+
+typedef struct MiniavAhbLock {
+    AHardwareBuffer* buffer;
+    void* virtual_address;
+    uint32_t stride_pixels;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+} MiniavAhbLock;
+
+/* Lock an AHardwareBuffer for CPU read and return a small descriptor.
+ * Caller must invoke miniav_shim_ahb_unlock to release. Returns NULL on
+ * failure. */
+MIO_API MiniavAhbLock* miniav_shim_ahb_lock_read(void* ahardware_buffer) {
+    if (!ahardware_buffer) return NULL;
+    AHardwareBuffer* hb = (AHardwareBuffer*)ahardware_buffer;
+    AHardwareBuffer_Desc desc;
+    AHardwareBuffer_describe(hb, &desc);
+    MiniavAhbLock* lk = (MiniavAhbLock*)calloc(1, sizeof(*lk));
+    if (!lk) return NULL;
+    int rc = AHardwareBuffer_lock(
+        hb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+        -1, NULL, &lk->virtual_address);
+    if (rc != 0 || !lk->virtual_address) {
+        free(lk);
+        return NULL;
+    }
+    lk->buffer = hb;
+    lk->stride_pixels = desc.stride;
+    lk->width = desc.width;
+    lk->height = desc.height;
+    lk->format = desc.format;
+    AHardwareBuffer_acquire(hb);
+    return lk;
+}
+
+MIO_API void* miniav_shim_ahb_lock_address(MiniavAhbLock* lk) {
+    return lk ? lk->virtual_address : NULL;
+}
+MIO_API unsigned miniav_shim_ahb_lock_stride(MiniavAhbLock* lk) {
+    return lk ? lk->stride_pixels : 0;
+}
+MIO_API unsigned miniav_shim_ahb_lock_width(MiniavAhbLock* lk) {
+    return lk ? lk->width : 0;
+}
+MIO_API unsigned miniav_shim_ahb_lock_height(MiniavAhbLock* lk) {
+    return lk ? lk->height : 0;
+}
+MIO_API unsigned miniav_shim_ahb_lock_format(MiniavAhbLock* lk) {
+    return lk ? lk->format : 0;
+}
+
+MIO_API void miniav_shim_ahb_unlock(MiniavAhbLock* lk) {
+    if (!lk) return;
+    if (lk->buffer) {
+        AHardwareBuffer_unlock(lk->buffer, NULL);
+        AHardwareBuffer_release(lk->buffer);
+    }
+    free(lk);
+}
+
+#endif /* __ANDROID__ */
+
+/* ====================================================================== *
+ *  Audio encoder helpers (cross-platform)
+ * ====================================================================== *
+ *
+ * AVChannelLayout is an opaque struct introduced in FFmpeg 5.x that lives
+ * deep inside both AVCodecContext and AVFrame at offsets that shift
+ * across libavutil minors. Rather than mirror the surrounding fields in
+ * Dart FFI, the shim exposes thin setters/getters that touch them on
+ * the C side where layout is known to the compiler.
+ */
+
+/* Set sample_fmt, sample_rate, ch_layout (default mask for `channels`)
+ * and bit_rate on an AVCodecContext via AVOptions where possible and
+ * direct field assignment for AVChannelLayout (which has no AVOption
+ * accessor in FFmpeg 7/8). Returns 0 on success, negative AVERROR on
+ * failure. */
+MIO_API int miniav_shim_codec_set_audio_params(AVCodecContext* ctx,
+                                               int sample_fmt,
+                                               int sample_rate,
+                                               int channels,
+                                               int64_t bit_rate) {
+    if (!ctx || channels <= 0 || sample_rate <= 0) return AVERROR(EINVAL);
+    ctx->sample_fmt = (enum AVSampleFormat)sample_fmt;
+    ctx->sample_rate = sample_rate;
+    ctx->bit_rate = bit_rate;
+    av_channel_layout_uninit(&ctx->ch_layout);
+    av_channel_layout_default(&ctx->ch_layout, channels);
+    return 0;
+}
+
+/* Number of samples-per-channel the opened encoder expects per AVFrame.
+ * Returns 0 if the codec has no fixed frame size (the caller may then
+ * pick any chunk size). */
+MIO_API int miniav_shim_codec_get_frame_size(const AVCodecContext* ctx) {
+    return ctx ? ctx->frame_size : 0;
+}
+
+/* Pick the first sample format from `codec->sample_fmts` (the first
+ * entry is conventionally the native/preferred format). Returns -1 if
+ * the codec exposes no list (rare for audio encoders). */
+MIO_API int miniav_shim_codec_pick_sample_fmt(const AVCodec* codec) {
+    if (!codec || !codec->sample_fmts) return -1;
+    return (int)codec->sample_fmts[0];
+}
+
+/* Returns 1 if `codec` supports `sample_fmt` (as listed in its
+ * sample_fmts table), 0 otherwise. */
+MIO_API int miniav_shim_codec_supports_sample_fmt(const AVCodec* codec,
+                                                  int sample_fmt) {
+    if (!codec || !codec->sample_fmts) return 0;
+    for (const enum AVSampleFormat* p = codec->sample_fmts;
+         *p != AV_SAMPLE_FMT_NONE; ++p) {
+        if ((int)*p == sample_fmt) return 1;
+    }
+    return 0;
+}
+
+/* Configure an audio AVFrame (format, sample_rate, ch_layout, nb_samples)
+ * and allocate its data buffers via av_frame_get_buffer. Returns 0 on
+ * success, negative AVERROR on failure. */
+MIO_API int miniav_shim_audio_frame_setup(AVFrame* f,
+                                          int sample_fmt,
+                                          int sample_rate,
+                                          int channels,
+                                          int nb_samples) {
+    if (!f || channels <= 0 || sample_rate <= 0 || nb_samples <= 0) {
+        return AVERROR(EINVAL);
+    }
+    f->format = sample_fmt;
+    f->sample_rate = sample_rate;
+    f->nb_samples = nb_samples;
+    av_channel_layout_uninit(&f->ch_layout);
+    av_channel_layout_default(&f->ch_layout, channels);
+    int err = av_frame_get_buffer(f, 0);
+    if (err < 0) return err;
+    return 0;
+}
+
+/* Set just the AVFrame's pts (used by the encoder driver between
+ * make_writable + send_frame). Helps avoid mirroring AVFrame's later
+ * fields when the caller only needs pts. */
+MIO_API void miniav_shim_audio_frame_set_pts(AVFrame* f, int64_t pts) {
+    if (f) f->pts = pts;
+}
+
+/* --- Sanity / version ------------------------------------------------- */
+
+MIO_API unsigned miniav_shim_avcodec_version(void) {
+    return avcodec_version();
+}
+
+/* Bumped when this shim's exported function set or struct expectations
+ * change. The Dart loader rejects mismatches.
+ *
+ * v3: miniav_shim_d3d11_copy_resource gained a leading `device` argument
+ *     and now does CopyResource + fence + flush + wait internally.
+ * v4: miniav_shim_d3d11_copy_resource takes explicit (dst_subresource,
+ *     src_subresource) and uses CopySubresourceRegion. Required because
+ *     FFmpeg's D3D11VA hwframes pool is a Texture2DArray.
+ * v5: added test-only helpers (miniav_shim_test_create_shared_bgra,
+ *     miniav_shim_test_fill_bgra, miniav_shim_test_texture_handle,
+ *     miniav_shim_test_destroy) for unit-test synthesis of NT-shared
+ *     D3D11 textures. Linked against dxgi.lib for IDXGIResource1 GUID.
+ * v6: cross-platform expansion. Added VideoToolbox helpers on macOS/iOS
+ *     (vt_attach_pixelbuffer, vt_pixbuf_from_iosurface, vt_pixbuf_release,
+ *     vt_pixbuf_{width,height,pixel_format}); VAAPI helpers on Linux
+ *     (vaapi_map_dmabuf for DRM-PRIME zero-copy import); AHardwareBuffer
+ *     helpers on Android (ahb_lock_read / ahb_unlock + accessors). All
+ *     gated behind platform #ifdefs; absent symbols are the contract on
+ *     the wrong host.
+ * v7: audio encoder helpers (codec_set_audio_params,
+ *     codec_get_frame_size, codec_pick_sample_fmt,
+ *     codec_supports_sample_fmt, audio_frame_setup,
+ *     audio_frame_set_pts). Encapsulate AVChannelLayout writes that
+ *     have no AVOption accessor in FFmpeg 7/8. */
+MIO_API unsigned miniav_shim_abi_version(void) {
+    return 7u;
+}

@@ -1566,6 +1566,31 @@ static void wgc_on_frame_arrived(
               nullptr, DXGI_SHARED_RESOURCE_READ, nullptr,
               &shared_handle_for_app);
           if (SUCCEEDED(hr) && shared_handle_for_app) {
+            // CRITICAL: synchronise the producer device before exposing the
+            // shared NT handle to a different-device consumer (e.g. an FFmpeg
+            // encoder). Without a fence the consumer may read garbage / black
+            // because pending GPU work on texture_to_share_com has not yet
+            // executed. See screen_context_win_dxgi.c for full rationale.
+            {
+              D3D11_QUERY_DESC fence_desc{};
+              fence_desc.Query = D3D11_QUERY_EVENT;
+              winrt::com_ptr<ID3D11Query> copy_done;
+              HRESULT q_hr = wgc_ctx->d3d_device->CreateQuery(
+                  &fence_desc, copy_done.put());
+              if (SUCCEEDED(q_hr) && copy_done) {
+                wgc_ctx->d3d_context->End(copy_done.get());
+                wgc_ctx->d3d_context->Flush();
+                ULONGLONG poll_start = GetTickCount64();
+                while (wgc_ctx->d3d_context->GetData(copy_done.get(), nullptr,
+                                                     0, 0) == S_FALSE) {
+                  if (GetTickCount64() - poll_start > 5) break;
+                  YieldProcessor();
+                }
+              } else {
+                wgc_ctx->d3d_context->Flush();
+              }
+            }
+
             texture_for_payload_ref_com =
                 texture_to_share_com; // This is the texture whose handle was
                                       // shared

@@ -586,8 +586,8 @@ static void on_stream_process(void *userdata) {
   }
 
   miniav_buffer->internal_handle = payload;
-  pw_ctx->parent_ctx->app_callback(miniav_buffer,
-                                   pw_ctx->parent_ctx->app_callback_user_data);
+  MINIAV_SAFE_DISPATCH(pw_ctx->parent_ctx->app_callback(
+      miniav_buffer, pw_ctx->parent_ctx->app_callback_user_data));
 
   pw_stream_queue_buffer(pw_ctx->stream, pw_buf);
 }

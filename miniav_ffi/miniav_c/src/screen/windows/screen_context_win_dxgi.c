@@ -1369,8 +1369,8 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
     buffer->internal_handle = internal_payload;
 
     if (dxgi_ctx->app_callback_internal) {
-      dxgi_ctx->app_callback_internal(
-          buffer, dxgi_ctx->app_callback_user_data_internal);
+      MINIAV_SAFE_DISPATCH(dxgi_ctx->app_callback_internal(
+          buffer, dxgi_ctx->app_callback_user_data_internal));
     } else {
       miniav_log(MINIAV_LOG_LEVEL_WARN,
                  "DXGI: No app callback. Releasing frame internally.");

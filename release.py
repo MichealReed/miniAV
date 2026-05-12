@@ -53,6 +53,7 @@ PACKAGES MANAGED:
 - miniav_platform_interface
 - miniav_ffi
 - miniav_web
+- miniav_flutter
 
 WHAT IT DOES:
 ------------
@@ -334,7 +335,7 @@ def add_message_to_current_version(file_path, message):
     content = content.strip() + '\n'
     save_changelog(file_path, content)
 
-PACKAGES = ["miniav", "miniav_platform_interface", "miniav_ffi", "miniav_web"]
+PACKAGES = ["miniav_platform_interface", "miniav", "miniav_ffi", "miniav_web", "miniav_flutter"]
 
 def main_version_update(version, is_release, message):
     root_dir = os.path.dirname(os.path.abspath(__file__))

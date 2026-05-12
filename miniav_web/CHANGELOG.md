@@ -1,11 +1,30 @@
 # miniav_web CHANGELOG
 
+## 0.5.6
+
+- fix FormatException on non-UTF-8 bytes in MiniAV log callback: use Utf8Decoder(allowMalformed: true) instead of toDartString()
+- add setLogCallback and installStderrLogger to route native MiniAV C library logs to a Dart callback
+
+## 0.5.5
+
+- fix wasapi loopback issue
+
+## 0.5.4
+
+- adds bindings observer lib to fix crash on hot restart
+
+## 0.5.3
+
+- Fix crash bug on hot refresh, fix crash on second use of recorder
+
 ## 0.5.2
 
 - adds shared textures
+
 ## 0.5.1
 
 - adds subscriptions and fixes lost device crashes
+
 ## 0.5.0
 
 - adding input support
@@ -13,13 +32,16 @@
 ## 0.4.7
 
 - fix loopback crackles
+
 ## 0.4.6
 
 - fix build hook null
 - update cmake toolchain
+
 ## 0.4.5
 
 - fixed black rendering on chrome
+
 ## 0.4.4
 
 ## 0.4.3

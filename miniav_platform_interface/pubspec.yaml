@@ -1,14 +1,14 @@
 name: miniav_platform_interface
 description: A platform interface for the miniav library, allowing for different implementations.
-version: 0.5.2
+version: 0.5.6
 repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_platform_interface
 
 environment:
   sdk: ^3.11.4
 
 dependencies:
-  miniav_ffi: 0.5.2
-  miniav_web: 0.5.2
+  miniav_ffi: 0.5.6
+  miniav_web: 0.5.6
 
 dev_dependencies:
   lints: ^5.0.0

@@ -5,8 +5,14 @@
 ///     a custom AVIOContext and are deferred.
 ///   - Single video track per file (most common case for MP4 from a single
 ///     encoder). Audio + multi-track come later.
-///   - Stream time_base = 1/1_000_000 (microseconds), so packet pts/dts pass
-///     through directly without rescaling.
+///   - Input packet timestamps are always in microseconds (1/1_000_000).
+///     avformat_write_header may change AVStream.time_base to a codec-native
+///     value (e.g. 1/sample_rate for AAC, 1/12800 for H.264 in MP4). After
+///     writeHeader we read back each stream's real time_base and use it to
+///     manually rescale every packet's pts/dts/duration before calling
+///     av_interleaved_write_frame. We do not rely on FFmpeg's automatic
+///     rescale-from-pkt.time_base path because it is not honoured by all
+///     mux implementations / builds.
 library;
 
 import 'dart:ffi';
@@ -42,6 +48,10 @@ String _containerName(Container c) {
       return 'ogg';
     case Container.wav:
       return 'wav';
+    case Container.m4a:
+      return 'ipod'; // libavformat's name for the MPEG-4 audio (.m4a) muxer
+    case Container.mp3:
+      return 'mp3';
     case Container.raw:
       return 'mpegts'; // not really right; raw needs codec-specific fmt
   }
@@ -91,6 +101,12 @@ class FfmpegMuxer implements PlatformMuxer {
   bool _headerWritten = false;
   bool _trailerWritten = false;
   bool _closed = false;
+
+  /// Per-stream time_base captured immediately after avformat_write_header.
+  /// Indexed by stream / track index. Defaults to {1, 1_000_000} until the
+  /// header is written.
+  List<int> _streamTbNum = const [];
+  List<int> _streamTbDen = const [];
 
   /// Bridge: optionally pre-bind an encoder (software or NVENC) to a track
   /// index so the muxer can pull extradata directly from its native codec
@@ -143,6 +159,44 @@ class FfmpegMuxer implements PlatformMuxer {
         );
       }
       fmtCtx = pFmtCtx.value;
+
+      // Tell the muxer to shift any negative timestamps up to zero AND
+      // emit an edit list (in MP4) so players skip the shifted-in preroll.
+      // This lets us pass a GOP head with negative pts (the frames between
+      // the keyframe and the actual clip start) and still get a precisely
+      // trimmed visible duration.
+      //   avoid_negative_ts: -1=auto 0=disabled 1=make_non_negative 2=make_zero
+      {
+        final optName = 'avoid_negative_ts'.toNativeUtf8();
+        try {
+          ff.avOptSetInt(fmtCtx.cast(), optName, 2, 0);
+        } finally {
+          calloc.free(optName);
+        }
+      }
+
+      // For MP4/M4A: move the moov atom to the front of the file (faststart).
+      // By default FFmpeg writes moov at the end, which means Windows Explorer
+      // (and any tool that reads only the beginning) cannot show duration,
+      // codec, or file-size metadata until a full seek to the end is done.
+      // With +faststart, av_write_trailer rewrites the file so moov is first —
+      // the OS sees full metadata immediately after the clip is saved.
+      // NOTE: do NOT apply this to fmp4 (fragmented MP4) because fragmented
+      // streams use a different movflags set and moov is written up-front
+      // anyway via the fragment mechanism.
+      if (cfg.container == Container.mp4 || cfg.container == Container.m4a) {
+        final privData = fmtCtx.cast<AVFormatContextPrefix>().ref.privData;
+        if (privData != nullptr) {
+          final optName = 'movflags'.toNativeUtf8();
+          final optVal = '+faststart'.toNativeUtf8();
+          try {
+            ff.avOptSet(privData, optName, optVal, 0);
+          } finally {
+            calloc.free(optName);
+            calloc.free(optVal);
+          }
+        }
+      }
 
       // 2. For each track: avformat_new_stream + populate codecpar.
       for (var i = 0; i < cfg.tracks.length; i++) {
@@ -224,14 +278,22 @@ class FfmpegMuxer implements PlatformMuxer {
       final ed = track.extraData;
       if (ed != null && ed.bytes.isNotEmpty) {
         // FFmpeg requires extradata buffer to have AV_INPUT_BUFFER_PADDING_SIZE
-        // (=64) bytes of zero padding. We over-allocate accordingly.
+        // (=64) bytes of zero padding AND it MUST be allocated by FFmpeg's
+        // allocator (av_mallocz) — otherwise avformat_free_context will
+        // av_free() a Dart-heap pointer and crash on Windows.
         const pad = 64;
-        final buf = calloc<Uint8>(ed.bytes.length + pad);
+        final buf = ff.avMallocZ(ed.bytes.length + pad);
+        if (buf == nullptr) {
+          throw const CodecInitException(
+            'ffmpeg',
+            'av_mallocz failed for extradata',
+          );
+        }
         buf.asTypedList(ed.bytes.length).setAll(0, ed.bytes);
         ref
           ..extradata = buf
           ..extradataSize = ed.bytes.length;
-        extradataAllocs.add(buf);
+        // Ownership is now with libavformat; do NOT add to extradataAllocs.
       }
     } else if (track is AudioTrackInfo) {
       // Audio tracks REQUIRE a bound encoder (passed via
@@ -285,6 +347,12 @@ class FfmpegMuxer implements PlatformMuxer {
       );
     }
     _headerWritten = true;
+
+    // Snapshot the actual per-stream time_bases. avformat_write_header may
+    // have replaced our 1/1_000_000 with a codec-native value (e.g. 1/48000
+    // for AAC, 1/12800 for H.264 in MP4). writePacket uses these to rescale.
+    _streamTbNum = [for (final s in _streams) s.ref.timeBaseNum];
+    _streamTbDen = [for (final s in _streams) s.ref.timeBaseDen];
   }
 
   @override
@@ -309,16 +377,41 @@ class FfmpegMuxer implements PlatformMuxer {
     final buf = calloc<Uint8>(packet.data.length + pad);
     buf.asTypedList(packet.data.length).setAll(0, packet.data);
 
+    // Rescale timestamps from microseconds to the stream's real time_base.
+    // Formula: out = us * tbDen / (1_000_000 * tbNum)
+    // For the common case tbNum == 1: out = us * tbDen / 1_000_000.
+    //
+    // Worst-case overflow: 24h × 1_000_000 × 90_000 ≈ 7.8 × 10^15 < 2^63. ✓
+    final si = packet.trackIndex;
+    final tbNum = (si >= 0 && si < _streamTbNum.length) ? _streamTbNum[si] : 1;
+    final tbDen = (si >= 0 && si < _streamTbDen.length)
+        ? _streamTbDen[si]
+        : 1000000;
+    // Defensive: if read-back returned garbage (zero/negative) fall back
+    // to microseconds so we still write *something* the player can consume.
+    final safeTbNum = tbNum > 0 ? tbNum : 1;
+    final safeTbDen = tbDen > 0 ? tbDen : 1000000;
+    int rescaleUs(int us) {
+      if (safeTbNum == 1 && safeTbDen == 1000000) return us;
+      return us * safeTbDen ~/ (1000000 * safeTbNum);
+    }
+
+    final rawDts = packet.dtsUs;
+    final ptsOut = rescaleUs(packet.ptsUs);
+    final dtsOut = rescaleUs(rawDts);
+    final durOut = rescaleUs(packet.durationUs);
+
     pkt.ref
       ..data = buf
       ..size = packet.data.length
-      ..pts = packet.ptsUs
-      ..dts = packet.dtsUs == 0 ? packet.ptsUs : packet.dtsUs
-      ..duration = packet.durationUs
+      ..pts = ptsOut
+      ..dts = dtsOut
+      ..duration = durOut
       ..streamIndex = packet.trackIndex
       ..flags = packet.isKeyframe ? kPktFlagKey : 0
-      ..timeBaseNum = 1
-      ..timeBaseDen = 1000000;
+      // Match the stream time_base so any FFmpeg auto-rescale is a no-op.
+      ..timeBaseNum = safeTbNum
+      ..timeBaseDen = safeTbDen;
 
     try {
       final r = _ff.avInterleavedWriteFrame(_fmtCtx, pkt);

@@ -18,8 +18,13 @@
 /// ```
 library;
 
+export 'package:miniav_tools/miniav_tools.dart' show MiniAVTools, WarmupProgress;
+
+export 'src/clip_buffer.dart';
+export 'src/container_utils.dart';
 export 'src/recorder.dart';
 export 'src/recorder_builder.dart';
+export 'src/recorder_devices.dart';
 export 'src/screen_effect.dart';
 export 'src/screen_scale_policy.dart';
 export 'src/track_chunk.dart';

@@ -81,8 +81,8 @@ keyboard_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
       event.action = MINIAV_KEY_ACTION_UP;
     }
 
-    g_active_input_platform->keyboard_cb(&event,
-                                         g_active_input_platform->user_data);
+    MINIAV_SAFE_DISPATCH(g_active_input_platform->keyboard_cb(
+        &event, g_active_input_platform->user_data));
   }
   return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
@@ -166,7 +166,7 @@ static LRESULT CALLBACK mouse_hook_proc(int nCode, WPARAM wParam,
     return CallNextHookEx(NULL, nCode, wParam, lParam);
   }
 
-  plat->mouse_cb(&event, plat->user_data);
+  MINIAV_SAFE_DISPATCH(plat->mouse_cb(&event, plat->user_data));
   return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
@@ -274,7 +274,7 @@ static DWORD WINAPI gamepad_poll_thread_proc(LPVOID param) {
           event.right_trigger = state.Gamepad.bRightTrigger;
         }
 
-        plat->gamepad_cb(&event, plat->user_data);
+        MINIAV_SAFE_DISPATCH(plat->gamepad_cb(&event, plat->user_data));
         plat->prev_gamepad_state[i] = state;
         plat->gamepad_was_connected[i] = connected;
       }

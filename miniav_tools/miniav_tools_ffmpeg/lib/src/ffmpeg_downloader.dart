@@ -120,10 +120,41 @@ class FfmpegDownloader {
     final installRoot = p.join(root, kFfmpegReleaseTag);
     final marker = File(p.join(installRoot, '.ready'));
 
+    // ---- Layer 1: marker present + libs found → fast path. -----------------
     if (!force && await marker.exists()) {
       final libDir = await _findLibDir(installRoot);
       if (libDir != null) {
         return FfmpegDownloadResult(libDir: libDir, installRoot: installRoot);
+      }
+    }
+
+    // ---- Layer 2: libs already on disk (no marker, or stale marker). -------
+    //   Common causes:
+    //     * Another instance of this app is already running and has the
+    //       DLLs mapped (Windows; their files would be locked against
+    //       overwrite, so re-extracting would crash with errno=32).
+    //     * A previous run extracted successfully but crashed before
+    //       writing .ready.
+    //     * User pre-installed FFmpeg into the cache dir manually.
+    //   In any of those cases the existing libs should be perfectly
+    //   loadable, so probe them and short-circuit.
+    if (!force) {
+      final existingLibDir = await _findLibDir(installRoot);
+      if (existingLibDir != null && _libsLookValid(existingLibDir)) {
+        // Best-effort marker write so future runs hit Layer 1.
+        try {
+          await marker.writeAsString(
+            jsonEncode({
+              'release': kFfmpegReleaseTag,
+              'extractedAt': DateTime.now().toUtc().toIso8601String(),
+              'recovered': true,
+            }),
+          );
+        } catch (_) {}
+        return FfmpegDownloadResult(
+          libDir: existingLibDir,
+          installRoot: installRoot,
+        );
       }
     }
 
@@ -132,14 +163,26 @@ class FfmpegDownloader {
     final asset = _assetName()!;
     final archivePath = p.join(installRoot, asset);
 
-    // Concurrent-process safety: use a sibling .lock file via O_EXCL semantics.
-    final lock = File(p.join(installRoot, '.lock'));
-    IOSink? lockSink;
+    // ---- Layer 3: real cross-process file lock. ----------------------------
+    //   `IOSink.openWrite` on Windows does NOT fail if another process has
+    //   the file open — it just truncates. To actually serialise concurrent
+    //   downloaders we need an OS-level advisory lock via
+    //   RandomAccessFile.lock.
+    final lockPath = p.join(installRoot, '.lock');
+    RandomAccessFile? lockHandle;
+    var holdsLock = false;
     try {
+      lockHandle = await File(lockPath).open(mode: FileMode.write);
       try {
-        lockSink = lock.openWrite(mode: FileMode.writeOnly);
+        await lockHandle.lock(FileLock.exclusive);
+        holdsLock = true;
       } catch (_) {
-        // Another process is downloading; wait briefly for the marker.
+        // Another process has the lock. Wait for the marker (with periodic
+        // re-probes in case extraction finishes mid-wait).
+        try {
+          await lockHandle.close();
+        } catch (_) {}
+        lockHandle = null;
         for (var i = 0; i < 600; i++) {
           await Future<void>.delayed(const Duration(seconds: 1));
           if (await marker.exists()) {
@@ -151,6 +194,36 @@ class FfmpegDownloader {
               );
             }
           }
+          // Even without the marker, if libs appear & load, we're done.
+          final probe = await _findLibDir(installRoot);
+          if (probe != null && _libsLookValid(probe)) {
+            return FfmpegDownloadResult(
+              libDir: probe,
+              installRoot: installRoot,
+            );
+          }
+        }
+        // 10 minutes elapsed — give up rather than fight for the lock.
+        return null;
+      }
+
+      // Re-probe after acquiring the lock — another process may have
+      // finished while we were blocked.
+      if (!force) {
+        final libDir = await _findLibDir(installRoot);
+        if (libDir != null && _libsLookValid(libDir)) {
+          if (!await marker.exists()) {
+            try {
+              await marker.writeAsString(
+                jsonEncode({
+                  'release': kFfmpegReleaseTag,
+                  'extractedAt': DateTime.now().toUtc().toIso8601String(),
+                  'recovered': true,
+                }),
+              );
+            } catch (_) {}
+          }
+          return FfmpegDownloadResult(libDir: libDir, installRoot: installRoot);
         }
       }
 
@@ -158,14 +231,48 @@ class FfmpegDownloader {
       final downloaded = await _download(uri, archivePath, progress: progress);
       if (!downloaded) return null;
 
-      // Extract.
-      if (asset.endsWith('.zip')) {
-        await _extractZip(archivePath, installRoot);
-      } else if (asset.endsWith('.tar.xz')) {
-        await _extractTarXz(archivePath, installRoot);
-      } else {
-        stderr.writeln('miniav_tools_ffmpeg: unknown archive format: $asset');
-        return null;
+      // Extract. If extraction throws because target files are in use
+      // (errno=32 on Windows), fall back to whatever's already on disk —
+      // a previous successful extract is almost certainly intact.
+      try {
+        if (asset.endsWith('.zip')) {
+          await _extractZip(archivePath, installRoot);
+        } else if (asset.endsWith('.tar.xz')) {
+          await _extractTarXz(archivePath, installRoot);
+        } else {
+          stderr.writeln('miniav_tools_ffmpeg: unknown archive format: $asset');
+          return null;
+        }
+      } on PathAccessException catch (e) {
+        stderr.writeln(
+          'miniav_tools_ffmpeg: extraction blocked (file in use): $e — '
+          'attempting to use existing install.',
+        );
+        final existing = await _findLibDir(installRoot);
+        if (existing != null && _libsLookValid(existing)) {
+          return FfmpegDownloadResult(
+            libDir: existing,
+            installRoot: installRoot,
+          );
+        }
+        rethrow;
+      } on FileSystemException catch (e) {
+        // Some Dart/Windows builds wrap the same condition as a plain
+        // FileSystemException with osError.errorCode == 32.
+        if (e.osError?.errorCode == 32) {
+          stderr.writeln(
+            'miniav_tools_ffmpeg: extraction blocked (errno=32): $e — '
+            'attempting to use existing install.',
+          );
+          final existing = await _findLibDir(installRoot);
+          if (existing != null && _libsLookValid(existing)) {
+            return FfmpegDownloadResult(
+              libDir: existing,
+              installRoot: installRoot,
+            );
+          }
+        }
+        rethrow;
       }
 
       // Best-effort cleanup of the archive to save disk.
@@ -180,11 +287,20 @@ class FfmpegDownloader {
         }),
       );
     } finally {
+      if (lockHandle != null) {
+        if (holdsLock) {
+          try {
+            await lockHandle.unlock();
+          } catch (_) {}
+        }
+        try {
+          await lockHandle.close();
+        } catch (_) {}
+      }
+      // Best-effort lock-file removal. On Windows another process may
+      // already hold a handle, in which case delete will fail — harmless.
       try {
-        await lockSink?.close();
-      } catch (_) {}
-      try {
-        if (await lock.exists()) await lock.delete();
+        if (await File(lockPath).exists()) await File(lockPath).delete();
       } catch (_) {}
     }
 
@@ -197,6 +313,41 @@ class FfmpegDownloader {
       return null;
     }
     return FfmpegDownloadResult(libDir: libDir, installRoot: installRoot);
+  }
+
+  /// Sanity-check that the per-platform key DLLs/so files are present and
+  /// non-empty. This is intentionally cheap (no DynamicLibrary.open here —
+  /// that requires the caller's loading isolate) and just guards against
+  /// half-extracted installs.
+  static bool _libsLookValid(String libDir) {
+    try {
+      final dir = Directory(libDir);
+      if (!dir.existsSync()) return false;
+      var sawAvcodec = false;
+      var sawAvformat = false;
+      var sawAvutil = false;
+      for (final f in dir.listSync()) {
+        if (f is! File) continue;
+        final name = p.basename(f.path).toLowerCase();
+        final isShared =
+            name.endsWith('.dll') ||
+            name.contains('.so') ||
+            name.endsWith('.dylib');
+        if (!isShared) continue;
+        // Reject zero-byte files (incomplete extraction).
+        try {
+          if (f.lengthSync() < 1024) continue;
+        } catch (_) {
+          continue;
+        }
+        if (name.startsWith('avcodec')) sawAvcodec = true;
+        if (name.startsWith('avformat')) sawAvformat = true;
+        if (name.startsWith('avutil')) sawAvutil = true;
+      }
+      return sawAvcodec && sawAvformat && sawAvutil;
+    } catch (_) {
+      return false;
+    }
   }
 
   // --- internals -----------------------------------------------------------

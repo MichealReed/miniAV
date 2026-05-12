@@ -602,8 +602,8 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   buffer_ptr->internal_handle = payload;
 
   if (mf_ctx->app_callback_internal) {
-    mf_ctx->app_callback_internal(buffer_ptr,
-                                  mf_ctx->app_callback_user_data_internal);
+    MINIAV_SAFE_DISPATCH(mf_ctx->app_callback_internal(
+        buffer_ptr, mf_ctx->app_callback_user_data_internal));
   } else {
     // No app callback, release resources
     if (processed_as_gpu_texture && frame_payload->gpu.shared_texture_handle) {

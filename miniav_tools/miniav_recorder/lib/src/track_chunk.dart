@@ -46,6 +46,26 @@ class TrackChunk {
   /// on subsequent chunks.
   final Uint8List? extraData;
 
+  // ── Track metadata (set on the FIRST chunk per track, null thereafter) ──
+
+  /// Video frame width in pixels. Non-null on the first video chunk.
+  final int? videoWidth;
+
+  /// Video frame height in pixels. Non-null on the first video chunk.
+  final int? videoHeight;
+
+  /// Video frame-rate numerator. Non-null on the first video chunk.
+  final int? videoFrameRateNum;
+
+  /// Video frame-rate denominator. Non-null on the first video chunk.
+  final int? videoFrameRateDen;
+
+  /// Audio sample rate in Hz. Non-null on the first audio chunk.
+  final int? sampleRate;
+
+  /// Number of audio channels. Non-null on the first audio chunk.
+  final int? channels;
+
   const TrackChunk({
     required this.trackIndex,
     required this.kind,
@@ -57,6 +77,12 @@ class TrackChunk {
     this.videoCodec,
     this.audioCodec,
     this.extraData,
+    this.videoWidth,
+    this.videoHeight,
+    this.videoFrameRateNum,
+    this.videoFrameRateDen,
+    this.sampleRate,
+    this.channels,
   });
 
   @override

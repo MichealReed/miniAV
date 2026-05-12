@@ -1,6 +1,6 @@
 # miniav_recorder
 
-High-level multi-source A/V recorder for Dart.  Combines screen, camera, microphone and loopback sources into one or more MP4/MKV outputs (or live chunked streams) with a shared master clock.
+High-level multi-source A/V recorder for Dart.  Combines screen, camera, microphone and loopback sources into one or more MP4/MKV/M4A/MP3 outputs (or live chunked streams) with a shared master clock.
 
 Built on [`miniav`](../miniAV/miniav/) + [`miniav_tools`](../miniav_tools/) + [`miniav_tools_ffmpeg`](../miniav_tools_ffmpeg/).
 
@@ -24,24 +24,51 @@ await rec.stop();
 
 ---
 
+## Enumerate devices
+
+Use `RecorderDevices` to list available capture devices before building a recorder.  Every `deviceId` returned can be passed directly to the matching builder method.
+
+```dart
+final displays = await RecorderDevices.displays();     // for addScreen(displayId:)
+final windows  = await RecorderDevices.windows();      // for addScreen(windowId:)
+final cameras  = await RecorderDevices.cameras();      // for addCamera(deviceId:)
+final mics     = await RecorderDevices.microphones();  // for addMic(deviceId:)
+final loops    = await RecorderDevices.loopbacks();    // for addLoopback(deviceId:)
+
+print(displays.map((d) => '${d.name}: ${d.deviceId}').join('\n'));
+```
+
+All lists carry a `MiniAVDeviceInfo` with `deviceId`, `name`, and `isDefault`.
+
+---
+
 ## Sources
 
 ### Screen / display
 
+`addScreen` accepts the display ID string returned by `RecorderDevices.displays()` (or `MiniScreen.enumerateDisplays()`) directly, or `null` to capture the platform's default display.
+
 ```dart
+// Use a specific display by ID
 builder.addScreen(
-  displayId: display.deviceId,  // null = default display
+  displayId: display.deviceId,   // from RecorderDevices.displays()
   codec:     VideoCodec.h264,
   hwAccel:   HwAccelPreference.preferred,   // default
   scale:     ScreenScalePolicy.h264Friendly, // optional downscale
 );
+
+// Platform default display
+builder.addScreen();
+
+// Specific application window
+builder.addScreen(windowId: win.deviceId);
 ```
 
 ### Camera
 
 ```dart
 builder.addCamera(
-  deviceId: camera.deviceId,
+  deviceId: camera.deviceId,    // from RecorderDevices.cameras()
   codec:    VideoCodec.h264,
 );
 ```
@@ -58,14 +85,75 @@ builder.addLoopback(deviceId: loopback.deviceId, codec: AudioCodec.aac);
 ## Sinks
 
 ```dart
-// Write to a container file (MKV or MP4 auto-selected).
+// Write to a container file — container is auto-selected (see below).
 builder.addFileOutput('rec.mkv');
 
+// Override the container explicitly.
+builder.addFileOutput('audio.m4a', container: Container.m4a);
+
 // Receive raw encoded packets for live streaming / network forwarding.
-builder.addStreamOutput((TrackChunk chunk) {
-  // chunk.bytes, chunk.kind, chunk.ptsUs, chunk.isKeyframe, …
+builder.addStreamOutput((Object chunk) {
+  if (chunk is TrackChunk) {
+    // chunk.bytes, chunk.kind, chunk.ptsUs, chunk.isKeyframe, …
+  }
 });
 ```
+
+### Auto-container selection
+
+When no `container:` override is supplied, the recorder infers the most natural container:
+
+| Track mix | Auto-selected container |
+|---|---|
+| Video + audio | `.mkv` |
+| Video only | `.mp4` |
+| Audio-only (AAC) | `.m4a` |
+| Audio-only (MP3) | `.mp3` |
+| Audio-only (Opus) | `.ogg` |
+| Audio-only (mixed/other) | `.mkv` |
+
+---
+
+## Audio-only recorders
+
+A recorder with no video sources is fully supported. Useful for recording mic or loopback audio to a standalone audio file:
+
+```dart
+final micRec = (RecorderBuilder()
+      ..addMic(deviceId: mic.deviceId, codec: AudioCodec.aac)
+      ..addFileOutput('mic.m4a'))  // auto-picks Container.m4a
+    .build();
+
+await micRec.start();
+await Future.delayed(const Duration(seconds: 30));
+await micRec.stop();
+```
+
+---
+
+## Synchronised multi-recorder (`RecorderGroup`)
+
+Record to multiple outputs simultaneously with clock-synchronised start.  The prepare phase (encoder/muxer init, GPU bringup) runs concurrently on all recorders, then all master clocks are started in a tight sequential loop to minimise clock skew.
+
+```dart
+final avRec = (RecorderBuilder()
+      ..addScreen()                   // null = platform default display
+      ..addLoopback(deviceId: loop.deviceId)
+      ..addFileOutput('av.mp4'))
+    .build();
+
+final micRec = (RecorderBuilder()
+      ..addMic(deviceId: mic.deviceId, codec: AudioCodec.aac)
+      ..addFileOutput('mic.m4a'))     // auto-picks Container.m4a
+    .build();
+
+final group = RecorderGroup([avRec, micRec]);
+await group.start();
+await Future.delayed(const Duration(seconds: 10));
+await group.stop();
+```
+
+`RecorderGroup.recorders` exposes each individual `Recorder` so you can query state or add per-recorder error handling.
 
 ---
 
@@ -82,6 +170,96 @@ When recording a screen source on Windows with a compatible hardware encoder (NV
 
 Falls back silently to the CPU-upload path on any failure (unsupported GPU, non-Windows, no HW encoder).
 
+### Process-global GPU singleton & hot restart
+
+The shared `Minigpu` + Dawn-allocated `ID3D11Device` are **lifetime-of-the-isolate** singletons.  `Recorder.start()` / `stop()` never tear them down — re-initialising Dawn within a single process can pick a different backend on the second run (D3D12 vs D3D11) and break the cross-API shared-texture path with errors like *“The D3D11 device of the texture and the D3D11 device of [Device "MGPU.MainDevice"] must be same”*.
+
+For Flutter **hot restart**, the MiniAV C library's `MiniAV_Dispose()` is called automatically via `MiniAV.dispose()`.  It acquires an exclusive write lock, waits for every in-flight native callback to finish, then disables further dispatch — so native worker threads can never invoke a closed `NativeCallable`.  The next `Recorder.start()` re-enables callbacks automatically.
+
+Wire both teardowns into your app's hot-restart hook so the Dawn/D3D11 device is also released cleanly:
+
+```dart
+import 'package:flutter/widgets.dart';
+import 'package:miniav/miniav.dart';
+import 'package:miniav_recorder/miniav_recorder.dart';
+
+class _MyAppState extends State<MyApp> {
+  @override
+  void reassemble() {
+    super.reassemble();
+    // Quiesce all native callbacks, then release the shared GPU.
+    MiniAV.dispose();            // disables C-level callbacks atomically
+    Recorder.disposeSharedGpu(); // tears down Dawn / D3D11 device
+  }
+}
+```
+
+Static helpers:
+
+| API | Purpose |
+|---|---|
+| `Recorder.ensureSharedGpu()` | Idempotently bring up the shared `Minigpu` + D3D11 device.  Called automatically by `start()` when needed. |
+| `Recorder.disposeSharedGpu()` | Explicitly destroy the shared GPU singleton.  Safe to call multiple times.  After this, the next `start()` re-initialises. |
+
+---
+
+## Logging
+
+`miniav_recorder` exposes a unified log API that routes messages from the Dart recorder runtime, the MiniAV C library, and FFmpeg through a single callback — all accessible from a single `import 'package:miniav_recorder/miniav_recorder.dart'`.
+
+### Log level
+
+```dart
+// Only emit warnings and errors (default: RecorderLogLevel.info).
+Recorder.setLogLevel(RecorderLogLevel.warning);
+```
+
+| Level | What is shown |
+|---|---|
+| `verbose` | All debug output from recorder, MiniAV, and FFmpeg |
+| `info` | Informational messages + warnings + errors (default) |
+| `warning` | Warnings and errors only |
+| `error` | Errors only |
+| `quiet` | Silence all logs |
+
+### Custom callback
+
+```dart
+Recorder.setLogCallback((source, level, message) {
+  print('[${source.name}] ${level.name}: $message');
+});
+```
+
+The callback receives:
+
+| Parameter | Type | Values |
+|---|---|---|
+| `source` | `RecorderLogSource` | `recorder` · `miniav` · `ffmpeg` |
+| `level` | `RecorderLogLevel` | `verbose` · `info` · `warning` · `error` |
+| `message` | `String` | The log line (no trailing newline) |
+
+`source` tells you which subsystem emitted the message so you can filter or route them independently.
+
+To remove the callback and revert to the default `stderr` output:
+
+```dart
+Recorder.setLogCallback(null);
+```
+
+### Combined example
+
+```dart
+// Verbose FFmpeg output only, everything else at warning+.
+Recorder.setLogLevel(RecorderLogLevel.verbose);
+Recorder.setLogCallback((source, level, message) {
+  if (source == RecorderLogSource.ffmpeg || level.index >= RecorderLogLevel.warning.index) {
+    myLogger.log('[${source.name}] $message');
+  }
+});
+```
+
+> **Note:** Dawn / minigpu logs are written directly to native `stderr` by the Dawn library and cannot be intercepted by this callback.
+
 ---
 
 ## GPU downscaling
@@ -97,15 +275,16 @@ Screen sources can be downscaled on the GPU before encoding using `ScreenScalePo
 
 ### How it works
 
-When zero-copy is active **and** a non-`none` policy is set, a `GpuDownscaler` is created for the track.  Per frame:
+When zero-copy is active **and** a non-`none` policy is set, a `GpuScreenProcessor` is created for the track.  Per frame:
 
 ```
 MiniAVBuffer (D3D11 NT handle)
   → gpu.importVideoFrame()          VideoTexture  (BGRA, srcW×srcH)
   → VideoTexture.toRGBA()           Buffer        (RGBA u32[], srcW×srcH)
   → WGSL bilinear dispatch          Buffer        (RGBA u32[], dstW×dstH)
+  → effects chain                   Buffer        (RGBA u32[], outW×outH)
   → SharedOutputTexture.copyFromBuffer
-                                    SharedOutputTexture (RGBA, dstW×dstH)
+                                    SharedOutputTexture (RGBA, outW×outH)
   → D3D11TextureFrameSource → FfmpegD3d11HwEncoder
 ```
 
@@ -125,50 +304,91 @@ builder.addScreen(
 
 ```dart
 // Half resolution
-builder.addScreen(
-  displayId: display.deviceId,
-  scale: ScreenScalePolicy.scaleFactor(0.5),
-);
+builder.addScreen(scale: ScreenScalePolicy.scaleFactor(0.5));
 
 // Fixed 1920×1080
-builder.addScreen(
-  displayId: display.deviceId,
-  scale: ScreenScalePolicy.fixedSize(1920, 1080),
-);
+builder.addScreen(scale: ScreenScalePolicy.fixedSize(1920, 1080));
 ```
 
 ---
 
 ## GPU effects pipeline
 
-Screen sources support an ordered chain of GPU post-processing effects applied **after** downscaling. All effects run as WGSL compute shaders on the GPU — no CPU copies, no PCIe round-trips.
+Screen sources support an ordered chain of GPU post-processing effects applied **after** any `ScreenScalePolicy` downscaling.  All effects run as WGSL compute shaders — no pixel data reaches the CPU.
 
-Effects are passed to `addScreen()` as a `List<ScreenEffect>`:
+Effects are passed to `addScreen()` as a `List<ScreenEffect>`.  They are applied left-to-right; each receives the output dimensions of the preceding step.
 
 ```dart
 builder.addScreen(
   displayId: display.deviceId,
   scale: ScreenScalePolicy.h264Friendly,
   effects: [
-    ScreenEffect.vignette(strength: 0.5),
+    ScreenEffect.crop(0, 0, 1920, 1040),   // 1. strip taskbar
+    ScreenEffect.vignette(strength: 0.4),  // 2. colour grade
   ],
 );
 ```
 
 ### Built-in effects
 
-| Factory | Description |
-|---|---|
-| `ScreenEffect.vignette({strength})` | Radial vignette + warm colour grade. `strength` 0–1 (default `0.4`). |
+| Factory | Changes dimensions? | Description |
+|---|---|---|
+| `ScreenEffect.vignette({strength})` | No | Radial vignette + warm colour grade. `strength` 0–1 (default `1.0`). |
+| `ScreenEffect.crop(x, y, width, height)` | **Yes** | Crop to a sub-rectangle. Encoder is opened at `width×height`. |
+| `ScreenEffect.flip({horizontal, vertical})` | No | Mirror horizontally and/or vertically. Uses a separate GPU buffer (avoids in-place race conditions). |
+| `ScreenEffect.rotate(ScreenRotation)` | **Yes** for 90°/270° | Clockwise rotation. 90°/270° swap width ↔ height. |
+| `ScreenEffect.scale(width, height)` | **Yes** | Bilinear resize to an arbitrary target size. Useful after a crop to upscale a region back to a standard resolution. |
+| `ScreenEffect.wgsl(source, {extraParams})` | No | Custom in-place WGSL compute shader. |
+
+#### Rotation values
+
+```dart
+ScreenEffect.rotate(ScreenRotation.r90)   // 90° clockwise  — output: H×W
+ScreenEffect.rotate(ScreenRotation.r180)  // 180° — output: W×H (unchanged)
+ScreenEffect.rotate(ScreenRotation.r270)  // 270° clockwise — output: H×W
+```
+
+### Dimension-changing effects
+
+When an effect changes the frame dimensions (`crop`, `rotate` 90°/270°, `scale`), the encoder and shared output texture are automatically opened at the correct final size — no configuration needed beyond listing the effects.
+
+```dart
+// 2560×1440 display → crop taskbar → portrait rotate → upscale
+builder.addScreen(
+  effects: [
+    ScreenEffect.crop(0, 0, 2560, 1400),      // → 2560×1400
+    ScreenEffect.rotate(ScreenRotation.r90),   // → 1400×2560
+    ScreenEffect.scale(700, 1280),             // → 700×1280
+  ],
+);
+```
+
+### Composing effects
+
+Some useful patterns:
+
+```dart
+// Correct a front-facing webcam (mirrored by default):
+effects: [ScreenEffect.flip(horizontal: true)]
+
+// Record a portion of the screen at full HD:
+effects: [
+  ScreenEffect.crop(640, 360, 640, 360),  // crop a 640×360 region from the centre
+  ScreenEffect.scale(1920, 1080),         // upscale to 1080p for the encoder
+]
+
+// Fix a sideways phone screen share:
+effects: [ScreenEffect.rotate(ScreenRotation.r270)]
+```
 
 ### Custom WGSL effects
 
-Provide your own compute shader source via `ScreenEffect.wgsl()`:
+Provide your own compute shader source via `ScreenEffect.wgsl()`.  The shader runs in-place on the current buffer (same dimensions in and out):
 
 ```dart
 ScreenEffect.wgsl(
   '''
-  struct Params { width: u32, height: u32, gamma: f32, };
+  struct Params { width: u32, height: u32, gamma: f32, _pad: f32 };
   @group(0) @binding(0) var<storage, read_write> pixels : array<u32>;
   @group(0) @binding(1) var<storage, read_write> params : Params;
 
@@ -176,10 +396,10 @@ ScreenEffect.wgsl(
   fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (gid.x >= params.width || gid.y >= params.height) { return; }
     let idx = gid.y * params.width + gid.x;
-    // ... transform pixels[idx] in place ...
+    // … transform pixels[idx] in place …
   }
   ''',
-  extraParams: [2.2], // passed as f32 fields from byte 8 in the Params struct
+  extraParams: [2.2], // passed as f32 from byte 8 in the Params struct
 )
 ```
 
@@ -190,26 +410,120 @@ ScreenEffect.wgsl(
 | `@binding(0)` | `array<u32>` (read_write) | Packed RGBA8 pixels, row-major. Modify in-place. |
 | `@binding(1)` | user-defined struct (read_write) | `width: u32` at offset 0, `height: u32` at offset 4, then the `extraParams` values as consecutive `f32` fields from byte 8. |
 
-Workgroups are dispatched at 8×8 threads. Always guard against out-of-bounds: `if (gid.x >= params.width || gid.y >= params.height) { return; }`.
+Workgroups are dispatched at 8×8 threads. Always guard: `if (gid.x >= params.width || gid.y >= params.height) { return; }`.
 
-### Effects + scale together
+### Effects + scale policy together
+
+Downscaling from `ScreenScalePolicy` runs first (still on the full-resolution D3D11 texture), then the effects chain runs on the smaller buffer — maximising efficiency.
 
 ```dart
 builder.addScreen(
-  displayId: display.deviceId,
-  scale: ScreenScalePolicy.h264Friendly,   // 1. downscale on GPU
+  scale: ScreenScalePolicy.h264Friendly,   // 1. GPU bilinear downscale
   effects: [
-    ScreenEffect.vignette(strength: 0.4),  // 2. vignette on smaller buffer
+    ScreenEffect.crop(0, 0, 3840, 2000),   // 2. strip taskbar
+    ScreenEffect.vignette(strength: 0.4),  // 3. colour grade
   ],
 );
 ```
 
-Downscaling runs first (on the full-resolution buffer), then effects run on the already-smaller destination buffer — maximising efficiency.
-
 ### Requirements
 
 - Zero-copy GPU path must be active (`preferZeroCopy = true`, Windows D3D12).  
-- If the GPU context is unavailable at runtime, a warning is printed and effects are skipped (encoding continues normally without them).
+- If the GPU context is unavailable the effects chain is skipped and a warning is printed; recording continues normally at the downscaled (or original) size.
+
+---
+
+## DVR clip buffer
+
+A `ClipBuffer` keeps a rolling in-memory ring of encoded packets covering the last `maxWindow` of recording.  Call `saveClip` at any point to materialise any sub-window to a file without pausing or splitting the active recording.
+
+```dart
+// Keep up to 3 minutes in RAM.
+final clip = builder.addClipBuffer(maxWindow: Duration(minutes: 3));
+final rec  = builder.build();
+await rec.start();
+
+// … record continuously …
+
+// Save clips of different lengths from the same buffer — non-destructive.
+await clip.saveClip('moment_5s.mp4',  duration: Duration(seconds: 5));
+await clip.saveClip('moment_30s.mp4', duration: Duration(seconds: 30));
+await clip.saveClip('replay_3min.mp4');  // omit duration → full maxWindow
+```
+
+### API
+
+| Member | Description |
+|---|---|
+| `addClipBuffer({required maxWindow, maxPackets})` | Register a `ClipBuffer` on the builder. Returns the buffer. |
+| `ClipBuffer.maxWindow` | Buffered duration (longest possible clip). |
+| `ClipBuffer.maxPackets` | Optional hard cap on ring size (bounds memory). |
+| `ClipBuffer.length` | Number of packets currently buffered. |
+| `ClipBuffer.oldestPtsUs` / `newestPtsUs` | Timestamp span of buffered data. |
+| `ClipBuffer.saveClip(path, {duration, container})` | Write the last `duration` (default: `maxWindow`) to `path`. |
+| `ClipBuffer.clear()` | Discard all buffered packets. |
+
+### Notes
+
+- The clip always starts on a **video keyframe** to ensure the file is playable.
+- Timestamps are **remapped to start from 0** in the output file.
+- `saveClip` can be called **multiple times concurrently** with different durations from the same `ClipBuffer`.
+- Memory scales with `maxWindow × average_bitrate`.  At 8 Mbps video + 128 Kbps audio, 3 minutes ≈ ~180 MB.
+- Add a `maxPackets` cap if memory is a concern:
+
+```dart
+// Cap at ~10 000 packets regardless of duration.
+builder.addClipBuffer(
+  maxWindow: Duration(minutes: 3),
+  maxPackets: 10000,
+);
+```
+
+---
+
+## Warmup
+
+On first run, the recorder may need to download FFmpeg shared libraries before encoding can start.  Call `MiniAVTools.warmup()` early in your app — in `main()` or `initState` — to trigger heavy initialisation up front and get byte-level download progress.
+
+```dart
+import 'package:miniav_recorder/miniav_recorder.dart';
+
+// Flutter — show a progress bar while FFmpeg downloads:
+@override
+void initState() {
+  super.initState();
+  MiniAVTools.warmup().listen(
+    (p) {
+      if (p.fraction != null) {
+        setState(() => _downloadProgress = p.fraction!);
+      }
+      if (p.isDone && p.error != null) {
+        debugPrint('Warmup error [${p.backendName}]: ${p.error}');
+      }
+    },
+    onDone: () => setState(() => _ready = true),
+  );
+}
+
+// Command-line / background — block until all backends are ready:
+await MiniAVTools.warmup().drain<void>();
+```
+
+If the libraries are already cached on disk, `warmup()` completes immediately with no events.  It is safe to call multiple times.
+
+Warmup is **optional**: `createEncoder`, `createMuxer`, etc. trigger auto-download on demand.  The benefit of calling `warmup()` early is that you control when the download happens and can give the user feedback instead of silently stalling.
+
+### `WarmupProgress` fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `backendName` | `String` | Backend that emitted the event (`"ffmpeg"`, etc.). |
+| `task` | `String` | Human-readable task description (e.g. `"Downloading FFmpeg"`). |
+| `isDone` | `bool` | `true` on the final event for this task — success **or** failure. |
+| `bytesReceived` | `int?` | Bytes received so far; `null` for non-download events. |
+| `totalBytes` | `int?` | Total expected bytes; `null` when server omits `Content-Length`. |
+| `fraction` | `double?` | Computed `bytesReceived / totalBytes` in `[0.0, 1.0]`, or `null`. |
+| `error` | `Object?` | Non-null when the task failed. The stream **never** errors itself. |
 
 ---
 

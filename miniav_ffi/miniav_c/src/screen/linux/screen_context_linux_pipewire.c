@@ -2924,8 +2924,8 @@ static void on_video_stream_process(void *data) {
     miniav_buffer->internal_handle = payload_alloc;
 
     // Deliver to app
-    pctx->parent_ctx->app_callback(miniav_buffer,
-                                   pctx->parent_ctx->app_callback_user_data);
+    MINIAV_SAFE_DISPATCH(pctx->parent_ctx->app_callback(
+        miniav_buffer, pctx->parent_ctx->app_callback_user_data));
     payload_alloc = NULL; // Ownership passed to app
 
   queue_and_continue_video:
@@ -3153,8 +3153,8 @@ static void on_audio_stream_process(void *data) {
                miniav_buffer->data_size_bytes,
                miniav_buffer->data.audio.frame_count,
                miniav_buffer->timestamp_us);
-    pctx->parent_ctx->app_callback(miniav_buffer,
-                                   pctx->parent_ctx->app_callback_user_data);
+    MINIAV_SAFE_DISPATCH(pctx->parent_ctx->app_callback(
+        miniav_buffer, pctx->parent_ctx->app_callback_user_data));
     payload_alloc = NULL; // Callback owns it now
 
   queue_audio_and_continue:

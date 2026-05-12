@@ -242,6 +242,9 @@ MiniAV_Input_StartCapture(MiniAVInputContextHandle context_handle) {
     return MINIAV_ERROR_NOT_SUPPORTED;
   }
 
+  // Re-enable callback dispatch in case MiniAV_Dispose() was called previously.
+  miniav_dispatch_set_enabled(1);
+
   MiniAVResultCode res = ctx->ops->start_capture(ctx);
   if (res == MINIAV_SUCCESS) {
     ctx->is_running = 1;

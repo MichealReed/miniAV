@@ -54,3 +54,37 @@ size_t miniav_strlcpy(char *dst, const char *src, size_t dst_size) {
   }
   return src_len;
 }
+
+// ---- Callback-dispatch guard ---------------------------------------------------
+#ifdef _WIN32
+#include <windows.h>
+
+static SRWLOCK      g_miniav_dispatch_srw     = SRWLOCK_INIT;
+static volatile int g_miniav_dispatch_enabled = 1;
+
+int miniav_dispatch_guard_acquire_if_enabled(void) {
+  AcquireSRWLockShared(&g_miniav_dispatch_srw);
+  if (!g_miniav_dispatch_enabled) {
+    ReleaseSRWLockShared(&g_miniav_dispatch_srw);
+    return 0;
+  }
+  return 1;
+}
+
+void miniav_dispatch_guard_release(void) {
+  ReleaseSRWLockShared(&g_miniav_dispatch_srw);
+}
+
+void miniav_dispatch_set_enabled(int enabled) {
+  AcquireSRWLockExclusive(&g_miniav_dispatch_srw);
+  g_miniav_dispatch_enabled = enabled;
+  ReleaseSRWLockExclusive(&g_miniav_dispatch_srw);
+}
+
+#else /* !_WIN32 */
+
+int  miniav_dispatch_guard_acquire_if_enabled(void) { return 1; }
+void miniav_dispatch_guard_release(void)             {}
+void miniav_dispatch_set_enabled(int enabled)        { (void)enabled; }
+
+#endif /* _WIN32 */

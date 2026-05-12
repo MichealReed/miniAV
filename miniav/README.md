@@ -50,6 +50,27 @@ Then run:
 dart pub get
 ```
 
+### Flutter apps: use `miniav_flutter` instead
+
+If you are building a Flutter app, add `miniav_flutter` rather than `miniav` directly.  It re-exports the full `miniav` API and adds a thin widget that automatically calls `MiniAV.dispose()` during hot reload — preventing the *"Callback invoked after it has been deleted"* crash that occurs when native capture threads hold live callbacks while the Dart isolate is rebuilt.
+
+```yaml
+dependencies:
+  miniav_flutter: ^0.5.0
+```
+
+Wrap your root widget with `MiniAVBinding` once in `main()`:
+
+```dart
+import 'package:miniav_flutter/miniav_flutter.dart';
+
+void main() {
+  runApp(const MiniAVBinding(child: MyApp()));
+}
+```
+
+No other changes are needed — all `MiniAV.*` APIs are available from the same import.
+
 ## Getting Started
 
 ```console

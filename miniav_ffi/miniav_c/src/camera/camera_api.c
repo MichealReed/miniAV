@@ -392,6 +392,9 @@ MiniAV_Camera_StartCapture(MiniAVCameraContextHandle context_handle,
     return MINIAV_ERROR_NOT_SUPPORTED;
   }
 
+  // Re-enable callback dispatch in case MiniAV_Dispose() was called previously.
+  miniav_dispatch_set_enabled(1);
+
   ctx->app_callback = callback;
   ctx->app_callback_user_data = user_data;
 

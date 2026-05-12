@@ -4,6 +4,7 @@ library;
 
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
+import 'clip_buffer.dart';
 import 'recorder.dart';
 import 'recorder_sink.dart';
 import 'recorder_source.dart';
@@ -63,6 +64,8 @@ class RecorderBuilder {
     HwAccelPreference hwAccel = HwAccelPreference.preferred,
     ScreenScalePolicy scale = ScreenScalePolicy.none,
     List<ScreenEffect> effects = const [],
+    double? quality,
+    Map<String, String> encoderOptions = const {},
   }) {
     _sources.add(
       ScreenRecorderSource(
@@ -76,6 +79,8 @@ class RecorderBuilder {
         hwAccel: hwAccel,
         scale: scale,
         effects: effects,
+        quality: quality,
+        encoderOptions: encoderOptions,
       ),
     );
   }
@@ -89,6 +94,8 @@ class RecorderBuilder {
     int? height,
     int? fps,
     HwAccelPreference hwAccel = HwAccelPreference.preferred,
+    double? quality,
+    Map<String, String> encoderOptions = const {},
   }) {
     _sources.add(
       CameraRecorderSource(
@@ -99,6 +106,8 @@ class RecorderBuilder {
         height: height,
         fps: fps,
         hwAccel: hwAccel,
+        quality: quality,
+        encoderOptions: encoderOptions,
       ),
     );
   }
@@ -141,13 +150,48 @@ class RecorderBuilder {
     );
   }
 
+  /// Add a **mixed** mic + loopback source.
+  ///
+  /// Both inputs are captured simultaneously, normalised to 48 kHz / stereo /
+  /// float32, summed, and emitted as **one** audio track. Most players (and
+  /// browsers, and Windows shell preview) only auto-play the first audio
+  /// track, so mixing is usually what you want for screen-recordings with
+  /// commentary.
+  ///
+  /// Use [micGainDb] / [loopbackGainDb] (in dB) to attenuate either source
+  /// before the sum — pass `-3` to each if you hear clipping when both are
+  /// loud at the same time.
+  void addMixedAudio({
+    required String micDeviceId,
+    required String loopbackDeviceId,
+    AudioCodec codec = AudioCodec.aac,
+    int? bitrateBps,
+    double micGainDb = 0.0,
+    double loopbackGainDb = 0.0,
+  }) {
+    _sources.add(
+      MixedAudioRecorderSource(
+        micDeviceId: micDeviceId,
+        loopbackDeviceId: loopbackDeviceId,
+        codec: codec,
+        bitrateBps: bitrateBps,
+        micGainDb: micGainDb,
+        loopbackGainDb: loopbackGainDb,
+      ),
+    );
+  }
+
   // --- sinks ---------------------------------------------------------------
 
   /// Mux every source's encoded packets into a container file.
   ///
-  /// [container] defaults to MKV when the file has any audio source +
-  /// any video source (more permissive than MP4 with multiple tracks).
-  /// Otherwise MP4.
+  /// If [container] is omitted the recorder infers it in order:
+  /// 1. File extension (`.mp4` → MP4, `.mkv` → MKV, `.webm` → WebM, etc.)
+  /// 2. Track-mix heuristic: video-only → MP4; video+audio → MKV (handles
+  ///    any codec mix); audio-only → M4A/MP3/OGG/MKV based on codec.
+  ///
+  /// Prefer naming your output file with the correct extension (e.g.
+  /// `recording.mp4`) so the right container is selected automatically.
   void addFileOutput(String path, {Container? container}) {
     _sinks.add(FileRecorderSink(path: path, container: container));
   }
@@ -157,6 +201,33 @@ class RecorderBuilder {
   /// container.
   void addStreamOutput(void Function(Object chunk) onChunk) {
     _sinks.add(StreamRecorderSink(onChunk: onChunk));
+  }
+
+  /// Attach a [ClipBuffer] that silently accumulates the last [maxWindow] of
+  /// encoded data. Call [ClipBuffer.saveClip] at any time with any
+  /// [Duration] ≤ [maxWindow] to write a clip without interrupting the
+  /// running recorder.
+  ///
+  /// Size [maxWindow] to the longest clip you will ever want. You can then
+  /// call `saveClip` multiple times with different durations from the same
+  /// buffer:
+  ///
+  /// ```dart
+  /// final clip = builder.addClipBuffer(maxWindow: Duration(minutes: 3));
+  /// final rec = builder.build();
+  /// await rec.start();
+  ///
+  /// // Save different lengths from the same 3-minute buffer:
+  /// await clip.saveClip('clip_5s.mp4',  duration: Duration(seconds: 5));
+  /// await clip.saveClip('clip_30s.mp4', duration: Duration(seconds: 30));
+  /// await clip.saveClip('clip_full.mp4');  // full 3 min
+  /// ```
+  ///
+  /// [maxPackets] is an optional hard cap on buffered packet count.
+  ClipBuffer addClipBuffer({required Duration maxWindow, int? maxPackets}) {
+    final buf = ClipBuffer(maxWindow: maxWindow, maxPackets: maxPackets);
+    _sinks.add(StreamRecorderSink(onChunk: buf.onChunk));
+    return buf;
   }
 
   // --- build ---------------------------------------------------------------

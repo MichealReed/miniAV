@@ -162,9 +162,11 @@ extension MiniAVBufferFFI on MiniAVBuffer {
       // Audio data
       Uint8List audioData = Uint8List(0);
       if (audio.data != ffi.nullptr) {
-        // You may need to know the correct size; here we use frame_count * channels * sample size
-        // If you have a data_size field, use it!
         final channels = info.channels;
+        // info.num_frames is set to the actual delivered frame count by all
+        // known native backends (e.g. WASAPI sets it to num_frames_available).
+        // audio.frame_count is only set on some platforms (macOS); on Windows
+        // it stays 0. Use num_frames as the primary source.
         final frames = info.num_frames;
         int bytesPerSample;
         switch (format) {
@@ -186,7 +188,10 @@ extension MiniAVBufferFFI on MiniAVBuffer {
       }
 
       audioBuffer = MiniAVAudioBuffer(
-        frameCount: audio.frame_count,
+        // frame_count is set on macOS/Linux; on Windows WASAPI it stays 0
+        // (only info.num_frames is populated). Fall back to num_frames so
+        // the Dart encoder always sees the correct sample count.
+        frameCount: audio.frame_count > 0 ? audio.frame_count : info.num_frames,
         info: MiniAVAudioInfo(
           format: MiniAVAudioFormat.values[format.value],
           sampleRate: info.sample_rate,

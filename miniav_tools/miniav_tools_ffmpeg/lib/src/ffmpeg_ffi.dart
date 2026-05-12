@@ -144,7 +144,7 @@ final class AVCodecParameters extends Struct {
   external int frDen;
 }
 
-/// `AVStream` partial prefix — FFmpeg 8.x (libavformat 62).
+/// `AVStream` partial prefix — FFmpeg 7.x / 8.x (libavformat 61+).
 /// Allocated by `avformat_new_stream()`. We only read/write the first few
 /// fields (index, codecpar pointer, time_base).
 final class AVStream extends Struct {
@@ -276,6 +276,15 @@ typedef _AvFrameUnref = void Function(Pointer<AVFrame>);
 
 typedef _AvGetPixFmtC = Int32 Function(Pointer<Utf8>);
 typedef _AvGetPixFmt = int Function(Pointer<Utf8>);
+
+// av_mallocz: allocate zero-initialized memory using FFmpeg's allocator.
+// AVCodecParameters.extradata MUST be allocated this way so that
+// avcodec_parameters_free / avformat_free_context can av_freep() it without
+// calling free() on a pointer that came from a different heap (which would
+// be an access violation on Windows where the CRT heap and FFmpeg's heap
+// are different DLLs).
+typedef _AvMallocZC = Pointer<Uint8> Function(IntPtr size);
+typedef _AvMallocZ = Pointer<Uint8> Function(int size);
 
 typedef _AvPacketAllocC = Pointer<AVPacket> Function();
 typedef _AvPacketAlloc = Pointer<AVPacket> Function();
@@ -571,6 +580,12 @@ class Ffmpeg {
   /// [AVPixelFormat] enum value. Returns -1 on unknown name.
   late final _AvGetPixFmt avGetPixFmtByName = _avutil
       .lookupFunction<_AvGetPixFmtC, _AvGetPixFmt>('av_get_pix_fmt');
+
+  /// Allocate zero-initialized memory using FFmpeg's allocator.
+  /// Required for AVCodecParameters.extradata so it can be safely freed by
+  /// libavformat using av_freep() (different heap than Dart's calloc).
+  late final _AvMallocZ avMallocZ = _avutil
+      .lookupFunction<_AvMallocZC, _AvMallocZ>('av_mallocz');
 
   // HW device / frame management (libavutil)
   late final _AvHwdeviceCtxAlloc avHwdeviceCtxAlloc = _avutil

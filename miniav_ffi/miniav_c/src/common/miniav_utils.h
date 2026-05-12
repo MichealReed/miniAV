@@ -22,6 +22,34 @@ size_t miniav_strlcpy(char* dst, const char* src, size_t dst_size);
 #define MINIAV_UNUSED(x) (void)(x)
 #endif
 
+// ---- Callback-dispatch guard ---------------------------------------------------
+// Use MINIAV_SAFE_DISPATCH() instead of calling a Dart/user callback directly.
+// This allows MiniAV_Dispose() to atomically quiesce all in-flight callback
+// invocations before the caller tears down its NativeCallable handles (e.g.
+// during Flutter hot restart).
+//
+// miniav_dispatch_guard_acquire_if_enabled():
+//   Acquires a shared read lock if callbacks are currently enabled.
+//   Returns 1 (lock held — caller MUST call miniav_dispatch_guard_release()).
+//   Returns 0 (callbacks disabled — caller must NOT call release).
+//
+// miniav_dispatch_guard_release(): releases the shared read lock.
+//
+// miniav_dispatch_set_enabled(): called by MiniAV_Dispose (0) and
+//   MiniAV_EnableCallbacks (1).  Acquires an exclusive write lock — blocks
+//   until every in-flight callback finishes, then updates the flag.
+int  miniav_dispatch_guard_acquire_if_enabled(void);
+void miniav_dispatch_guard_release(void);
+void miniav_dispatch_set_enabled(int enabled); /* 0 = off, 1 = on */
+
+#define MINIAV_SAFE_DISPATCH(call_expr)                     \
+  do {                                                      \
+    if (miniav_dispatch_guard_acquire_if_enabled()) {       \
+      (call_expr);                                          \
+      miniav_dispatch_guard_release();                      \
+    }                                                       \
+  } while (0)
+
 #ifdef __cplusplus
 }
 #endif

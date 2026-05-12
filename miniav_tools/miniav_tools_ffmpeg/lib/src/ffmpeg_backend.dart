@@ -6,7 +6,8 @@
 /// Phase C (planned): MP4 / MKV muxer and demuxer via libavformat.
 library;
 
-import 'dart:io' show Platform;
+import 'dart:async';
+import 'dart:io';
 
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
@@ -57,6 +58,59 @@ class FfmpegBackend extends MiniAVToolsBackend {
         'to silence this attempt.',
       );
     }
+  }
+
+  // --- Warmup ---------------------------------------------------------------
+
+  static const _kTaskFfmpegDownload = 'Downloading FFmpeg';
+
+  @override
+  Stream<WarmupProgress> warmup() {
+    if (_isAvailable) return const Stream.empty();
+
+    final ctrl = StreamController<WarmupProgress>();
+
+    ffi
+        .ensureFFmpegLoaded(
+          onDownloadProgress: (int received, int total) {
+            ctrl.add(
+              WarmupProgress(
+                backendName: name,
+                task: _kTaskFfmpegDownload,
+                isDone: false,
+                bytesReceived: received,
+                // Some HTTP responses omit Content-Length (-1 sentinel).
+                totalBytes: total < 0 ? null : total,
+              ),
+            );
+          },
+        )
+        .then(
+          (ok) {
+            _available = ok;
+            ctrl.add(
+              WarmupProgress(
+                backendName: name,
+                task: _kTaskFfmpegDownload,
+                isDone: true,
+                error: ok ? null : 'FFmpeg auto-download failed or is disabled',
+              ),
+            );
+          },
+          onError: (Object e) {
+            ctrl.add(
+              WarmupProgress(
+                backendName: name,
+                task: _kTaskFfmpegDownload,
+                isDone: true,
+                error: e,
+              ),
+            );
+          },
+        )
+        .whenComplete(ctrl.close);
+
+    return ctrl.stream;
   }
 
   // --- Capabilities ---------------------------------------------------------
@@ -186,24 +240,49 @@ class FfmpegBackend extends MiniAVToolsBackend {
             );
           }
           // Context-driven zero-copy is best-effort — just fall through.
+          stderr.writeln(
+            '[ffmpeg] createEncoder: D3D11 zero-copy skipped — no D3D11VA '
+            'encoder available for ${config.codec} in this FFmpeg build.',
+          );
         } else {
           try {
-            return FfmpegD3d11HwEncoder.open(
+            final enc = FfmpegD3d11HwEncoder.open(
               config,
               existingD3d11Device: ctxZeroCopy ? context.d3d11DeviceHandle : 0,
             );
-          } on CodecInitException {
+            stderr.writeln(
+              '[ffmpeg] createEncoder: D3D11 zero-copy encoder opened '
+              '(${enc.runtimeType}) for ${config.codec} '
+              '${config.width}x${config.height}'
+              '${ctxZeroCopy ? " [injected device 0x${context.d3d11DeviceHandle.toRadixString(16)}]" : " [new device]"}',
+            );
+            return enc;
+          } on CodecInitException catch (e) {
             // Strict opt-in (a) — propagate. Context opt-in (b) — fall back.
             if (zerocopyOpt) rethrow;
+            stderr.writeln(
+              '[ffmpeg] createEncoder: D3D11 zero-copy failed ($e) — '
+              'falling back to Stage A NVENC/software.',
+            );
           }
         }
       }
       if (ffmpegHwEncoderAvailable(config.codec)) {
         try {
-          return FfmpegHwEncoder.open(config);
-        } on CodecInitException {
+          final enc = FfmpegHwEncoder.open(config);
+          stderr.writeln(
+            '[ffmpeg] createEncoder: Stage A HW encoder opened '
+            '(${enc.runtimeType}) for ${config.codec} '
+            '${config.width}x${config.height}',
+          );
+          return enc;
+        } on CodecInitException catch (e) {
           if (config.hwAccel == HwAccelPreference.required) rethrow;
           // preferred: fall through to software.
+          stderr.writeln(
+            '[ffmpeg] createEncoder: Stage A HW encoder failed ($e) — '
+            'falling back to software.',
+          );
         }
       } else if (config.hwAccel == HwAccelPreference.required) {
         throw CodecInitException(
@@ -212,11 +291,22 @@ class FfmpegBackend extends MiniAVToolsBackend {
           'FFmpeg build (hwAccel=required). Vendors checked: NVENC, QSV, '
           'AMF, VideoToolbox, MediaFoundation, V4L2.',
         );
+      } else {
+        stderr.writeln(
+          '[ffmpeg] createEncoder: no HW encoder available for ${config.codec}'
+          ' — using software.',
+        );
       }
       // hwAccel=preferred: silently fall through to software.
     }
 
-    return FfmpegSoftwareEncoder.open(config);
+    final enc = FfmpegSoftwareEncoder.open(config);
+    stderr.writeln(
+      '[ffmpeg] createEncoder: software encoder opened '
+      '(${enc.runtimeType}) for ${config.codec} '
+      '${config.width}x${config.height}',
+    );
+    return enc;
   }
 
   /// Pick the best [VideoCodec] for the given resolution + HW preference.

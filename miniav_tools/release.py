@@ -75,8 +75,10 @@ Follows markdownlint rules:
 """
 import os
 import re
+import json
 import argparse
 import subprocess
+import urllib.request
 from datetime import datetime
 
 def load_yaml_preserve_structure(file_path):
@@ -408,6 +410,89 @@ def main_change(packages_args, message):
         else:
             print(f"Warning: Package directory for {dir_name} not found")
 
+# External packages whose version constraints should be kept up-to-date.
+# Maps pub.dev package name → human-readable group label.
+EXTERNAL_DEPS = [
+    # miniav family
+    "miniav",
+    "miniav_ffi",
+    "miniav_platform_interface",
+    "miniav_web",
+    # minigpu family
+    "minigpu",
+    "minigpu_ffi",
+    "minigpu_platform_interface",
+    "minigpu_web",
+    "gpu_tensor",
+    "gpu_pipeline",
+]
+
+
+def fetch_latest_version(package_name):
+    """Query pub.dev for the latest published version of a package."""
+    url = f"https://pub.dev/api/packages/{package_name}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            return data["latest"]["version"]
+    except Exception as e:
+        print(f"  Warning: could not fetch version for {package_name}: {e}")
+        return None
+
+
+def update_dep_constraint(content, package_name, new_version):
+    """Replace an existing caret constraint for package_name with ^new_version."""
+    pattern = rf'^(\s+{re.escape(package_name)}:\s*)\^[\d.]+\+?[\d.]*'
+    replacement = rf'\g<1>^{new_version}'
+    return re.sub(pattern, replacement, content, flags=re.MULTILINE)
+
+
+def main_deps(specific_deps=None):
+    """Fetch latest versions from pub.dev and update all managed pubspecs."""
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+
+    deps_to_update = specific_deps if specific_deps else EXTERNAL_DEPS
+
+    # Fetch latest versions once.
+    print("Fetching latest versions from pub.dev...")
+    versions = {}
+    for pkg in deps_to_update:
+        v = fetch_latest_version(pkg)
+        if v:
+            versions[pkg] = v
+            print(f"  {pkg}: {v}")
+
+    if not versions:
+        print("No versions fetched. Aborting.")
+        return
+
+    # Collect all pubspec.yaml files under managed packages + examples.
+    pubspec_paths = []
+    for dir_name in PACKAGES:
+        p = os.path.join(root_dir, dir_name, "pubspec.yaml")
+        if os.path.exists(p):
+            pubspec_paths.append(p)
+    examples_dir = os.path.join(root_dir, "examples")
+    if os.path.isdir(examples_dir):
+        for entry in os.listdir(examples_dir):
+            p = os.path.join(examples_dir, entry, "pubspec.yaml")
+            if os.path.exists(p):
+                pubspec_paths.append(p)
+
+    print("\nUpdating pubspec.yaml files...")
+    for pubspec_path in pubspec_paths:
+        content = load_yaml_preserve_structure(pubspec_path)
+        original = content
+        for pkg, ver in versions.items():
+            content = update_dep_constraint(content, pkg, ver)
+        if content != original:
+            with open(pubspec_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            print(f"  Updated: {pubspec_path}")
+        else:
+            print(f"  No changes: {pubspec_path}")
+
+
 def main_publish():
     root_dir = os.path.dirname(os.path.abspath(__file__))
     all_actions_successful = True
@@ -542,6 +627,9 @@ if __name__ == "__main__":
     change_parser.add_argument("message", help="Message to add to changelog (e.g., \"Fixed an issue with X\")")
     change_parser.add_argument("packages", nargs="*", help="Specific package names (comma or space separated). If empty, applies to all.")
     
+    deps_parser = subparsers.add_parser('deps', help='Fetch latest versions from pub.dev and update all managed pubspecs.')
+    deps_parser.add_argument("packages", nargs="*", help="Specific external package names to update (default: all known external deps).")
+
     publish_parser = subparsers.add_parser('publish', help='Prepares all packages for release and attempts to publish them.')
     
     args = parser.parse_args()
@@ -550,6 +638,8 @@ if __name__ == "__main__":
         main_version_update(args.version, args.release, args.message)
     elif args.command == 'change':
         main_change(args.packages, args.message)
+    elif args.command == 'deps':
+        main_deps(args.packages if args.packages else None)
     elif args.command == 'publish':
         main_publish()
     else:

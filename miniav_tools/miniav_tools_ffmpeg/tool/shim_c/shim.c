@@ -19,8 +19,10 @@
 #include <libavutil/channel_layout.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/log.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/samplefmt.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -860,7 +862,71 @@ MIO_API unsigned miniav_shim_avcodec_version(void) {
  *     codec_get_frame_size, codec_pick_sample_fmt,
  *     codec_supports_sample_fmt, audio_frame_setup,
  *     audio_frame_set_pts). Encapsulate AVChannelLayout writes that
- *     have no AVOption accessor in FFmpeg 7/8. */
+ *     have no AVOption accessor in FFmpeg 7/8.
+ * v8: FFmpeg log forwarding helpers (set_ffmpeg_log_level,
+ *     set_ffmpeg_log_callback). Allow Dart to control av_log level and
+ *     route FFmpeg log output to a Dart-side callback.
+ * v9: free_log_message. Log callback now passes a heap-allocated copy so
+ *     the NativeCallable.listener async dispatch is safe. Dart must call
+ *     miniav_shim_free_log_message() after consuming each message. */
 MIO_API unsigned miniav_shim_abi_version(void) {
-    return 7u;
+    return 9u;
+}
+
+/* --- FFmpeg log forwarding ------------------------------------------------
+ *
+ * FFmpeg's av_log_set_callback takes a va_list which is not bindable
+ * directly from Dart FFI. This shim bridges the gap: Dart installs a
+ * simple  (int level, const char* message)  callback here, and we set up
+ * our own av_log callback that formats the message with vsnprintf and
+ * forwards it.
+ *
+ * Thread safety: the global function pointer is written under the lock
+ * that av_log_set_callback provides on its own end. We do not provide
+ * additional synchronisation — reads happen only inside the av_log
+ * callback which is serialised by FFmpeg's internal mutex.
+ */
+
+typedef void (*MiniavDartFfmpegLogCb)(int level, const char* message);
+static MiniavDartFfmpegLogCb _dart_ffmpeg_log_cb = NULL;
+
+static void _ffmpeg_dart_log_bridge(void* avcl, int level, const char* fmt, va_list vl) {
+    (void)avcl;
+    MiniavDartFfmpegLogCb cb = _dart_ffmpeg_log_cb;
+    if (!cb) return;
+    if (level > av_log_get_level()) return; /* respect the current level */
+    char buf[2048];
+    vsnprintf(buf, sizeof(buf), fmt, vl);
+    /* NativeCallable.listener dispatches asynchronously on the Dart event
+     * loop.  By the time Dart runs, this stack frame has returned and buf[]
+     * is gone.  Heap-copy so the pointer stays valid; Dart must call
+     * miniav_shim_free_log_message() after reading. */
+    size_t len = strlen(buf);
+    char* heap = (char*)malloc(len + 1);
+    if (!heap) return;
+    memcpy(heap, buf, len + 1);
+    cb(level, heap);
+}
+
+/* Set (or clear) the Dart log callback. Pass NULL to restore FFmpeg's
+ * default logger. */
+MIO_API void miniav_shim_set_ffmpeg_log_callback(MiniavDartFfmpegLogCb cb) {
+    _dart_ffmpeg_log_cb = cb;
+    if (cb) {
+        av_log_set_callback(_ffmpeg_dart_log_bridge);
+    } else {
+        av_log_set_callback(av_log_default_callback);
+    }
+}
+
+/* Free a heap-allocated log message returned via the log callback.
+ * Dart MUST call this after consuming each message. */
+MIO_API void miniav_shim_free_log_message(const char* msg) {
+    free((void*)msg);
+}
+
+/* Set the FFmpeg log level (AV_LOG_* constants: QUIET=-8, ERROR=16,
+ * WARNING=24, INFO=32, VERBOSE=40, DEBUG=48). */
+MIO_API void miniav_shim_set_ffmpeg_log_level(int level) {
+    av_log_set_level(level);
 }

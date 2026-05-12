@@ -11,8 +11,14 @@
 @DefaultAsset('package:miniav_tools_ffmpeg/ffmpeg_shim.dart')
 library;
 
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:ffi/ffi.dart';
+
+import 'ffmpeg_bindings.dart' as bindings;
 
 // =============================================================================
 // External shim entry points (resolved via the native asset registered by
@@ -270,6 +276,28 @@ external int _avcodecVersion();
 @Native<Uint32 Function()>(symbol: 'miniav_shim_abi_version')
 external int _abiVersion();
 
+// ---- FFmpeg log forwarding (v8+) ----------------------------------------
+//
+// Dart cannot bind av_log_set_callback directly (va_list is not expressible
+// in dart:ffi). The shim wraps it: we pass a simple (int level, char* msg)
+// callback and the shim formats + forwards each av_log call.
+
+/// Native function type for the Dart-side FFmpeg log callback.
+typedef _FfmpegLogCbNative = Void Function(Int32 level, Pointer<Char> message);
+
+@Native<Void Function(Pointer<NativeFunction<_FfmpegLogCbNative>>)>(
+  symbol: 'miniav_shim_set_ffmpeg_log_callback',
+)
+external void _setFfmpegLogCallback(
+  Pointer<NativeFunction<_FfmpegLogCbNative>> cb,
+);
+
+@Native<Void Function(Int32)>(symbol: 'miniav_shim_set_ffmpeg_log_level')
+external void _setFfmpegLogLevel(int level);
+
+@Native<Void Function(Pointer<Char>)>(symbol: 'miniav_shim_free_log_message')
+external void _freeLogMessage(Pointer<Char> msg);
+
 // =============================================================================
 // Public façade
 // =============================================================================
@@ -280,16 +308,27 @@ class FfmpegShim {
   FfmpegShim._();
 
   /// Currently expected shim ABI. Bump in lock-step with `shim.c`.
-  static const int kExpectedAbiVersion = 7;
+  static const int kExpectedAbiVersion = 9;
 
   static FfmpegShim? _instance;
   static bool _attemptedLoad = false;
 
   /// Returns the shim if the native asset is loadable and ABI-compatible,
   /// otherwise `null`. Cached after the first call.
+  ///
+  /// NOTE: the shim DLL imports avcodec/avutil. On Windows those imports are
+  /// resolved at load time (not lazily). If FFmpeg has not yet been loaded
+  /// via `ensureFFmpegLoaded()` / `tryLoadFFmpeg()`, the shim load will fail
+  /// because the OS DLL search path doesn't include the auto-downloader's
+  /// cache directory. We detect that case via [bindings.tryLoadFFmpeg] and
+  /// return `null` WITHOUT caching the failure, so a later call (after
+  /// FFmpeg has been loaded) can succeed.
   static FfmpegShim? tryLoad() {
     if (_instance != null) return _instance;
     if (_attemptedLoad) return null;
+    // Don't poison the cache if FFmpeg isn't loaded yet — the shim's
+    // imports won't resolve and we'd permanently disable Stage B.
+    if (!bindings.tryLoadFFmpeg()) return null;
     _attemptedLoad = true;
     try {
       final abi = _abiVersion();
@@ -579,4 +618,61 @@ class FfmpegShim {
   /// Set just `AVFrame::pts`.
   void audioFrameSetPts(Pointer<Void> frame, int pts) =>
       _audioFrameSetPts(frame, pts);
+
+  // ---- FFmpeg log forwarding (v8+) ----------------------------------------
+
+  /// Active log NativeCallable — kept alive while a callback is registered.
+  NativeCallable<_FfmpegLogCbNative>? _ffmpegLogCallable;
+
+  /// Set the FFmpeg log level using av_log_set_level.
+  ///
+  /// Standard AV_LOG_* constants: `quiet=-8`, `error=16`, `warning=24`,
+  /// `info=32`, `verbose=40`, `debug=48`.
+  void setFfmpegLogLevel(int avLevel) => _setFfmpegLogLevel(avLevel);
+
+  /// Install (or replace) a callback that receives formatted FFmpeg log
+  /// lines. [callback] receives the AV_LOG_* level integer and the already-
+  /// Decode a null-terminated C string from native memory using
+  /// [Utf8Decoder.allowMalformed] so that FFmpeg log messages that contain
+  /// non-UTF-8 bytes (e.g. Latin-1 filenames on Windows) never throw.
+  static String _decodeCString(Pointer<Char> ptr) {
+    if (ptr.address == 0) return '';
+    final bytes = ptr.cast<Uint8>();
+    var len = 0;
+    while (bytes[len] != 0) len++;
+    final data = Uint8List.view(bytes.asTypedList(len).buffer, 0, len);
+    return const Utf8Decoder(allowMalformed: true).convert(data);
+  }
+
+  /// formatted message string. Pass `null` to restore FFmpeg's default logger
+  /// (which writes to native stderr — not visible in most Flutter apps).
+  ///
+  /// The callback is dispatched on the Dart event loop via a `listener`
+  /// NativeCallable, so it is safe to perform Dart I/O (e.g. `stderr.writeln`).
+  void setFfmpegLogCallback(
+    void Function(int level, String message)? callback,
+  ) {
+    final old = _ffmpegLogCallable;
+    _ffmpegLogCallable = null;
+
+    if (callback == null) {
+      _setFfmpegLogCallback(Pointer.fromAddress(0));
+      old?.close();
+      return;
+    }
+
+    final nc = NativeCallable<_FfmpegLogCbNative>.listener((
+      int level,
+      Pointer<Char> msg,
+    ) {
+      final str = _decodeCString(msg).trimRight();
+      // C++ heap-allocated this copy so the pointer stays valid across the
+      // async NativeCallable.listener dispatch.  Free it after consuming.
+      _freeLogMessage(msg);
+      callback(level, str);
+    });
+    _setFfmpegLogCallback(nc.nativeFunction);
+    _ffmpegLogCallable = nc;
+    old?.close();
+  }
 }

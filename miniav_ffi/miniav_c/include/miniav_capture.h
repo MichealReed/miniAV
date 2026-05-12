@@ -242,6 +242,21 @@ MiniAV_Input_StopCapture(MiniAVInputContextHandle context);
 MINIAV_API MiniAVResultCode MiniAV_Input_SetGamepadChangeCallback(
     MiniAVDeviceChangeCallback callback, void *user_data);
 
+// --- Global Lifecycle ---
+//
+// MiniAV_Dispose() atomically disables all callback dispatch and waits for
+// any in-flight callback invocations to complete before returning.  Call this
+// before tearing down Dart NativeCallable handles — for example, from
+// Flutter's reassemble() — to prevent "Callback invoked after it has been
+// deleted" fatal crashes during hot restart.
+//
+// MiniAV_EnableCallbacks() re-enables callback dispatch.  It is called
+// automatically by every MiniAV_*_StartCapture() function so that a new
+// recording session works correctly after a previous MiniAV_Dispose() call.
+// Explicit calls are rarely needed.
+MINIAV_API MiniAVResultCode MiniAV_Dispose(void);
+MINIAV_API MiniAVResultCode MiniAV_EnableCallbacks(void);
+
 // --- Property APIs (TBD) ---
 // MiniAV_Camera_GetPropertyInfo(...)
 // MiniAV_Camera_GetProperty(...)

@@ -43,6 +43,16 @@ abstract class MiniAVPlatformInterface {
 
   String getVersionString();
   void setLogLevel(int level);
+
+  /// Install a callback that receives native log messages from the MiniAV C
+  /// library. [callback] receives a raw level integer (matching the
+  /// [MiniAVLogLevel] index mapping used by [setLogLevel]) and the message
+  /// string. Pass `null` to remove the current callback.
+  ///
+  /// The default implementation is a no-op (platforms that do not support
+  /// native log callbacks — e.g. web — simply ignore this call).
+  void setLogCallback(void Function(int level, String message)? callback) {}
+
   void dispose();
   Future<void> releaseBuffer(MiniAVBuffer buffer);
 }

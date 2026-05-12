@@ -56,6 +56,13 @@ enum Container {
 
   /// WAV — uncompressed audio container.
   wav,
+
+  /// MPEG-4 Audio — `.m4a`. AAC (or ALAC) in an MPEG-4 container without
+  /// a video track. Ideal for audio-only AAC recordings.
+  m4a,
+
+  /// MPEG Audio Layer III — `.mp3`. Audio-only MP3 container.
+  mp3,
 }
 
 /// Hardware acceleration preference.

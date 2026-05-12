@@ -1728,9 +1728,11 @@ static void wgc_on_frame_arrived(
         buffer; // Store heap-allocated buffer
     buffer->internal_handle = internal_payload;
 
-    // Callback is already checked and wgc_ctx is valid under critical section
-    wgc_ctx->app_callback_internal(buffer,
-                                   wgc_ctx->app_callback_user_data_internal);
+    // Callback is already checked and wgc_ctx is valid under critical section.
+    // MINIAV_SAFE_DISPATCH acquires a shared read lock so MiniAV_Dispose() can
+    // atomically quiesce in-flight callbacks before NativeCallables are closed.
+    MINIAV_SAFE_DISPATCH(wgc_ctx->app_callback_internal(
+        buffer, wgc_ctx->app_callback_user_data_internal));
     // App now owns buffer.internal_handle and its payload, and
     // gpu_shared_handle_for_app if provided. App must call
     // MiniAV_ReleaseBuffer.

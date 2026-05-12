@@ -9,6 +9,7 @@ import 'codec_types.dart';
 import 'config.dart';
 import 'frame_source.dart';
 import 'platform_codec.dart';
+import 'warmup.dart';
 
 abstract class MiniAVToolsBackend {
   /// Human-readable backend name, e.g. `"ffmpeg"`, `"webcodecs"`, `"minigpu"`.
@@ -58,4 +59,22 @@ abstract class MiniAVToolsBackend {
     AudioEncoderConfig config, {
     BackendContext? context,
   }) async => null;
+
+  // --- Warmup ---------------------------------------------------------------
+
+  /// Perform any slow early initialisation required by this backend.
+  ///
+  /// Common uses:
+  /// - Downloading FFmpeg shared libraries on first run.
+  /// - Fetching a remote ML model.
+  /// - Warming up a JIT or shader cache.
+  ///
+  /// Emit [WarmupProgress] events as work proceeds. The stream **must**
+  /// complete (fire `onDone`) when all work is done or has failed.
+  /// Failures should be emitted as [WarmupProgress] events with a non-null
+  /// [WarmupProgress.error] — the stream itself must not error.
+  ///
+  /// The default implementation returns an empty stream (no warmup needed).
+  /// Backends that need no early initialisation do not need to override this.
+  Stream<WarmupProgress> warmup() => const Stream.empty();
 }

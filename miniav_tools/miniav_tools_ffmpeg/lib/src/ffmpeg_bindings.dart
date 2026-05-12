@@ -121,13 +121,16 @@ List<String> _candidateDirs() {
 }
 
 /// Look for a previously-downloaded cache directory without doing any
-/// network I/O. Returns the lib directory if `.ready` marker is present.
+/// network I/O. Returns the lib directory if a usable install is found.
+///
+/// We do NOT require the `.ready` marker — it can legitimately be missing
+/// if a previous run crashed mid-marker-write or a concurrent process is
+/// in the middle of extracting. The presence of plausible avcodec /
+/// avformat / avutil shared libraries is itself enough evidence.
 String? _existingCacheLibDir() {
   try {
     final root = FfmpegDownloader.defaultCacheRoot();
     final installRoot = '$root${Platform.pathSeparator}$kFfmpegReleaseTag';
-    final ready = File('$installRoot${Platform.pathSeparator}.ready');
-    if (!ready.existsSync()) return null;
     final dir = Directory(installRoot);
     if (!dir.existsSync()) return null;
     for (final entry in dir.listSync()) {
@@ -139,6 +142,13 @@ String? _existingCacheLibDir() {
         if (candidate.existsSync() && _hasAvSync(candidate)) {
           return candidate.path;
         }
+      }
+    }
+    // Some archives extract directly without a wrapper folder.
+    for (final sub in const ['bin', 'lib']) {
+      final candidate = Directory('$installRoot${Platform.pathSeparator}$sub');
+      if (candidate.existsSync() && _hasAvSync(candidate)) {
+        return candidate.path;
       }
     }
   } catch (_) {}

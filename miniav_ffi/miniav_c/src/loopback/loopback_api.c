@@ -466,6 +466,9 @@ MiniAV_Loopback_StartCapture(MiniAVLoopbackContextHandle context_handle,
     return MINIAV_ERROR_ALREADY_RUNNING;
   }
 
+  // Re-enable callback dispatch in case MiniAV_Dispose() was called previously.
+  miniav_dispatch_set_enabled(1);
+
   ctx->app_callback = callback;
   ctx->app_callback_user_data = user_data;
 

@@ -295,8 +295,9 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
 
         buffer.data.audio.info = ctx->configured_video_format;
         buffer.data.audio.info.num_frames = num_frames_available;
+        buffer.data.audio.frame_count = num_frames_available;
 
-        ctx->app_callback(&buffer, ctx->app_callback_user_data);
+        MINIAV_SAFE_DISPATCH(ctx->app_callback(&buffer, ctx->app_callback_user_data));
       }
 
       hr = platform_ctx->capture_client->lpVtbl->ReleaseBuffer(

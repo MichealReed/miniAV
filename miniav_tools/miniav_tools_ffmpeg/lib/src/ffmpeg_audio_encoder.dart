@@ -38,6 +38,11 @@ abstract final class _AvSampleFmt {
 
 bool _isPlanar(int fmt) => fmt >= _AvSampleFmt.u8p && fmt <= _AvSampleFmt.fltp;
 
+/// `AV_NOPTS_VALUE` from libavutil/avutil.h — INT64_MIN. FFmpeg sets this on
+/// output packet pts/dts fields when no timestamp is available (common for
+/// audio DTS on codecs that have no B-frames).
+const int _avNoPtsValue = -9223372036854775808;
+
 int _bytesPerSample(int fmt) {
   switch (fmt) {
     case _AvSampleFmt.u8:
@@ -528,9 +533,16 @@ class FfmpegAudioEncoder implements PlatformAudioEncoder, FfmpegEncoderBridge {
     // The encoder time_base is 1/sample_rate (FFmpeg sets this for
     // audio encoders automatically). Convert pts (in samples) → us and
     // shift by the wall-clock epoch we captured on the first encode().
+    //
+    // FFmpeg leaves p.dts = AV_NOPTS_VALUE (INT64_MIN) for audio codecs
+    // that have no B-frames (AAC, Opus, …). Passing INT64_MIN through
+    // _samplesToUs() overflows Dart 64-bit arithmetic and produces garbage
+    // that causes av_interleaved_write_frame to silently drop the packet.
+    // Fall back to pts for those cases.
     final epoch = _epochUs ?? 0;
+    final rawDts = (p.dts == _avNoPtsValue) ? p.pts : p.dts;
     final ptsUs = epoch + _samplesToUs(p.pts);
-    final dtsUs = epoch + _samplesToUs(p.dts);
+    final dtsUs = epoch + _samplesToUs(rawDts);
     final durationUs = _samplesToUs(p.duration);
 
     final pktOut = EncodedPacket(

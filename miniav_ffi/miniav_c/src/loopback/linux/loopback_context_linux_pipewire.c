@@ -936,7 +936,7 @@ static void on_stream_process(void *data) {
       buffer->data.audio.info = pw_ctx->configured_video_format;
       buffer->data.audio.data = spa_d->data + spa_d->chunk->offset;
 
-      pw_ctx->app_callback(buffer, pw_ctx->app_user_data);
+      MINIAV_SAFE_DISPATCH(pw_ctx->app_callback(buffer, pw_ctx->app_user_data));
     }
 
     // Return the PipeWire buffer immediately after callback

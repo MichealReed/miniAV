@@ -98,6 +98,27 @@ MiniAVResultCode MiniAV_FreeFormatList(
   int count,
 ) => MiniAVResultCode.fromValue(_MiniAV_FreeFormatList(formats, count));
 
+// --- Global lifecycle ---
+
+@ffi.Native<ffi.Int Function()>(symbol: 'MiniAV_Dispose')
+external int _MiniAV_Dispose();
+
+/// Atomically disables all callback dispatch and waits for any in-flight
+/// callback invocations to complete.  Call this before tearing down Dart
+/// [NativeCallable] handles (e.g. from Flutter's [reassemble]) to prevent
+/// "Callback invoked after it has been deleted" fatal crashes on hot restart.
+MiniAVResultCode MiniAV_Dispose() =>
+    MiniAVResultCode.fromValue(_MiniAV_Dispose());
+
+@ffi.Native<ffi.Int Function()>(symbol: 'MiniAV_EnableCallbacks')
+external int _MiniAV_EnableCallbacks();
+
+/// Re-enables callback dispatch after a [MiniAV_Dispose] call.  Called
+/// automatically by every `MiniAV_*_StartCapture` C function — explicit Dart
+/// calls are rarely needed.
+MiniAVResultCode MiniAV_EnableCallbacks() =>
+    MiniAVResultCode.fromValue(_MiniAV_EnableCallbacks());
+
 @ffi.Native<
   ffi.Int Function(
     ffi.Pointer<ffi.Pointer<MiniAVDeviceInfo>>,

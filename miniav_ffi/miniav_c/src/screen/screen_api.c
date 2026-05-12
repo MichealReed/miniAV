@@ -443,6 +443,10 @@ MiniAVResultCode MiniAV_Screen_StartCapture(MiniAVScreenContext *ctx,
     return MINIAV_ERROR_ALREADY_RUNNING;
   }
 
+  // Re-enable callback dispatch in case MiniAV_Dispose() was called previously
+  // (e.g. during Flutter hot restart).
+  miniav_dispatch_set_enabled(1);
+
   ctx->app_callback = callback;
   ctx->app_callback_user_data = user_data;
 

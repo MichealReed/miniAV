@@ -9,9 +9,9 @@ environment:
 
 dependencies:
   # miniav screen capture
-  miniav: ^0.5.1
-  miniav_ffi: ^0.5.1
-  miniav_platform_interface: ^0.5.1
+  miniav: ^0.5.6
+  miniav_ffi: ^0.5.6
+  miniav_platform_interface: ^0.5.6
 
   # codec + muxer facade + FFmpeg backend
   miniav_tools: ^0.1.0
@@ -20,7 +20,7 @@ dependencies:
 
   # GPU colour-space conversion + D3D11 texture import
   miniav_tools_minigpu: ^0.1.0
-  minigpu: ^1.2.4
+  minigpu: ^1.4.7
 
   ffi: ^2.1.4
 

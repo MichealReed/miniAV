@@ -13,6 +13,7 @@ export 'src/frame_source.dart';
 export 'src/packet.dart';
 export 'src/platform.dart';
 export 'src/platform_codec.dart';
+export 'src/warmup.dart';
 
 // Re-export commonly used miniav types so users don't need a second import.
 export 'package:miniav_platform_interface/miniav_platform_types.dart'

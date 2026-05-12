@@ -166,3 +166,16 @@ MiniAVResultCode MiniAV_FreeFormatList(void *formats, uint32_t count) {
   }
   return MINIAV_SUCCESS;
 }
+
+// ---- Global lifecycle ----------------------------------------------------------
+MiniAVResultCode MiniAV_Dispose(void) {
+  // Acquire exclusive write lock: blocks until all in-flight callback
+  // invocations finish, then disables future dispatches.
+  miniav_dispatch_set_enabled(0);
+  return MINIAV_SUCCESS;
+}
+
+MiniAVResultCode MiniAV_EnableCallbacks(void) {
+  miniav_dispatch_set_enabled(1);
+  return MINIAV_SUCCESS;
+}

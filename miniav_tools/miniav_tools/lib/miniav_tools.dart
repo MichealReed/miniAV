@@ -5,6 +5,8 @@
 /// highest-priority backend that supports the request.
 library;
 
+import 'dart:async';
+
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
 import 'src/encoder.dart';
@@ -173,5 +175,91 @@ class MiniAVTools {
     throw NoBackendForCodecException.container(
       config.container ?? Container.mp4,
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // Warmup
+  // -------------------------------------------------------------------------
+
+  /// Run all registered backends' warmup tasks in parallel and merge their
+  /// progress events into a single stream.
+  ///
+  /// Call this **once at application start** before the first
+  /// encoder/muxer creation. On a cold start — for example, when FFmpeg
+  /// shared libraries need to be downloaded — this lets you show a progress
+  /// indicator instead of blocking silently inside `createEncoder`.
+  ///
+  /// The returned stream completes (`onDone`) when every backend finishes
+  /// its warmup (or skips it). Each event carries [WarmupProgress.backendName]
+  /// so you can attribute progress to a specific backend.
+  ///
+  /// The stream never errors: backend failures are delivered as
+  /// [WarmupProgress] events with [WarmupProgress.error] set.
+  ///
+  /// ### Flutter example
+  ///
+  /// ```dart
+  /// @override
+  /// void initState() {
+  ///   super.initState();
+  ///   MiniAVTools.warmup().listen(
+  ///     (p) => setState(() => _warmupProgress = p),
+  ///     onDone: () => setState(() => _ready = true),
+  ///   );
+  /// }
+  /// ```
+  ///
+  /// ### Command-line / background example
+  ///
+  /// ```dart
+  /// await MiniAVTools.warmup().last; // block until all warmup is done
+  /// ```
+  ///
+  /// If no backends are registered the stream completes immediately.
+  static Stream<WarmupProgress> warmup() {
+    final backends = MiniAVToolsPlatform.instance.backends;
+    if (backends.isEmpty) return const Stream.empty();
+    if (backends.length == 1) return _guardedWarmup(backends.first);
+
+    // Fan out to all backends in parallel and merge into one stream.
+    final ctrl = StreamController<WarmupProgress>();
+    var remaining = backends.length;
+
+    for (final backend in backends) {
+      _guardedWarmup(backend).listen(
+        ctrl.add,
+        onDone: () {
+          if (--remaining == 0) ctrl.close();
+        },
+        // _guardedWarmup never errors — errors are already converted to events.
+        cancelOnError: false,
+      );
+    }
+
+    return ctrl.stream;
+  }
+
+  /// Wraps a single backend's [warmup] stream so that stream errors are
+  /// converted to [WarmupProgress] events and the stream always completes.
+  static Stream<WarmupProgress> _guardedWarmup(MiniAVToolsBackend backend) {
+    final ctrl = StreamController<WarmupProgress>();
+
+    backend.warmup().listen(
+      ctrl.add,
+      onError: (Object e, StackTrace _) {
+        ctrl.add(
+          WarmupProgress(
+            backendName: backend.name,
+            task: 'warmup',
+            isDone: true,
+            error: e,
+          ),
+        );
+      },
+      onDone: ctrl.close,
+      cancelOnError: false,
+    );
+
+    return ctrl.stream;
   }
 }

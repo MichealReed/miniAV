@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:miniav_platform_interface/miniav_platform_interface.dart';
 import './src/miniav_audio_input.dart';
 import './src/miniav_camera.dart';
@@ -38,6 +40,40 @@ class MiniAV {
   /// Set the log level for the MiniAV library
   static void setLogLevel(MiniAVLogLevel level) =>
       _platform.setLogLevel(level.index);
+
+  /// Install a callback that receives log messages from the MiniAV C library.
+  ///
+  /// [callback] is invoked on the Dart event loop (not the native thread) with
+  /// a [MiniAVLogLevel] and the trimmed message string. Pass `null` to remove
+  /// the current callback and stop forwarding.
+  ///
+  /// Calling [setLogLevel] does NOT automatically install this callback — you
+  /// must call [setLogCallback] or [installStderrLogger] separately.
+  static void setLogCallback(
+    void Function(MiniAVLogLevel level, String message)? callback,
+  ) {
+    _platform.setLogCallback(
+      callback == null
+          ? null
+          : (int levelInt, String msg) {
+              final idx = levelInt.clamp(0, MiniAVLogLevel.values.length - 1);
+              callback(MiniAVLogLevel.values[idx], msg);
+            },
+    );
+  }
+
+  /// Install a stderr forwarder so that all MiniAV C-library log messages
+  /// (at the currently configured log level) are written to Dart's `stderr`.
+  ///
+  /// Output format: `[miniav] <level>: <message>`
+  ///
+  /// Replaces any callback previously installed via [setLogCallback].
+  static void installStderrLogger() {
+    setLogCallback(
+      (level, msg) =>
+          stderr.writeln('[miniav] ${level.name}: ${msg.trimRight()}'),
+    );
+  }
 
   /// Dispose of all MiniAV resources
   static void dispose() => _platform.dispose();

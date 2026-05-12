@@ -494,6 +494,11 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
               'AVHWDeviceContext (corrupt or wrong-platform shim build)',
         );
       }
+      stderr.writeln(
+        '[ffmpeg-d3d11] openWith: d3dDevice=0x${d3dDevice.address.toRadixString(16)} '
+        '${existingD3d11Device != 0 ? "[injected — same device as Dawn GPU]" : "[FFmpeg-created — display adapter (adapter 0)]"}'
+        '\n  Compare with [minigpu_external] ID3D11Device and [shim] luid= logs.',
+      );
 
       // Resolve AV_PIX_FMT_D3D11 dynamically (enum values shift between
       // libavutil majors). Fall back to the documented value if name lookup

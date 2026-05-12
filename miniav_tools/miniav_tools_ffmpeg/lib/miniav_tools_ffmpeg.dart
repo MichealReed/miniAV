@@ -28,6 +28,7 @@ export 'src/ffmpeg_encoder.dart' show FfmpegSoftwareEncoder;
 export 'src/ffmpeg_muxer.dart' show FfmpegMuxer, FfmpegEncoderBridge;
 export 'src/ffmpeg_nvenc_encoder.dart'
     show FfmpegNvencEncoder, ffmpegNvencAvailable;
+export 'src/ffmpeg_shim.dart' show FfmpegShim;
 export 'src/ffmpeg_hw_encoder.dart'
     show
         FfmpegHwEncoder,

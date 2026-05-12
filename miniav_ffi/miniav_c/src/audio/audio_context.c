@@ -439,7 +439,7 @@ static void ma_data_callback(ma_device *pDevice, void *pOutput,
       frameCount * ma_get_bytes_per_frame(pDevice->capture.format,
                                           pDevice->capture.channels);
 
-  ctx->callback(&buffer, ctx->callback_user_data);
+  MINIAV_SAFE_DISPATCH(ctx->callback(&buffer, ctx->callback_user_data));
 }
 
 // Miniaudio notification callback. Used to detect device loss (mic unplugged,
@@ -481,6 +481,9 @@ MiniAVResultCode MiniAV_Audio_StartCapture(MiniAVAudioContextHandle context,
   }
   if (ctx->is_running)
     return MINIAV_ERROR_ALREADY_RUNNING;
+
+  // Re-enable callback dispatch in case MiniAV_Dispose() was called previously.
+  miniav_dispatch_set_enabled(1);
 
   ctx->callback = callback;
   ctx->callback_user_data = user_data;

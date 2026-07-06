@@ -422,6 +422,13 @@ class FfmpegNvencEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   }
 
   @override
+  bool get supportsGpuBufferInput => false;
+
+  // NVENC (CPU-fed) wants packed RGB/BGR0, not YUV420P planes.
+  @override
+  bool get acceptsYuv420pPlanes => false;
+
+  @override
   Future<void> close() async {
     if (_closed) return;
     _closed = true;

@@ -57,6 +57,12 @@ class MiniAVWebPlatform extends MiniAVPlatformInterface {
     // Web does not require explicit buffer release
     // This can be a no-op or implement custom logic if needed
   }
+
+  @override
+  void releaseBufferSync(MiniAVBuffer buffer) {
+    // Web does not require explicit buffer release — no-op (overrides the
+    // default delegation so the hot path allocates no Future on web either).
+  }
 }
 
 /// Registers the web implementation of MiniAV

@@ -118,7 +118,19 @@ MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
       res = MINIAV_ERROR_INVALID_HANDLE;
     }
   } else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_AUDIO) {
+    // Free the heap-copied PCM data (native_singular_resource_ptr) and the
+    // heap-allocated MiniAVBuffer (parent_miniav_buffer_ptr) that were
+    // created in the capture thread before dispatching to the Dart event queue.
+    if (payload->native_singular_resource_ptr) {
+      miniav_free(payload->native_singular_resource_ptr);
+      payload->native_singular_resource_ptr = NULL;
+    }
+    MiniAVBuffer *parent_buf =
+        (MiniAVBuffer *)payload->parent_miniav_buffer_ptr;
     miniav_free(payload);
+    if (parent_buf) {
+      miniav_free(parent_buf);
+    }
     res = MINIAV_SUCCESS;
   }
    else {

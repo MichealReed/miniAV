@@ -9,8 +9,10 @@ import 'recorder.dart';
 import 'recorder_sink.dart';
 import 'recorder_source.dart';
 
+export 'audio_effect.dart';
 export 'screen_effect.dart';
 export 'screen_scale_policy.dart';
+export 'recorder_source.dart' show VideoIdleFramePolicy;
 
 class RecorderBuilder {
   final List<RecorderSource> _sources = [];
@@ -66,6 +68,8 @@ class RecorderBuilder {
     List<ScreenEffect> effects = const [],
     double? quality,
     Map<String, String> encoderOptions = const {},
+    VideoIdleFramePolicy idleFramePolicy = VideoIdleFramePolicy.duplicate,
+    bool adaptiveGpuThrottle = true,
   }) {
     _sources.add(
       ScreenRecorderSource(
@@ -81,6 +85,8 @@ class RecorderBuilder {
         effects: effects,
         quality: quality,
         encoderOptions: encoderOptions,
+        idleFramePolicy: idleFramePolicy,
+        adaptiveGpuThrottle: adaptiveGpuThrottle,
       ),
     );
   }
@@ -96,6 +102,7 @@ class RecorderBuilder {
     HwAccelPreference hwAccel = HwAccelPreference.preferred,
     double? quality,
     Map<String, String> encoderOptions = const {},
+    VideoIdleFramePolicy idleFramePolicy = VideoIdleFramePolicy.none,
   }) {
     _sources.add(
       CameraRecorderSource(
@@ -108,6 +115,7 @@ class RecorderBuilder {
         hwAccel: hwAccel,
         quality: quality,
         encoderOptions: encoderOptions,
+        idleFramePolicy: idleFramePolicy,
       ),
     );
   }
@@ -161,6 +169,20 @@ class RecorderBuilder {
   /// Use [micGainDb] / [loopbackGainDb] (in dB) to attenuate either source
   /// before the sum — pass `-3` to each if you hear clipping when both are
   /// loud at the same time.
+  ///
+  /// [micEffects] / [loopbackEffects] are [AudioEffect] chains applied to
+  /// each source (after its gain) before the sum; [masterEffects] runs on
+  /// the summed mix just before encoding. Typical setup for "mic much
+  /// louder than the game" plus keyboard noise:
+  ///
+  /// ```dart
+  /// builder.addMixedAudio(
+  ///   micDeviceId: mic, loopbackDeviceId: loop,
+  ///   micEffects: AudioEffect.voiceChain(),          // HPF + gate + AGC
+  ///   loopbackEffects: [AudioEffect.autoLevel()],    // match loudness
+  ///   masterEffects: [AudioEffect.limiter()],        // transparent ceiling
+  /// );
+  /// ```
   void addMixedAudio({
     required String micDeviceId,
     required String loopbackDeviceId,
@@ -168,6 +190,9 @@ class RecorderBuilder {
     int? bitrateBps,
     double micGainDb = 0.0,
     double loopbackGainDb = 0.0,
+    List<AudioEffect> micEffects = const [],
+    List<AudioEffect> loopbackEffects = const [],
+    List<AudioEffect> masterEffects = const [],
   }) {
     _sources.add(
       MixedAudioRecorderSource(
@@ -177,6 +202,9 @@ class RecorderBuilder {
         bitrateBps: bitrateBps,
         micGainDb: micGainDb,
         loopbackGainDb: loopbackGainDb,
+        micEffects: micEffects,
+        loopbackEffects: loopbackEffects,
+        masterEffects: masterEffects,
       ),
     );
   }
@@ -224,8 +252,16 @@ class RecorderBuilder {
   /// ```
   ///
   /// [maxPackets] is an optional hard cap on buffered packet count.
-  ClipBuffer addClipBuffer({required Duration maxWindow, int? maxPackets}) {
-    final buf = ClipBuffer(maxWindow: maxWindow, maxPackets: maxPackets);
+  ClipBuffer addClipBuffer({
+    required Duration maxWindow,
+    int? maxPackets,
+    PlatformMuxer Function(MuxerConfig)? muxerFactory,
+  }) {
+    final buf = ClipBuffer(
+      maxWindow: maxWindow,
+      maxPackets: maxPackets,
+      muxerFactory: muxerFactory,
+    );
     _sinks.add(StreamRecorderSink(onChunk: buf.onChunk));
     return buf;
   }

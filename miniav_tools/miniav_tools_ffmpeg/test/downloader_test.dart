@@ -20,10 +20,23 @@ void main() {
         expect(uri!.host, equals('github.com'));
         expect(uri.path, contains('BtbN/FFmpeg-Builds'));
         expect(uri.path, contains(kFfmpegReleaseTag));
+        // Must be the LGPL build, never the GPL one, to keep downstream
+        // products free of GPL copyleft. (`-lgpl-shared` contains the
+        // substring `gpl`, so match the dash-delimited tokens.)
+        expect(uri.path, contains('-lgpl-shared'));
+        expect(uri.path, isNot(contains('-gpl-shared')));
+        expect(kFfmpegLicense, equals('lgpl'));
       } else {
         // macOS: no official shared build, downloader returns null.
         expect(uri, isNull);
       }
+    });
+
+    test('install dir is namespaced by release tag and licence', () {
+      expect(kFfmpegInstallDir, equals('$kFfmpegReleaseTag-$kFfmpegLicense'));
+      // A flipped licence must change the cache dir so an existing `gpl`
+      // install is never silently reused for an `lgpl` switch.
+      expect(kFfmpegInstallDir, contains('lgpl'));
     });
 
     test('defaultCacheRoot is platform-appropriate', () {

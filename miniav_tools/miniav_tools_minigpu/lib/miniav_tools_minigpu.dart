@@ -11,6 +11,11 @@ export 'src/minigpu_backend.dart' show MinigpuBackend;
 export 'src/gpu_codec_pipeline.dart'
     show GpuCodecPipeline, GpuCodecEncoder, kFrameInputKey, kEncodedOutputKey;
 export 'src/minigpu_mjpeg_pipeline.dart' show MinigpuMjpegPipeline;
+export 'src/av1/minigpu_av1_pipeline.dart' show MinigpuAv1Pipeline;
+export 'src/av1/av1_yuv420_stage.dart'
+    show Yuv420Layout, buildRgba8ToYuv420Bt709LimitedStage, kYuv420Key;
+export 'src/av1/av1_yuv420_reference.dart' show rgbaToYuv420Bt709LimitedCpu;
+export 'src/av1/mp4/av1_mp4_muxer.dart' show Av1Mp4Muxer;
 
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 

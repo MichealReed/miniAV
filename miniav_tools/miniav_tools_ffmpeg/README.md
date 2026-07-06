@@ -4,7 +4,10 @@ FFmpeg backend for [`miniav_tools`](../miniav_tools).
 Wraps `libavcodec` / `libavformat` / `libavutil` over FFI and self-registers
 with the `miniav_tools_platform_interface` registry on import.
 
-> Importing `package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart` is enough.
+> Call `registerFfmpegBackend()` once at startup (idempotent) — importing
+> the library alone does **not** register it, because Dart top-level finals
+> are lazy. Apps using `miniav_recorder` get this for free:
+> `Recorder.warmup()` and `Recorder.start()` both register the backend.
 > Once registered, `MiniAVTools.createEncoder(...)` etc. will pick this
 > backend whenever it can satisfy the requested codec/container.
 
@@ -24,15 +27,135 @@ with the `miniav_tools_platform_interface` registry on import.
 ## Auto-download of FFmpeg shared libraries
 
 On first `ensureFFmpegLoaded()` (called implicitly by `createEncoder` etc.)
-the package downloads BtbN's GPL-shared FFmpeg build for the current OS
-into `${HOME}/.miniav_tools_ffmpeg/` and loads the DLLs / .so / .dylib from
-there. Set:
+the package downloads BtbN's **LGPL** shared FFmpeg build for the current OS
+into a per-user cache and loads the DLLs / `.so` from there. macOS has no
+BtbN shared build — install via `brew install ffmpeg`; the loader probes the
+Homebrew lib directories automatically.
+
+### Why LGPL (and what it costs)
+
+We pull the `lgpl` build, not the `gpl` one, so that products dynamically
+linking these libraries are **not** subject to GPL copyleft — the LGPL build
+keeps `libav*` under LGPL-2.1, which is safe for proprietary downstream use.
+The trade-off: the LGPL build omits the GPL-only software encoders
+**libx264 / libx265**, so there is no CPU-side H.264/HEVC fallback. Hardware
+H.264/HEVC (NVENC / QSV / AMF / MediaFoundation / VideoToolbox) and software
+VP8/VP9 (libvpx), AV1 (SVT-AV1), MJPEG and ProRes are all still present. On
+Windows the `h264_mf` / `hevc_mf` MediaFoundation encoders act as the
+universal H.264/HEVC fallback when no vendor SDK is available. The licence
+variant is controlled by `kFfmpegLicense` in `ffmpeg_downloader.dart`; the
+cache is namespaced per-variant so changing it forces a fresh download.
+
+Default cache root (the release tag is appended as a subdirectory):
+
+| OS | Cache root |
+|---|---|
+| Windows | `%LOCALAPPDATA%\miniav_tools\ffmpeg` |
+| Linux | `$XDG_CACHE_HOME/miniav_tools/ffmpeg` (or `~/.cache/miniav_tools/ffmpeg`) |
+| macOS | `~/Library/Caches/miniav_tools/ffmpeg` (auto-download not available — see above) |
+
+Environment variables:
 
 | Variable | Effect |
 |---|---|
-| `MINIAV_TOOLS_FFMPEG_NO_AUTODOWNLOAD=1` | Disable auto-download — caller must set `FFMPEG_LIB_DIR` |
-| `MINIAV_TOOLS_FFMPEG_CACHE=<path>` | Override the cache directory |
-| `FFMPEG_LIB_DIR=<path>` | Use FFmpeg libs from a specific directory |
+| `MINIAV_TOOLS_FFMPEG_NO_AUTODOWNLOAD=1` | Disable auto-download — caller must set `FFMPEG_LIB_DIR` or install FFmpeg system-wide |
+| `MINIAV_TOOLS_FFMPEG_CACHE=<path>` | Override the cache root |
+| `FFMPEG_LIB_DIR=<path>` | Probe FFmpeg libs from a specific directory first |
+
+Concurrent processes are safe: downloaders serialise on an OS-level file
+lock inside the cache and re-probe after acquiring it, so two app instances
+starting at once produce one download.
+
+## Warming up FFmpeg
+
+On a fresh machine the first `createEncoder` / `Recorder.start()` blocks on
+the download + extraction (tens of MB — seconds to minutes depending on the
+connection). Warm up at app startup instead so the first recording starts
+instantly.
+
+**Simplest — load (and download if needed) ahead of time:**
+
+```dart
+import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
+
+// At app startup. Returns true once libav* are loaded. Safe to call
+// repeatedly; a no-op when the cache is already populated.
+final ok = await ensureFFmpegLoaded(
+  onDownloadProgress: (received, total) =>
+      print('ffmpeg: $received / $total'),
+);
+```
+
+**With UI progress — `MiniAVTools.warmup()`:**
+
+Runs every registered backend's warmup tasks (this backend reports a
+`"Downloading FFmpeg"` task) and streams `WarmupProgress` events. The stream
+never errors — failures arrive as events with `error` set — so no `onError`
+handler is needed.
+
+```dart
+import 'package:miniav_tools/miniav_tools.dart';
+import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
+
+registerFfmpegBackend(); // required — warmup only covers registered backends
+
+MiniAVTools.warmup().listen(
+  (p) {
+    if (p.fraction != null) {
+      setState(() => _downloadProgress = p.fraction!); // 0.0 – 1.0
+    }
+  },
+  onDone: () => setState(() => _ready = true),
+);
+
+// Or block until everything is warm:
+await MiniAVTools.warmup().last;
+```
+
+Apps built on `miniav_recorder` should call `Recorder.warmup()` instead —
+same stream, but it registers this backend first and needs no extra import.
+
+**Lower level — direct downloader control:**
+
+```dart
+final result = await FfmpegDownloader.ensureFfmpeg(
+  progress: (received, total) { /* total is -1 when unknown */ },
+  force: true, // re-download even if a cached install exists
+);
+print(result?.libDir); // directory the DLLs were loaded from
+```
+
+On Windows, hardware-encoder SDKs (QSV / MF / NVENC / AMF) also have a
+one-time driver cold-start. The recorder triggers `ffmpegD3d11WarmUp`
+automatically when zero-copy is enabled, so the first session doesn't fall
+back to CPU; direct users of `FfmpegD3d11HwEncoder` can call it themselves
+after `ensureFFmpegLoaded()`.
+
+## Logging
+
+All Dart-side diagnostics (downloader, encoder selection, vendor probing,
+fallbacks) flow through one hook:
+
+```dart
+import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
+
+setFfmpegToolsLogLevel(MiniAVLogLevel.debug); // default: info
+setFfmpegToolsLogCallback((level, msg) => myLogger.log(level, msg));
+```
+
+Without a callback, messages go to `print` — deliberately **not** `dart:io`
+`stderr`/`stdout`: in a console-less Windows GUI app (a packaged Flutter
+desktop build) the OS stdio handles are invalid and `dart:io` stdio writes
+crash with an uncatchable async `FileSystemException` (errno 6). Custom
+callbacks should avoid `stderr` for the same reason.
+
+Native `av_log` messages from the FFmpeg libraries are a separate stream,
+bridged via `FfmpegShim.setFfmpegLogCallback`.
+
+Apps using `miniav_recorder` don't need any of this directly:
+`Recorder.setLogCallback` / `Recorder.setLogLevel` wire both hooks (plus
+MiniAV and minigpu) automatically, tagging messages from this package as
+`RecorderLogSource.ffmpeg`.
 
 ## Stage B — zero-copy D3D11 (Windows)
 

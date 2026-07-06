@@ -3,13 +3,17 @@
 /// This package provides codecs/muxers/demuxers backed by FFmpeg
 /// (libavcodec, libavformat, libavutil, libswscale, libswresample).
 ///
-/// Importing this library auto-registers the backend with
-/// [MiniAVToolsPlatform]. To use it explicitly:
+/// Call [registerFfmpegBackend] once at startup (idempotent) to register
+/// the backend with [MiniAVToolsPlatform] — importing the library alone is
+/// NOT enough (Dart top-level finals are lazy, so an import-side-effect
+/// registration never fires). Apps using `miniav_recorder` don't need to:
+/// `Recorder.warmup()` and `Recorder.start()` both register it.
 ///
 /// ```dart
 /// import 'package:miniav_tools/miniav_tools.dart';
 /// import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
 ///
+/// registerFfmpegBackend();
 /// final enc = await MiniAVTools.createEncoder(
 ///   const EncoderConfig(
 ///     codec: VideoCodec.h264,
@@ -22,9 +26,11 @@ library;
 
 export 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 export 'src/ffmpeg_backend.dart' show FfmpegBackend;
-export 'src/ffmpeg_bindings.dart' show ensureFFmpegLoaded, tryLoadFFmpeg;
+export 'src/ffmpeg_bindings.dart'
+    show ensureFFmpegLoaded, tryLoadFFmpeg, ffmpegLoadedLibDir;
 export 'src/ffmpeg_audio_encoder.dart' show FfmpegAudioEncoder;
 export 'src/ffmpeg_encoder.dart' show FfmpegSoftwareEncoder;
+export 'src/isolate_software_encoder.dart' show IsolateSoftwareEncoder;
 export 'src/ffmpeg_muxer.dart' show FfmpegMuxer, FfmpegEncoderBridge;
 export 'src/ffmpeg_nvenc_encoder.dart'
     show FfmpegNvencEncoder, ffmpegNvencAvailable;
@@ -41,23 +47,31 @@ export 'src/ffmpeg_d3d11_hw_encoder.dart'
         D3d11HwVendor,
         D3d11HwSourceFormat,
         ffmpegD3d11EncoderAvailable,
-        ffmpegD3d11VendorsAvailable;
+        ffmpegD3d11EncoderCompatibleWith,
+        ffmpegD3d11VendorsAvailable,
+        ffmpegD3d11WarmUp;
 export 'src/ffmpeg_downloader.dart'
     show
         FfmpegDownloader,
         FfmpegDownloadResult,
         kFfmpegReleaseTag,
-        kFfmpegVersionSuffix;
+        kFfmpegVersionSuffix,
+        kFfmpegLicense,
+        kFfmpegInstallDir;
+export 'src/ffmpeg_log.dart'
+    show
+        FfmpegToolsLogCallback,
+        setFfmpegToolsLogCallback,
+        setFfmpegToolsLogLevel;
 
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
 import 'src/ffmpeg_backend.dart';
 
-/// Top-level side-effect: registers [FfmpegBackend] on first import.
-// ignore: unused_element
-final _registered = registerFfmpegBackend();
-
-/// Manually register the FFmpeg backend (idempotent).
+/// Register the FFmpeg backend with the tools registry (idempotent).
+///
+/// Must be called before `MiniAVTools.createEncoder` / `MiniAVTools.warmup()`
+/// can pick this backend. `miniav_recorder` calls it automatically.
 bool registerFfmpegBackend() {
   final existing = MiniAVToolsPlatform.instance.backends.any(
     (b) => b.name == FfmpegBackend.backendName,

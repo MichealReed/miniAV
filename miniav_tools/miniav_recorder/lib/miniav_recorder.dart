@@ -18,10 +18,13 @@
 /// ```
 library;
 
-export 'package:miniav_tools/miniav_tools.dart' show MiniAVTools, WarmupProgress;
+export 'package:miniav_tools/miniav_tools.dart'
+    show MiniAVTools, WarmupProgress;
 
+export 'src/audio_effect.dart';
 export 'src/clip_buffer.dart';
 export 'src/container_utils.dart';
+export 'src/gpu_screen_processor.dart' show GpuScreenProcessor;
 export 'src/recorder.dart';
 export 'src/recorder_builder.dart';
 export 'src/recorder_devices.dart';

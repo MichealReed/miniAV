@@ -34,6 +34,20 @@ abstract class PlatformEncoder {
 
   /// Release encoder resources.
   Future<void> close();
+
+  /// Whether this encoder can accept GPU buffer input via an out-of-band
+  /// path (bypassing the normal [FrameSource] pipeline).  When `true` the
+  /// recorder can hand a caller-owned GPU buffer directly to the encoder
+  /// without a CPU round-trip.  Default: `false`.
+  bool get supportsGpuBufferInput => false;
+
+  /// Whether this encoder consumes pre-converted planar YUV420P (I420) frames
+  /// directly (`FrameSource.yuv420p`) without an internal RGBA→YUV conversion.
+  /// When `true`, the recorder's GPU-downscale + CPU-readback path can convert
+  /// to YUV420P on the GPU and read back the smaller planes instead of RGBA.
+  /// Encoders that need a different input layout (e.g. NV12 for a CPU-fed HW
+  /// encoder) should leave this `false`.  Default: `false`.
+  bool get acceptsYuv420pPlanes => false;
 }
 
 /// Abstract audio encoder. Backends return a concrete subclass from

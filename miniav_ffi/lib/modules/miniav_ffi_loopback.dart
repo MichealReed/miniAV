@@ -197,9 +197,17 @@ class MiniAVFFILoopbackContextPlatform
       ffi.Pointer<bindings.MiniAVBuffer> buffer,
       ffi.Pointer<ffi.Void> cbUserData,
     ) {
-      // Check if context was destroyed during callback
+      // Check if context was destroyed during callback.
+      // Still release the heap-allocated buffer to avoid a memory leak — the
+      // C capture thread may have allocated heap_buf/audio_copy before the
+      // dispatch guard was disabled, then queued this event while Dart was
+      // processing destroy().
       if (_isDestroyed) {
-        return; // Silently ignore if destroyed
+        final handle = buffer.ref.internal_handle;
+        if (handle != ffi.nullptr) {
+          bindings.MiniAV_ReleaseBuffer(handle);
+        }
+        return;
       }
 
       final platformBuffer = MiniAVBufferFFI.fromPointer(buffer);

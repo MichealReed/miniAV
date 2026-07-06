@@ -33,13 +33,21 @@ String _formatStatsLine({
   required String label,
   required double elapsedSecs,
   required int framesIn,
-  required int framesDropped,
+  required int throttleDropped,
+  required int busyDropped,
   required int packetsOut,
   required int totalPktBytes,
   required int minPktBytes,
   required int maxPktBytes,
   required int encodeErrors,
   required Object? lastError,
+  int gpuUsSum = 0,
+  int gpuUsMax = 0,
+  int gpuSamples = 0,
+  int encUsSum = 0,
+  int encUsMax = 0,
+  int encSamples = 0,
+  int adaptDivisor = 1,
 }) {
   final avgPkt = packetsOut > 0 ? (totalPktBytes / packetsOut).round() : 0;
   final pktRange = packetsOut > 0
@@ -48,13 +56,22 @@ String _formatStatsLine({
   final errStr = encodeErrors > 0
       ? ' ERRORS=${encodeErrors} (last: $lastError)'
       : '';
+  final gpuStr = gpuSamples > 0
+      ? ' gpu=${(gpuUsSum / gpuSamples / 1000).toStringAsFixed(1)}'
+            '/${(gpuUsMax / 1000).toStringAsFixed(1)}ms'
+      : '';
+  final encStr = encSamples > 0
+      ? ' enc=${(encUsSum / encSamples / 1000).toStringAsFixed(1)}'
+            '/${(encUsMax / 1000).toStringAsFixed(1)}ms'
+      : '';
+  final adaptStr = adaptDivisor > 1 ? ' adapt=÷$adaptDivisor' : '';
   return '[recorder] $label video stats over '
       '${elapsedSecs.toStringAsFixed(1)}s: '
       'in=${framesIn} (${(framesIn / elapsedSecs).toStringAsFixed(1)} fps) '
-      'dropped=${framesDropped} '
+      'thr_drop=${throttleDropped} busy_drop=${busyDropped} '
       'encoded=${packetsOut} '
       '(${(packetsOut / elapsedSecs).toStringAsFixed(1)} fps) '
-      'pkt=$pktRange$errStr';
+      'pkt=$pktRange$gpuStr$encStr$adaptStr$errStr';
 }
 
 void main() {
@@ -67,7 +84,8 @@ void main() {
         label: 'screen',
         elapsedSecs: 2.0,
         framesIn: 60,
-        framesDropped: 0,
+        throttleDropped: 0,
+        busyDropped: 0,
         packetsOut: 60,
         totalPktBytes: 600000,
         minPktBytes: 8000,
@@ -78,7 +96,8 @@ void main() {
 
       expect(line, startsWith('[recorder] screen video stats over'));
       expect(line, contains('in=60'));
-      expect(line, contains('dropped=0'));
+      expect(line, contains('thr_drop=0'));
+      expect(line, contains('busy_drop=0'));
       expect(line, contains('encoded=60'));
       expect(line, contains('8000..12000B'));
       expect(line, contains('avg=10000B'));
@@ -91,7 +110,8 @@ void main() {
         label: 'screen',
         elapsedSecs: 2.0,
         framesIn: 60,
-        framesDropped: 5,
+        throttleDropped: 5,
+        busyDropped: 2,
         packetsOut: 50,
         totalPktBytes: 500000,
         minPktBytes: 9000,
@@ -102,7 +122,8 @@ void main() {
 
       expect(line, contains('ERRORS=3'));
       expect(line, contains('(last: StateError: device lost)'));
-      expect(line, contains('dropped=5'));
+      expect(line, contains('thr_drop=5'));
+      expect(line, contains('busy_drop=2'));
       expect(line, contains('encoded=50'));
     });
 
@@ -111,7 +132,8 @@ void main() {
         label: 'cam',
         elapsedSecs: 2.0,
         framesIn: 0,
-        framesDropped: 0,
+        throttleDropped: 0,
+        busyDropped: 0,
         packetsOut: 0,
         totalPktBytes: 0,
         minPktBytes: 0x7fffffff,
@@ -128,7 +150,8 @@ void main() {
         label: 'screen',
         elapsedSecs: 2.0,
         framesIn: 60,
-        framesDropped: 0,
+        throttleDropped: 0,
+        busyDropped: 0,
         packetsOut: 30,
         totalPktBytes: 300000,
         minPktBytes: 9500,
@@ -150,7 +173,8 @@ void main() {
         label: 'screen',
         elapsedSecs: 2.0,
         framesIn: 3,
-        framesDropped: 0,
+        throttleDropped: 0,
+        busyDropped: 0,
         packetsOut: 3,
         totalPktBytes: 1001,
         minPktBytes: 300,
@@ -161,6 +185,54 @@ void main() {
 
       // 1001 / 3 = 333.67 → rounded to 334.
       expect(line, contains('avg=334B'));
+    });
+
+    test('gpu=/enc= stage timing appears as avg/max ms when sampled', () {
+      final line = _formatStatsLine(
+        label: 'screen',
+        elapsedSecs: 2.0,
+        framesIn: 60,
+        throttleDropped: 0,
+        busyDropped: 0,
+        packetsOut: 60,
+        totalPktBytes: 600000,
+        minPktBytes: 8000,
+        maxPktBytes: 12000,
+        encodeErrors: 0,
+        lastError: null,
+        gpuUsSum: 90000, // 60 samples → avg 1.5 ms
+        gpuUsMax: 4200,
+        gpuSamples: 60,
+        encUsSum: 300000, // 60 samples → avg 5.0 ms
+        encUsMax: 12500,
+        encSamples: 60,
+      );
+
+      expect(line, contains('gpu=1.5/4.2ms'));
+      expect(line, contains('enc=5.0/12.5ms'));
+      // Divisor 1 → no adapt marker.
+      expect(line, isNot(contains('adapt=')));
+    });
+
+    test('gpu=/enc= omitted with no samples; adapt=÷N shown when reduced', () {
+      final line = _formatStatsLine(
+        label: 'screen',
+        elapsedSecs: 2.0,
+        framesIn: 30,
+        throttleDropped: 30,
+        busyDropped: 0,
+        packetsOut: 30,
+        totalPktBytes: 300000,
+        minPktBytes: 9000,
+        maxPktBytes: 11000,
+        encodeErrors: 0,
+        lastError: null,
+        adaptDivisor: 2,
+      );
+
+      expect(line, isNot(contains('gpu=')));
+      expect(line, isNot(contains('enc=')));
+      expect(line, contains('adapt=÷2'));
     });
   });
 

@@ -48,7 +48,7 @@
 
 #if defined(__linux__) && !defined(__ANDROID__)
   /* hwcontext_vaapi.h is present in any FFmpeg build that enabled --enable-vaapi.
-   * The BtbN gpl-shared Linux build does. We also pull hwcontext_drm.h for the
+   * The BtbN lgpl-shared Linux build does. We also pull hwcontext_drm.h for the
    * DRM_PRIME frame descriptor used by dmabuf import. */
   #include <libavutil/hwcontext_drm.h>
   #include <libavutil/hwcontext_vaapi.h>
@@ -80,6 +80,15 @@ MIO_API void miniav_shim_set_hw_frames_ctx(AVCodecContext* ctx,
     ctx->hw_frames_ctx = ref ? av_buffer_ref(ref) : NULL;
 }
 
+/* Set hw_frames_ctx on an AVFrame (used for QSV hwframe mapping).
+ * Refs the provided buffer; NULL clears any existing ref. */
+MIO_API void miniav_shim_av_frame_set_hw_frames_ctx(AVFrame* frame,
+                                                    AVBufferRef* ref) {
+    if (!frame) return;
+    av_buffer_unref(&frame->hw_frames_ctx);
+    frame->hw_frames_ctx = ref ? av_buffer_ref(ref) : NULL;
+}
+
 /* --- AVHWFramesContext access ----------------------------------------- */
 
 MIO_API AVHWFramesContext* miniav_shim_hwframes_data(AVBufferRef* ref) {
@@ -107,6 +116,42 @@ MIO_API AVHWDeviceContext* miniav_shim_hwdev_data(AVBufferRef* ref) {
 }
 
 #ifdef _WIN32
+/* Ensure the calling thread's COM apartment is MTA (multi-threaded).
+ *
+ * Several FFmpeg encoders on Windows require MTA:
+ *   - h264_mf / hevc_mf  (Media Foundation IMFTransform)
+ *   - h264_qsv / hevc_qsv (oneVPL / libmfx session)
+ * Flutter's UI isolate initialises COM as STA on the platform thread; any
+ * Dart async callback that ends up calling avcodec_open2() inherits that
+ * apartment and the encoder init then fails with "COM must not be in STA
+ * mode" or MFX_ERR_DEVICE_FAILED (-9).
+ *
+ * Returns:
+ *    0  COM apartment is MTA on this thread (newly initialised, already MTA,
+ *       or already initialised as MTA).
+ *   -1  COM is already initialised as STA on this thread and cannot be
+ *       changed (RPC_E_CHANGED_MODE).  The caller must not proceed with
+ *       MFX/MF encoder init.
+ *
+ * Safe to call repeatedly; CoUninitialize is intentionally NOT paired —
+ * the COM apartment lives for the lifetime of the thread, which matches
+ * what the encoder runtime expects. */
+MIO_API int miniav_shim_ensure_mta(void) {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (hr == S_OK || hr == S_FALSE) return 0;          /* now MTA / already MTA */
+    if (hr == RPC_E_CHANGED_MODE) {
+        fprintf(stderr,
+                "[shim] miniav_shim_ensure_mta: thread is already STA "
+                "(RPC_E_CHANGED_MODE) — MFX/MF encoders will fail.  "
+                "The caller should run encoder init on a worker thread.\n");
+        return -1;
+    }
+    fprintf(stderr,
+            "[shim] miniav_shim_ensure_mta: CoInitializeEx FAILED hr=0x%08lX\n",
+            (unsigned long)hr);
+    return -1;
+}
+
 /* Helper: AVBufferRef -> AVHWDeviceContext -> AVD3D11VADeviceContext.
  * Returns NULL if any link is missing. */
 static AVD3D11VADeviceContext* _miniav_d3d11_ctx_from_ref(AVBufferRef* ref) {
@@ -302,6 +347,82 @@ MIO_API void miniav_shim_d3d11_copy_resource(void* id3d11_device,
 MIO_API void miniav_shim_d3d11_release(void* iunknown) {
     if (!iunknown) return;
     ((IUnknown*)iunknown)->lpVtbl->Release((IUnknown*)iunknown);
+}
+
+/* Create a sibling ID3D11Device on the same DXGI adapter as `existing_device`
+ * but with D3D11_CREATE_DEVICE_VIDEO_SUPPORT enabled.
+ *
+ * MediaFoundation MFTs require the D3D11 device they use to have been created
+ * with VIDEO_SUPPORT; Dawn (WebGPU) does not set that flag because it is
+ * unnecessary for graphics/compute work and slightly increases driver overhead.
+ * Since both devices are on the same adapter, process-shared NT handles open
+ * successfully (OpenSharedResource1 is adapter-scoped, not device-scoped).
+ *
+ * The caller is responsible for calling IUnknown::Release on the returned
+ * ID3D11Device* when it is no longer needed. Returns NULL on failure. */
+MIO_API void* miniav_shim_d3d11_create_video_device_for(void* existing_device) {
+    if (!existing_device) return NULL;
+
+    /* Obtain the IDXGIAdapter the existing device is bound to. */
+    IDXGIDevice* dxgiDev = NULL;
+    HRESULT hr = ((ID3D11Device*)existing_device)->lpVtbl->QueryInterface(
+        (ID3D11Device*)existing_device, &IID_IDXGIDevice, (void**)&dxgiDev);
+    if (FAILED(hr) || !dxgiDev) {
+        fprintf(stderr, "[shim] d3d11CreateVideoDeviceFor: QueryInterface(IDXGIDevice) FAILED hr=0x%08lX\n",
+            (unsigned long)hr);
+        return NULL;
+    }
+    IDXGIAdapter* adapter = NULL;
+    hr = dxgiDev->lpVtbl->GetAdapter(dxgiDev, &adapter);
+    dxgiDev->lpVtbl->Release(dxgiDev);
+    if (FAILED(hr) || !adapter) {
+        fprintf(stderr, "[shim] d3d11CreateVideoDeviceFor: GetAdapter FAILED hr=0x%08lX\n",
+            (unsigned long)hr);
+        return NULL;
+    }
+
+    /* Create a new D3D11 device on the SAME adapter with VIDEO_SUPPORT. */
+    static const D3D_FEATURE_LEVEL fls[] = {
+        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0,
+    };
+    ID3D11Device* newDev = NULL;
+    D3D_FEATURE_LEVEL gotLevel = (D3D_FEATURE_LEVEL)0;
+    hr = D3D11CreateDevice(
+        adapter,
+        D3D_DRIVER_TYPE_UNKNOWN,   /* must be UNKNOWN when adapter != NULL */
+        NULL,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        fls, (UINT)(sizeof(fls) / sizeof(fls[0])),
+        D3D11_SDK_VERSION,
+        &newDev, &gotLevel, NULL);
+    adapter->lpVtbl->Release(adapter);
+    if (FAILED(hr) || !newDev) {
+        fprintf(stderr, "[shim] d3d11CreateVideoDeviceFor: D3D11CreateDevice(VIDEO_SUPPORT) FAILED hr=0x%08lX\n",
+            (unsigned long)hr);
+        return NULL;
+    }
+
+    /* Log LUID for cross-referencing with the existing device's LUID. */
+    {
+        IDXGIDevice* d2 = NULL;
+        if (SUCCEEDED(newDev->lpVtbl->QueryInterface(newDev, &IID_IDXGIDevice, (void**)&d2))) {
+            IDXGIAdapter* a2 = NULL;
+            if (SUCCEEDED(d2->lpVtbl->GetAdapter(d2, &a2))) {
+                DXGI_ADAPTER_DESC adesc;
+                if (SUCCEEDED(a2->lpVtbl->GetDesc(a2, &adesc))) {
+                    fprintf(stderr,
+                        "[shim] d3d11CreateVideoDeviceFor: sibling device=%p luid=%08lX:%08lX (VIDEO_SUPPORT)\n",
+                        (void*)newDev,
+                        (unsigned long)adesc.AdapterLuid.HighPart,
+                        (unsigned long)adesc.AdapterLuid.LowPart);
+                }
+                a2->lpVtbl->Release(a2);
+            }
+            d2->lpVtbl->Release(d2);
+        }
+    }
+    return (void*)newDev;
 }
 
 /* --- Test-only helpers ----------------------------------------------------
@@ -868,9 +989,372 @@ MIO_API unsigned miniav_shim_avcodec_version(void) {
  *     route FFmpeg log output to a Dart-side callback.
  * v9: free_log_message. Log callback now passes a heap-allocated copy so
  *     the NativeCallable.listener async dispatch is safe. Dart must call
- *     miniav_shim_free_log_message() after consuming each message. */
+ *     miniav_shim_free_log_message() after consuming each message.
+ * v10: d3d11_create_video_device_for. Creates a sibling D3D11 device on the
+ *     same adapter as an injected device but with VIDEO_SUPPORT enabled,
+ *     allowing MediaFoundation MFTs to accept it as an encoding device.
+ * v11: av_frame_set_hw_frames_ctx. Sets hw_frames_ctx on an AVFrame so that
+ *     av_hwframe_map can map a D3D11VA frame to a derived QSV frame.
+ * v12: (internal fixes — no new exports)
+ * v13: d3d11_vp_create / d3d11_vp_destroy / d3d11_vp_bgra_to_nv12.
+ *      D3D11 VideoProcessor-based BGRA→NV12 conversion for Intel QSV/MF
+ *      GPU zero-copy path.  Also d3d11va_frames_set_bind_flags so callers
+ *      can include D3D11_BIND_RENDER_TARGET on the NV12 hwframes pool
+ *      (required for VideoProcessor output views).
+ *      Also d3d11_get_vendor_id: returns DXGI_ADAPTER_DESC.VendorId for an
+ *      ID3D11Device so callers can filter to only compatible encoder vendors
+ *      (e.g. skip h264_nvenc / h264_amf probes on an Intel iGPU device). */
+
+#ifdef _WIN32
+/* =========================================================================
+ * d3d11_get_vendor_id — query DXGI adapter vendor from an ID3D11Device
+ *
+ * Returns DXGI_ADAPTER_DESC.VendorId (e.g. 0x8086 Intel, 0x10DE NVIDIA,
+ * 0x1002 AMD) or 0 on failure.  Used by the Dart encoder layer to restrict
+ * the vendor probe order to only the IHV that matches the injected device,
+ * avoiding wasted NVENC/AMF open attempts on Intel iGPU devices and vice
+ * versa.
+ * ========================================================================= */
+MIO_API unsigned miniav_shim_d3d11_get_vendor_id(void* id3d11_device) {
+    if (!id3d11_device) return 0;
+    IDXGIDevice* dxgi_dev = NULL;
+    HRESULT hr = ((ID3D11Device*)id3d11_device)->lpVtbl->QueryInterface(
+        (ID3D11Device*)id3d11_device, &IID_IDXGIDevice, (void**)&dxgi_dev);
+    if (FAILED(hr) || !dxgi_dev) return 0;
+    IDXGIAdapter* adapter = NULL;
+    hr = dxgi_dev->lpVtbl->GetAdapter(dxgi_dev, &adapter);
+    dxgi_dev->lpVtbl->Release(dxgi_dev);
+    if (FAILED(hr) || !adapter) return 0;
+    DXGI_ADAPTER_DESC desc;
+    ZeroMemory(&desc, sizeof(desc));
+    hr = adapter->lpVtbl->GetDesc(adapter, &desc);
+    adapter->lpVtbl->Release(adapter);
+    if (FAILED(hr)) return 0;
+    return (unsigned)desc.VendorId;
+}
+
+/* =========================================================================
+ * D3D11 VideoProcessor — BGRA → NV12 GPU color-space conversion
+ *
+ * Intel QSV (h264_qsv) and MediaFoundation (h264_mf) require NV12 input.
+ * Our minigpu SharedOutputTexture is BGRA.  The D3D11 VideoProcessor API
+ * converts BGRA → NV12 in GPU memory using the driver's built-in CSC unit
+ * (the same hardware Intel's iGPU uses for video decode/encode internally).
+ *
+ * The VIDEO_SUPPORT sibling device is used — Dawn's device cannot be used
+ * for VideoProcessor because it lacks D3D11_CREATE_DEVICE_VIDEO_SUPPORT.
+ *
+ * Cross-device source import: The BGRA SharedOutputTexture was created on
+ * Dawn's ID3D11Device with D3D11_RESOURCE_MISC_SHARED, so it supports
+ * IDXGIResource::GetSharedHandle + ID3D11Device::OpenSharedResource for
+ * within-process, same-adapter access.  When cross_device=1 the shim
+ * performs the import internally; when cross_device=0 the caller has
+ * already opened the texture on the VP device (MiniAVBufferSource path).
+ * ========================================================================= */
+
+typedef struct MiniavD3d11Vp {
+    ID3D11VideoDevice*              video_device;
+    ID3D11VideoContext*             video_context;
+    ID3D11VideoProcessorEnumerator* enumerator;
+    ID3D11VideoProcessor*           processor;
+    UINT                            width;
+    UINT                            height;
+} MiniavD3d11Vp;
+
+/* Create a VideoProcessor context for BGRA→NV12 conversion at [width]x[height].
+ * [id3d11_device] must have D3D11_CREATE_DEVICE_VIDEO_SUPPORT (the sibling
+ * device created by miniav_shim_d3d11_create_video_device_for).
+ * Returns an opaque MiniavD3d11Vp* or NULL on failure.
+ * The caller must pair every successful call with miniav_shim_d3d11_vp_destroy. */
+MIO_API void* miniav_shim_d3d11_vp_create(void*    id3d11_device,
+                                           void*    id3d11_context,
+                                           unsigned width,
+                                           unsigned height) {
+    if (!id3d11_device || !id3d11_context || width == 0 || height == 0)
+        return NULL;
+    ID3D11Device*        dev = (ID3D11Device*)id3d11_device;
+    ID3D11DeviceContext* ctx = (ID3D11DeviceContext*)id3d11_context;
+
+    MiniavD3d11Vp* vp = (MiniavD3d11Vp*)calloc(1, sizeof(*vp));
+    if (!vp) return NULL;
+
+    HRESULT hr = dev->lpVtbl->QueryInterface(
+        dev, &IID_ID3D11VideoDevice, (void**)&vp->video_device);
+    if (FAILED(hr) || !vp->video_device) {
+        fprintf(stderr,
+            "[shim] vp_create: QueryInterface(IID_ID3D11VideoDevice) FAILED "
+            "hr=0x%08lX — device may lack D3D11_CREATE_DEVICE_VIDEO_SUPPORT\n",
+            (unsigned long)hr);
+        free(vp);
+        return NULL;
+    }
+
+    hr = ctx->lpVtbl->QueryInterface(
+        ctx, &IID_ID3D11VideoContext, (void**)&vp->video_context);
+    if (FAILED(hr) || !vp->video_context) {
+        fprintf(stderr,
+            "[shim] vp_create: QueryInterface(IID_ID3D11VideoContext) FAILED "
+            "hr=0x%08lX\n", (unsigned long)hr);
+        vp->video_device->lpVtbl->Release(vp->video_device);
+        free(vp);
+        return NULL;
+    }
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC desc;
+    ZeroMemory(&desc, sizeof(desc));
+    desc.InputFrameFormat            = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    desc.InputFrameRate.Numerator    = 60;
+    desc.InputFrameRate.Denominator  = 1;
+    desc.InputWidth                  = width;
+    desc.InputHeight                 = height;
+    desc.OutputFrameRate.Numerator   = 60;
+    desc.OutputFrameRate.Denominator = 1;
+    desc.OutputWidth                 = width;
+    desc.OutputHeight                = height;
+    desc.Usage                       = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+
+    hr = vp->video_device->lpVtbl->CreateVideoProcessorEnumerator(
+        vp->video_device, &desc, &vp->enumerator);
+    if (FAILED(hr) || !vp->enumerator) {
+        fprintf(stderr,
+            "[shim] vp_create: CreateVideoProcessorEnumerator FAILED "
+            "hr=0x%08lX\n", (unsigned long)hr);
+        vp->video_context->lpVtbl->Release(vp->video_context);
+        vp->video_device->lpVtbl->Release(vp->video_device);
+        free(vp);
+        return NULL;
+    }
+
+    hr = vp->video_device->lpVtbl->CreateVideoProcessor(
+        vp->video_device, vp->enumerator, 0, &vp->processor);
+    if (FAILED(hr) || !vp->processor) {
+        fprintf(stderr,
+            "[shim] vp_create: CreateVideoProcessor FAILED hr=0x%08lX\n",
+            (unsigned long)hr);
+        vp->enumerator->lpVtbl->Release(vp->enumerator);
+        vp->video_context->lpVtbl->Release(vp->video_context);
+        vp->video_device->lpVtbl->Release(vp->video_device);
+        free(vp);
+        return NULL;
+    }
+
+    vp->width  = width;
+    vp->height = height;
+    fprintf(stderr, "[shim] vp_create: VideoProcessor ready for BGRA→NV12 "
+        "%ux%u device=%p\n", width, height, id3d11_device);
+    return (void*)vp;
+}
+
+MIO_API void miniav_shim_d3d11_vp_destroy(void* vp_ctx) {
+    if (!vp_ctx) return;
+    MiniavD3d11Vp* vp = (MiniavD3d11Vp*)vp_ctx;
+    if (vp->processor)     vp->processor->lpVtbl->Release(vp->processor);
+    if (vp->enumerator)    vp->enumerator->lpVtbl->Release(vp->enumerator);
+    if (vp->video_context) vp->video_context->lpVtbl->Release(vp->video_context);
+    if (vp->video_device)  vp->video_device->lpVtbl->Release(vp->video_device);
+    free(vp);
+}
+
+/* Convert one BGRA frame to an NV12 slice in a Texture2DArray via
+ * D3D11 VideoProcessor.
+ *
+ * [cross_device]:
+ *   1 — src_bgra_tex is an ID3D11Texture2D* on a DIFFERENT device
+ *       (e.g. Dawn's device).  The shim opens it on vp_device internally
+ *       via IDXGIResource::GetSharedHandle + OpenSharedResource (legacy,
+ *       within-process, same-adapter). Requires D3D11_RESOURCE_MISC_SHARED
+ *       on the source texture.
+ *   0 — src_bgra_tex is already on vp_device (e.g. opened via
+ *       OpenSharedResource1 in the MiniAVBufferSource path).  Used directly
+ *       without an additional cross-device import.
+ *
+ * [dst_subresource]: Texture2DArray slice index from av_hwframe_get_buffer
+ *   (AVFrame::data[1] cast through intptr_t).
+ * [dst_nv12_tex]: The Texture2DArray from AVFrame::data[0] (NV12 pool).
+ *
+ * Returns 0 on success, negative on failure. */
+MIO_API int miniav_shim_d3d11_vp_bgra_to_nv12(void* vp_ctx,
+                                               void* vp_device,
+                                               void* vp_context,
+                                               void* src_bgra_tex,
+                                               int   cross_device,
+                                               int   dst_subresource,
+                                               void* dst_nv12_tex) {
+    if (!vp_ctx || !vp_device || !vp_context || !src_bgra_tex || !dst_nv12_tex)
+        return -1;
+
+    MiniavD3d11Vp*       vp  = (MiniavD3d11Vp*)vp_ctx;
+    ID3D11Device*        dev = (ID3D11Device*)vp_device;
+    ID3D11DeviceContext* ctx = (ID3D11DeviceContext*)vp_context;
+
+    /* ---------- cross-device import (D3D11_RESOURCE_MISC_SHARED) --------- */
+    ID3D11Texture2D* src_on_vp = NULL;
+    if (cross_device) {
+        IDXGIResource* dxgi_res = NULL;
+        HRESULT hr = ((ID3D11Resource*)src_bgra_tex)->lpVtbl->QueryInterface(
+            (ID3D11Resource*)src_bgra_tex, &IID_IDXGIResource,
+            (void**)&dxgi_res);
+        if (FAILED(hr) || !dxgi_res) {
+            fprintf(stderr,
+                "[shim] vp_bgra_to_nv12: QueryInterface(IDXGIResource) FAILED "
+                "hr=0x%08lX\n", (unsigned long)hr);
+            return -2;
+        }
+        HANDLE legacy_handle = NULL;
+        hr = dxgi_res->lpVtbl->GetSharedHandle(dxgi_res, &legacy_handle);
+        dxgi_res->lpVtbl->Release(dxgi_res);
+        if (FAILED(hr) || !legacy_handle) {
+            fprintf(stderr,
+                "[shim] vp_bgra_to_nv12: GetSharedHandle FAILED hr=0x%08lX "
+                "(texture may lack D3D11_RESOURCE_MISC_SHARED)\n",
+                (unsigned long)hr);
+            return -3;
+        }
+        hr = dev->lpVtbl->OpenSharedResource(
+            dev, legacy_handle, &IID_ID3D11Texture2D, (void**)&src_on_vp);
+        if (FAILED(hr) || !src_on_vp) {
+            fprintf(stderr,
+                "[shim] vp_bgra_to_nv12: OpenSharedResource FAILED "
+                "hr=0x%08lX handle=%p\n",
+                (unsigned long)hr, (void*)legacy_handle);
+            return -4;
+        }
+    } else {
+        src_on_vp = (ID3D11Texture2D*)src_bgra_tex;
+    }
+
+    /* ---------- optional keyed-mutex sync --------------------------------- */
+    IDXGIKeyedMutex* km = NULL;
+    ((ID3D11Resource*)src_on_vp)->lpVtbl->QueryInterface(
+        (ID3D11Resource*)src_on_vp, &IID_IDXGIKeyedMutex, (void**)&km);
+    if (km) {
+        HRESULT ahr = km->lpVtbl->AcquireSync(km, 0, INFINITE);
+        if (FAILED(ahr)) { km->lpVtbl->Release(km); km = NULL; }
+    }
+
+    /* ---------- input view on BGRA source --------------------------------- */
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd;
+    ZeroMemory(&ivd, sizeof(ivd));
+    ivd.FourCC           = 0; /* infer from texture format */
+    ivd.ViewDimension    = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    ivd.Texture2D.MipSlice = 0;
+    ID3D11VideoProcessorInputView* input_view = NULL;
+    HRESULT hr = vp->video_device->lpVtbl->CreateVideoProcessorInputView(
+        vp->video_device, (ID3D11Resource*)src_on_vp,
+        vp->enumerator, &ivd, &input_view);
+    if (FAILED(hr) || !input_view) {
+        fprintf(stderr,
+            "[shim] vp_bgra_to_nv12: CreateVideoProcessorInputView FAILED "
+            "hr=0x%08lX\n", (unsigned long)hr);
+        if (km) { km->lpVtbl->ReleaseSync(km, 0); km->lpVtbl->Release(km); }
+        if (cross_device) src_on_vp->lpVtbl->Release(src_on_vp);
+        return -5;
+    }
+
+    /* ---------- output view on NV12 Texture2DArray slice ------------------ */
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd;
+    ZeroMemory(&ovd, sizeof(ovd));
+    ovd.ViewDimension                    = D3D11_VPOV_DIMENSION_TEXTURE2DARRAY;
+    ovd.Texture2DArray.MipSlice          = 0;
+    ovd.Texture2DArray.FirstArraySlice   = (UINT)dst_subresource;
+    ovd.Texture2DArray.ArraySize         = 1;
+    ID3D11VideoProcessorOutputView* output_view = NULL;
+    hr = vp->video_device->lpVtbl->CreateVideoProcessorOutputView(
+        vp->video_device, (ID3D11Resource*)dst_nv12_tex,
+        vp->enumerator, &ovd, &output_view);
+    if (FAILED(hr) || !output_view) {
+        fprintf(stderr,
+            "[shim] vp_bgra_to_nv12: CreateVideoProcessorOutputView FAILED "
+            "hr=0x%08lX (dst texture may need D3D11_BIND_RENDER_TARGET)\n",
+            (unsigned long)hr);
+        input_view->lpVtbl->Release(input_view);
+        if (km) { km->lpVtbl->ReleaseSync(km, 0); km->lpVtbl->Release(km); }
+        if (cross_device) src_on_vp->lpVtbl->Release(src_on_vp);
+        return -6;
+    }
+
+    /* ---------- color-space hints (RGB full → YCbCr BT.709 limited) ------- */
+    {
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs;
+        ZeroMemory(&cs, sizeof(cs));
+        /* Input: full-range RGB (BGRA screen capture / compute output) */
+        cs.RGB_Range     = 0; /* 0 = full range 0-255 */
+        cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+        vp->video_context->lpVtbl->VideoProcessorSetStreamColorSpace(
+            vp->video_context, vp->processor, 0, &cs);
+
+        ZeroMemory(&cs, sizeof(cs));
+        /* Output: limited-range YCbCr BT.709 (standard for H.264 encode) */
+        cs.Usage         = 1;  /* video/encoder output */
+        cs.YCbCr_Matrix  = 1;  /* BT.709 */
+        cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+        vp->video_context->lpVtbl->VideoProcessorSetOutputColorSpace(
+            vp->video_context, vp->processor, &cs);
+    }
+
+    /* ---------- execute blt ----------------------------------------------- */
+    D3D11_VIDEO_PROCESSOR_STREAM stream;
+    ZeroMemory(&stream, sizeof(stream));
+    stream.Enable            = TRUE;
+    stream.OutputIndex       = 0;
+    stream.InputFrameOrField = 0;
+    stream.pInputSurface     = input_view;
+    hr = vp->video_context->lpVtbl->VideoProcessorBlt(
+        vp->video_context, vp->processor, output_view, 0, 1, &stream);
+
+    output_view->lpVtbl->Release(output_view);
+    input_view->lpVtbl->Release(input_view);
+    if (km) { km->lpVtbl->ReleaseSync(km, 0); km->lpVtbl->Release(km); }
+    if (cross_device) src_on_vp->lpVtbl->Release(src_on_vp);
+
+    if (FAILED(hr)) {
+        fprintf(stderr,
+            "[shim] vp_bgra_to_nv12: VideoProcessorBlt FAILED hr=0x%08lX\n",
+            (unsigned long)hr);
+        return -7;
+    }
+
+    /* GPU fence: ensure VP blt completes before the QSV/MF encoder reads. */
+    {
+        D3D11_QUERY_DESC qd; qd.Query = D3D11_QUERY_EVENT; qd.MiscFlags = 0;
+        ID3D11Query* fence = NULL;
+        if (SUCCEEDED(dev->lpVtbl->CreateQuery(dev, &qd, &fence)) && fence) {
+            ctx->lpVtbl->End(ctx, (ID3D11Asynchronous*)fence);
+            ctx->lpVtbl->Flush(ctx);
+            ULONGLONG t0 = GetTickCount64();
+            for (;;) {
+                HRESULT gd = ctx->lpVtbl->GetData(
+                    ctx, (ID3D11Asynchronous*)fence, NULL, 0, 0);
+                if (gd == S_OK || gd != S_FALSE) break;
+                if (GetTickCount64() - t0 > 50) break;
+                YieldProcessor();
+            }
+            fence->lpVtbl->Release(fence);
+        } else {
+            ctx->lpVtbl->Flush(ctx);
+        }
+    }
+    return 0;
+}
+
+/* Set BindFlags on an AVD3D11VAFramesContext before av_hwframe_ctx_init.
+ * For VideoProcessor output, include D3D11_BIND_RENDER_TARGET (0x20).
+ * For QSV/MF encode input, also include D3D11_BIND_VIDEO_ENCODER (0x400).
+ * AVD3D11VAFramesContext::BindFlags defaults to 0, which makes FFmpeg use
+ * D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE — those don't allow VP
+ * output views.  Must be called BEFORE av_hwframe_ctx_init(). */
+MIO_API void miniav_shim_d3d11va_frames_set_bind_flags(AVBufferRef* ref,
+                                                       unsigned     bind_flags) {
+    if (!ref || !ref->data) return;
+    AVHWFramesContext*      ctx     = (AVHWFramesContext*)ref->data;
+    AVD3D11VAFramesContext* d3d_ctx = (AVD3D11VAFramesContext*)ctx->hwctx;
+    if (!d3d_ctx) return;
+    d3d_ctx->BindFlags = (UINT)bind_flags;
+}
+#endif /* _WIN32 (VP section) */
+
 MIO_API unsigned miniav_shim_abi_version(void) {
-    return 9u;
+    return 13u;
 }
 
 /* --- FFmpeg log forwarding ------------------------------------------------

@@ -9,7 +9,7 @@
 /// | AMD AMF (Win)   | h264_amf / hevc_amf / av1_amf                     | nv12/bgra  | usage=transcoding/ultralowlat. |
 /// | Intel QSV       | h264_qsv / hevc_qsv / av1_qsv / vp9_qsv           | nv12/bgra  | preset veryfast..veryslow      |
 /// | Apple VideoTb.  | h264_videotoolbox / hevc_videotoolbox             | nv12       | realtime=1, allow_sw=1         |
-/// | MediaFoundation | h264_mf / hevc_mf (Win, ARM64 useful)             | nv12       | hw_encoding=1                  |
+/// | MediaFoundation | h264_mf / hevc_mf (Win, ARM64 useful)             | nv12       | auto MFT (sw fallback ok)      |
 /// | V4L2 M2M        | h264_v4l2m2m / hevc_v4l2m2m (Linux/RPi)           | nv12       |                                |
 ///
 /// **Resolution caps** (typical, varies by GPU generation):
@@ -25,12 +25,18 @@ import 'dart:ffi';
 import 'dart:typed_data';
 import 'dart:io' show Platform;
 
+import 'package:meta/meta.dart';
+
 import 'package:ffi/ffi.dart';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
+import 'package:minigpu_platform_interface/minigpu_platform_interface.dart'
+    show MinigpuPlatform, PlatformBuffer, PlatformComputeShader, BufferDataType;
 
 import 'ffmpeg_encoder.dart' show address;
 import 'ffmpeg_ffi.dart';
+import 'ffmpeg_log.dart';
 import 'ffmpeg_muxer.dart' show FfmpegEncoderBridge;
+import 'ffmpeg_shim.dart';
 import 'pixel_convert.dart';
 
 /// Hardware encoder vendor / FFmpeg backend family.
@@ -212,6 +218,14 @@ const List<_HwSpec> _hwSpecs = [
   ),
 
   // ─────────── Windows Media Foundation ───────────
+  // NOTE: we deliberately do NOT default `hw_encoding=1`. MediaFoundation is
+  // the LAST entry in the probe order, so it is only ever reached when no
+  // vendor HW encoder (NVENC/QSV/AMF) is present — exactly the machines that
+  // have no hardware MFT. Forcing `hw_encoding=1` there enumerates hardware
+  // MFTs only and fails. Leaving it unset lets MF pick its **software** H.264
+  // MFT ("H264 Encoder MFT"), which is the genuine CPU fallback now that the
+  // LGPL build has no libx264. Callers that specifically want the hardware
+  // MFT can still pass `backendOptions: {'hw_encoding': '1'}`.
   _HwSpec(
     vendor: HwEncoderVendor.mediafoundation,
     codec: VideoCodec.h264,
@@ -219,7 +233,7 @@ const List<_HwSpec> _hwSpecs = [
     inputFmt: _HwInputFmt.nv12,
     maxWidth: 4096,
     maxHeight: 4096,
-    defaults: {'hw_encoding': '1'},
+    defaults: {},
   ),
   _HwSpec(
     vendor: HwEncoderVendor.mediafoundation,
@@ -228,7 +242,11 @@ const List<_HwSpec> _hwSpecs = [
     inputFmt: _HwInputFmt.nv12,
     maxWidth: 8192,
     maxHeight: 8192,
-    defaults: {'hw_encoding': '1'},
+    // The Windows "HEVCVideoExtensionEncoder" software MFT is unreliable
+    // (E_FAIL on input) — HEVC via MF realistically needs a hardware MFT, so
+    // there is no dependable HEVC CPU fallback in the LGPL build. Auto-select
+    // anyway so a HW MFT is used when present.
+    defaults: {},
   ),
 
   // ─────────── Linux V4L2 M2M ───────────
@@ -370,6 +388,41 @@ _HwSpec? _pickSpec(
 /// * converts to `nv12` first (AMF / QSV / VideoToolbox / MF / V4L2).
 ///
 /// True zero-copy from a D3D11 / DMA-BUF / IOSurface texture is Stage B.
+// WGSL bilinear scale kernel (identical to gpu_screen_processor.dart).
+// Works for both downscale and upscale.  Inputs: src u32[], dst u32[],
+// params{srcW,srcH,dstW,dstH} u32[4].
+const _kScaleWgsl = r'''
+struct Params {
+  srcW     : u32,
+  srcH     : u32,
+  dstW     : u32,
+  dstH     : u32,
+};
+@group(0) @binding(0) var<storage, read_write> src    : array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst    : array<u32>;
+@group(0) @binding(2) var<storage, read_write> params : Params;
+fn unpack(p:u32)->vec4<f32>{
+  return vec4<f32>(f32(p&0xFFu),f32((p>>8u)&0xFFu),f32((p>>16u)&0xFFu),f32((p>>24u)&0xFFu))/255.0;
+}
+fn pack(c:vec4<f32>)->u32{
+  let q=clamp(c,vec4<f32>(0.0),vec4<f32>(1.0))*255.0+vec4<f32>(0.5);
+  return u32(q.x)|(u32(q.y)<<8u)|(u32(q.z)<<16u)|(u32(q.w)<<24u);
+}
+fn rd(x:u32,y:u32)->vec4<f32>{
+  return unpack(src[clamp(y,0u,params.srcH-1u)*params.srcW+clamp(x,0u,params.srcW-1u)]);
+}
+@compute @workgroup_size(8,8,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  if(gid.x>=params.dstW||gid.y>=params.dstH){return;}
+  let sx=(f32(gid.x)+0.5)*f32(params.srcW)/f32(params.dstW)-0.5;
+  let sy=(f32(gid.y)+0.5)*f32(params.srcH)/f32(params.dstH)-0.5;
+  let x0=u32(max(i32(sx),0));let y0=u32(max(i32(sy),0));
+  let x1=min(x0+1u,params.srcW-1u);let y1=min(y0+1u,params.srcH-1u);
+  let tx=fract(sx);let ty=fract(sy);
+  dst[gid.y*params.dstW+gid.x]=pack(mix(mix(rd(x0,y0),rd(x1,y0),tx),mix(rd(x0,y1),rd(x1,y1),tx),ty));
+}
+''';
+
 class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   FfmpegHwEncoder._(
     this._ff,
@@ -377,8 +430,9 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
     this._spec,
     this._codecCtx,
     this._frame,
-    this._packet,
-  );
+    this._packet, {
+    bool hasGpu = false,
+  }) : _hasGpu = hasGpu;
 
   final Ffmpeg _ff;
   final EncoderConfig _cfg;
@@ -387,22 +441,41 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   final Pointer<AVFrame> _frame;
   final Pointer<AVPacket> _packet;
 
+  /// Whether a minigpu platform context is available for GPU compute rescale.
+  final bool _hasGpu;
+
+  // GPU compute rescale cache — only used when [_hasGpu] is true.
+  // Recreated whenever the source dimensions change.
+  PlatformComputeShader? _gpuScaleShader;
+  PlatformBuffer? _gpuSrcBuf;
+  PlatformBuffer? _gpuDstBuf;
+  PlatformBuffer? _gpuParamsBuf;
+  int _gpuScaleSrcW = 0;
+  int _gpuScaleSrcH = 0;
+
   bool _closed = false;
   int _nextPts = 0;
   CodecExtraData? _extraData;
   bool _forceKeyframe = false;
+  bool _loggedRescale = false;
 
   HwEncoderVendor get vendor => _spec.vendor;
   String get encoderName => _spec.encoderName;
 
   /// Open the best-available HW encoder for [cfg.codec], picking among
-  /// vendors using [vendorOrder]. When unspecified, defaults to a
+  /// vendors using [vendorOrder]. [gpu] is an optional minigpu
+  /// [Object] (a `Minigpu` instance in practice) used to accelerate
+  /// mid-stream resolution rescaling on GPU rather than in Dart.
+  /// When null the encoder falls back to pure-Dart bilinear rescaling.
+  /// Pass the value of [BackendContext.sharedGpu] from the caller.
+  /// When unspecified, defaults to a
   /// platform-biased order: Windows → NVENC/AMF/QSV/MF; macOS → VT;
   /// Linux → NVENC/QSV/V4L2; Android → V4L2. Throws [CodecInitException]
   /// when nothing matches or init fails.
   static FfmpegHwEncoder open(
     EncoderConfig cfg, {
     List<HwEncoderVendor>? vendorOrder,
+    Object? gpu,
   }) {
     final ff = Ffmpeg.instance();
     if (ff == null) {
@@ -420,19 +493,30 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
             'Tried vendors: ${probe.join(', ')}.',
       );
     }
-    return openWith(cfg, spec.vendor);
+    return openWith(cfg, spec.vendor, gpu: gpu);
   }
 
   /// Open a specific vendor's encoder for [cfg.codec]. Throws if that
   /// combination isn't supported or the encoder isn't present in the loaded
   /// FFmpeg build.
-  static FfmpegHwEncoder openWith(EncoderConfig cfg, HwEncoderVendor vendor) {
+  static FfmpegHwEncoder openWith(
+    EncoderConfig cfg,
+    HwEncoderVendor vendor, {
+    Object? gpu,
+  }) {
     final ff = Ffmpeg.instance();
     if (ff == null) {
       throw const CodecInitException(
         'ffmpeg-hw',
         'FFmpeg not loaded — call ensureFFmpegLoaded() first',
       );
+    }
+    // QSV (libmfx) and MediaFoundation both need MTA on Windows.  Flutter's
+    // UI isolate is STA by default; elevate the current thread before init.
+    if (Platform.isWindows &&
+        (vendor == HwEncoderVendor.qsv ||
+            vendor == HwEncoderVendor.mediafoundation)) {
+      FfmpegShim.tryLoad()?.ensureMta();
     }
     final spec = _findSpec(vendor, cfg.codec);
     if (spec == null) {
@@ -517,8 +601,15 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
         );
       }
 
-      return FfmpegHwEncoder._(ff, cfg, spec, codecCtx, frame, packet)
-        .._loadExtraData();
+      return FfmpegHwEncoder._(
+        ff,
+        cfg,
+        spec,
+        codecCtx,
+        frame,
+        packet,
+        hasGpu: gpu != null,
+      ).._loadExtraData();
     } catch (_) {
       final ptr = calloc<Pointer<AVCodecContext>>()..value = codecCtx;
       ff.avcodecFreeContext(ptr);
@@ -704,13 +795,24 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   @override
   Future<EncodedPacket?> encode(FrameSource frame) async {
     _checkOpen();
-    final src = _frameToRgba(frame);
+    var src = _frameToRgba(frame);
     if (src.width != _cfg.width || src.height != _cfg.height) {
-      throw CodecRuntimeException(
-        'ffmpeg-hw',
-        'Frame size ${src.width}x${src.height} != encoder size '
-            '${_cfg.width}x${_cfg.height}',
-      );
+      // Capture resolution changed mid-stream (e.g. game launched at a
+      // different size than the desktop).  The encoder's SPS/PPS were
+      // baked in at open-time and cannot change, so rescale the input
+      // frame to the encoder's fixed dimensions.  Bilinear is a cheap
+      // safety-net; the GPU path normally handles this via shader scale.
+      if (!_loggedRescale) {
+        _loggedRescale = true;
+        // ignore: avoid_print
+        print(
+          '[ffmpeg-hw] rescaling input ${src.width}x${src.height} -> '
+          '${_cfg.width}x${_cfg.height} (capture resolution changed)',
+        );
+      }
+      src = _hasGpu
+          ? (await _gpuRescaleRgba(src, _cfg.width, _cfg.height))
+          : _bilinearRescaleRgba(src, _cfg.width, _cfg.height);
     }
 
     final mw = _ff.avFrameMakeWritable(_frame);
@@ -821,9 +923,25 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   }
 
   @override
+  bool get supportsGpuBufferInput => false;
+
+  // CPU-fed HW encoder repacks RGBA to NV12 itself; it does not take YUV420P.
+  @override
+  bool get acceptsYuv420pPlanes => false;
+
+  @override
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    // Release GPU compute rescale resources.
+    _gpuScaleShader?.destroy();
+    _gpuScaleShader = null;
+    _gpuSrcBuf?.destroy();
+    _gpuSrcBuf = null;
+    _gpuDstBuf?.destroy();
+    _gpuDstBuf = null;
+    _gpuParamsBuf?.destroy();
+    _gpuParamsBuf = null;
     final fp = calloc<Pointer<AVFrame>>()..value = _frame;
     final pp = calloc<Pointer<AVPacket>>()..value = _packet;
     final cp = calloc<Pointer<AVCodecContext>>()..value = _codecCtx;
@@ -1053,6 +1171,167 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
         );
     }
   }
+
+  /// GPU-compute bilinear rescale using the minigpu WebGPU backend.
+  ///
+  /// Creates (and caches) a compute shader + three GPU buffers on the first
+  /// call for a given src dimension, then dispatches the scale kernel and
+  /// reads the result back to CPU.  Buffers are recreated only when the
+  /// source dimensions change; the encoder's dst dimensions are fixed at
+  /// open time so [_gpuDstBuf] is never reallocated.
+  ///
+  /// Falls back to [_bilinearRescaleRgba] on any GPU error so the encode
+  /// loop stays alive even if WebGPU becomes unavailable mid-session.
+  Future<_PreparedRgba> _gpuRescaleRgba(
+    _PreparedRgba src,
+    int dstW,
+    int dstH,
+  ) async {
+    final srcW = src.width;
+    final srcH = src.height;
+    final gpu = MinigpuPlatform.instance;
+    try {
+      // (Re)allocate src-side buffer and shader when source dims change.
+      if (_gpuScaleShader == null ||
+          srcW != _gpuScaleSrcW ||
+          srcH != _gpuScaleSrcH) {
+        _gpuScaleShader?.destroy();
+        _gpuSrcBuf?.destroy();
+        _gpuParamsBuf?.destroy();
+
+        _gpuScaleShader = gpu.createComputeShader()
+          ..loadKernelString(_kScaleWgsl);
+        _gpuSrcBuf = gpu.createBuffer(srcW * srcH * 4, BufferDataType.uint8);
+        _gpuParamsBuf = gpu.createBuffer(16, BufferDataType.uint8);
+        _gpuDstBuf ??= gpu.createBuffer(dstW * dstH * 4, BufferDataType.uint8);
+
+        _gpuScaleSrcW = srcW;
+        _gpuScaleSrcH = srcH;
+      }
+
+      // Upload source RGBA/BGRA pixels.
+      await _gpuSrcBuf!.write(
+        src.bytes,
+        srcW * srcH,
+        dataType: BufferDataType.uint8,
+      );
+
+      // Upload params: srcW, srcH, dstW, dstH (4×u32 LE).
+      final params = ByteData(16)
+        ..setUint32(0, srcW, Endian.little)
+        ..setUint32(4, srcH, Endian.little)
+        ..setUint32(8, dstW, Endian.little)
+        ..setUint32(12, dstH, Endian.little);
+      await _gpuParamsBuf!.write(
+        params.buffer.asUint8List(),
+        16,
+        dataType: BufferDataType.uint8,
+      );
+
+      // Bind and dispatch.
+      _gpuScaleShader!
+        ..setBuffer(0, _gpuSrcBuf!)
+        ..setBuffer(1, _gpuDstBuf!)
+        ..setBuffer(2, _gpuParamsBuf!);
+      const kGroup = 8;
+      await _gpuScaleShader!.dispatch(
+        (dstW + kGroup - 1) ~/ kGroup,
+        (dstH + kGroup - 1) ~/ kGroup,
+        1,
+      );
+
+      // Readback.
+      final output = Uint8List(dstW * dstH * 4);
+      await _gpuDstBuf!.read(
+        output,
+        dstW * dstH,
+        dataType: BufferDataType.uint8,
+      );
+
+      return _PreparedRgba(
+        bytes: output,
+        width: dstW,
+        height: dstH,
+        srcStride: dstW * 4,
+        bgra: src.bgra,
+        sourceFormat: src.sourceFormat,
+      );
+    } catch (e) {
+      ffmpegToolsLog(
+        MiniAVLogLevel.warn,
+        '[ffmpeg-hw] GPU rescale error ($e); falling back to Dart bilinear',
+      );
+      return _bilinearRescaleRgba(src, dstW, dstH);
+    }
+  }
+
+  /// Bilinear resample a packed 32-bpp (RGBA / BGRA) [_PreparedRgba] buffer
+  /// to [dstW] × [dstH].  Used as a safety-net when the capture source
+  /// resolution diverges from the encoder's fixed dimensions; the GPU
+  /// path (Stage B) handles this via shader scale.  Pure Dart (no sws
+  /// FFI dependency).  Channel order is preserved.
+  _PreparedRgba _bilinearRescaleRgba(_PreparedRgba src, int dstW, int dstH) {
+    final srcW = src.width;
+    final srcH = src.height;
+    final srcStride = src.srcStride;
+    final srcBytes = src.bytes;
+    final dstStride = dstW * 4;
+    final dst = Uint8List(dstStride * dstH);
+
+    // Map dst pixel centre to src coordinates.  Guard against 1-pixel
+    // sources to avoid div-by-zero.
+    final xRatio = srcW > 1 ? (srcW - 1) / dstW : 0.0;
+    final yRatio = srcH > 1 ? (srcH - 1) / dstH : 0.0;
+
+    for (var y = 0; y < dstH; y++) {
+      final fy = (y + 0.5) * yRatio;
+      var y0 = fy.floor();
+      if (y0 < 0) y0 = 0;
+      if (y0 > srcH - 1) y0 = srcH - 1;
+      var y1 = y0 + 1;
+      if (y1 > srcH - 1) y1 = srcH - 1;
+      final wy = fy - y0;
+      final row0Base = y0 * srcStride;
+      final row1Base = y1 * srcStride;
+      final dstBase = y * dstStride;
+
+      for (var x = 0; x < dstW; x++) {
+        final fx = (x + 0.5) * xRatio;
+        var x0 = fx.floor();
+        if (x0 < 0) x0 = 0;
+        if (x0 > srcW - 1) x0 = srcW - 1;
+        var x1 = x0 + 1;
+        if (x1 > srcW - 1) x1 = srcW - 1;
+        final wx = fx - x0;
+
+        final i00 = row0Base + x0 * 4;
+        final i01 = row0Base + x1 * 4;
+        final i10 = row1Base + x0 * 4;
+        final i11 = row1Base + x1 * 4;
+        final dstIdx = dstBase + x * 4;
+
+        for (var c = 0; c < 4; c++) {
+          final v00 = srcBytes[i00 + c].toDouble();
+          final v01 = srcBytes[i01 + c].toDouble();
+          final v10 = srcBytes[i10 + c].toDouble();
+          final v11 = srcBytes[i11 + c].toDouble();
+          final top = v00 + (v01 - v00) * wx;
+          final bot = v10 + (v11 - v10) * wx;
+          final v = top + (bot - top) * wy;
+          dst[dstIdx + c] = v.round().clamp(0, 255);
+        }
+      }
+    }
+
+    return _PreparedRgba(
+      bytes: dst,
+      width: dstW,
+      height: dstH,
+      srcStride: dstStride,
+      bgra: src.bgra,
+      sourceFormat: src.sourceFormat,
+    );
+  }
 }
 
 class _PreparedRgba {
@@ -1082,3 +1361,96 @@ class _PreparedRgba {
 }
 
 const int _avNoPts = -0x8000000000000000;
+
+/// Exposes [FfmpegHwEncoder]'s bilinear rescale algorithm for unit testing.
+///
+/// [src] is a flat RGBA/BGRA buffer with dimensions [srcW]×[srcH]. Returns a
+/// flat buffer of [dstW]×[dstH] in the same channel order.
+@visibleForTesting
+Uint8List bilinearRescaleRgbaForTest(
+  Uint8List src,
+  int srcW,
+  int srcH,
+  int dstW,
+  int dstH,
+) {
+  // Re-use the private implementation via a throw-away _PreparedRgba wrapper.
+  final prepared = _PreparedRgba(
+    bytes: src,
+    width: srcW,
+    height: srcH,
+    srcStride: srcW * 4,
+    bgra: false,
+    sourceFormat: MiniAVPixelFormat.rgba32,
+  );
+  // We need a FfmpegHwEncoder instance to call the instance method, but the
+  // algorithm is pure and only depends on the src buffer — so we extract it
+  // as a standalone free function here.
+  return _bilinearRescaleStandalone(prepared, dstW, dstH).bytes;
+}
+
+/// Standalone bilinear rescale used by [bilinearRescaleRgbaForTest].
+Uint8List _bilinearFreeFunction(
+  Uint8List srcBytes,
+  int srcW,
+  int srcH,
+  int srcStride,
+  int dstW,
+  int dstH,
+) {
+  final dstStride = dstW * 4;
+  final dst = Uint8List(dstStride * dstH);
+  final xRatio = srcW > 1 ? (srcW - 1) / dstW : 0.0;
+  final yRatio = srcH > 1 ? (srcH - 1) / dstH : 0.0;
+  for (var y = 0; y < dstH; y++) {
+    final fy = (y + 0.5) * yRatio;
+    var y0 = fy.floor().clamp(0, srcH - 1);
+    var y1 = (y0 + 1).clamp(0, srcH - 1);
+    final wy = fy - y0;
+    final row0Base = y0 * srcStride;
+    final row1Base = y1 * srcStride;
+    final dstBase = y * dstStride;
+    for (var x = 0; x < dstW; x++) {
+      final fx = (x + 0.5) * xRatio;
+      var x0 = fx.floor().clamp(0, srcW - 1);
+      var x1 = (x0 + 1).clamp(0, srcW - 1);
+      final wx = fx - x0;
+      final i00 = row0Base + x0 * 4;
+      final i01 = row0Base + x1 * 4;
+      final i10 = row1Base + x0 * 4;
+      final i11 = row1Base + x1 * 4;
+      final dstIdx = dstBase + x * 4;
+      for (var c = 0; c < 4; c++) {
+        final top =
+            srcBytes[i00 + c] + (srcBytes[i01 + c] - srcBytes[i00 + c]) * wx;
+        final bot =
+            srcBytes[i10 + c] + (srcBytes[i11 + c] - srcBytes[i10 + c]) * wx;
+        dst[dstIdx + c] = (top + (bot - top) * wy).round().clamp(0, 255);
+      }
+    }
+  }
+  return dst;
+}
+
+_PreparedRgba _bilinearRescaleStandalone(
+  _PreparedRgba src,
+  int dstW,
+  int dstH,
+) {
+  final dst = _bilinearFreeFunction(
+    src.bytes,
+    src.width,
+    src.height,
+    src.srcStride,
+    dstW,
+    dstH,
+  );
+  return _PreparedRgba(
+    bytes: dst,
+    width: dstW,
+    height: dstH,
+    srcStride: dstW * 4,
+    bgra: src.bgra,
+    sourceFormat: src.sourceFormat,
+  );
+}

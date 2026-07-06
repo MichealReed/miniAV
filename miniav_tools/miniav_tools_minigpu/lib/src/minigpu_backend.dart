@@ -3,6 +3,8 @@ library;
 
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
+import 'av1/minigpu_av1_pipeline.dart';
+import 'av1/mp4/av1_mp4_muxer.dart';
 import 'gpu_codec_pipeline.dart';
 import 'minigpu_mjpeg_pipeline.dart';
 
@@ -16,8 +18,10 @@ class MinigpuBackend extends MiniAVToolsBackend {
   @override
   int get priority => defaultPriority;
 
-  // For now, advertise MJPEG as the primary target (compute-friendly DCT/VLC).
-  static const _encodeCodecs = <VideoCodec>{VideoCodec.mjpeg};
+  // MJPEG: fully working GPU pipeline.
+  // AV1: Phase 0 skeleton — bitstream framing + MP4 muxer only.
+  static const _encodeCodecs = <VideoCodec>{VideoCodec.mjpeg, VideoCodec.av1};
+  static const _muxContainers = <Container>{Container.mp4};
 
   @override
   bool supportsEncode(VideoCodec codec, {bool hwAccel = false}) =>
@@ -32,7 +36,7 @@ class MinigpuBackend extends MiniAVToolsBackend {
   bool supportsAudioDecode(AudioCodec codec) => false;
 
   @override
-  bool supportsMux(Container container) => false;
+  bool supportsMux(Container container) => _muxContainers.contains(container);
   @override
   bool supportsDemux(Container container) => false;
 
@@ -54,6 +58,8 @@ class MinigpuBackend extends MiniAVToolsBackend {
     switch (config.codec) {
       case VideoCodec.mjpeg:
         return GpuCodecEncoder(MinigpuMjpegPipeline(config: config));
+      case VideoCodec.av1:
+        return GpuCodecEncoder(MinigpuAv1Pipeline(config: config));
       default:
         return null;
     }
@@ -66,7 +72,15 @@ class MinigpuBackend extends MiniAVToolsBackend {
   }) async => null;
 
   @override
-  Future<PlatformMuxer?> createMuxer(MuxerConfig config) async => null;
+  Future<PlatformMuxer?> createMuxer(MuxerConfig config) async {
+    if (!_muxContainers.contains(config.container)) return null;
+    switch (config.container) {
+      case Container.mp4:
+        return Av1Mp4Muxer(config);
+      default:
+        return null;
+    }
+  }
 
   @override
   Future<PlatformDemuxer?> createDemuxer(DemuxerConfig config) async => null;

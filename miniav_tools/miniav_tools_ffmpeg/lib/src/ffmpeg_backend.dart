@@ -9,6 +9,7 @@ library;
 import 'dart:async';
 import 'dart:io';
 
+import 'package:meta/meta.dart';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
 import 'ffmpeg_audio_encoder.dart';
@@ -16,7 +17,9 @@ import 'ffmpeg_bindings.dart' as ffi;
 import 'ffmpeg_d3d11_hw_encoder.dart';
 import 'ffmpeg_decoder.dart';
 import 'ffmpeg_encoder.dart';
+import 'isolate_software_encoder.dart';
 import 'ffmpeg_hw_encoder.dart';
+import 'ffmpeg_log.dart';
 import 'ffmpeg_muxer.dart';
 
 class FfmpegBackend extends MiniAVToolsBackend {
@@ -206,6 +209,27 @@ class FfmpegBackend extends MiniAVToolsBackend {
     }
     await _ensureAvailable();
 
+    // Resolve the request to something this FFmpeg build can actually encode.
+    // The LGPL build has no software HEVC and H.264 tops out at 4096px, so
+    // HEVC-without-hardware and >4096px H.264 both fall back to a downscaled
+    // H.264 stream. Must run AFTER _ensureAvailable() so HW probing is valid.
+    // Both the HW and software encoders rescale oversized capture frames to
+    // their configured size, so callers can keep feeding full-resolution
+    // frames after this substitution.
+    final resolved = _resolveEncodableConfig(config);
+    if (resolved.codec != config.codec ||
+        resolved.width != config.width ||
+        resolved.height != config.height) {
+      ffmpegToolsLog(
+        MiniAVLogLevel.info,
+        '[ffmpeg] createEncoder: ${config.codec} '
+        '${config.width}x${config.height} is not directly encodable in this '
+        '(LGPL) build — falling back to ${resolved.codec} '
+        '${resolved.width}x${resolved.height} (downscale + H.264).',
+      );
+    }
+    config = resolved;
+
     // Stage A hardware path: try every supported vendor (NVENC > QSV > AMF
     // > VideoToolbox > MediaFoundation > V4L2) for h264 / hevc / av1 when
     // the user asked for hwAccel and an encoder is available in this
@@ -240,7 +264,8 @@ class FfmpegBackend extends MiniAVToolsBackend {
             );
           }
           // Context-driven zero-copy is best-effort — just fall through.
-          stderr.writeln(
+          ffmpegToolsLog(
+            MiniAVLogLevel.warn,
             '[ffmpeg] createEncoder: D3D11 zero-copy skipped — no D3D11VA '
             'encoder available for ${config.codec} in this FFmpeg build.',
           );
@@ -249,8 +274,15 @@ class FfmpegBackend extends MiniAVToolsBackend {
             final enc = FfmpegD3d11HwEncoder.open(
               config,
               existingD3d11Device: ctxZeroCopy ? context.d3d11DeviceHandle : 0,
+              // Both the ctxZeroCopy path (Minigpu SharedOutputTexture) and the
+              // legacy zerocopy=1 path (raw DXGI capture) deliver
+              // DXGI_FORMAT_B8G8R8A8_UNORM textures.  SharedOutputTexture is
+              // created with DXGI_FORMAT_B8G8R8A8_UNORM in minigpu_external.cpp;
+              // the buffer→texture WGSL writes to bgra8unorm storage.
+              // Default sourceTextureFormat (bgra) is correct for both paths.
             );
-            stderr.writeln(
+            ffmpegToolsLog(
+              MiniAVLogLevel.info,
               '[ffmpeg] createEncoder: D3D11 zero-copy encoder opened '
               '(${enc.runtimeType}) for ${config.codec} '
               '${config.width}x${config.height}'
@@ -260,7 +292,8 @@ class FfmpegBackend extends MiniAVToolsBackend {
           } on CodecInitException catch (e) {
             // Strict opt-in (a) — propagate. Context opt-in (b) — fall back.
             if (zerocopyOpt) rethrow;
-            stderr.writeln(
+            ffmpegToolsLog(
+              MiniAVLogLevel.warn,
               '[ffmpeg] createEncoder: D3D11 zero-copy failed ($e) — '
               'falling back to Stage A NVENC/software.',
             );
@@ -269,8 +302,9 @@ class FfmpegBackend extends MiniAVToolsBackend {
       }
       if (ffmpegHwEncoderAvailable(config.codec)) {
         try {
-          final enc = FfmpegHwEncoder.open(config);
-          stderr.writeln(
+          final enc = FfmpegHwEncoder.open(config, gpu: context?.sharedGpu);
+          ffmpegToolsLog(
+            MiniAVLogLevel.info,
             '[ffmpeg] createEncoder: Stage A HW encoder opened '
             '(${enc.runtimeType}) for ${config.codec} '
             '${config.width}x${config.height}',
@@ -279,7 +313,8 @@ class FfmpegBackend extends MiniAVToolsBackend {
         } on CodecInitException catch (e) {
           if (config.hwAccel == HwAccelPreference.required) rethrow;
           // preferred: fall through to software.
-          stderr.writeln(
+          ffmpegToolsLog(
+            MiniAVLogLevel.warn,
             '[ffmpeg] createEncoder: Stage A HW encoder failed ($e) — '
             'falling back to software.',
           );
@@ -292,7 +327,8 @@ class FfmpegBackend extends MiniAVToolsBackend {
           'AMF, VideoToolbox, MediaFoundation, V4L2.',
         );
       } else {
-        stderr.writeln(
+        ffmpegToolsLog(
+          MiniAVLogLevel.info,
           '[ffmpeg] createEncoder: no HW encoder available for ${config.codec}'
           ' — using software.',
         );
@@ -300,14 +336,91 @@ class FfmpegBackend extends MiniAVToolsBackend {
       // hwAccel=preferred: silently fall through to software.
     }
 
+    // Host the software encoder on a worker isolate so the synchronous libav
+    // encode never blocks the calling (UI) isolate — a 720p+ software encode
+    // costs tens of ms per frame, which reads as an app freeze while
+    // recording. Frames cross as TransferableTypedData (~1 ms at 720p).
+    // Escape hatch: backendOptions {'sw_isolate': '0'} keeps the in-isolate
+    // encoder (used by tests that poke encoder internals).
+    if (config.backendOptions['sw_isolate'] != '0') {
+      final enc = await IsolateSoftwareEncoder.open(config);
+      ffmpegToolsLog(
+        MiniAVLogLevel.info,
+        '[ffmpeg] createEncoder: software encoder opened on worker isolate '
+        '(${enc.runtimeType}) for ${config.codec} '
+        '${config.width}x${config.height}',
+      );
+      return enc;
+    }
     final enc = FfmpegSoftwareEncoder.open(config);
-    stderr.writeln(
+    ffmpegToolsLog(
+      MiniAVLogLevel.info,
       '[ffmpeg] createEncoder: software encoder opened '
       '(${enc.runtimeType}) for ${config.codec} '
       '${config.width}x${config.height}',
     );
     return enc;
   }
+
+  /// Hardware H.264 encoders (NVENC/QSV/AMF/MF/VT) and the LGPL build's
+  /// software H.264 (libopenh264) all top out at 4096px per side. HEVC/AV1 go
+  /// higher (8192px), which is why captures above this promote to HEVC when a
+  /// HW HEVC encoder exists.
+  static const int kH264MaxDimension = 4096;
+
+  /// Resolve a requested encoder [config] to one the loaded FFmpeg build can
+  /// actually produce, applying the "downscale + H.264" fallback:
+  ///
+  ///  * **HEVC with no hardware HEVC encoder** — the LGPL build has no software
+  ///    HEVC (no libx265; the Windows HEVC software MFT returns E_FAIL), so
+  ///    substitute H.264, which every HW vendor plus the MediaFoundation
+  ///    software MFT and libopenh264 can produce.
+  ///  * **H.264 above 4096px** (requested directly, or substituted above) —
+  ///    downscale, preserving aspect ratio with even dimensions, to fit within
+  ///    [kH264MaxDimension] on the longer side.
+  ///
+  /// AV1 is left untouched: SVT-AV1 software handles arbitrary resolution, so
+  /// an explicit AV1 request keeps full resolution even with no HW AV1.
+  ///
+  /// The encoder built from the returned config rescales oversized capture
+  /// frames to its configured size, so callers keep feeding full-size frames.
+  ///
+  /// Requires FFmpeg to be loaded (HW probing); call after [_ensureAvailable].
+  static EncoderConfig _resolveEncodableConfig(EncoderConfig config) {
+    var codec = config.codec;
+
+    // No software HEVC in the LGPL build → fall back to H.264 when no hardware
+    // HEVC encoder is present.
+    if (codec == VideoCodec.hevc &&
+        !ffmpegHwEncoderAvailable(VideoCodec.hevc)) {
+      codec = VideoCodec.h264;
+    }
+
+    var width = config.width;
+    var height = config.height;
+    if (codec == VideoCodec.h264 &&
+        (width > kH264MaxDimension || height > kH264MaxDimension)) {
+      final longer = width > height ? width : height;
+      final scale = kH264MaxDimension / longer;
+      width = (width * scale).floor();
+      height = (height * scale).floor();
+      // 4:2:0 encoders require even dimensions.
+      if (width.isOdd) width -= 1;
+      if (height.isOdd) height -= 1;
+    }
+
+    if (codec == config.codec &&
+        width == config.width &&
+        height == config.height) {
+      return config;
+    }
+    return config.copyWith(codec: codec, width: width, height: height);
+  }
+
+  /// Test hook for [_resolveEncodableConfig].
+  @visibleForTesting
+  static EncoderConfig resolveEncodableConfigForTest(EncoderConfig config) =>
+      _resolveEncodableConfig(config);
 
   /// Pick the best [VideoCodec] for the given resolution + HW preference.
   ///

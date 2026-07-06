@@ -269,36 +269,80 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
         // handles it.
       }
 
-      if (num_frames_available > 0 && ctx->app_callback) {
-        MiniAVBuffer buffer;
-        memset(&buffer, 0, sizeof(MiniAVBuffer));
-        buffer.type = MINIAV_BUFFER_TYPE_AUDIO;
-        buffer.content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+      // Only allocate + dispatch if callbacks are currently enabled.  This
+      // avoids leaking the heap buffer/PCM copy when MiniAV_Dispose has been
+      // called (e.g. during Flutter hot restart) and the dispatch would be
+      // a no-op.  We hold the dispatch guard for the whole window so the Dart
+      // NativeCallable cannot be torn down between alloc and post.
+      if (num_frames_available > 0 && ctx->app_callback &&
+          miniav_dispatch_guard_acquire_if_enabled()) {
+        // IMPORTANT: app_callback is a Dart NativeCallable.listener — it posts
+        // to the Dart event queue and returns immediately.  By the time Dart
+        // processes the event, the WASAPI data_ptr will already have been
+        // released via IAudioCaptureClient::ReleaseBuffer below, and the
+        // stack-allocated MiniAVBuffer will have been overwritten by the next
+        // loop iteration.  We must heap-allocate both the buffer struct and a
+        // copy of the audio data so they remain valid until Dart calls
+        // MiniAV_ReleaseBuffer.
+        const size_t audio_bytes =
+            (flags & AUDCLNT_BUFFERFLAGS_SILENT)
+                ? 0
+                : (size_t)num_frames_available *
+                      platform_ctx->capture_format->nBlockAlign;
 
-        // Convert QPC to us
+        MiniAVNativeBufferInternalPayload *payload =
+            (MiniAVNativeBufferInternalPayload *)miniav_calloc(
+                1, sizeof(MiniAVNativeBufferInternalPayload));
+        MiniAVBuffer *heap_buf =
+            (MiniAVBuffer *)miniav_calloc(1, sizeof(MiniAVBuffer));
+        void *audio_copy = NULL;
+        if (audio_bytes > 0) {
+          audio_copy = miniav_calloc(audio_bytes, 1);
+        }
+
+        if (!payload || !heap_buf || (audio_bytes > 0 && !audio_copy)) {
+          miniav_free(payload);
+          miniav_free(heap_buf);
+          miniav_free(audio_copy);
+          miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                     "WASAPI: OOM allocating audio buffer payload.");
+          miniav_dispatch_guard_release();
+          goto release_wasapi_buffer;
+        }
+
+        if (audio_bytes > 0) {
+          memcpy(audio_copy, data_ptr, audio_bytes);
+        }
+
+        // Compute timestamp.
+        uint64_t ts_us;
         if (platform_ctx->qpc_frequency.QuadPart != 0) {
-          buffer.timestamp_us =
+          ts_us =
               (qpc_position * 1000000) / platform_ctx->qpc_frequency.QuadPart;
         } else {
-          buffer.timestamp_us = miniav_get_time_us();
+          ts_us = miniav_get_time_us();
         }
 
-        // If silent, provide size=0 or a zeroed scratch buffer to avoid NULL data_ptr surprises
-        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-          buffer.data.audio.data = NULL;
-          buffer.data_size_bytes = 0; // consumer must synthesize silence if needed
-        } else {
-          buffer.data.audio.data = data_ptr;
-          buffer.data_size_bytes =
-              num_frames_available * platform_ctx->capture_format->nBlockAlign;
-        }
+        heap_buf->type = MINIAV_BUFFER_TYPE_AUDIO;
+        heap_buf->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+        heap_buf->timestamp_us = ts_us;
+        heap_buf->data.audio.data = audio_copy; // NULL for silent packets
+        heap_buf->data_size_bytes = audio_bytes;
+        heap_buf->data.audio.info = ctx->configured_video_format;
+        heap_buf->data.audio.info.num_frames = num_frames_available;
+        heap_buf->data.audio.frame_count = num_frames_available;
 
-        buffer.data.audio.info = ctx->configured_video_format;
-        buffer.data.audio.info.num_frames = num_frames_available;
-        buffer.data.audio.frame_count = num_frames_available;
+        // MiniAV_ReleaseBuffer will free audio_copy + heap_buf via the payload.
+        payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_AUDIO;
+        payload->native_singular_resource_ptr = audio_copy;
+        payload->parent_miniav_buffer_ptr = heap_buf;
+        heap_buf->internal_handle = payload;
 
-        MINIAV_SAFE_DISPATCH(ctx->app_callback(&buffer, ctx->app_callback_user_data));
+        ctx->app_callback(heap_buf, ctx->app_callback_user_data);
+        miniav_dispatch_guard_release();
       }
+
+release_wasapi_buffer:
 
       hr = platform_ctx->capture_client->lpVtbl->ReleaseBuffer(
           platform_ctx->capture_client, num_frames_available);

@@ -199,6 +199,7 @@ Static helpers:
 | API | Purpose |
 |---|---|
 | `Recorder.ensureSharedGpu()` | Idempotently bring up the shared `Minigpu` + D3D11 device.  Called automatically by `start()` when needed. |
+| `Recorder.sharedGpu` | The live `Minigpu` instance after `ensureSharedGpu()`, or `null` when GPU is unsupported.  Use to run custom compute passes (e.g. `gpu.copyBuffer`, a custom WGSL effect, or a `GpuScreenProcessor` for live preview) on the same Dawn device without a second `gpu.init()`. |
 | `Recorder.disposeSharedGpu()` | Explicitly destroy the shared GPU singleton.  Safe to call multiple times.  After this, the next `start()` re-initialises. |
 
 ---
@@ -234,17 +235,25 @@ The callback receives:
 
 | Parameter | Type | Values |
 |---|---|---|
-| `source` | `RecorderLogSource` | `recorder` · `miniav` · `ffmpeg` |
+| `source` | `RecorderLogSource` | `recorder` · `miniav` · `ffmpeg` · `minigpu` |
 | `level` | `RecorderLogLevel` | `verbose` · `info` · `warning` · `error` |
 | `message` | `String` | The log line (no trailing newline) |
 
-`source` tells you which subsystem emitted the message so you can filter or route them independently.
+`source` tells you which subsystem emitted the message so you can filter or
+route them independently. `ffmpeg` covers both native `av_log` messages and
+the `miniav_tools_ffmpeg` Dart layer (auto-downloader, encoder selection).
 
-To remove the callback and revert to the default `stderr` output:
+To remove the callback and revert to the default console output via `print`:
 
 ```dart
 Recorder.setLogCallback(null);
 ```
+
+Avoid writing to `dart:io` `stderr`/`stdout` from your callback: in a
+console-less Windows GUI app (a packaged Flutter desktop build) the OS stdio
+handles are invalid and those writes crash with an uncatchable async
+`FileSystemException` (errno 6). Use `print`, a file sink, or a logging
+package instead.
 
 ### Combined example
 
@@ -483,7 +492,7 @@ builder.addClipBuffer(
 
 ## Warmup
 
-On first run, the recorder may need to download FFmpeg shared libraries before encoding can start.  Call `MiniAVTools.warmup()` early in your app — in `main()` or `initState` — to trigger heavy initialisation up front and get byte-level download progress.
+On first run, the recorder may need to download FFmpeg shared libraries before encoding can start.  Call `Recorder.warmup()` early in your app — in `main()` or `initState` — to trigger heavy initialisation up front and get byte-level download progress.
 
 ```dart
 import 'package:miniav_recorder/miniav_recorder.dart';
@@ -492,7 +501,7 @@ import 'package:miniav_recorder/miniav_recorder.dart';
 @override
 void initState() {
   super.initState();
-  MiniAVTools.warmup().listen(
+  Recorder.warmup().listen(
     (p) {
       if (p.fraction != null) {
         setState(() => _downloadProgress = p.fraction!);
@@ -506,10 +515,16 @@ void initState() {
 }
 
 // Command-line / background — block until all backends are ready:
-await MiniAVTools.warmup().drain<void>();
+await Recorder.warmup().drain<void>();
 ```
 
 If the libraries are already cached on disk, `warmup()` completes immediately with no events.  It is safe to call multiple times.
+
+> Prefer `Recorder.warmup()` over calling `MiniAVTools.warmup()` directly:
+> backends are only warmed once **registered**, and the FFmpeg backend is
+> otherwise registered lazily inside `Recorder.start()`. `Recorder.warmup()`
+> registers it first, so the FFmpeg download is included even when no
+> recorder has been built yet.
 
 Warmup is **optional**: `createEncoder`, `createMuxer`, etc. trigger auto-download on demand.  The benefit of calling `warmup()` early is that you control when the download happens and can give the user feedback instead of silently stalling.
 

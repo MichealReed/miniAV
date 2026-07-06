@@ -57,6 +57,9 @@ void main() {
               'preset': 'ultrafast',
               'tune': 'zerolatency',
               'global_header': '1',
+              // This test needs the in-isolate encoder: it casts to
+              // FfmpegSoftwareEncoder and wires its bridge into the muxer.
+              'sw_isolate': '0',
             },
           ),
         );

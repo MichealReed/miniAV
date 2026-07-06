@@ -16,9 +16,8 @@ import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:ffi/ffi.dart';
-
 import 'ffmpeg_bindings.dart' as bindings;
+import 'ffmpeg_log.dart';
 
 // =============================================================================
 // External shim entry points (resolved via the native asset registered by
@@ -105,6 +104,88 @@ external void _d3d11CopyResource(
 @Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_d3d11_release')
 external void _d3d11Release(Pointer<Void> iunknown);
 
+/// Windows-only. Returns the DXGI `VendorId` of the adapter backing an
+/// `ID3D11Device*` (e.g. `0x8086` Intel, `0x10DE` NVIDIA, `0x1002` AMD).
+/// Returns `0` on failure (null pointer, QueryInterface failure, etc.).
+@Native<Uint32 Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_d3d11_get_vendor_id',
+)
+external int _d3d11GetVendorId(Pointer<Void> id3d11Device);
+
+/// Windows-only. Ensures the calling thread is in the COM MTA apartment.
+/// Required before opening h264_mf / h264_qsv / hevc_mf / hevc_qsv encoders
+/// from a Dart isolate (Flutter's UI thread is STA by default).
+///
+/// Returns 0 on success (now MTA, or already MTA), -1 if the thread is
+/// pinned to STA and cannot be changed.
+@Native<Int32 Function()>(symbol: 'miniav_shim_ensure_mta')
+external int _ensureMta();
+
+/// Sets [AVFrame.hw_frames_ctx] on a native AVFrame (used for QSV hwframe
+/// mapping). The ref is av_buffer_ref'd internally; pass [nullptr] to clear.
+@Native<Void Function(Pointer<Void>, Pointer<Void>)>(
+  symbol: 'miniav_shim_av_frame_set_hw_frames_ctx',
+)
+external void _avFrameSetHwFramesCtx(
+  Pointer<Void> frame,
+  Pointer<Void> hwFramesCtxRef,
+);
+
+/// Windows-only. Creates a sibling ID3D11Device on the same DXGI adapter as
+/// [existingDevice] but with D3D11_CREATE_DEVICE_VIDEO_SUPPORT enabled.
+@Native<Pointer<Void> Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_d3d11_create_video_device_for',
+)
+external Pointer<Void> _d3d11CreateVideoDeviceFor(Pointer<Void> existingDevice);
+// ---- D3D11 VideoProcessor — BGRA→NV12 for Intel QSV/MF zero-copy path ----
+//
+// Intel QSV (h264_qsv) and MediaFoundation (h264_mf) require NV12 input.
+// The VideoProcessor converts BGRA→NV12 in GPU memory using the driver's
+// hardware CSC unit.  All symbols are Windows-only.
+
+@Native<Pointer<Void> Function(Pointer<Void>, Pointer<Void>, Uint32, Uint32)>(
+  symbol: 'miniav_shim_d3d11_vp_create',
+)
+external Pointer<Void> _d3d11VpCreate(
+  Pointer<Void> id3d11Device,
+  Pointer<Void> id3d11Context,
+  int width,
+  int height,
+);
+
+@Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_d3d11_vp_destroy')
+external void _d3d11VpDestroy(Pointer<Void> vpCtx);
+
+@Native<
+  Int32 Function(
+    Pointer<Void>,
+    Pointer<Void>,
+    Pointer<Void>,
+    Pointer<Void>,
+    Int32,
+    Int32,
+    Pointer<Void>,
+  )
+>(symbol: 'miniav_shim_d3d11_vp_bgra_to_nv12')
+external int _d3d11VpBgraToNv12(
+  Pointer<Void> vpCtx,
+  Pointer<Void> vpDevice,
+  Pointer<Void> vpContext,
+  Pointer<Void> srcBgraTex,
+  int crossDevice,
+  int dstSubresource,
+  Pointer<Void> dstNv12Tex,
+);
+
+/// Sets [BindFlags] on an [AVD3D11VAFramesContext] before
+/// [av_hwframe_ctx_init]. For VideoProcessor output: include
+/// `D3D11_BIND_RENDER_TARGET (0x20)`. For QSV/MF encode: also include
+/// `D3D11_BIND_VIDEO_ENCODER (0x400)`. Must be called after
+/// `av_hwframe_ctx_alloc` and before `av_hwframe_ctx_init`. Windows-only.
+@Native<Void Function(Pointer<Void>, Uint32)>(
+  symbol: 'miniav_shim_d3d11va_frames_set_bind_flags',
+)
+external void _d3d11vaFramesSetBindFlags(Pointer<Void> hwFramesRef, int flags);
 // ---- Test-only helpers (Windows; safe no-op linkage on POSIX) ----------
 //
 // These produce an NT-shared BGRA D3D11 texture without depending on miniav.
@@ -308,7 +389,7 @@ class FfmpegShim {
   FfmpegShim._();
 
   /// Currently expected shim ABI. Bump in lock-step with `shim.c`.
-  static const int kExpectedAbiVersion = 9;
+  static const int kExpectedAbiVersion = 13;
 
   static FfmpegShim? _instance;
   static bool _attemptedLoad = false;
@@ -333,7 +414,8 @@ class FfmpegShim {
     try {
       final abi = _abiVersion();
       if (abi != kExpectedAbiVersion) {
-        stderr.writeln(
+        ffmpegToolsLog(
+          MiniAVLogLevel.error,
           'miniav_tools_ffmpeg: shim reports ABI $abi, expected '
           '$kExpectedAbiVersion. Rebuild with `dart pub get` (or '
           '`flutter clean && flutter pub get`) to refresh the build hook.',
@@ -363,6 +445,23 @@ class FfmpegShim {
 
   void setHwFramesCtx(Pointer<Void> ctx, Pointer<Void> ref) =>
       _setHwFramesCtx(ctx, ref);
+
+  /// Sets [AVFrame.hw_frames_ctx] on a native AVFrame pointer so that
+  /// [av_hwframe_map] can resolve the target hwframes context for mapping
+  /// a D3D11VA frame to a derived QSV frame.
+  void avFrameSetHwFramesCtx(
+    Pointer<Void> frame,
+    Pointer<Void> hwFramesCtxRef,
+  ) => _avFrameSetHwFramesCtx(frame, hwFramesCtxRef);
+
+  /// Windows-only.  Ensures the calling thread is in the COM MTA apartment
+  /// (a hard requirement for `h264_mf` / `h264_qsv` / `hevc_mf` / `hevc_qsv`
+  /// encoder init).  No-op on non-Windows or when COM is already MTA.
+  /// Returns 0 on success, -1 if the thread is locked into STA.
+  int ensureMta() {
+    if (!Platform.isWindows) return 0;
+    return _ensureMta();
+  }
 
   Pointer<Void> hwFramesData(Pointer<Void> ref) => _hwFramesData(ref);
 
@@ -444,6 +543,94 @@ class FfmpegShim {
   void d3d11Release(Pointer<Void> p) {
     assert(Platform.isWindows, 'd3d11Release is Windows-only');
     _d3d11Release(p);
+  }
+
+  /// Returns the DXGI `VendorId` of the adapter backing [id3d11Device]
+  /// (e.g. `0x8086` Intel, `0x10DE` NVIDIA, `0x1002` AMD). Returns `0` on
+  /// failure. Windows-only.
+  int d3d11GetVendorId(Pointer<Void> id3d11Device) {
+    assert(Platform.isWindows, 'd3d11GetVendorId is Windows-only');
+    return _d3d11GetVendorId(id3d11Device);
+  }
+
+  /// Creates a sibling `ID3D11Device` on the same DXGI adapter as
+  /// [existingDevice] but with `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` enabled.
+  ///
+  /// MediaFoundation MFTs require this flag on the device they use to encode.
+  /// Dawn/WebGPU devices omit it (it has overhead and is useless for
+  /// graphics/compute). Since both devices live on the same adapter,
+  /// `OpenSharedResource1` on NT handles succeeds from either device.
+  ///
+  /// The caller MUST release the returned pointer with [d3d11Release] once it
+  /// is no longer needed (after `d3d11SetDevice` — which AddRefs internally —
+  /// or after an `av_hwdevice_ctx_init` error). Returns `nullptr` on failure.
+  /// Windows-only.
+  Pointer<Void> d3d11CreateVideoDeviceFor(Pointer<Void> existingDevice) {
+    assert(Platform.isWindows, 'd3d11CreateVideoDeviceFor is Windows-only');
+    return _d3d11CreateVideoDeviceFor(existingDevice);
+  }
+
+  // ---- D3D11 VideoProcessor — BGRA→NV12 ----------------------------------
+
+  /// Create a VideoProcessor context for BGRA→NV12 GPU color-space conversion.
+  /// [id3d11Device] must have `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` (the sibling
+  /// device from [d3d11CreateVideoDeviceFor]). Returns `nullptr` on failure.
+  /// Must be destroyed with [d3d11VpDestroy]. Windows-only.
+  Pointer<Void> d3d11VpCreate(
+    Pointer<Void> id3d11Device,
+    Pointer<Void> id3d11Context,
+    int width,
+    int height,
+  ) {
+    assert(Platform.isWindows, 'd3d11VpCreate is Windows-only');
+    return _d3d11VpCreate(id3d11Device, id3d11Context, width, height);
+  }
+
+  /// Destroy a VideoProcessor context created by [d3d11VpCreate]. Windows-only.
+  void d3d11VpDestroy(Pointer<Void> vpCtx) {
+    assert(Platform.isWindows, 'd3d11VpDestroy is Windows-only');
+    _d3d11VpDestroy(vpCtx);
+  }
+
+  /// GPU BGRA→NV12 color-space conversion via D3D11 VideoProcessor.
+  ///
+  /// [srcBgraTex] is the BGRA source `ID3D11Texture2D*`.
+  /// [crossDevice]: if `true`, `srcBgraTex` is on a different device (e.g.
+  /// Dawn's) and the shim will import it via `IDXGIResource::GetSharedHandle +
+  /// OpenSharedResource` (requires `D3D11_RESOURCE_MISC_SHARED`).  If `false`,
+  /// `srcBgraTex` is already on the VP device.
+  /// [dstSubresource] is the `Texture2DArray` slice index from `AVFrame::data[1]`.
+  /// [dstNv12Tex] is the `Texture2DArray` `ID3D11Texture2D*` from `AVFrame::data[0]`.
+  ///
+  /// Returns 0 on success, negative on failure. Windows-only.
+  int d3d11VpBgraToNv12(
+    Pointer<Void> vpCtx,
+    Pointer<Void> vpDevice,
+    Pointer<Void> vpContext,
+    Pointer<Void> srcBgraTex, {
+    required bool crossDevice,
+    required int dstSubresource,
+    required Pointer<Void> dstNv12Tex,
+  }) {
+    assert(Platform.isWindows, 'd3d11VpBgraToNv12 is Windows-only');
+    return _d3d11VpBgraToNv12(
+      vpCtx,
+      vpDevice,
+      vpContext,
+      srcBgraTex,
+      crossDevice ? 1 : 0,
+      dstSubresource,
+      dstNv12Tex,
+    );
+  }
+
+  /// Sets `BindFlags` on an `AVD3D11VAFramesContext` before
+  /// `av_hwframe_ctx_init`. Include `D3D11_BIND_RENDER_TARGET (0x20)` to
+  /// allow VideoProcessor output views, and `D3D11_BIND_VIDEO_ENCODER (0x400)`
+  /// for QSV/MF encode. Windows-only.
+  void d3d11vaFramesSetBindFlags(Pointer<Void> hwFramesRef, int bindFlags) {
+    assert(Platform.isWindows, 'd3d11vaFramesSetBindFlags is Windows-only');
+    _d3d11vaFramesSetBindFlags(hwFramesRef, bindFlags);
   }
 
   /// **Test-only** — create a producer-side ID3D11Device + a BGRA
@@ -630,8 +817,6 @@ class FfmpegShim {
   /// `info=32`, `verbose=40`, `debug=48`.
   void setFfmpegLogLevel(int avLevel) => _setFfmpegLogLevel(avLevel);
 
-  /// Install (or replace) a callback that receives formatted FFmpeg log
-  /// lines. [callback] receives the AV_LOG_* level integer and the already-
   /// Decode a null-terminated C string from native memory using
   /// [Utf8Decoder.allowMalformed] so that FFmpeg log messages that contain
   /// non-UTF-8 bytes (e.g. Latin-1 filenames on Windows) never throw.
@@ -644,11 +829,15 @@ class FfmpegShim {
     return const Utf8Decoder(allowMalformed: true).convert(data);
   }
 
+  /// Install (or replace) a callback that receives formatted FFmpeg log
+  /// lines. [callback] receives the AV_LOG_* level integer and the already-
   /// formatted message string. Pass `null` to restore FFmpeg's default logger
   /// (which writes to native stderr — not visible in most Flutter apps).
   ///
   /// The callback is dispatched on the Dart event loop via a `listener`
-  /// NativeCallable, so it is safe to perform Dart I/O (e.g. `stderr.writeln`).
+  /// NativeCallable, so it is safe to run arbitrary Dart code (e.g. forward
+  /// to a logging framework — avoid `dart:io` `stderr`, which throws an
+  /// uncatchable async error in console-less Windows GUI apps).
   void setFfmpegLogCallback(
     void Function(int level, String message)? callback,
   ) {

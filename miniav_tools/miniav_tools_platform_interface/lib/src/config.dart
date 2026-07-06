@@ -57,6 +57,46 @@ class EncoderConfig {
     this.bFrameCount = 0,
     this.backendOptions = const {},
   });
+
+  /// Returns a copy with the given fields replaced. Used by backends that
+  /// must adjust the requested codec/resolution to something the loaded
+  /// encoder build can actually produce (e.g. downscaling a >4096px capture
+  /// and switching to H.264 when no HEVC encoder is available).
+  EncoderConfig copyWith({
+    VideoCodec? codec,
+    int? width,
+    int? height,
+    int? bitrateBps,
+    int? gopLength,
+    int? frameRateNumerator,
+    int? frameRateDenominator,
+    MiniAVPixelFormat? inputPixelFormat,
+    HwAccelPreference? hwAccel,
+    RateControl? rateControl,
+    int? crfQuality,
+    EncoderProfile? profile,
+    EncoderLevel? level,
+    int? bFrameCount,
+    Map<String, String>? backendOptions,
+  }) {
+    return EncoderConfig(
+      codec: codec ?? this.codec,
+      width: width ?? this.width,
+      height: height ?? this.height,
+      bitrateBps: bitrateBps ?? this.bitrateBps,
+      gopLength: gopLength ?? this.gopLength,
+      frameRateNumerator: frameRateNumerator ?? this.frameRateNumerator,
+      frameRateDenominator: frameRateDenominator ?? this.frameRateDenominator,
+      inputPixelFormat: inputPixelFormat ?? this.inputPixelFormat,
+      hwAccel: hwAccel ?? this.hwAccel,
+      rateControl: rateControl ?? this.rateControl,
+      crfQuality: crfQuality ?? this.crfQuality,
+      profile: profile ?? this.profile,
+      level: level ?? this.level,
+      bFrameCount: bFrameCount ?? this.bFrameCount,
+      backendOptions: backendOptions ?? this.backendOptions,
+    );
+  }
 }
 
 /// Configuration for a video decoder.

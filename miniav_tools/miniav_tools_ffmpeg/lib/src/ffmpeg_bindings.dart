@@ -63,6 +63,11 @@ DynamicLibrary? get avcodec => _avcodec;
 DynamicLibrary? get avformat => _avformat;
 DynamicLibrary? get avutil => _avutil;
 
+/// The directory from which FFmpeg shared libraries were loaded, or `null`
+/// if FFmpeg has not been loaded yet. On Windows this is the `bin/` folder
+/// that also contains `ffprobe.exe` and `ffmpeg.exe`.
+String? get ffmpegLoadedLibDir => _downloadedLibDir;
+
 DynamicLibrary? _open(
   String basename,
   List<String> dirs, {
@@ -130,7 +135,7 @@ List<String> _candidateDirs() {
 String? _existingCacheLibDir() {
   try {
     final root = FfmpegDownloader.defaultCacheRoot();
-    final installRoot = '$root${Platform.pathSeparator}$kFfmpegReleaseTag';
+    final installRoot = '$root${Platform.pathSeparator}$kFfmpegInstallDir';
     final dir = Directory(installRoot);
     if (!dir.existsSync()) return null;
     for (final entry in dir.listSync()) {

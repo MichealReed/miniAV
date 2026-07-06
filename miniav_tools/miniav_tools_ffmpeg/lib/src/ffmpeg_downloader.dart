@@ -5,8 +5,8 @@
 /// macOS via the auto-build pipeline. We pin to a known-good release.
 ///
 /// Cache layout:
-///   `<cacheRoot>/<release-tag>/<platform>/bin`   (Windows DLLs)
-///   `<cacheRoot>/<release-tag>/<platform>/lib`   (Linux .so / macOS .dylib)
+///   `<cacheRoot>/<release-tag>-<license>/<platform>/bin`   (Windows DLLs)
+///   `<cacheRoot>/<release-tag>-<license>/<platform>/lib`   (Linux .so / macOS .dylib)
 ///
 /// `cacheRoot` defaults to:
 ///   - Windows: %LOCALAPPDATA%\miniav_tools\ffmpeg
@@ -26,11 +26,33 @@ import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
+import 'ffmpeg_log.dart';
+
 /// Pinned release tag from https://github.com/BtbN/FFmpeg-Builds/releases.
-/// `latest` is a rolling tag updated daily by the CI; assets are named
-/// `ffmpeg-master-latest-<platform>-<gpl|lgpl>-shared.<ext>`.
+/// `latest` is the rolling tag; 8.1 stable assets are named
+/// `ffmpeg-n8.1-latest-<platform>-<license>-shared-8.1.<ext>`.
 const String kFfmpegReleaseTag = 'latest';
-const String kFfmpegVersionSuffix = 'master-latest';
+const String kFfmpegVersionSuffix = 'n8.1-latest';
+
+/// FFmpeg build licence variant to download.
+///
+/// **`lgpl`** (the default) pulls BtbN's LGPL shared build. We deliberately
+/// avoid the `gpl` build: that one is compiled with `--enable-gpl` and links
+/// GPL-only components (libx264, libx265, libxvid, …), which makes the whole
+/// FFmpeg binary GPLv2+ and would impose copyleft obligations on any product
+/// that loads it. The LGPL build keeps libav* under LGPL-2.1 — safe for
+/// proprietary dynamic linking — at the cost of the software x264/x265
+/// encoders. Hardware encoders (NVENC / QSV / AMF / MediaFoundation /
+/// VideoToolbox) and libvpx / SVT-AV1 remain available, so the only feature
+/// lost is the CPU-side H.264/HEVC fallback. See ffmpeg_backend.dart.
+const String kFfmpegLicense = 'lgpl';
+
+/// Cache subdirectory under the cache root, namespaced by release tag AND
+/// licence so flipping [kFfmpegLicense] forces a fresh download instead of
+/// silently reusing a previously-cached `gpl` install (which would defeat the
+/// licence switch). Both [FfmpegDownloader] and the binding loader build their
+/// install path from this constant so they always agree.
+const String kFfmpegInstallDir = '$kFfmpegReleaseTag-$kFfmpegLicense';
 
 class FfmpegDownloadResult {
   /// Directory containing the loadable shared libraries
@@ -48,10 +70,10 @@ class FfmpegDownloader {
   /// Asset filename per platform (BtbN naming convention).
   static String? _assetName() {
     if (Platform.isWindows) {
-      return 'ffmpeg-master-latest-win64-gpl-shared.zip';
+      return 'ffmpeg-$kFfmpegVersionSuffix-win64-$kFfmpegLicense-shared-8.1.zip';
     }
     if (Platform.isLinux) {
-      return 'ffmpeg-master-latest-linux64-gpl-shared.tar.xz';
+      return 'ffmpeg-$kFfmpegVersionSuffix-linux64-$kFfmpegLicense-shared-8.1.tar.xz';
     }
     // macOS: BtbN does not ship official macOS shared builds. User must
     // install via `brew install ffmpeg` (homebrew puts dylibs in
@@ -117,7 +139,7 @@ class FfmpegDownloader {
     if (uri == null) return null; // unsupported platform
 
     final root = cacheRoot ?? defaultCacheRoot();
-    final installRoot = p.join(root, kFfmpegReleaseTag);
+    final installRoot = p.join(root, kFfmpegInstallDir);
     final marker = File(p.join(installRoot, '.ready'));
 
     // ---- Layer 1: marker present + libs found → fast path. -----------------
@@ -240,11 +262,15 @@ class FfmpegDownloader {
         } else if (asset.endsWith('.tar.xz')) {
           await _extractTarXz(archivePath, installRoot);
         } else {
-          stderr.writeln('miniav_tools_ffmpeg: unknown archive format: $asset');
+          ffmpegToolsLog(
+            MiniAVLogLevel.error,
+            'miniav_tools_ffmpeg: unknown archive format: $asset',
+          );
           return null;
         }
       } on PathAccessException catch (e) {
-        stderr.writeln(
+        ffmpegToolsLog(
+          MiniAVLogLevel.warn,
           'miniav_tools_ffmpeg: extraction blocked (file in use): $e — '
           'attempting to use existing install.',
         );
@@ -260,7 +286,8 @@ class FfmpegDownloader {
         // Some Dart/Windows builds wrap the same condition as a plain
         // FileSystemException with osError.errorCode == 32.
         if (e.osError?.errorCode == 32) {
-          stderr.writeln(
+          ffmpegToolsLog(
+            MiniAVLogLevel.warn,
             'miniav_tools_ffmpeg: extraction blocked (errno=32): $e — '
             'attempting to use existing install.',
           );
@@ -306,7 +333,8 @@ class FfmpegDownloader {
 
     final libDir = await _findLibDir(installRoot);
     if (libDir == null) {
-      stderr.writeln(
+      ffmpegToolsLog(
+        MiniAVLogLevel.error,
         'miniav_tools_ffmpeg: extracted FFmpeg but no lib dir found under '
         '$installRoot',
       );
@@ -367,7 +395,8 @@ class FfmpegDownloader {
         return _download(Uri.parse(loc), destPath, progress: progress);
       }
       if (res.statusCode != 200) {
-        stderr.writeln(
+        ffmpegToolsLog(
+          MiniAVLogLevel.error,
           'miniav_tools_ffmpeg: download failed HTTP '
           '${res.statusCode} for $uri',
         );
@@ -387,7 +416,10 @@ class FfmpegDownloader {
       }
       return true;
     } catch (e) {
-      stderr.writeln('miniav_tools_ffmpeg: download error: $e');
+      ffmpegToolsLog(
+        MiniAVLogLevel.error,
+        'miniav_tools_ffmpeg: download error: $e',
+      );
       return false;
     } finally {
       client.close();

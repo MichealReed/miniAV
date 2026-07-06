@@ -117,6 +117,79 @@ void main() {
       },
     );
 
+    // -------------------------------------------------------------------------
+    // Regression: encoding frames whose pixel dimensions differ from the
+    // encoder config must NOT throw — the bilinear rescale path absorbs them.
+    // -------------------------------------------------------------------------
+    test('mismatched frame size is rescaled silently (no throw)', () async {
+      final vendors = ffmpegHwVendorsAvailable();
+      if (vendors.isEmpty) {
+        print('SKIP: no HW encoder vendors present');
+        return;
+      }
+
+      // Encoder fixed at 1280x720; frames will arrive at 1920x1080.
+      const encW = 1280, encH = 720;
+      const srcW = 1920, srcH = 1080;
+      final rgba = _makeGradient(srcW, srcH);
+
+      FfmpegHwEncoder? enc;
+      for (final vendor in vendors) {
+        try {
+          enc = FfmpegHwEncoder.openWith(
+            const EncoderConfig(
+              codec: VideoCodec.h264,
+              width: encW,
+              height: encH,
+              bitrateBps: 1_500_000,
+              frameRateNumerator: 30,
+              frameRateDenominator: 1,
+              bFrameCount: 0,
+              hwAccel: HwAccelPreference.required,
+              rateControl: RateControl.vbr,
+            ),
+            vendor,
+          );
+          break;
+        } on CodecInitException catch (e) {
+          print('SKIP $vendor (mismatch test): ${e.message}');
+        }
+      }
+      if (enc == null) {
+        print('SKIP: all vendors failed to open for mismatch test');
+        return;
+      }
+
+      var packets = 0;
+      try {
+        for (var f = 0; f < 5; f++) {
+          final pkt = await enc.encode(
+            FrameSource.cpu(
+              bytes: rgba,
+              pixelFormat: MiniAVPixelFormat.rgba32,
+              width: srcW, // ← intentionally != encW
+              height: srcH, // ← intentionally != encH
+              timestampUs: f * 33333,
+            ),
+          );
+          if (pkt != null) packets++;
+        }
+        packets += (await enc.flush()).length;
+      } finally {
+        await enc.close();
+      }
+
+      print(
+        'Mismatch rescale: $packets packets from ${srcW}x$srcH → ${encW}x$encH',
+      );
+      expect(
+        packets,
+        greaterThan(0),
+        reason:
+            'Rescaled mismatched input should still produce encoded packets',
+      );
+    });
+
     test('bestCodecForResolution promotes H.264 → HEVC above 4096px', () {
       expect(
         FfmpegBackend.bestCodecForResolution(

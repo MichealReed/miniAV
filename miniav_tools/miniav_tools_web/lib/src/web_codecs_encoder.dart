@@ -156,6 +156,14 @@ class WebCodecsVideoEncoder implements PlatformEncoder {
   @override
   Future<void> requestKeyframe() async => _nextKeyframe = true;
 
+  // WebCodecs consumes VideoFrames (FrameSource.webVideoFrame / cpu), not GPU
+  // storage buffers or pre-converted YUV420P planes.
+  @override
+  bool get supportsGpuBufferInput => false;
+
+  @override
+  bool get acceptsYuv420pPlanes => false;
+
   @override
   Future<void> close() async {
     try {

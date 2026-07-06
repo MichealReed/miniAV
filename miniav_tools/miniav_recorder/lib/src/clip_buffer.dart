@@ -19,7 +19,6 @@
 library;
 
 import 'dart:collection';
-import 'dart:io';
 import 'dart:math' show min;
 import 'dart:typed_data';
 
@@ -28,6 +27,7 @@ import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
 import 'container_utils.dart';
+import 'recorder_log.dart';
 import 'track_chunk.dart';
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -95,6 +95,88 @@ class _TrackMeta {
   }
 }
 
+/// Selected slice of the clip ring buffer: the PTS-sorted [chunks] snapshot to
+/// mux, the set of video track indices seen in the window, and whether video
+/// had to be dropped (no keyframe available).
+typedef ClipSlice = ({
+  List<TrackChunk> chunks,
+  Set<int> videoTracks,
+  bool droppedVideo,
+});
+
+/// Selects + snapshots the chunks for a clip covering `[cutoffPts, lastPts]` in
+/// a single bounded operation (a couple of scans over [buf] plus one sort),
+/// producing a stable copy decoupled from the live ring buffer.
+///
+/// When the window contains video, the clip is extended back to the most recent
+/// keyframe at or before [cutoffPts] (the GOP boundary) so the decoder has an
+/// IDR to anchor to — or, failing that, trimmed forward to the first keyframe
+/// inside the window. If no keyframe exists anywhere and the window has
+/// non-video content, video is dropped so a valid audio-only file still results.
+///
+/// Pure and top-level so the (subtle) windowing/keyframe logic is unit-testable
+/// without a live recorder.
+ClipSlice selectClipSlice(
+  Iterable<TrackChunk> buf,
+  int cutoffPts,
+  int lastPts,
+) {
+  // Pass 1: which video tracks appear in the window, and is there any non-video?
+  final videoTracks = <int>{};
+  var hasNonVideoInWindow = false;
+  for (final c in buf) {
+    if (c.ptsUs < cutoffPts || c.ptsUs > lastPts) continue;
+    if (c.kind == TrackKind.video) {
+      videoTracks.add(c.trackIndex);
+    } else {
+      hasNonVideoInWindow = true;
+    }
+  }
+
+  var startPts = cutoffPts;
+  var droppedVideo = false;
+  if (videoTracks.isNotEmpty) {
+    // Pass 2: find the keyframe-aligned clip start. Prefer the newest keyframe
+    // at or before the window (full duration, extended to the GOP boundary);
+    // else the first keyframe inside the window.
+    int? bestKeyPts; // newest video keyframe pts <= cutoffPts
+    int? firstKeyInside; // first video keyframe pts in (cutoffPts, lastPts]
+    for (final c in buf) {
+      if (c.kind != TrackKind.video || !c.isKeyframe) continue;
+      if (!videoTracks.contains(c.trackIndex)) continue;
+      if (c.ptsUs <= cutoffPts) {
+        if (bestKeyPts == null || c.ptsUs > bestKeyPts) bestKeyPts = c.ptsUs;
+      } else if (c.ptsUs <= lastPts && firstKeyInside == null) {
+        firstKeyInside = c.ptsUs;
+      }
+    }
+    final clipStart = bestKeyPts ?? firstKeyInside;
+    if (clipStart != null) {
+      startPts = clipStart;
+    } else {
+      // No keyframe anywhere — GOP exceeds the buffer. Drop video (keep audio)
+      // when there is non-video content; otherwise keep the video chunks so the
+      // caller's metadata validation runs (matching the prior behavior).
+      droppedVideo = hasNonVideoInWindow;
+    }
+  }
+
+  // Pass 3: snapshot the selected chunks once, then sort by PTS so DTS is
+  // monotonic per stream (the IDR precedes the P-frames that reference it).
+  final chunks = <TrackChunk>[];
+  for (final c in buf) {
+    if (c.ptsUs < startPts || c.ptsUs > lastPts) continue;
+    if (droppedVideo && c.kind == TrackKind.video) continue;
+    chunks.add(c);
+  }
+  chunks.sort((a, b) => a.ptsUs.compareTo(b.ptsUs));
+  return (
+    chunks: chunks,
+    videoTracks: videoTracks,
+    droppedVideo: droppedVideo,
+  );
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // ClipBuffer
 // ──────────────────────────────────────────────────────────────────────────────
@@ -119,7 +201,15 @@ class ClipBuffer {
   ///
   /// [maxPackets] is an optional hard cap on the ring size to bound memory
   /// usage when the encoder produces many small packets.
-  ClipBuffer({required this.maxWindow, this.maxPackets});
+  /// Optional muxer factory used by [saveClip] for **video-only** clips.
+  ///
+  /// When set and the clip contains a single video track (no audio), this
+  /// factory is called instead of [FfmpegMuxer.open], letting the caller
+  /// supply a backend-native muxer (e.g. [Av1Mp4Muxer] for the minigpu
+  /// AV1 path). For clips that include audio tracks [FfmpegMuxer] is
+  /// always used regardless of this setting, because audio muxing requires
+  /// FFmpeg's `ch_layout` bridge.
+  ClipBuffer({required this.maxWindow, this.maxPackets, this.muxerFactory});
 
   /// Maximum buffered duration. Packets older than `now − maxWindow` are
   /// evicted automatically. This is the upper bound for [saveClip]'s
@@ -129,6 +219,10 @@ class ClipBuffer {
   /// Optional maximum number of packets retained. When non-null the oldest
   /// packets are dropped even if they are still within [window].
   final int? maxPackets;
+
+  /// Optional factory for creating a [PlatformMuxer] for video-only clips.
+  /// See constructor doc for details.
+  final PlatformMuxer Function(MuxerConfig)? muxerFactory;
 
   // Ring buffer — newest packets at the back, oldest at the front.
   final _buf = ListQueue<TrackChunk>();
@@ -229,60 +323,23 @@ class ClipBuffer {
     final lastPts = _buf.isEmpty ? 0 : _maxPtsUs;
     final cutoffPts = lastPts - effectiveWindowUs;
 
-    // 2. Gather all chunks within the window (in arrival/DTS order).
-    var chunks = _buf.where((c) => c.ptsUs >= cutoffPts).toList();
+    // 2–3. Select + snapshot the clip slice (keyframe-aligned) in one bounded
+    //      operation, decoupled from the live ring buffer. The returned chunks
+    //      are already PTS-sorted. See [selectClipSlice].
+    final slice = selectClipSlice(_buf, cutoffPts, lastPts);
+    final chunks = slice.chunks;
+    final videoTrackIndices = slice.videoTracks;
+    if (slice.droppedVideo) {
+      recorderLog(
+        RecorderLogSource.recorder,
+        RecorderLogLevel.warning,
+        '[clip_buffer] no IDR/keyframe in buffer for video tracks '
+        '$videoTrackIndices — encoder gopLength likely exceeds buffer '
+        'window. Dropping video from this clip.',
+      );
+    }
     if (chunks.isEmpty) {
       throw StateError('ClipBuffer.saveClip: no packets in requested window');
-    }
-
-    // 3. If there are video tracks, the clip MUST start at a keyframe so the
-    //    decoder has an IDR to anchor to. Find the most recent keyframe at
-    //    or before the window start and use that as the new clip start.
-    //    If no such keyframe exists in the whole buffer (e.g. encoder GOP
-    //    is longer than the buffer), fall back to the first keyframe inside
-    //    the window; if there is none of those either, drop video.
-    final videoTrackIndices = chunks
-        .where((c) => c.kind == TrackKind.video)
-        .map((c) => c.trackIndex)
-        .toSet();
-    if (videoTrackIndices.isNotEmpty) {
-      // Walk the buffer once, tracking the latest keyframe seen at-or-before
-      // cutoffPts and the first keyframe seen strictly after it.
-      int? bestKeyPts; // newest keyframe <= cutoffPts
-      int? firstKeyInsideWindow;
-      for (final c in _buf) {
-        if (!videoTrackIndices.contains(c.trackIndex)) continue;
-        if (!c.isKeyframe) continue;
-        if (c.ptsUs <= cutoffPts) {
-          bestKeyPts = c.ptsUs;
-        } else if (firstKeyInsideWindow == null) {
-          firstKeyInsideWindow = c.ptsUs;
-        }
-      }
-      // Prefer the keyframe just before the window — this gives the user
-      // the full requested duration (slightly extended back to the GOP
-      // boundary). Only if none exists do we trim forward to the first
-      // in-window keyframe.
-      final clipStartPts = bestKeyPts ?? firstKeyInsideWindow;
-      if (clipStartPts != null) {
-        chunks = _buf
-            .where((c) => c.ptsUs >= clipStartPts && c.ptsUs <= lastPts)
-            .toList();
-      } else {
-        // Buffer holds video chunks but no keyframe at all — encoder GOP
-        // exceeds buffer length. Drop video so we still get an audio file
-        // rather than a broken video file. If video is the only track,
-        // fall through to the metadata-validation error path.
-        final hasNonVideo = chunks.any((c) => c.kind != TrackKind.video);
-        if (hasNonVideo) {
-          stderr.writeln(
-            '[clip_buffer] WARN: no IDR/keyframe in buffer for video tracks '
-            '$videoTrackIndices — encoder gopLength likely exceeds buffer '
-            'window. Dropping video from this clip.',
-          );
-          chunks = chunks.where((c) => c.kind != TrackKind.video).toList();
-        }
-      }
     }
 
     // 4. Determine which track indices are actually present.
@@ -304,9 +361,49 @@ class ClipBuffer {
       for (var i = 0; i < presentIndices.length; i++) presentIndices[i]: i,
     };
 
-    // 6. Build track-info list and open temporary audio encoders (needed only
-    //    so FfmpegMuxer can call avcodec_parameters_from_context for audio
-    //    streams — ch_layout can only be set up via a live AVCodecContext).
+    // 6. Resolve container up front so we can choose the muxer strategy
+    //    before deciding whether the temporary FFmpeg audio encoders are
+    //    even needed.
+    final effectiveContainer =
+        container ??
+        containerForExtension(path) ??
+        containerForTrackMix(
+          hasVideo: videoTrackIndices.isNotEmpty,
+          hasAudio: presentIndices.any(
+            (i) => _meta[i]!.kind == TrackKind.audio,
+          ),
+          audioCodecs: presentIndices
+              .where((i) => _meta[i]!.kind == TrackKind.audio)
+              .map((i) => _meta[i]!.audioCodec!)
+              .toSet(),
+        );
+
+    // 7. Decide muxer strategy. The caller-supplied muxerFactory (the
+    //    pure-Dart Av1Mp4Muxer for the minigpu path) can handle MP4 clips
+    //    with exactly one AV1 video track plus any number of AAC audio
+    //    tracks — no FFmpeg round-trip and no temporary audio encoders.
+    final videoMetas = presentIndices
+        .map((i) => _meta[i]!)
+        .where((m) => m.kind == TrackKind.video)
+        .toList();
+    final audioMetas = presentIndices
+        .map((i) => _meta[i]!)
+        .where((m) => m.kind == TrackKind.audio)
+        .toList();
+    final useDartMuxer =
+        muxerFactory != null &&
+        effectiveContainer == Container.mp4 &&
+        videoMetas.length == 1 &&
+        videoMetas.first.videoCodec == VideoCodec.av1 &&
+        audioMetas.every((m) => m.audioCodec == AudioCodec.aac);
+
+    // 8. Build track-info list. For the FFmpeg path we open a temporary audio
+    //    encoder per audio track purely so FfmpegMuxer can call
+    //    avcodec_parameters_from_context (ch_layout needs a live context).
+    //    The Dart muxer needs no encoder — it muxes the already-encoded AAC
+    //    packets directly, passing through the captured AudioSpecificConfig
+    //    when present (otherwise it synthesises one from sample-rate /
+    //    channel-count).
     final trackInfos = <TrackInfo>[];
     final tempAudioEncoders = <int, AudioEncoder>{}; // remapped idx → encoder
     final encoderForTrack = <int, FfmpegEncoderBridge>{};
@@ -318,6 +415,21 @@ class ClipBuffer {
 
         if (meta.kind == TrackKind.video) {
           trackInfos.add(meta.toVideoTrackInfo());
+        } else if (useDartMuxer) {
+          final ed = meta.extraData;
+          trackInfos.add(
+            AudioTrackInfo(
+              codec: meta.audioCodec!,
+              sampleRate: meta.sampleRate!,
+              channels: meta.channels!,
+              extraData: (ed != null && ed.isNotEmpty)
+                  ? CodecExtraData.audio(
+                      meta.audioCodec,
+                      Uint8List.fromList(ed),
+                    )
+                  : null,
+            ),
+          );
         } else {
           // Audio: create a temporary encoder purely for codecpar filling.
           final enc = await MiniAVTools.createAudioEncoder(
@@ -344,30 +456,20 @@ class ClipBuffer {
         }
       }
 
-      // 7. Resolve container.
-      final effectiveContainer =
-          container ??
-          containerForExtension(path) ??
-          containerForTrackMix(
-            hasVideo: videoTrackIndices.isNotEmpty,
-            hasAudio: presentIndices.any(
-              (i) => _meta[i]!.kind == TrackKind.audio,
-            ),
-            audioCodecs: presentIndices
-                .where((i) => _meta[i]!.kind == TrackKind.audio)
-                .map((i) => _meta[i]!.audioCodec!)
-                .toSet(),
-          );
-
-      // 8. Open muxer.
-      final muxer = FfmpegMuxer.open(
-        MuxerConfig(
-          container: effectiveContainer,
-          output: FileMuxerOutput(path),
-          tracks: trackInfos,
-        ),
-        encoderForTrack: encoderForTrack.isNotEmpty ? encoderForTrack : null,
+      // Open muxer: Dart muxer for the AV1(+AAC) MP4 path, FFmpeg otherwise.
+      final muxerConfig = MuxerConfig(
+        container: effectiveContainer,
+        output: FileMuxerOutput(path),
+        tracks: trackInfos,
       );
+      final PlatformMuxer muxer = useDartMuxer
+          ? muxerFactory!(muxerConfig)
+          : FfmpegMuxer.open(
+              muxerConfig,
+              encoderForTrack: encoderForTrack.isNotEmpty
+                  ? encoderForTrack
+                  : null,
+            );
 
       // 9. Write header. After this the muxer no longer needs the encoder
       //    bridges, so we can close the temp encoders immediately.
@@ -399,22 +501,12 @@ class ClipBuffer {
       final earliestPts = chunks.map((c) => c.ptsUs).reduce(min);
       final originPts = cutoffPts > earliestPts ? cutoffPts : earliestPts;
 
-      // 11. Write packets sorted by PTS.
-      //
-      //    The buffer stores chunks in *arrival* order, which is NOT the same
-      //    as PTS order.  The H.264 IDR/keyframe is larger than subsequent
-      //    P-frames so it can take longer to encode and land in the queue
-      //    *after* those P-frames even though its PTS is earlier.  Writing
-      //    in arrival order would give av_interleaved_write_frame a
-      //    backwards DTS within the video stream, causing it to silently drop
-      //    the IDR.  Without a keyframe the decoder shows frozen / garbled
-      //    frames for the whole first GOP.
-      //
-      //    Sorting by PTS (== DTS for no-B-frame streams) guarantees that
-      //    DTS is monotonically increasing within each stream and that the
-      //    IDR always precedes the P-frames that reference it.
-      chunks.sort((a, b) => a.ptsUs.compareTo(b.ptsUs));
-
+      // 11. Write packets. [chunks] is already PTS-sorted by [selectClipSlice]
+      //    (the buffer stores *arrival* order, which is NOT PTS order — an IDR
+      //    can land after the P-frames it precedes; writing arrival order would
+      //    give av_interleaved_write_frame a backwards DTS and it would silently
+      //    drop the IDR, garbling the first GOP). Sorting by PTS (== DTS for
+      //    no-B-frame streams) keeps DTS monotonic per stream.
       var written = 0;
       for (final chunk in chunks) {
         final remapIdx = idxRemap[chunk.trackIndex]!;
@@ -437,7 +529,11 @@ class ClipBuffer {
           );
           written++;
         } catch (e) {
-          stderr.writeln('[clip_buffer] writePacket track=$remapIdx: $e');
+          recorderLog(
+            RecorderLogSource.recorder,
+            RecorderLogLevel.error,
+            '[clip_buffer] writePacket track=$remapIdx: $e',
+          );
         }
       }
 

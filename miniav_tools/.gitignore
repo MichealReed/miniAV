@@ -38,3 +38,5 @@ Thumbs.db
 *.opus
 *.flac
 *.m4a
+*.yuv
+*.log

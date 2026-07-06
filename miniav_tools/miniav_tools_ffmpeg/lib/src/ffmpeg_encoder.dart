@@ -77,6 +77,7 @@ class FfmpegSoftwareEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   int _nextPts = 0;
   CodecExtraData? _extraData;
   bool _forceKeyframe = false;
+  bool _loggedRescale = false;
 
   /// Build + open an encoder. Throws [CodecInitException] on any failure.
   static FfmpegSoftwareEncoder open(EncoderConfig cfg) {
@@ -264,12 +265,30 @@ class FfmpegSoftwareEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   Future<EncodedPacket?> encode(FrameSource frame) async {
     _checkOpen();
     final yuv = _frameToYuv420p(frame);
-    if (yuv.width != _cfg.width || yuv.height != _cfg.height) {
-      throw CodecRuntimeException(
-        'ffmpeg',
-        'Frame size ${yuv.width}x${yuv.height} != encoder size '
-            '${_cfg.width}x${_cfg.height}',
-      );
+
+    final cw = _cfg.width, ch = _cfg.height;
+    Uint8List yP, uP, vP;
+    if (yuv.width == cw && yuv.height == ch) {
+      yP = yuv.y;
+      uP = yuv.u;
+      vP = yuv.v;
+    } else {
+      // Capture resolution differs from the encoder's fixed size — typically
+      // because the backend downscaled a >4096px capture to fit H.264 (see
+      // FfmpegBackend._resolveEncodableConfig). Bilinear-rescale each YUV420
+      // plane to the encoder size. Mirrors the hardware encoder's rescale
+      // safety-net so the software path doesn't reject mismatched input.
+      if (!_loggedRescale) {
+        _loggedRescale = true;
+        // ignore: avoid_print
+        print(
+          '[ffmpeg-sw] rescaling input ${yuv.width}x${yuv.height} -> '
+          '${cw}x$ch',
+        );
+      }
+      yP = _bilinearPlane(yuv.y, yuv.width, yuv.height, cw, ch);
+      uP = _bilinearPlane(yuv.u, yuv.width ~/ 2, yuv.height ~/ 2, cw ~/ 2, ch ~/ 2);
+      vP = _bilinearPlane(yuv.v, yuv.width ~/ 2, yuv.height ~/ 2, cw ~/ 2, ch ~/ 2);
     }
 
     // Make frame writable + copy plane data.
@@ -282,9 +301,9 @@ class FfmpegSoftwareEncoder implements PlatformEncoder, FfmpegEncoderBridge {
       );
     }
     final f = _frame.ref;
-    _copyPlane(f.data0, f.linesize0, yuv.y, yuv.width, yuv.height);
-    _copyPlane(f.data1, f.linesize1, yuv.u, yuv.width ~/ 2, yuv.height ~/ 2);
-    _copyPlane(f.data2, f.linesize2, yuv.v, yuv.width ~/ 2, yuv.height ~/ 2);
+    _copyPlane(f.data0, f.linesize0, yP, cw, ch);
+    _copyPlane(f.data1, f.linesize1, uP, cw ~/ 2, ch ~/ 2);
+    _copyPlane(f.data2, f.linesize2, vP, cw ~/ 2, ch ~/ 2);
     f.pts = _nextPts++;
     f.pictType = _forceKeyframe ? 1 /* AV_PICTURE_TYPE_I */ : 0;
     _forceKeyframe = false;
@@ -320,6 +339,14 @@ class FfmpegSoftwareEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   }
 
   @override
+  bool get supportsGpuBufferInput => false;
+
+  // libx264 (and the software path generally) encodes YUV420P natively, so it
+  // accepts GPU-converted planes directly — no internal RGBA→YUV conversion.
+  @override
+  bool get acceptsYuv420pPlanes => true;
+
+  @override
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
@@ -343,6 +370,48 @@ class FfmpegSoftwareEncoder implements PlatformEncoder, FfmpegEncoderBridge {
     if (_closed) {
       throw const CodecRuntimeException('ffmpeg', 'encoder closed');
     }
+  }
+
+  /// Single-channel bilinear resize of a tightly-packed plane (stride ==
+  /// width). Used to fit a mismatched-size capture frame to the encoder's
+  /// configured dimensions — the YUV-plane analogue of the hardware encoder's
+  /// packed-RGBA rescale.
+  static Uint8List _bilinearPlane(
+    Uint8List src,
+    int sw,
+    int sh,
+    int dw,
+    int dh,
+  ) {
+    if (sw == dw && sh == dh) return src;
+    final dst = Uint8List(dw * dh);
+    final xRatio = sw > 1 ? (sw - 1) / dw : 0.0;
+    final yRatio = sh > 1 ? (sh - 1) / dh : 0.0;
+    for (var y = 0; y < dh; y++) {
+      final fy = (y + 0.5) * yRatio;
+      var y0 = fy.floor();
+      if (y0 < 0) y0 = 0;
+      if (y0 > sh - 1) y0 = sh - 1;
+      var y1 = y0 + 1;
+      if (y1 > sh - 1) y1 = sh - 1;
+      final wy = fy - y0;
+      final r0 = y0 * sw;
+      final r1 = y1 * sw;
+      final db = y * dw;
+      for (var x = 0; x < dw; x++) {
+        final fx = (x + 0.5) * xRatio;
+        var x0 = fx.floor();
+        if (x0 < 0) x0 = 0;
+        if (x0 > sw - 1) x0 = sw - 1;
+        var x1 = x0 + 1;
+        if (x1 > sw - 1) x1 = sw - 1;
+        final wx = fx - x0;
+        final top = src[r0 + x0] + (src[r0 + x1] - src[r0 + x0]) * wx;
+        final bot = src[r1 + x0] + (src[r1 + x1] - src[r1 + x0]) * wx;
+        dst[db + x] = (top + (bot - top) * wy).round().clamp(0, 255);
+      }
+    }
+    return dst;
   }
 
   /// Internal accessor for the FFmpeg muxer (same package). Allows the muxer
@@ -405,6 +474,15 @@ class FfmpegSoftwareEncoder implements PlatformEncoder, FfmpegEncoderBridge {
 
   PreparedYuv420p _frameToYuv420p(FrameSource src) {
     switch (src) {
+      case Yuv420pFrameSource():
+        // Already planar YUV420P (e.g. converted on the GPU) — no CPU work.
+        return PreparedYuv420p(
+          y: src.yPlane,
+          u: src.uPlane,
+          v: src.vPlane,
+          width: src.width,
+          height: src.height,
+        );
       case CpuFrameSource():
         return toYuv420p(
           src: src.bytes,

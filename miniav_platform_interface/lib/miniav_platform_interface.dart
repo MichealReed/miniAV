@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:miniav_platform_interface/miniav_platform_types.dart';
 
 import 'modules/miniav_camera_interface.dart';
@@ -55,4 +57,14 @@ abstract class MiniAVPlatformInterface {
 
   void dispose();
   Future<void> releaseBuffer(MiniAVBuffer buffer);
+
+  /// Synchronous, fire-and-forget buffer release for hot paths (e.g. the
+  /// per-frame capture callback) that cannot afford a per-call [Future]
+  /// allocation. The default implementation delegates to [releaseBuffer] and
+  /// drops the returned future; backends with a genuinely synchronous release
+  /// (e.g. the native FFI backend, whose underlying C call is synchronous)
+  /// should override this to release directly with no allocation.
+  void releaseBufferSync(MiniAVBuffer buffer) {
+    unawaited(releaseBuffer(buffer));
+  }
 }

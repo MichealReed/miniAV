@@ -184,6 +184,36 @@ sealed class ScreenEffect {
   /// ```
   factory ScreenEffect.scale(int width, int height) =>
       ScaleScreenEffect(width: width, height: height);
+
+  /// Overlay a solid-colour rectangle to censor part of the frame in-place.
+  ///
+  /// Coordinates are in pixels relative to the *encoder input* (i.e. after
+  /// any [ScreenScalePolicy] downscaling and after earlier effects in the
+  /// chain). Output dimensions are unchanged.
+  ///
+  /// [color] is the fill colour packed as `R | G<<8 | B<<16 | A<<24`.
+  /// Defaults to opaque black (`0xFF000000`).
+  ///
+  /// ```dart
+  /// // Black out a 200×100 box at (50, 50):
+  /// ScreenEffect.censor(50, 50, 200, 100)
+  ///
+  /// // Semi-transparent red box:
+  /// ScreenEffect.censor(0, 0, 100, 100, color: 0x800000FF)
+  /// ```
+  factory ScreenEffect.censor(
+    int x,
+    int y,
+    int width,
+    int height, {
+    int color = 0xFF000000,
+  }) => CensorScreenEffect(
+    boxX: x,
+    boxY: y,
+    boxW: width,
+    boxH: height,
+    color: color,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +304,40 @@ final class ScaleScreenEffect extends ScreenEffect {
 
   @override
   (int, int) outputSize(int inW, int inH) => (width, height);
+}
+
+// ---------------------------------------------------------------------------
+// CensorScreenEffect
+// ---------------------------------------------------------------------------
+
+/// Overlays a solid-colour rectangle over the frame in-place (dimensions
+/// unchanged). Created via [ScreenEffect.censor].
+final class CensorScreenEffect extends ScreenEffect {
+  const CensorScreenEffect({
+    required this.boxX,
+    required this.boxY,
+    required this.boxW,
+    required this.boxH,
+    this.color = 0xFF000000,
+  });
+
+  /// Left edge of the censor box in pixels.
+  final int boxX;
+
+  /// Top edge of the censor box in pixels.
+  final int boxY;
+
+  /// Width of the censor box in pixels.
+  final int boxW;
+
+  /// Height of the censor box in pixels.
+  final int boxH;
+
+  /// Fill colour packed as `R | G<<8 | B<<16 | A<<24`.
+  /// Defaults to opaque black (`0xFF000000`).
+  final int color;
+
+  // outputSize is identity (same dimensions) — no override needed.
 }
 
 // ---------------------------------------------------------------------------

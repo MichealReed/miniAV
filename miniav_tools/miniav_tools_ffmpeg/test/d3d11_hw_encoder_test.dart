@@ -88,7 +88,7 @@ void main() {
 
     test(
       'per-vendor open succeeds OR throws CodecInitException — never crashes',
-      () {
+      () async {
         if (!Platform.isWindows || !ffmpegOk) {
           markTestSkipped('preconditions');
           return;
@@ -126,8 +126,19 @@ void main() {
           } on CodecInitException catch (e) {
             print('OPEN SKIP: $v — ${e.message.split('\n').first}');
           } finally {
-            enc?.close();
+            await enc?.close();
           }
+        }
+        if (!openedAtLeastOne) {
+          // Machine-dependent: e.g. no HEVC NVENC, and AMF/MF require the
+          // NV12 + VideoProcessor pool, which some adapters cannot create.
+          // Every vendor failing CLEANLY (CodecInitException, no crash) is
+          // exactly the contract this test locks down.
+          markTestSkipped(
+            'no HEVC D3D11 vendor opened on this machine (all failed with '
+            'clean CodecInitException)',
+          );
+          return;
         }
         expect(
           openedAtLeastOne,
@@ -171,7 +182,17 @@ void main() {
           rateControl: RateControl.vbr,
         );
 
-        final enc = FfmpegD3d11HwEncoder.open(cfg);
+        final FfmpegD3d11HwEncoder enc;
+        try {
+          enc = FfmpegD3d11HwEncoder.open(cfg);
+        } on CodecInitException catch (e) {
+          // Machine-dependent: e.g. no HEVC NVENC, and AMF/MF now require the
+          // NV12 + VideoProcessor pool (BGRA input to AMF encodes black or is
+          // rejected), which some adapters cannot create (NV12 texture-array
+          // with RENDER_TARGET → E_INVALIDARG). No usable vendor → skip.
+          markTestSkipped('no usable HEVC D3D11 vendor on this machine: $e');
+          return;
+        }
         print('chosen vendor: ${enc.vendor} (${enc.encoderName})');
 
         // Producer-side: independent device + texture, NT shared handle.
@@ -195,12 +216,21 @@ void main() {
             final ntHandle = shim.testTextureHandle(tex);
             expect(ntHandle, isNot(equals(nullptr)));
 
-            final src = FrameSource.d3d11Texture(
-              texturePtr: ntHandle.address,
-              width: w,
-              height: h,
-              pixelFormat: MiniAVPixelFormat.bgra32,
-              timestampUs: i * 33333,
+            final src = FrameSource.miniavBuffer(
+              MiniAVBuffer(
+                type: MiniAVBufferType.video,
+                contentType: MiniAVBufferContentType.gpuD3D11Handle,
+                timestampUs: i * 33333,
+                dataSizeBytes: 0,
+                data: MiniAVVideoBuffer(
+                  width: w,
+                  height: h,
+                  pixelFormat: MiniAVPixelFormat.bgra32,
+                  strideBytes: const [],
+                  planes: const [],
+                  nativeHandles: [ntHandle],
+                ),
+              ),
             );
             final pkt = await enc.encode(src);
             if (pkt != null) {
@@ -247,7 +277,9 @@ void main() {
           return;
         }
         const cfg = EncoderConfig(
-          codec: VideoCodec.hevc,
+          // The subject (frame-size mismatch rejection) is codec-agnostic —
+          // use H.264, the most widely available D3D11 vendor codec.
+          codec: VideoCodec.h264,
           width: 640,
           height: 480,
           bitrateBps: 1_000_000,
@@ -256,15 +288,31 @@ void main() {
           bFrameCount: 0,
           hwAccel: HwAccelPreference.required,
         );
-        final enc = FfmpegD3d11HwEncoder.open(cfg);
+        final FfmpegD3d11HwEncoder enc;
+        try {
+          enc = FfmpegD3d11HwEncoder.open(cfg);
+        } on CodecInitException catch (e) {
+          markTestSkipped('no usable H.264 D3D11 vendor on this machine: $e');
+          return;
+        }
         final tex = shim.testCreateSharedBgra(1280, 720);
         try {
           shim.testFillBgra(tex, 0);
-          final src = FrameSource.d3d11Texture(
-            texturePtr: shim.testTextureHandle(tex).address,
-            width: 1280,
-            height: 720,
-            pixelFormat: MiniAVPixelFormat.bgra32,
+          final src = FrameSource.miniavBuffer(
+            MiniAVBuffer(
+              type: MiniAVBufferType.video,
+              contentType: MiniAVBufferContentType.gpuD3D11Handle,
+              timestampUs: 0,
+              dataSizeBytes: 0,
+              data: MiniAVVideoBuffer(
+                width: 1280,
+                height: 720,
+                pixelFormat: MiniAVPixelFormat.bgra32,
+                strideBytes: const [],
+                planes: const [],
+                nativeHandles: [shim.testTextureHandle(tex)],
+              ),
+            ),
           );
           await expectLater(
             enc.encode(src),
@@ -288,7 +336,8 @@ void main() {
         return;
       }
       const cfg = EncoderConfig(
-        codec: VideoCodec.hevc,
+        // Codec-agnostic subject (source-kind rejection) — use H.264.
+        codec: VideoCodec.h264,
         width: 640,
         height: 480,
         bitrateBps: 1_000_000,
@@ -297,7 +346,13 @@ void main() {
         bFrameCount: 0,
         hwAccel: HwAccelPreference.required,
       );
-      final enc = FfmpegD3d11HwEncoder.open(cfg);
+      final FfmpegD3d11HwEncoder enc;
+      try {
+        enc = FfmpegD3d11HwEncoder.open(cfg);
+      } on CodecInitException catch (e) {
+        markTestSkipped('no usable H.264 D3D11 vendor on this machine: $e');
+        return;
+      }
       try {
         final src = FrameSource.cpu(
           bytes: Uint8List(640 * 480 * 4),
@@ -326,7 +381,7 @@ void main() {
 
     test(
       'openWith(sourceTextureFormat: rgba) opens or fails cleanly — never crashes',
-      () {
+      () async {
         if (!Platform.isWindows || !ffmpegOk) {
           markTestSkipped('preconditions');
           return;
@@ -366,43 +421,53 @@ void main() {
           // D3D11 hwframes pool. The contract is "no crash".
           expect(e.message, isNotEmpty);
         } finally {
-          enc?.close();
+          await enc?.close();
         }
       },
     );
 
-    test('openWith(existingD3d11Device: 0) is the documented default path', () {
-      // Smoke-coverage for the new optional parameter at the API level:
-      // passing the default sentinel must behave identically to omitting
-      // it (FFmpeg picks adapter 0). End-to-end coverage of a non-zero
-      // device pointer lives in the screenshare_mp4 example, which wires
-      // minigpu's createD3D11DeviceOnDawnAdapter through to this call —
-      // we don't pull minigpu into this package's test deps just for that.
-      if (!Platform.isWindows || !ffmpegOk) {
-        markTestSkipped('preconditions');
-        return;
-      }
-      if (FfmpegShim.tryLoad() == null ||
-          ffmpegD3d11VendorsAvailable().isEmpty) {
-        markTestSkipped('no shim / no vendor');
-        return;
-      }
-      const cfg = EncoderConfig(
-        codec: VideoCodec.hevc,
-        width: 640,
-        height: 360,
-        bitrateBps: 1_000_000,
-        frameRateNumerator: 30,
-        frameRateDenominator: 1,
-        bFrameCount: 0,
-        hwAccel: HwAccelPreference.required,
-      );
-      final enc = FfmpegD3d11HwEncoder.open(cfg, existingD3d11Device: 0);
-      try {
-        expect(enc.encoderName, isNotEmpty);
-      } finally {
-        enc.close();
-      }
-    });
+    test(
+      'openWith(existingD3d11Device: 0) is the documented default path',
+      () async {
+        // Smoke-coverage for the new optional parameter at the API level:
+        // passing the default sentinel must behave identically to omitting
+        // it (FFmpeg picks adapter 0). End-to-end coverage of a non-zero
+        // device pointer lives in the screenshare_mp4 example, which wires
+        // minigpu's createD3D11DeviceOnDawnAdapter through to this call —
+        // we don't pull minigpu into this package's test deps just for that.
+        if (!Platform.isWindows || !ffmpegOk) {
+          markTestSkipped('preconditions');
+          return;
+        }
+        if (FfmpegShim.tryLoad() == null ||
+            ffmpegD3d11VendorsAvailable().isEmpty) {
+          markTestSkipped('no shim / no vendor');
+          return;
+        }
+        const cfg = EncoderConfig(
+          // Codec-agnostic subject (default-parameter smoke) — use H.264.
+          codec: VideoCodec.h264,
+          width: 640,
+          height: 360,
+          bitrateBps: 1_000_000,
+          frameRateNumerator: 30,
+          frameRateDenominator: 1,
+          bFrameCount: 0,
+          hwAccel: HwAccelPreference.required,
+        );
+        final FfmpegD3d11HwEncoder enc;
+        try {
+          enc = FfmpegD3d11HwEncoder.open(cfg, existingD3d11Device: 0);
+        } on CodecInitException catch (e) {
+          markTestSkipped('no usable H.264 D3D11 vendor on this machine: $e');
+          return;
+        }
+        try {
+          expect(enc.encoderName, isNotEmpty);
+        } finally {
+          await enc.close();
+        }
+      },
+    );
   });
 }

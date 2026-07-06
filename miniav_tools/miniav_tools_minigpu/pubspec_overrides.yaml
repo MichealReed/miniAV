@@ -15,3 +15,7 @@ dependency_overrides:
     path: ../../../minigpu/gpu_tensor
   gpu_pipeline:
     path: ../../../minigpu/gpu_pipeline
+  miniav_ffi:
+    path: ../../miniav_ffi
+  miniav_web:
+    path: ../../miniav_web

@@ -271,6 +271,71 @@ static MiniAVResultCode dxgi_enumerate_windows(MiniAVDeviceInfo **windows_out,
   return MINIAV_ERROR_NOT_SUPPORTED;
 }
 
+// ---------------------------------------------------------------------------
+// GPU scheduling priority boost (anti-stutter when another process saturates
+// the GPU).
+// ---------------------------------------------------------------------------
+// When a game maxes the GPU, this process's capture submissions (the
+// desktop-duplication blit, the shareable-copy CopyResource) queue behind the
+// game's work and capture cadence collapses. Two complementary, best-effort
+// boosts (failure is logged and capture proceeds at normal priority):
+//  1. D3DKMTSetProcessSchedulingPriorityClass(HIGH): process-wide GPU
+//     scheduling priority — covers EVERY D3D device in this process,
+//     including Dawn's minigpu device. Resolved dynamically from gdi32.dll so
+//     no WDK header/link dependency. (REALTIME would need elevation; HIGH
+//     does not.) This is the same lever OBS's "GPU priority" uses.
+//  2. IDXGIDevice::SetGPUThreadPriority(+7): per-device submission priority
+//     on the capture device.
+
+typedef LONG(WINAPI *PFN_D3DKMTSetProcessSchedulingPriorityClass)(HANDLE, int);
+
+static void dxgi_boost_gpu_scheduling(ID3D11Device *device) {
+  // Process-wide boost — attempt exactly once per process (thread-safe; this
+  // is also reached from the ACCESS_LOST reinit path).
+  static volatile LONG s_process_boost_attempted = 0;
+  if (InterlockedCompareExchange(&s_process_boost_attempted, 1, 0) == 0) {
+    HMODULE gdi32 = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi32)
+      gdi32 = LoadLibraryW(L"gdi32.dll");
+    PFN_D3DKMTSetProcessSchedulingPriorityClass set_prio =
+        gdi32 ? (PFN_D3DKMTSetProcessSchedulingPriorityClass)GetProcAddress(
+                    gdi32, "D3DKMTSetProcessSchedulingPriorityClass")
+              : NULL;
+    if (set_prio) {
+      // D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH == 4
+      // (idle=0, below_normal=1, normal=2, above_normal=3, high=4, realtime=5)
+      LONG status = set_prio(GetCurrentProcess(), 4);
+      if (status >= 0) {
+        miniav_log(MINIAV_LOG_LEVEL_INFO,
+                   "DXGI: process GPU scheduling priority raised to HIGH.");
+      } else {
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "DXGI: D3DKMTSetProcessSchedulingPriorityClass(HIGH) "
+                   "failed: 0x%lX (continuing at normal GPU priority).",
+                   (unsigned long)status);
+      }
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "DXGI: D3DKMTSetProcessSchedulingPriorityClass unavailable "
+                 "in gdi32.dll (continuing at normal GPU priority).");
+    }
+  }
+
+  // Per-device submission priority on the capture device (re-applied per
+  // (re)init because the device is recreated on ACCESS_LOST).
+  if (device) {
+    IDXGIDevice *dxgi_device = NULL;
+    if (SUCCEEDED(ID3D11Device_QueryInterface(device, &IID_IDXGIDevice,
+                                              (void **)&dxgi_device))) {
+      HRESULT phr = IDXGIDevice_SetGPUThreadPriority(dxgi_device, 7);
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "DXGI: SetGPUThreadPriority(+7) on capture device: 0x%X",
+                 (unsigned)phr);
+      IDXGIDevice_Release(dxgi_device);
+    }
+  }
+}
+
 static MiniAVResultCode
 dxgi_init_d3d_and_duplication(DXGIScreenPlatformContext *dxgi_ctx,
                               UINT adapter_idx, UINT output_idx) {
@@ -310,6 +375,10 @@ dxgi_init_d3d_and_duplication(DXGIScreenPlatformContext *dxgi_ctx,
     IDXGIFactory1_Release(factory);
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
   }
+
+  // Best-effort GPU scheduling boost so capture keeps its cadence when
+  // another process (e.g. a game) saturates the GPU.
+  dxgi_boost_gpu_scheduling(dxgi_ctx->d3d_device);
 
   if (FAILED(IDXGIAdapter1_EnumOutputs(adapter, output_idx, &output))) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
@@ -1029,6 +1098,17 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
   if (frame_timeout_ms == 0)
     frame_timeout_ms = 16;
 
+  // Wall-clock pacing state. We pace from the time the previous frame was
+  // delivered rather than sleeping a fixed interval while still holding the
+  // duplication frame (the old behaviour, which capped producer FPS because
+  // Desktop Duplication will not compose the next frame until ReleaseFrame).
+  ULONGLONG last_deliver_ms = 0;
+  // Tracks whether we currently hold an acquired duplication frame that still
+  // needs IDXGIOutputDuplication_ReleaseFrame. Set right after a successful
+  // AcquireNextFrame and cleared the moment the frame is released (either mid-
+  // loop on the success path, or at the top of the loop on an error path).
+  BOOL frame_acquired = FALSE;
+
   MiniAVOutputPreference desired_output_pref =
       dxgi_ctx->configured_video_format.output_preference;
 
@@ -1043,12 +1123,19 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
       break;
     }
 
-    if (acquired_texture) {
-      ID3D11Texture2D_Release(acquired_texture);
-      acquired_texture = NULL;
-    }
-    if (dxgi_ctx->output_duplication) {
-      IDXGIOutputDuplication_ReleaseFrame(dxgi_ctx->output_duplication);
+    // Safety-net release for error paths that `continue` mid-iteration without
+    // having released the frame (QI failure, allocation failure, no-content
+    // frames). The success path releases the frame inline before pacing, so on
+    // those iterations frame_acquired is already FALSE and this is a no-op.
+    if (frame_acquired) {
+      if (acquired_texture) {
+        ID3D11Texture2D_Release(acquired_texture);
+        acquired_texture = NULL;
+      }
+      if (dxgi_ctx->output_duplication) {
+        IDXGIOutputDuplication_ReleaseFrame(dxgi_ctx->output_duplication);
+      }
+      frame_acquired = FALSE;
     }
 
     hr = IDXGIOutputDuplication_AcquireNextFrame(dxgi_ctx->output_duplication,
@@ -1095,6 +1182,11 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
       Sleep(frame_timeout_ms);
       continue;
     }
+
+    // We now hold a duplication frame; it must be released via ReleaseFrame
+    // before the next AcquireNextFrame (inline below on success, or at the top
+    // of the next iteration on the error/no-content paths).
+    frame_acquired = TRUE;
 
     if (frame_info.LastPresentTime.QuadPart == 0) {
       if (desktop_resource_handle)
@@ -1318,6 +1410,24 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
       buffer->data_size_bytes = 0; // GPU textures don't have size
     }
 
+    // The acquired desktop-duplication frame has now been fully consumed: its
+    // pixels were copied into the per-frame staging texture (CPU path) or into
+    // a shareable copy / an AddRef'd payload texture (GPU path, after the fence
+    // above committed the copy). Release it and the duplication frame NOW, so
+    // Desktop Duplication can compose the next frame immediately instead of
+    // waiting until the top of the next iteration — which previously happened
+    // only AFTER the fixed pacing Sleep, capping producer FPS and adding a full
+    // frame of latency. The payload retains its own reference to whatever it
+    // needs, so releasing the capture thread's acquired_texture ref here is safe.
+    if (acquired_texture) {
+      ID3D11Texture2D_Release(acquired_texture);
+      acquired_texture = NULL;
+    }
+    if (frame_acquired && dxgi_ctx->output_duplication) {
+      IDXGIOutputDuplication_ReleaseFrame(dxgi_ctx->output_duplication);
+      frame_acquired = FALSE;
+    }
+
     MiniAVNativeBufferInternalPayload *internal_payload =
         (MiniAVNativeBufferInternalPayload *)miniav_calloc(
             1, sizeof(MiniAVNativeBufferInternalPayload));
@@ -1393,7 +1503,22 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
       miniav_free(buffer);
     }
 
-    Sleep(frame_timeout_ms > 0 ? frame_timeout_ms : 1);
+    // Pace by wall clock from the previous delivery — sleep = max(0, interval -
+    // elapsed). This runs AFTER the frame was released above, so the sleep no
+    // longer blocks Desktop Duplication from producing the next frame.
+    // (AcquireNextFrame's 500 ms timeout is unrelated to this cadence, so the
+    // pacing has to be explicit.)
+    {
+      UINT interval_ms = frame_timeout_ms > 0 ? frame_timeout_ms : 1;
+      ULONGLONG now_ms = GetTickCount64();
+      if (last_deliver_ms != 0) {
+        ULONGLONG elapsed = now_ms - last_deliver_ms;
+        if (elapsed < interval_ms) {
+          Sleep((DWORD)(interval_ms - elapsed));
+        }
+      }
+      last_deliver_ms = GetTickCount64();
+    }
   }
 
   if (acquired_texture) {

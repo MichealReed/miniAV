@@ -22,6 +22,36 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 
 import 'ffmpeg_encoder.dart';
 import 'ffmpeg_ffi.dart';
+import 'ffmpeg_shim.dart';
+
+/// Rolling capture of the most recent FFmpeg log lines, used purely for
+/// diagnostics when avformat_write_header rejects a stream. Populated by a
+/// shim log callback that is installed ONCE per process and NEVER closed —
+/// closing the global FFmpeg av_log callback while encoder threads are still
+/// invoking it crashes with "Callback invoked after it has been deleted".
+final List<String> _ffmpegDiagLog = <String>[];
+bool _ffmpegDiagInstalled = false;
+
+/// Ensure FFmpeg log lines are captured into [_ffmpegDiagLog]. Falls back to
+/// FFmpeg's built-in stderr logger if the shim cannot be loaded.
+void _ensureFfmpegDiagCapture(Ffmpeg ff) {
+  final shim = FfmpegShim.tryLoad();
+  if (shim == null) {
+    // No shim → can't format va_list in Dart. Restore the native stderr
+    // handler (visible when a console is attached) at DEBUG verbosity.
+    ff.enableStderrLogging();
+    return;
+  }
+  shim.setFfmpegLogLevel(48 /* AV_LOG_DEBUG */);
+  if (_ffmpegDiagInstalled) return;
+  _ffmpegDiagInstalled = true;
+  shim.setFfmpegLogCallback((level, message) {
+    _ffmpegDiagLog.add(message);
+    if (_ffmpegDiagLog.length > 256) {
+      _ffmpegDiagLog.removeRange(0, _ffmpegDiagLog.length - 256);
+    }
+  });
+}
 
 /// Tiny bridge interface implemented by both [FfmpegSoftwareEncoder] and
 /// [FfmpegNvencEncoder] so the muxer can pull `extradata` (SPS/PPS) and
@@ -339,11 +369,46 @@ class FfmpegMuxer implements PlatformMuxer {
       calloc.free(pIo);
     }
 
+    // Capture FFmpeg's own log output (via the shim's formatted callback) so
+    // that, if avformat_write_header rejects a stream, mov_init's real reason
+    // is folded into the exception below. Installed once, never closed.
+    _ensureFfmpegDiagCapture(_ff);
+    final diagStart = _ffmpegDiagLog.length;
+
     final wr = _ff.avformatWriteHeader(_fmtCtx, nullptr);
     if (wr < 0) {
+      // The shim callback dispatches asynchronously on the Dart event loop, so
+      // give it a moment to drain the lines logged during write_header.
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      final captured = _ffmpegDiagLog
+          .skip(diagStart)
+          .map((l) => l.trim())
+          .where((l) => l.isNotEmpty)
+          .join(' | ');
+
+      // Fold the per-stream parameters into the exception so they survive even
+      // when no FFmpeg log line was captured.
+      final sb = StringBuffer();
+      for (var i = 0; i < _streams.length; i++) {
+        final cp = _streams[i].ref.codecpar;
+        if (cp == nullptr) {
+          sb.write(' [s$i: codecpar=NULL]');
+          continue;
+        }
+        final r = cp.ref;
+        sb.write(
+          ' [s$i type=${r.codecType} codec=${r.codecId} tag=${r.codecTag} '
+          'fmt=${r.format} ${r.width}x${r.height} '
+          'sar=${r.sarNum}/${r.sarDen} fr=${r.frNum}/${r.frDen} '
+          'extradata=${r.extradataSize}B]',
+        );
+      }
       throw CodecInitException(
         'ffmpeg',
-        'avformat_write_header failed: ${_ff.strError(wr)} ($wr)',
+        'avformat_write_header failed: ${_ff.strError(wr)} ($wr) '
+            'container=${_containerName(_cfg.container)} streams=${_streams.length}'
+            '$sb'
+            '${captured.isNotEmpty ? ' || ffmpeg: $captured' : ''}',
       );
     }
     _headerWritten = true;

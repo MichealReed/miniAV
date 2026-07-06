@@ -3,11 +3,36 @@ library;
 
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
+import 'audio_effect.dart';
 import 'screen_effect.dart';
 import 'screen_scale_policy.dart';
 
+export 'audio_effect.dart';
 export 'screen_effect.dart';
 export 'screen_scale_policy.dart';
+
+/// Controls how [_VideoTrackRuntime] fills the gap when the capture source
+/// delivers frames at a lower rate than the configured fps (e.g. WGC / DXGI
+/// only sending a frame when content changes).
+enum VideoIdleFramePolicy {
+  /// Re-encode the last captured GPU frame (zero-copy [SharedOutputTexture])
+  /// at the target interval.
+  ///
+  /// Only active on the zero-copy GPU path. Silently does nothing on CPU or
+  /// GPU-readback paths since those don't retain a reusable frame between
+  /// captures.
+  duplicate,
+
+  /// Emit a black (all-zeros RGBA) CPU frame at the target interval when idle.
+  ///
+  /// Works on all encoding paths. The encoder typically produces tiny P/skip
+  /// frames for static input, so bitrate overhead is minimal.
+  black,
+
+  /// No idle fill — the encoded stream reflects the capture source cadence,
+  /// which may be as low as 1–2 fps on a mostly-static screen.
+  none,
+}
 
 sealed class RecorderSource {
   const RecorderSource();
@@ -63,6 +88,18 @@ class ScreenRecorderSource extends RecorderSource {
   /// ```
   final Map<String, String> encoderOptions;
 
+  /// How to fill video gaps when the capture source delivers fewer frames than
+  /// the configured fps. Defaults to [VideoIdleFramePolicy.duplicate].
+  final VideoIdleFramePolicy idleFramePolicy;
+
+  /// When true (default), sustained GPU saturation (e.g. a game maxing the GPU
+  /// so the recorder's downscale/effects/copy passes queue behind it) steps the
+  /// live capture rate down evenly (2×/4× frame spacing) instead of dropping
+  /// frames unevenly under back-pressure; [idleFramePolicy] duplication keeps
+  /// the encoded output at the target fps, so playback degrades smoothly rather
+  /// than stuttering. Restores automatically when GPU pressure clears.
+  final bool adaptiveGpuThrottle;
+
   const ScreenRecorderSource({
     this.displayId,
     this.windowId,
@@ -76,6 +113,8 @@ class ScreenRecorderSource extends RecorderSource {
     this.effects = const [],
     this.quality,
     this.encoderOptions = const {},
+    this.idleFramePolicy = VideoIdleFramePolicy.duplicate,
+    this.adaptiveGpuThrottle = true,
   });
 }
 
@@ -94,6 +133,10 @@ class CameraRecorderSource extends RecorderSource {
   /// See [ScreenRecorderSource.encoderOptions].
   final Map<String, String> encoderOptions;
 
+  /// See [VideoIdleFramePolicy]. Defaults to [VideoIdleFramePolicy.none]
+  /// because cameras deliver at a fixed rate and rarely need idle fill.
+  final VideoIdleFramePolicy idleFramePolicy;
+
   const CameraRecorderSource({
     required this.deviceId,
     required this.codec,
@@ -104,6 +147,7 @@ class CameraRecorderSource extends RecorderSource {
     required this.hwAccel,
     this.quality,
     this.encoderOptions = const {},
+    this.idleFramePolicy = VideoIdleFramePolicy.none,
   });
 }
 
@@ -152,6 +196,11 @@ class LoopbackRecorderSource extends RecorderSource {
 ///
 /// [micGainDb] / [loopbackGainDb] adjust each source's level before the sum
 /// (use a negative value such as `-3` to avoid clipping when both are loud).
+///
+/// [micEffects] / [loopbackEffects] are per-source [AudioEffect] chains
+/// applied (after the gain) before the sum; [masterEffects] runs on the
+/// summed mix just before encoding. See [AudioEffect] for the built-in
+/// stages (auto-level, noise gate, high-pass, limiter).
 class MixedAudioRecorderSource extends RecorderSource {
   final String micDeviceId;
   final String loopbackDeviceId;
@@ -159,6 +208,9 @@ class MixedAudioRecorderSource extends RecorderSource {
   final int? bitrateBps;
   final double micGainDb;
   final double loopbackGainDb;
+  final List<AudioEffect> micEffects;
+  final List<AudioEffect> loopbackEffects;
+  final List<AudioEffect> masterEffects;
 
   const MixedAudioRecorderSource({
     required this.micDeviceId,
@@ -167,5 +219,8 @@ class MixedAudioRecorderSource extends RecorderSource {
     this.bitrateBps,
     this.micGainDb = 0.0,
     this.loopbackGainDb = 0.0,
+    this.micEffects = const [],
+    this.loopbackEffects = const [],
+    this.masterEffects = const [],
   });
 }

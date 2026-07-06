@@ -1,14 +1,14 @@
 name: miniav_tools_platform_interface
 description: Platform interface for miniav_tools, providing codec/container types and abstract backend contracts.
-version: 0.2.15
+version: 0.5.0
 repository: https://github.com/PracticalXR/miniav_tools/tree/master/miniav_tools_platform_interface
 
 environment:
   sdk: ^3.11.4
 
 dependencies:
-  miniav_platform_interface: ^0.5.6
-  minigpu_platform_interface: ^1.4.7
+  miniav_platform_interface: ^0.5.10
+  minigpu_platform_interface: ^1.5.5
 
 dev_dependencies:
   lints: ^5.0.0

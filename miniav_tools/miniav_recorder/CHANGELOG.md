@@ -1,3 +1,227 @@
+# Changelog
+
+## 0.5.0
+
+- GPU-saturation anti-stutter (when another workload, e.g. a game, maxes the GPU):
+  - Per-stage timing in the video stats line: `gpu=avg/max ms` (GPU processor
+    stage — downscale/effects/YUV/shared-texture copy) and `enc=avg/max ms`
+    (encoder stage). A `gpu=` figure far above the frame interval while encoded
+    fps sags identifies GPU saturation directly.
+  - Adaptive GPU-pressure throttle (`addScreen(adaptiveGpuThrottle: true)`,
+    default on): sustained GPU-stage overrun steps the LIVE capture rate down by
+    a power-of-two divisor (shown as `adapt=÷N` in stats) instead of letting
+    frames pile into the encode queue and drop unevenly as `busy_drop` stutter.
+    Throttle drops are evenly spaced and the frame duplicator keeps the encoded
+    output at the target fps, so playback degrades smoothly; the divisor
+    restores automatically (with hysteresis) when GPU pressure clears.
+  - Together with the process/device GPU scheduling priority boost shipping in
+    miniav_ffi 0.5.10 and minigpu_ffi 1.5.5 (capture + compute submissions
+    preempt a saturating workload), this converts "GPU maxed → stutter" into
+    "GPU maxed → briefly reduced live refresh at a steady cadence".
+  - Direct BGRA passthrough on the zero-copy path: when no scale policy and no
+    effects are configured, encoder-sized capture frames are fed to the D3D11
+    encoder as their shared NT handle directly (`FrameSource.miniavBuffer`) —
+    the encoder opens the handle on its own device and copies it with the COPY
+    engine. Zero shader-core work per frame, so a saturated GPU has nothing of
+    ours to starve. The frame duplicator retains the last live buffer as its
+    idle-fill source; size-mismatched frames (mid-stream display mode change)
+    fall back to the GPU processor, which rescales.
+  - Pipelined zero-copy encode (scale/effects configs): the GPU processor stage
+    of frame N+1 now overlaps the encode of frame N (each stage internally
+    serialized, single-slot handoff). `GpuScreenProcessor` gained a
+    shared-output texture ring (`sharedRingDepth`, recorder uses depth 2) so
+    the texture being written is never the one the encoder is reading — under
+    GPU saturation the ballooned GPU stage hides behind the encode instead of
+    adding to it, and tearing is structurally impossible on this path.
+- Software fallback no longer freezes the app:
+  - Video `TrackInfo` now carries the encoder's codec extradata (SPS/PPS) when
+    available at open, so `FfmpegMuxer` can write the track header without a
+    live encoder bridge — required for the isolate-hosted software encoder
+    (miniav_tools_ffmpeg 0.5.0), whose `AVCodecContext` lives on a worker
+    isolate and performs the libav encode off the UI isolate.
+
+## 0.4.10
+
+- Frame-drop / lag fixes. The capture→encode pipeline was
+  CPU/event-loop-bound, dropping frames while the GPU idled:
+  - Replace the depth-1 back-pressure gate with a small bounded (depth-3) frame
+    queue with oldest-drop, so a brief encode overrun no longer drops the next
+    frame. The encode stage stays strictly serialized (the encoder/muxer FFI is
+    single-threaded); only a sustained overrun drops, and then the oldest frame.
+  - Split the video frame-drop counter into throttle-drops (by design — capture
+    outruns the target fps) vs busy-drops (real back-pressure). The video stats
+    log now reports `thr_drop=`/`busy_drop=` separately so a busy-bound config
+    is immediately distinguishable.
+  - GPU CPU-readback path (`processToBytes`) reuses a persistent read-back
+    buffer instead of allocating ~8 MB per frame at 1080p; the mixed-audio path
+    recycles its PCM byte buffers from a small pool and drops a per-chunk
+    `sublist` copy.
+  - Per-frame buffer release on the capture hot path uses the new synchronous
+    `MiniAV.releaseBufferSync()` (no per-frame `Future` allocation).
+  - Accepted frames now carry their capture-time timestamp so PTS spacing stays
+    even when the serialized encoder briefly stalls and then drains the queue.
+- Frame-drop / lag fixes:
+  - Decouple muxing from the encode path. `dispatchPacket` previously awaited the
+    shared muxer's `writePacket` inline, so every encoded video/audio packet
+    blocked the encode gate on a libav write. Encoded packets are now chained onto
+    a bounded, serialized per-sink write queue (`BoundedWriteQueue`) drained
+    independently; the muxer write overlaps the next encode instead of blocking
+    it. Order is preserved (FIFO per track; libav interleaves by DTS), and a
+    sustained backlog applies back-pressure rather than dropping encoded data. The
+    queue is fully drained before the muxer trailer is written on stop.
+  - GPU color conversion for the software/CPU-encode fallback. New
+    `GpuYuv420Converter` runs RGBA→YUV420P (planar u8, BT.601 limited) as a
+    minigpu compute shader instead of the per-pixel Dart loop. It reads the RGBA
+    straight from the on-GPU effects buffer and reads back the ~2.7× smaller YUV
+    planes (1.5 vs 4 bytes/px); the software encoder consumes YUV420P natively.
+    Output is byte-identical to the previous CPU conversion (verified against the
+    reference on the real GPU). The `processorCpuReadback` encode path now uses
+    this GPU YUV conversion (and feeds the planes via `FrameSource.yuv420p`)
+    whenever the encoder reports `acceptsYuv420pPlanes` (the software path);
+    CPU-fed hardware encoders (NV12/RGBA) keep the RGBA read-back.
+  - Clip export (`ClipBuffer.saveClip`): the keyframe-aligned window selection is
+    now a single bounded snapshot pass (`selectClipSlice`) instead of multiple
+    full-buffer `where().toList()` scans plus a separate later sort. This shrinks
+    the synchronous block on the live recording path when a clip is saved and
+    produces a stable, pre-sorted copy decoupled from the live ring buffer. The
+    (previously untested) GOP-preroll / no-keyframe-drop logic is now unit-tested.
+    (Moving the FFmpeg mux itself fully off the isolate onto a worker is a
+    follow-up — see Phase 2 #9 worker offload.)
+  - Zero-copy GPU encode path now awaits minigpu's async shared-output copy
+    (`bgraToRgbaSharedOutputAsync` / `copyFromBufferAsync`, minigpu ≥ 1.5.3)
+    instead of the synchronous variants, so the per-frame GPU copy + cross-device
+    present sync runs on minigpu's worker thread rather than busy-polling on this
+    isolate. (Requires `minigpu: ^1.5.3`.)
+
+## 0.4.9
+
+- Increment to keep in step with others.
+
+## 0.4.8
+
+- Increment to keep in step with others.
+
+## 0.4.7
+
+- Add `Recorder.warmup()`: registers the FFmpeg backend, then delegates to
+  `MiniAVTools.warmup()`. Calling `MiniAVTools.warmup()` from `main()` before
+  any `start()` silently skipped FFmpeg (the backend is only registered
+  lazily inside `start()`), so the download still hit the first recording.
+
+## 0.4.6
+
+- Dart-side logging no longer writes to `dart:io` `stderr` anywhere
+  (recorder runtime, clip buffer, GPU screen processor): those writes crash
+  console-less Windows GUI apps with an uncatchable async
+  `FileSystemException` (errno 6). All messages now flow through the
+  `Recorder.setLogCallback` router; the no-callback default sink is `print`.
+- `Recorder.setLogCallback` / `setLogLevel` now also route the
+  `miniav_tools_ffmpeg` Dart layer (auto-downloader, encoder selection,
+  vendor probing) as `RecorderLogSource.ffmpeg`, so FFmpeg download failures
+  are visible through the unified callback.
+
+## 0.4.5
+
+- Add `Recorder.sharedGpu` getter: exposes the process-global `Minigpu`
+  instance after `ensureSharedGpu()` returns, or `null` when GPU is
+  unsupported. Allows host code (e.g. a live GPU preview widget or a custom
+  compute pass) to reuse the same Dawn device without a second `gpu.init()`.
+- Export `GpuScreenProcessor` from the public `miniav_recorder` API so callers
+  can build their own GPU preview pipelines using
+  `MinigpuPreviewController` + `MiniavGpuPreview` from `minigpu_view`.
+
+## 0.4.4
+
+- Fix recorder loopback drift.
+
+## 0.4.3
+
+- audio data issue, increment miniav
+
+## 0.4.2
+
+- fix timing issue
+
+## 0.4.1
+
+- fix audio timing, add frame duplication
+
+## 0.4.0
+
+- fix frame rate scheduling
+
+## 0.3.12
+
+- fused shader cache fix
+
+## 0.3.11
+
+- Use GPU until we cant.
+
+## 0.3.9
+
+- AMF Fix, fix unknown audio error
+
+## 0.3.8
+
+- Fix vendor Order
+
+## 0.3.7
+
+- fix NV12 path
+
+## 0.3.6
+
+- fix cpu path
+
+## 0.3.5
+
+- fix recorder sync drift
+
+## 0.3.4
+
+- attempt fix resolution issue
+
+## 0.3.3
+
+- fix precheck
+
+## 0.3.2
+
+- fix property
+
+## 0.3.1
+
+- fix scaling crazy, attempt fix other HW encoders
+
+## 0.3.0
+
+- fix recorder logging, Tier A path, deps to 1.5.0
+
+## 0.2.21
+
+- increments minigpu to 1.4.15
+
+## 0.2.20
+
+- increments minigpu to 1.4.14
+
+## 0.2.19
+
+- increments minigpu to 1.4.12
+
+## 0.2.18
+
+- increments minigpu to 1.4.11
+
+## 0.2.17
+
+- increments minigpu to 1.4.9
+
+## 0.2.16
+
+- increments minigpu to 1.4.8, hopefully fix cpu fallback
+
 ## 0.2.15
 
 - increments minigpu to 1.4.7

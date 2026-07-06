@@ -197,8 +197,10 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
   final ValueNotifier<ui.Image?> _cameraPreview = ValueNotifier(null);
   final ValueNotifier<ui.Image?> _screenPreview = ValueNotifier(null);
   // GPU zero-copy preview controllers (Windows D3D11 / Web GPUCanvasContext).
-  final MiniavPreviewController _cameraPreviewCtrl = MiniavPreviewController();
-  final MiniavPreviewController _screenPreviewCtrl = MiniavPreviewController();
+  final MinigpuPreviewController _cameraPreviewCtrl =
+      MinigpuPreviewController();
+  final MinigpuPreviewController _screenPreviewCtrl =
+      MinigpuPreviewController();
   bool _buildingCameraImage = false;
   bool _buildingScreenImage = false;
   int _cameraFrameSkip = 0;
@@ -742,7 +744,7 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     required String streamKey,
     required MiniAVBuffer buffer,
     required ValueNotifier<ui.Image?> preview,
-    MiniavPreviewController? previewController,
+    MinigpuPreviewController? previewController,
     required bool Function() buildingFlag,
     required void Function(bool) setBuildingFlag,
     required int Function() frameSkipCounter,

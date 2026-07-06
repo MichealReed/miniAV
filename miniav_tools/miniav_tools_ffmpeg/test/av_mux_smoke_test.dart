@@ -69,7 +69,9 @@ Future<void> _runAvMux({
       bitrateBps: 800_000,
       frameRateNumerator: fps,
       frameRateDenominator: 1,
-      backendOptions: const {'global_header': '1'},
+      // This test wires the encoder's FfmpegEncoderBridge into the muxer, so
+      // keep the in-isolate software encoder (the isolate host has no bridge).
+      backendOptions: const {'global_header': '1', 'sw_isolate': '0'},
     ),
   );
   expect(venc, isNotNull);

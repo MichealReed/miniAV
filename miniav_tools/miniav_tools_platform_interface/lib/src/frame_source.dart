@@ -16,6 +16,9 @@ import 'package:minigpu_platform_interface/minigpu_platform_interface.dart'
 /// support without runtime type checks.
 enum FrameSourceKind {
   cpu,
+
+  /// Pre-converted planar YUV420P (I420) — three tightly-packed u8 planes.
+  yuv420pPlanar,
   miniavBufferCpu,
   miniavBufferD3D11,
   miniavBufferMetal,
@@ -61,6 +64,19 @@ sealed class FrameSource {
     List<int>? strideBytes,
     int timestampUs,
   }) = CpuFrameSource;
+
+  /// Pre-converted planar YUV420P (I420): a full-resolution [yPlane] plus
+  /// 2×2-subsampled [uPlane]/[vPlane]. Lets a GPU color-conversion step feed
+  /// planes straight to a YUV420P encoder with no further conversion. Each
+  /// plane must be tightly packed (Y: width*height, U/V: (width/2)*(height/2)).
+  factory FrameSource.yuv420p({
+    required Uint8List yPlane,
+    required Uint8List uPlane,
+    required Uint8List vPlane,
+    required int width,
+    required int height,
+    int timestampUs,
+  }) = Yuv420pFrameSource;
 
   /// A miniav-produced buffer — backend extracts native handle for zero-copy
   /// when possible.
@@ -147,6 +163,34 @@ class CpuFrameSource extends FrameSource {
 
   @override
   FrameSourceKind get kind => FrameSourceKind.cpu;
+}
+
+/// Pre-converted planar YUV420P (I420) frame: three tightly-packed u8 planes.
+class Yuv420pFrameSource extends FrameSource {
+  final Uint8List yPlane;
+  final Uint8List uPlane;
+  final Uint8List vPlane;
+  @override
+  final int width;
+  @override
+  final int height;
+  @override
+  final int timestampUs;
+
+  const Yuv420pFrameSource({
+    required this.yPlane,
+    required this.uPlane,
+    required this.vPlane,
+    required this.width,
+    required this.height,
+    this.timestampUs = 0,
+  });
+
+  @override
+  MiniAVPixelFormat get pixelFormat => MiniAVPixelFormat.i420;
+
+  @override
+  FrameSourceKind get kind => FrameSourceKind.yuv420pPlanar;
 }
 
 class MiniAVBufferSource extends FrameSource {

@@ -41,6 +41,7 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 
 import 'ffmpeg_encoder.dart' show address;
 import 'ffmpeg_ffi.dart';
+import 'ffmpeg_log.dart';
 import 'ffmpeg_muxer.dart' show FfmpegEncoderBridge;
 import 'ffmpeg_shim.dart';
 
@@ -52,6 +53,34 @@ const int _avPixFmtD3d11Fallback = 174;
 
 /// Encoder vendors that natively consume `AV_PIX_FMT_D3D11`.
 enum D3d11HwVendor { nvenc, amf, qsv, mediafoundation }
+
+// DXGI adapter VendorId constants — used to filter the vendor probe order
+// to only candidates compatible with the injected D3D11 device's adapter.
+const int _dxgiVendorIntel = 0x8086;
+const int _dxgiVendorNvidia = 0x10DE;
+const int _dxgiVendorAmd = 0x1002;
+
+/// Returns the D3D11VA vendor probe order for a specific DXGI adapter vendor.
+///
+/// Restricts open/warm-up attempts to only the IHV-native vendor plus the
+/// universal MediaFoundation fallback. This avoids spending time opening
+/// h264_nvenc with an Intel device (fast failure, but still wasteful and
+/// noisy in logs) and prevents unnecessary VIDEO_SUPPORT sibling creation for
+/// vendors that can never work on this adapter.
+///
+/// Returns [_defaultD3d11Order] for unknown vendors so no probe is skipped.
+List<D3d11HwVendor> _vendorOrderForDxgiVendor(int dxgiVendorId) {
+  switch (dxgiVendorId) {
+    case _dxgiVendorIntel:
+      return [D3d11HwVendor.qsv, D3d11HwVendor.mediafoundation];
+    case _dxgiVendorNvidia:
+      return [D3d11HwVendor.nvenc, D3d11HwVendor.mediafoundation];
+    case _dxgiVendorAmd:
+      return [D3d11HwVendor.amf, D3d11HwVendor.mediafoundation];
+    default:
+      return _defaultD3d11Order; // unknown adapter — try everything
+  }
+}
 
 /// DXGI pixel layout of the source textures the encoder will receive in
 /// `encode()`. Determines the `sw_format` of FFmpeg's hwframes pool, which
@@ -252,6 +281,304 @@ bool ffmpegD3d11EncoderAvailable(VideoCodec codec) {
   return false;
 }
 
+/// Eagerly triggers D3D11VA vendor SDK initialization without blocking the
+/// caller. Call this as soon as the shared D3D11 device is available (e.g.
+/// right after `ensureSharedGpu`). The vendors (h264_qsv, h264_mf, etc.)
+/// each require a one-time driver-side startup — MFStartup, DXVA session
+/// creation, MFX session init — that is triggered as a side effect of the
+/// first `avcodec_open2` call, even when that call fails. By firing these
+/// attempts in the background before recording starts, the vendor SDKs are
+/// warm by the time [ffmpegD3d11EncoderCompatibleWith] runs its real probe,
+/// preventing cold-start fallback to CPU on the very first session.
+///
+/// All failures are silently ignored — this is purely a side-effect trigger.
+/// The function is a no-op on non-Windows or when no vendors are registered.
+void ffmpegD3d11WarmUp(int existingD3d11Device) {
+  if (!Platform.isWindows) return;
+  if (existingD3d11Device == 0) return;
+  if (FfmpegShim.tryLoad() == null) return;
+  final ff = Ffmpeg.instance();
+  if (ff == null) return;
+
+  // Determine which vendors are worth warming up for this specific adapter.
+  // E.g. on an Intel iGPU: only qsv + mediafoundation; skip nvenc/amf entirely.
+  final shim = FfmpegShim.tryLoad()!;
+  final dxgiVendorId = shim.d3d11GetVendorId(
+    Pointer<Void>.fromAddress(existingD3d11Device),
+  );
+  if (dxgiVendorId == 0) {
+    ffmpegToolsLog(
+      MiniAVLogLevel.warn,
+      '[ffmpeg-d3d11] ffmpegD3d11WarmUp: '
+      'IDXGIDevice::QueryInterface returned 0 for '
+      'device=0x${existingD3d11Device.toRadixString(16)} — vendor ID '
+      'unknown; warming all registered vendors.',
+    );
+  }
+  final compatibleOrder = _vendorOrderForDxgiVendor(dxgiVendorId);
+
+  // Fire one open attempt per registered vendor that is also compatible with
+  // this adapter, unawaited. Each attempt loads the vendor DLL and inits its
+  // global state. We use h264 as the probe codec (always present when the
+  // vendor is available).
+  final vendors = ffmpegD3d11VendorsAvailable()
+      .where(compatibleOrder.contains)
+      .toList();
+  if (vendors.isEmpty) {
+    // No adapter-compatible vendors exist in this FFmpeg build — log and
+    // bail so we don't pollute the log with NVENC/AMF errors against the
+    // wrong adapter.
+    ffmpegToolsLog(
+      MiniAVLogLevel.info,
+      '[ffmpeg-d3d11] ffmpegD3d11WarmUp: no adapter-compatible vendors '
+      'present in this FFmpeg build for '
+      'vendorID=0x${dxgiVendorId.toRadixString(16)} '
+      '(device=0x${existingD3d11Device.toRadixString(16)}). '
+      'Available: ${ffmpegD3d11VendorsAvailable().map((v) => v.name).join(', ')}. '
+      'Zero-copy warm-up skipped.',
+    );
+    return;
+  }
+  ffmpegToolsLog(
+    MiniAVLogLevel.info,
+    '[ffmpeg-d3d11] ffmpegD3d11WarmUp: triggering background SDK init for '
+    '${vendors.map((v) => v.name).join(', ')} '
+    '(device=0x${existingD3d11Device.toRadixString(16)}, '
+    'vendorID=0x${dxgiVendorId.toRadixString(16)})',
+  );
+  // Each vendor gets its own unawaited future so they run concurrently.
+  for (final vendor in vendors) {
+    final spec = _d3d11Specs.firstWhere(
+      (s) => s.vendor == vendor && s.codec == VideoCodec.h264,
+      orElse: () => _d3d11Specs.firstWhere((s) => s.vendor == vendor),
+    );
+    Future(() async {
+      FfmpegD3d11HwEncoder? enc;
+      try {
+        enc = FfmpegD3d11HwEncoder.open(
+          EncoderConfig(
+            codec: spec.codec,
+            width: 256,
+            height: 256,
+            bitrateBps: 500_000,
+            frameRateNumerator: 30,
+            frameRateDenominator: 1,
+            bFrameCount: 0,
+            hwAccel: HwAccelPreference.required,
+            rateControl: RateControl.vbr,
+          ),
+          existingD3d11Device: existingD3d11Device,
+          vendorOrder: [vendor],
+        );
+        // Success — SDK is already warm. Close cleanly so resources are freed.
+        await enc.close();
+        enc = null;
+        ffmpegToolsLog(
+          MiniAVLogLevel.info,
+          '[ffmpeg-d3d11] ffmpegD3d11WarmUp: ${vendor.name} opened '
+          'successfully — SDK is warm.',
+        );
+      } catch (_) {
+        // Expected on first call — the failure itself triggers initialization.
+        if (enc != null) {
+          try {
+            await enc.close();
+          } catch (_) {}
+        }
+      }
+    });
+  }
+}
+
+/// Returns [true] if at least one D3D11VA vendor can successfully open an
+/// encoder for [codec] when [existingD3d11Device] is injected as the
+/// `ID3D11Device*` that the encoder must use.
+///
+/// Unlike [ffmpegD3d11EncoderAvailable], which only checks that encoder
+/// symbols are registered in the FFmpeg build, this function **actually
+/// tries to open** a minimal encoder to verify runtime adapter
+/// compatibility. This distinguishes between "NVENC symbols exist" (fast
+/// symbol check) and "NVENC can open on THIS device" (which fails when the
+/// injected device is on a different GPU vendor — e.g. an Intel iGPU device
+/// passed to the NVENC path).
+///
+/// The probe is slightly more expensive than the symbol check (~50–200 ms
+/// first call) but prevents a false-positive "GPU zero-copy mode" decision
+/// in the recorder when the Dawn/WebGPU device is on an Intel iGPU and
+/// only NVENC/AMF encoders are registered.
+///
+/// Returns [true] without probing when [existingD3d11Device] is 0 (no
+/// injected device — the encoder is free to create its own D3D11 device on
+/// any adapter, so adapter compatibility is not a concern here).
+Future<bool> ffmpegD3d11EncoderCompatibleWith(
+  VideoCodec codec,
+  int existingD3d11Device,
+) async {
+  if (!ffmpegD3d11EncoderAvailable(codec)) return false;
+  if (existingD3d11Device == 0) return true;
+
+  // Restrict the vendor probe order to only IHV-compatible vendors.
+  // E.g. on Intel iGPU (vendorID=0x8086): only [qsv, mediafoundation].
+  // This avoids wasted NVENC/AMF open attempts (and noisy stderr) on a
+  // device those vendors can never use.
+  final shim =
+      FfmpegShim.tryLoad()!; // already validated by ffmpegD3d11EncoderAvailable
+  final dxgiVendorId = shim.d3d11GetVendorId(
+    Pointer<Void>.fromAddress(existingD3d11Device),
+  );
+  if (dxgiVendorId == 0) {
+    ffmpegToolsLog(
+      MiniAVLogLevel.warn,
+      '[ffmpeg-d3d11] ffmpegD3d11EncoderCompatibleWith: '
+      'IDXGIDevice::QueryInterface returned 0 for '
+      'device=0x${existingD3d11Device.toRadixString(16)} — vendor ID '
+      'unknown; probing all registered vendors. '
+      'If NVENC/AMF errors follow, this is why.',
+    );
+  }
+  final vendorOrder = _vendorOrderForDxgiVendor(dxgiVendorId);
+
+  // Fast-fail: if no vendor in the adapter-filtered order is actually
+  // present in this FFmpeg build, skip the entire probe.  Without this,
+  // the loop below burns ~400 ms × 2 attempts per absent vendor before
+  // returning false, and the warmup fires NVENC/AMF probes against the
+  // wrong adapter — generating log noise that looks like real failures.
+  //
+  // Example: Dawn on Intel iGPU (vendorID=0x8086) → vendorOrder=[qsv, mf],
+  // but the FFmpeg build only ships h264_nvenc / h264_amf → intersection
+  // is empty → return false immediately.
+  final presentVendors = ffmpegD3d11VendorsAvailable().toSet().intersection(
+    vendorOrder.toSet(),
+  );
+  if (presentVendors.isEmpty) {
+    ffmpegToolsLog(
+      MiniAVLogLevel.warn,
+      '[ffmpeg-d3d11] ffmpegD3d11EncoderCompatibleWith: '
+      'no adapter-compatible vendors present in this FFmpeg build '
+      '(adapter vendorID=0x${dxgiVendorId.toRadixString(16)}, '
+      'needed: ${vendorOrder.map((v) => v.name).join(', ')}, '
+      'available: ${ffmpegD3d11VendorsAvailable().map((v) => v.name).join(', ')}). '
+      'Zero-copy is unavailable; CPU path will be used.',
+    );
+    return false;
+  }
+
+  // Re-order the candidates so adapter-compatible ones come first and we
+  // still respect priority, but never attempt vendors missing from the build.
+  final effectiveVendorOrder = vendorOrder
+      .where(presentVendors.contains)
+      .toList(growable: false);
+  ffmpegToolsLog(
+    MiniAVLogLevel.debug,
+    '[ffmpeg-d3d11] ffmpegD3d11EncoderCompatibleWith: '
+    'vendorID=0x${dxgiVendorId.toRadixString(16)}, '
+    'probing vendors: ${effectiveVendorOrder.map((v) => v.name).join(', ')}',
+  );
+
+  // Probe at 256×256 — large enough to satisfy every vendor's minimum
+  // dimension constraint (NVENC HEVC requires ≥ 144×144, others are smaller).
+  final probeConfig = EncoderConfig(
+    codec: codec,
+    width: 256,
+    height: 256,
+    bitrateBps: 500_000,
+    frameRateNumerator: 30,
+    frameRateDenominator: 1,
+    bFrameCount: 0,
+    hwAccel: HwAccelPreference.required,
+    rateControl: RateControl.vbr,
+  );
+
+  // Iterate vendors in priority order, probing each one individually.
+  //
+  // Using open() (which returns the first that opens) and then probing is
+  // WRONG: if open() picks QSV but the frame-format probe fails, the old
+  // code returned false immediately without ever trying MediaFoundation.
+  //
+  // Per-vendor iteration means:
+  //   • CodecInitException (open fails) → retry once (400 ms cold-start
+  //     window), then continue to the next vendor.
+  //   • _probeAcceptsHwFrame returns false (encoder opens but rejects the
+  //     pool's pixel format) → close and continue to the next vendor.
+  //   • First vendor whose probe succeeds → return true.
+  outer:
+  for (final vendor in effectiveVendorOrder) {
+    for (var attempt = 0; attempt < 2; attempt++) {
+      FfmpegD3d11HwEncoder? enc;
+      try {
+        enc = FfmpegD3d11HwEncoder.openWith(
+          probeConfig,
+          vendor,
+          existingD3d11Device: existingD3d11Device,
+        );
+        // CRITICAL: openWith() succeeding only proves the codec context
+        // initialised — it does NOT prove the vendor accepts our pool's
+        // pixel format.  Send one pool-allocated hwframe through the encoder
+        // to confirm end-to-end compatibility before committing to this
+        // vendor for the real recording.
+        final accepted = enc._probeAcceptsHwFrame();
+        await enc.close();
+        enc = null;
+        if (!accepted) {
+          ffmpegToolsLog(
+            MiniAVLogLevel.info,
+            '[ffmpeg-d3d11] ffmpegD3d11EncoderCompatibleWith: '
+            '${vendor.name} opened but rejected pool-allocated frame '
+            '(pixel-format incompatible). Trying next vendor.',
+          );
+          continue outer; // try the next vendor, don't give up
+        }
+        return true; // this vendor is fully compatible
+      } on CodecInitException catch (e) {
+        if (enc != null) {
+          try {
+            await enc.close();
+          } catch (_) {
+            /* best effort */
+          }
+          enc = null;
+        }
+        if (attempt == 0) {
+          // The first failure triggered the vendor SDK's global cold-start
+          // (MFStartup / DXVA session / MFX session init).  Wait 400 ms so
+          // the driver has time to finish before the second attempt.
+          ffmpegToolsLog(
+            MiniAVLogLevel.debug,
+            '[ffmpeg-d3d11] ffmpegD3d11EncoderCompatibleWith: '
+            '${vendor.name} attempt 1 failed ($e) — '
+            'waiting 400 ms for SDK cold-start, then retrying.',
+          );
+          await Future<void>.delayed(const Duration(milliseconds: 400));
+          continue; // retry same vendor
+        }
+        // Second failure: this vendor is genuinely incompatible or missing.
+        ffmpegToolsLog(
+          MiniAVLogLevel.debug,
+          '[ffmpeg-d3d11] ffmpegD3d11EncoderCompatibleWith: '
+          '${vendor.name} attempt 2 also failed ($e) — trying next vendor.',
+        );
+        continue outer;
+      } catch (e) {
+        if (enc != null) {
+          try {
+            await enc.close();
+          } catch (_) {
+            /* best effort */
+          }
+          enc = null;
+        }
+        ffmpegToolsLog(
+          MiniAVLogLevel.warn,
+          '[ffmpeg-d3d11] ffmpegD3d11EncoderCompatibleWith: '
+          '${vendor.name} threw unexpected error ($e) — trying next vendor.',
+        );
+        continue outer;
+      }
+    }
+  }
+  return false; // no vendor was compatible
+}
+
 /// True zero-copy D3D11VA hardware encoder. See library doc-comment for
 /// pipeline details.
 class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
@@ -267,6 +594,9 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
     this._d3dDevice,
     this._d3dContext,
     this._d3dPixFmt,
+    this._qsvHwDeviceRef,
+    this._qsvHwFramesRef,
+    this._vpContext,
   );
 
   final Ffmpeg _ff;
@@ -280,7 +610,7 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   Pointer<Void> _hwDeviceRef;
 
   /// `AVBufferRef*` to the FFmpeg-owned `AVHWFramesContext` (pool of
-  /// `width × height` BGRA D3D11 textures).
+  /// `width × height` BGRA D3D11 textures used for CopySubresourceRegion).
   Pointer<Void> _hwFramesRef;
 
   /// `ID3D11Device*` owned by FFmpeg (we don't AddRef/Release — FFmpeg
@@ -290,8 +620,22 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   /// `ID3D11DeviceContext*` (immediate context) on the same device.
   final Pointer<Void> _d3dContext;
 
-  /// Resolved `AV_PIX_FMT_D3D11` value.
+  /// Resolved hardware pixel format value for the codec context.
+  /// For most vendors: `AV_PIX_FMT_D3D11`. For QSV: `AV_PIX_FMT_QSV`.
   final int _d3dPixFmt;
+
+  /// QSV-only: `AVBufferRef*` to the derived QSV `AVHWDeviceContext`.
+  /// `nullptr` for non-QSV vendors.
+  Pointer<Void> _qsvHwDeviceRef;
+
+  /// QSV-only: `AVBufferRef*` to the derived QSV `AVHWFramesContext`.
+  /// Set on the codec ctx; `nullptr` for non-QSV vendors.
+  Pointer<Void> _qsvHwFramesRef;
+
+  /// D3D11 VideoProcessor context for BGRA→NV12 GPU color conversion.
+  /// Non-null only when vendor == QSV or MF (Intel iGPU path).
+  /// Created during [openWith]; destroyed in [close].
+  Pointer<Void> _vpContext;
 
   bool _closed = false;
   int _nextPts = 0;
@@ -300,6 +644,13 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
 
   D3d11HwVendor get vendor => _spec.vendor;
   String get encoderName => _spec.encoderName;
+
+  /// The `ID3D11Device*` address used by this encoder (owned by FFmpeg).
+  ///
+  /// Use this when you need to create or import a texture on the **same**
+  /// D3D11 device — required for [D3D11TextureFrameSource], whose
+  /// `texturePtr` must be a `ID3D11Texture2D*` on the encoder's device.
+  int get d3dDeviceAddress => _d3dDevice.address;
 
   /// Open the best D3D11VA encoder for [cfg.codec], honouring [vendorOrder]
   /// (default: AMF → QSV → MediaFoundation). Throws [CodecInitException]
@@ -401,6 +752,15 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
     if (ff == null) {
       throw const CodecInitException('ffmpeg-d3d11', 'FFmpeg not loaded');
     }
+    // QSV (h264_qsv / hevc_qsv) and MediaFoundation (h264_mf / hevc_mf)
+    // both require the calling thread to be in the COM MTA apartment.
+    // Flutter's UI isolate is STA by default; this elevates the current
+    // thread to MTA before the encoder init touches MFX or IMFTransform.
+    // Other vendors (NVENC, AMF) tolerate either apartment.
+    if (vendor == D3d11HwVendor.qsv ||
+        vendor == D3d11HwVendor.mediafoundation) {
+      shim.ensureMta();
+    }
     final spec = _findSpec(vendor, cfg.codec);
     if (spec == null) {
       throw CodecInitException(
@@ -424,28 +784,66 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
 
     // 1) Create (or inject) a D3D11VA hardware device.
     //
-    // When `existingD3d11Device` is non-zero we use the alloc+set+init path
-    // so that FFmpeg's D3D11 device is on the SAME DXGI adapter as an
-    // external GPU API (e.g. Dawn/WebGPU).  Cross-adapter NT-handle sharing
-    // always fails with E_INVALIDARG; same-adapter sharing works fine.
+    // QSV uses a standalone MFXLoad-based init path (see the try block below)
+    // and does NOT go through D3D11 device injection.  hwDeviceRef is set to
+    // nullptr here and replaced by the standalone init.
+    //
+    // For NVENC / AMF / MediaFoundation, when `existingD3d11Device` is
+    // non-zero we use the alloc+set+init path so that FFmpeg's D3D11 device
+    // is on the SAME DXGI adapter as an external GPU API (e.g. Dawn/WebGPU).
+    // Cross-adapter NT-handle sharing always fails with E_INVALIDARG;
+    // same-adapter sharing works fine.
     //
     // When no device is provided we fall back to av_hwdevice_ctx_create with
     // a NULL device string so FFmpeg picks adapter 0 (the display adapter).
     Pointer<Void> hwDeviceRef;
-    if (existingD3d11Device != 0) {
+    if (vendor == D3d11HwVendor.qsv) {
+      // Placeholder — replaced with D3D11VA-from-QSV in the try block.
+      hwDeviceRef = nullptr;
+    } else if (existingD3d11Device != 0) {
       // Allocate an empty AV_HWDEVICE_TYPE_D3D11VA context, inject the
       // caller's ID3D11Device, then initialise (FFmpeg creates a context).
+      //
+      // For MediaFoundation the injected device must have been created with
+      // D3D11_CREATE_DEVICE_VIDEO_SUPPORT, which Dawn/WebGPU devices lack.
+      // We create a sibling device on the SAME adapter with that flag, inject
+      // it instead, and release our local ref immediately (d3d11SetDevice
+      // AddRefs, so FFmpeg holds the only remaining ref).
+      // NT handle sharing is adapter-scoped, so OpenSharedResource1 on the
+      // Dawn-originated textures still succeeds from the sibling device.
+      final Pointer<Void> deviceToInject;
+      Pointer<Void>? siblingToRelease;
+      if (vendor == D3d11HwVendor.mediafoundation) {
+        final sibling = shim.d3d11CreateVideoDeviceFor(
+          Pointer<Void>.fromAddress(existingD3d11Device),
+        );
+        if (sibling == nullptr) {
+          throw CodecInitException(
+            'ffmpeg-d3d11',
+            '$vendor: failed to create VIDEO_SUPPORT sibling device '
+                'on the injected adapter. The driver may not support '
+                'D3D11_CREATE_DEVICE_VIDEO_SUPPORT on this GPU.',
+          );
+        }
+        deviceToInject = sibling;
+        siblingToRelease = sibling;
+      } else {
+        deviceToInject = Pointer<Void>.fromAddress(existingD3d11Device);
+      }
+
       final allocRef = ff.avHwdeviceCtxAlloc(kAvHwdeviceTypeD3d11Va);
       if (allocRef == nullptr) {
+        if (siblingToRelease != null) shim.d3d11Release(siblingToRelease);
         throw const CodecInitException(
           'ffmpeg-d3d11',
           'av_hwdevice_ctx_alloc(D3D11VA) returned NULL',
         );
       }
-      shim.d3d11SetDevice(
-        allocRef,
-        Pointer<Void>.fromAddress(existingD3d11Device),
-      );
+      shim.d3d11SetDevice(allocRef, deviceToInject);
+      // d3d11SetDevice AddRefs internally — release our own ref to the
+      // sibling device (if any) so FFmpeg is the sole owner.
+      if (siblingToRelease != null) shim.d3d11Release(siblingToRelease);
+
       final initRet = ff.avHwdeviceCtxInit(allocRef);
       if (initRet < 0) {
         // av_buffer_unref to free the alloc
@@ -481,10 +879,73 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
     }
 
     Pointer<Void> hwFramesRef = nullptr;
+    Pointer<Void> qsvHwDeviceRef = nullptr;
+    Pointer<Void> qsvHwFramesRef = nullptr;
     Pointer<AVCodecContext> codecCtx = nullptr;
     Pointer<AVPacket> packet = nullptr;
 
     try {
+      // --- QSV standalone init -------------------------------------------
+      // QSV uses MFXLoad (oneVPL API) rather than the legacy MFXInitEx +
+      // MFXVideoCORE_SetHandle(D3D11_DEVICE) path.  MFXLoad works with both
+      // libmfx (legacy MSDK) and oneVPL (Intel 12th-gen+ / Arc GPUs which
+      // ship WITHOUT legacy libmfx).  The injection path uses MFXInitEx and
+      // therefore always fails on oneVPL-only systems.
+      //
+      // We create a standalone QSV device first, then derive D3D11VA from it
+      // (reverse direction).  hwDeviceRef becomes D3D11VA-from-QSV so that
+      // d3dDevice/Context, the hwFrames NV12 pool, and the VideoProcessor are
+      // all on QSV's own D3D11 device.
+      //
+      // Source textures (SharedOutputTexture) carry D3D11_RESOURCE_MISC_SHARED
+      // so the VP blit opens them cross-device via GetSharedHandle +
+      // OpenSharedResource — no adapter restriction.
+      if (vendor == D3d11HwVendor.qsv) {
+        final qsvStandaloneOut = calloc<Pointer<Void>>();
+        final qsvStandaloneRet = ff.avHwdeviceCtxCreate(
+          qsvStandaloneOut,
+          kAvHwdeviceTypeQsv,
+          nullptr,
+          nullptr,
+          0,
+        );
+        qsvHwDeviceRef = qsvStandaloneOut.value;
+        calloc.free(qsvStandaloneOut);
+        if (qsvStandaloneRet < 0 || qsvHwDeviceRef == nullptr) {
+          throw CodecInitException(
+            'ffmpeg-d3d11',
+            'av_hwdevice_ctx_create(QSV standalone): '
+                '${ff.strError(qsvStandaloneRet)} ($qsvStandaloneRet). '
+                'Install Intel graphics driver (includes VPL / MSDK runtime).',
+          );
+        }
+
+        // Derive D3D11VA from QSV (reverse direction).  This exposes QSV's
+        // internal D3D11 device so hwFrames + VP are allocated on it.
+        final d3d11vaFromQsvOut = calloc<Pointer<Void>>();
+        final d3d11vaFromQsvRet = ff.avHwdeviceCtxCreateDerived(
+          d3d11vaFromQsvOut,
+          kAvHwdeviceTypeD3d11Va,
+          qsvHwDeviceRef,
+          0,
+        );
+        hwDeviceRef = d3d11vaFromQsvOut.value;
+        calloc.free(d3d11vaFromQsvOut);
+        if (d3d11vaFromQsvRet < 0 || hwDeviceRef == nullptr) {
+          throw CodecInitException(
+            'ffmpeg-d3d11',
+            'av_hwdevice_ctx_create_derived(D3D11VA from QSV): '
+                '${ff.strError(d3d11vaFromQsvRet)} ($d3d11vaFromQsvRet).',
+          );
+        }
+        ffmpegToolsLog(
+          MiniAVLogLevel.debug,
+          '[ffmpeg-d3d11] QSV standalone init OK: '
+          'hwDeviceRef(D3D11VA)=0x${hwDeviceRef.address.toRadixString(16)} '
+          'qsvHwDeviceRef=0x${qsvHwDeviceRef.address.toRadixString(16)}',
+        );
+      }
+
       final d3dDevice = shim.d3d11GetDevice(hwDeviceRef);
       final d3dContext = shim.d3d11GetContext(hwDeviceRef);
       if (d3dDevice == nullptr || d3dContext == nullptr) {
@@ -494,9 +955,14 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
               'AVHWDeviceContext (corrupt or wrong-platform shim build)',
         );
       }
-      stderr.writeln(
+      ffmpegToolsLog(
+        MiniAVLogLevel.debug,
         '[ffmpeg-d3d11] openWith: d3dDevice=0x${d3dDevice.address.toRadixString(16)} '
-        '${existingD3d11Device != 0 ? "[injected — same device as Dawn GPU]" : "[FFmpeg-created — display adapter (adapter 0)]"}'
+        '${vendor == D3d11HwVendor.qsv
+            ? "[QSV standalone — Intel device via MFXLoad]"
+            : existingD3d11Device != 0
+            ? (vendor == D3d11HwVendor.mediafoundation ? "[VIDEO_SUPPORT sibling — same adapter as Dawn GPU]" : "[injected — same device as Dawn GPU]")
+            : "[FFmpeg-created — display adapter (adapter 0)]"}'
         '\n  Compare with [minigpu_external] ID3D11Device and [shim] luid= logs.',
       );
 
@@ -508,15 +974,31 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
       calloc.free(d3dName);
       if (d3dPixFmt < 0) d3dPixFmt = _avPixFmtD3d11Fallback;
 
-      // SW-format: this is the DXGI texture format used by the hwframes
-      // pool the encoder will allocate. CopySubresourceRegion REQUIRES the
-      // source and destination to be in the same DXGI type group, so this
-      // must match the format of the textures the caller will hand us in
-      // encode() — `bgra` for miniav DXGI capture, `rgba` for minigpu's
-      // SharedOutputTexture (rgba8unorm storage texture).
-      final swFmtName = sourceTextureFormat == D3d11HwSourceFormat.rgba
-          ? 'rgba'
-          : 'bgra';
+      // SW-format: the DXGI texture format for the hwframes pool.
+      //
+      // For NVENC / AMF: use BGRA (or RGBA) to match the source texture format
+      // exactly.  CopySubresourceRegion requires matching DXGI format groups,
+      // so src and dst must be the same.
+      //
+      // For QSV / MediaFoundation (Intel iGPU): those encoders reject BGRA
+      // frames at avcodec_send_frame (AVERROR_EXTERNAL).  They require NV12.
+      // We allocate an NV12 pool and use a D3D11 VideoProcessor to convert
+      // BGRA→NV12 in GPU memory.  The VP runs on the VIDEO_SUPPORT sibling
+      // device, making the Intel GPU do the full encode path without ever
+      // touching system RAM.
+      final needsNv12ForVp =
+          vendor == D3d11HwVendor.qsv ||
+          vendor == D3d11HwVendor.mediafoundation ||
+          // AMF: BGRA D3D11 input is broken on real AMD hardware — AMD iGPUs
+          // reject BGRA frames at avcodec_send_frame ("Unknown error"), and
+          // some dGPU/driver combos accept them but silently encode black.
+          // AMF's native input format is NV12, so always feed it through the
+          // same VideoProcessor BGRA→NV12 path QSV/MF use (fixed-function,
+          // no shader-core cost).
+          vendor == D3d11HwVendor.amf;
+      final swFmtName = needsNv12ForVp
+          ? 'nv12'
+          : (sourceTextureFormat == D3d11HwSourceFormat.rgba ? 'rgba' : 'bgra');
       final swNamePtr = swFmtName.toNativeUtf8();
       final bgraFmt = ff.avGetPixFmtByName(swNamePtr);
       calloc.free(swNamePtr);
@@ -526,32 +1008,149 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
           'av_get_pix_fmt("$swFmtName") failed',
         );
       }
-      // 2) Allocate the hwframes pool against the hwdev context.
-      hwFramesRef = ff.avHwframeCtxAlloc(hwDeviceRef);
-      if (hwFramesRef == nullptr) {
-        throw const CodecInitException(
-          'ffmpeg-d3d11',
-          'av_hwframe_ctx_alloc returned NULL',
+      // 2) Allocate + init the hwframes pool against the hwdev context.
+      //
+      // For the VP (NV12) path the pool's bind flags are driver-sensitive:
+      // Intel wants SHADER_RESOURCE|RENDER_TARGET|DECODER|VIDEO_ENCODER, but
+      // AMD rejects the DECODER|RENDER_TARGET combination with E_INVALIDARG
+      // (0x80070057), and some drivers also balk at VIDEO_ENCODER. Rather
+      // than hard-coding per-vendor tables, try flag sets from richest to
+      // minimal (RENDER_TARGET is the hard requirement — VP writes to it),
+      // re-allocating the frames ctx per attempt (a failed init poisons it).
+      final bindFlagCandidates = !needsNv12ForVp
+          ? const <int?>[null] // BGRA pool: FFmpeg's defaults, single attempt
+          : <int>[
+              if (vendor != D3d11HwVendor.amf)
+                0x08 | 0x20 | 0x200 | 0x400, // Intel-tuned combo (QSV/MF)
+              0x08 | 0x20 | 0x400, // SR | RT | VIDEO_ENCODER
+              0x08 | 0x20, // SR | RT (minimum for VP output)
+            ];
+      var framesInit = -1;
+      for (final bindFlags in bindFlagCandidates) {
+        hwFramesRef = ff.avHwframeCtxAlloc(hwDeviceRef);
+        if (hwFramesRef == nullptr) {
+          throw const CodecInitException(
+            'ffmpeg-d3d11',
+            'av_hwframe_ctx_alloc returned NULL',
+          );
+        }
+        final framesData = shim.hwFramesData(hwFramesRef);
+        shim.hwFramesSetParams(
+          framesData,
+          format: d3dPixFmt,
+          swFormat: bgraFmt,
+          width: cfg.width,
+          height: cfg.height,
+          // Pool size must cover encoder reorder + our own in-flight count.
+          // 8 is the FFmpeg-recommended floor for typical low-latency configs.
+          initialPoolSize: 8,
+        );
+        if (bindFlags != null) {
+          shim.d3d11vaFramesSetBindFlags(hwFramesRef, bindFlags);
+        }
+        framesInit = ff.avHwframeCtxInit(hwFramesRef);
+        if (framesInit >= 0) {
+          if (needsNv12ForVp && bindFlags != bindFlagCandidates.first) {
+            ffmpegToolsLog(
+              MiniAVLogLevel.info,
+              '[ffmpeg-d3d11] NV12 pool init succeeded with reduced bind '
+              'flags 0x${bindFlags!.toRadixString(16)} (driver rejected the '
+              'richer combination).',
+            );
+          }
+          break;
+        }
+        // Failed — free the poisoned ctx and try the next flag set.
+        final rp = calloc<Pointer<Void>>()..value = hwFramesRef;
+        ff.avBufferUnref(rp);
+        calloc.free(rp);
+        hwFramesRef = nullptr;
+        ffmpegToolsLog(
+          MiniAVLogLevel.debug,
+          '[ffmpeg-d3d11] av_hwframe_ctx_init failed with bind flags '
+          '${bindFlags != null ? "0x${bindFlags.toRadixString(16)}" : "(default)"}: '
+          '${ff.strError(framesInit)} ($framesInit).',
         );
       }
-      final framesData = shim.hwFramesData(hwFramesRef);
-      shim.hwFramesSetParams(
-        framesData,
-        format: d3dPixFmt,
-        swFormat: bgraFmt,
-        width: cfg.width,
-        height: cfg.height,
-        // Pool size must cover encoder reorder + our own in-flight count.
-        // 8 is the FFmpeg-recommended floor for typical low-latency configs.
-        initialPoolSize: 8,
-      );
-      final framesInit = ff.avHwframeCtxInit(hwFramesRef);
-      if (framesInit < 0) {
+      if (framesInit < 0 || hwFramesRef == nullptr) {
         throw CodecInitException(
           'ffmpeg-d3d11',
           'av_hwframe_ctx_init: ${ff.strError(framesInit)} ($framesInit). '
-              'Likely BGRA D3D11 textures unsupported on this adapter.',
+              '${needsNv12ForVp ? "NV12 D3D11 pool init failed with every bind-flag set — VP BGRA→NV12 path unavailable." : "Likely BGRA D3D11 textures unsupported on this adapter."}',
         );
+      }
+
+      // Create VideoProcessor for BGRA→NV12 when using the QSV/MF path.
+      // The VP runs on the VIDEO_SUPPORT sibling device (d3dDevice here is
+      // the sibling, not Dawn's device) and converts BGRA screen frames to
+      // NV12 entirely in GPU memory.
+      Pointer<Void> vpContext = nullptr;
+      if (needsNv12ForVp) {
+        vpContext = shim.d3d11VpCreate(
+          d3dDevice,
+          d3dContext,
+          cfg.width,
+          cfg.height,
+        );
+        if (vpContext == nullptr) {
+          throw const CodecInitException(
+            'ffmpeg-d3d11',
+            'D3D11 VideoProcessor creation failed for BGRA→NV12 conversion. '
+                'The VIDEO_SUPPORT sibling device may not support VideoProcessor '
+                'on this adapter. GPU path unavailable; use CPU encoder instead.',
+          );
+        }
+        ffmpegToolsLog(
+          MiniAVLogLevel.info,
+          '[ffmpeg-d3d11] openWith: VideoProcessor BGRA→NV12 created for '
+          '${spec.encoderName} — Intel iGPU GPU zero-copy path active.',
+        );
+      }
+
+      // QSV requires a derived QSV hwdevice + hwframes context layered on top
+      // of the D3D11VA hwdevice + hwframes context.  The derived QSV hwframes
+      // pool shares the same D3D11 textures as the D3D11VA pool, so
+      // CopySubresourceRegion targets the D3D11VA frame and the QSV encoder
+      // reads the same memory via the mfxFrameSurface1 wrapper.
+      var codecPixFmt = d3dPixFmt; // overridden to QSV pixel fmt for QSV vendor
+      var codecHwFramesRef = hwFramesRef; // overridden to QSV frames for QSV
+
+      if (spec.vendor == D3d11HwVendor.qsv) {
+        // Resolve AV_PIX_FMT_QSV dynamically.
+        final qsvFmtNamePtr = 'qsv'.toNativeUtf8();
+        final qsvPixFmt = ff.avGetPixFmtByName(qsvFmtNamePtr);
+        calloc.free(qsvFmtNamePtr);
+        if (qsvPixFmt < 0) {
+          throw const CodecInitException(
+            'ffmpeg-d3d11',
+            'av_get_pix_fmt("qsv") returned -1 — QSV is not compiled into '
+                'this FFmpeg build',
+          );
+        }
+
+        // qsvHwDeviceRef was set in the standalone init block above.
+        // Derive QSV hwframes from D3D11VA hwframes — the derived pool shares
+        // the same D3D11 NV12 textures allocated on QSV's own device.
+        final qsvFramesOut = calloc<Pointer<Void>>();
+        final qsvFramesRet = ff.avHwframeCtxCreateDerived(
+          qsvFramesOut,
+          qsvPixFmt,
+          qsvHwDeviceRef,
+          hwFramesRef,
+          0,
+        );
+        qsvHwFramesRef = qsvFramesOut.value;
+        calloc.free(qsvFramesOut);
+        if (qsvFramesRet < 0 || qsvHwFramesRef == nullptr) {
+          throw CodecInitException(
+            'ffmpeg-d3d11',
+            'av_hwframe_ctx_create_derived(QSV): '
+                '${ff.strError(qsvFramesRet)} ($qsvFramesRet)',
+          );
+        }
+
+        codecPixFmt = qsvPixFmt;
+        codecHwFramesRef = qsvHwFramesRef;
       }
 
       // 3) Allocate + configure the encoder's AVCodecContext.
@@ -570,11 +1169,13 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
         );
       }
 
-      _configureCtx(ff, codecCtx, cfg, spec, d3dPixFmt);
+      _configureCtx(ff, codecCtx, cfg, spec, codecPixFmt);
 
       // Hand the codec ctx its own ref to the hwframes context. The shim
       // calls av_buffer_ref internally — we keep `hwFramesRef` for cleanup.
-      shim.setHwFramesCtx(codecCtx.cast<Void>(), hwFramesRef);
+      // For QSV, the codec ctx gets the derived QSV hwframes; D3D11VA hwframes
+      // are kept separately for av_hwframe_get_buffer in encode().
+      shim.setHwFramesCtx(codecCtx.cast<Void>(), codecHwFramesRef);
 
       final openRet = ff.avcodecOpen2(codecCtx, codec, nullptr);
       if (openRet < 0) {
@@ -606,11 +1207,16 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
         hwFramesRef,
         d3dDevice,
         d3dContext,
-        d3dPixFmt,
+        codecPixFmt,
+        qsvHwDeviceRef,
+        qsvHwFramesRef,
+        vpContext,
       ).._loadExtraData();
       // Ownership of refs / codec ctx / packet is now in the instance.
       hwDeviceRef = nullptr;
       hwFramesRef = nullptr;
+      qsvHwDeviceRef = nullptr;
+      qsvHwFramesRef = nullptr;
       codecCtx = nullptr;
       packet = nullptr;
       return enc;
@@ -625,6 +1231,18 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
         final cp = calloc<Pointer<AVCodecContext>>()..value = codecCtx;
         ff.avcodecFreeContext(cp);
         calloc.free(cp);
+      }
+      // Release derived QSV refs before base D3D11VA refs (derived must be
+      // freed first so the base retains a positive ref count).
+      if (qsvHwFramesRef != nullptr) {
+        final wrap = calloc<Pointer<Void>>()..value = qsvHwFramesRef;
+        ff.avBufferUnref(wrap);
+        calloc.free(wrap);
+      }
+      if (qsvHwDeviceRef != nullptr) {
+        final wrap = calloc<Pointer<Void>>()..value = qsvHwDeviceRef;
+        ff.avBufferUnref(wrap);
+        calloc.free(wrap);
       }
       if (hwFramesRef != nullptr) {
         final rp = calloc<Pointer<Pointer<Void>>>().cast<Pointer<Void>>();
@@ -863,6 +1481,7 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
     }
 
     Pointer<AVFrame> hwFrame = nullptr;
+    Pointer<AVFrame> qsvFrame = nullptr;
     try {
       hwFrame = _ff.avFrameAlloc();
       if (hwFrame == address(0)) {
@@ -874,7 +1493,7 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
 
       // av_hwframe_get_buffer pulls a free pool texture into the AVFrame.
       // After this call: data[0]=ID3D11Texture2D*, data[1]=subresource idx
-      // (as integer cast to pointer), hw_frames_ctx is bound.
+      // (as integer cast to pointer), hw_frames_ctx is bound to D3D11VA frames.
       final gb = _ff.avHwframeGetBuffer(_hwFramesRef, hwFrame, 0);
       if (gb < 0) {
         throw CodecRuntimeException(
@@ -884,20 +1503,83 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
         );
       }
 
-      // Pure GPU copy + fence: the shim issues CopySubresourceRegion then
-      // waits on a D3D11_QUERY_EVENT before returning.
+      // Pure GPU copy (NVENC/AMF) or VideoProcessor BGRA→NV12 blt (QSV/MF).
       final dstTex = hwFrame.ref.data0.cast<Void>();
       final dstSlice = hwFrame.ref.data1.address;
-      _shim.d3d11CopyResource(
-        _d3dDevice,
-        _d3dContext,
-        dstTex,
-        dstSlice,
-        srcTex,
-        subresource,
-      );
+      if (_vpContext != nullptr) {
+        // Intel QSV/MF path: D3D11 VideoProcessor converts BGRA→NV12 on the
+        // VIDEO_SUPPORT sibling device.
+        //
+        // D3D11TextureFrameSource: srcTex is on Dawn's ID3D11Device (different
+        // from the sibling).  The shim opens it via GetSharedHandle +
+        // OpenSharedResource internally (cross_device=1).  Requires
+        // D3D11_RESOURCE_MISC_SHARED on the SharedOutputTexture (see
+        // minigpu_external.cpp create_shared_output_texture).
+        //
+        // MiniAVBufferSource: srcTex is already on the sibling device (opened
+        // via OpenSharedResource1 / NT handle above).  cross_device=0.
+        final vpRet = _shim.d3d11VpBgraToNv12(
+          _vpContext,
+          _d3dDevice,
+          _d3dContext,
+          srcTex,
+          crossDevice:
+              !ownsSrcTex, // ownsSrcTex=true → srcTex on sibling already
+          dstSubresource: dstSlice,
+          dstNv12Tex: dstTex,
+        );
+        if (vpRet < 0) {
+          throw CodecRuntimeException(
+            'ffmpeg-d3d11',
+            'D3D11 VideoProcessor BGRA→NV12 blt failed: $vpRet. '
+                'Check shim logs for hr= detail.',
+          );
+        }
+      } else {
+        _shim.d3d11CopyResource(
+          _d3dDevice,
+          _d3dContext,
+          dstTex,
+          dstSlice,
+          srcTex,
+          subresource,
+        );
+      }
 
-      hwFrame.ref
+      // For QSV: the encoder needs a QSV-format frame (mfxFrameSurface1
+      // wrapper) rather than a raw D3D11VA frame.  We map the D3D11VA frame
+      // to a new QSV frame that references the same underlying texture via
+      // the derived hwframes relationship.  The copy above has already written
+      // into the D3D11VA texture, so the QSV frame automatically sees it.
+      Pointer<AVFrame> frameToSend;
+      if (_qsvHwFramesRef != nullptr) {
+        qsvFrame = _ff.avFrameAlloc();
+        if (qsvFrame == address(0)) {
+          throw const CodecRuntimeException(
+            'ffmpeg-d3d11',
+            'av_frame_alloc for QSV frame returned NULL',
+          );
+        }
+        // Set hw_frames_ctx on qsvFrame so av_hwframe_map can resolve the
+        // QSV hwframes context (needed to pick the correct mapping path).
+        _shim.avFrameSetHwFramesCtx(qsvFrame.cast<Void>(), _qsvHwFramesRef);
+        final mapRet = _ff.avHwframeMap(
+          qsvFrame,
+          hwFrame,
+          kAvHwframeMapRead | kAvHwframeMapDirect,
+        );
+        if (mapRet < 0) {
+          throw CodecRuntimeException(
+            'ffmpeg-d3d11',
+            'av_hwframe_map(D3D11VA→QSV): ${_ff.strError(mapRet)} ($mapRet)',
+          );
+        }
+        frameToSend = qsvFrame;
+      } else {
+        frameToSend = hwFrame;
+      }
+
+      frameToSend.ref
         ..width = _cfg.width
         ..height = _cfg.height
         ..format = _d3dPixFmt
@@ -905,7 +1587,7 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
         ..pictType = _forceKeyframe ? 1 /* AV_PICTURE_TYPE_I */ : 0;
       _forceKeyframe = false;
 
-      final sendRet = _ff.avcodecSendFrame(_codecCtx, hwFrame);
+      final sendRet = _ff.avcodecSendFrame(_codecCtx, frameToSend);
       if (sendRet < 0 && sendRet != kAvErrorEAgain) {
         throw CodecRuntimeException(
           'ffmpeg-d3d11',
@@ -913,6 +1595,12 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
         );
       }
     } finally {
+      if (qsvFrame != nullptr) {
+        _ff.avFrameUnref(qsvFrame);
+        final fp = calloc<Pointer<AVFrame>>()..value = qsvFrame;
+        _ff.avFrameFree(fp);
+        calloc.free(fp);
+      }
       if (hwFrame != nullptr) {
         _ff.avFrameUnref(hwFrame);
         final fp = calloc<Pointer<AVFrame>>()..value = hwFrame;
@@ -946,6 +1634,109 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
     return out;
   }
 
+  /// Probe whether the opened encoder will actually ACCEPT a frame from
+  /// the hwframes pool. This is meaningfully different from "the codec
+  /// opened successfully": on Intel iGPUs h264_qsv / h264_mf typically
+  /// require NV12 input and reject our BGRA pool with AVERROR_EXTERNAL on
+  /// every avcodec_send_frame, even though avcodec_open2 returned 0.
+  ///
+  /// We allocate a single pool frame (no source-texture copy needed —
+  /// uninitialised contents are fine for input-format validation), set
+  /// width/height/format/pts/hw_frames_ctx, then call avcodec_send_frame.
+  /// AVERROR_EXTERNAL or any other negative non-EAGAIN return ⇒ vendor
+  /// rejects this input format ⇒ caller should fall back to CPU.
+  ///
+  /// Returns true on send success or EAGAIN (encoder accepted but
+  /// internal buffer full — still indicates format compatibility).
+  bool _probeAcceptsHwFrame() {
+    if (_closed) return false;
+    Pointer<AVFrame> hwFrame = nullptr;
+    Pointer<AVFrame> qsvFrame = nullptr;
+    try {
+      hwFrame = _ff.avFrameAlloc();
+      if (hwFrame == address(0)) return false;
+      final gb = _ff.avHwframeGetBuffer(_hwFramesRef, hwFrame, 0);
+      if (gb < 0) return false;
+
+      Pointer<AVFrame> frameToSend;
+      if (_qsvHwFramesRef != nullptr) {
+        qsvFrame = _ff.avFrameAlloc();
+        if (qsvFrame == address(0)) return false;
+        _shim.avFrameSetHwFramesCtx(qsvFrame.cast<Void>(), _qsvHwFramesRef);
+        final mapRet = _ff.avHwframeMap(
+          qsvFrame,
+          hwFrame,
+          kAvHwframeMapRead | kAvHwframeMapDirect,
+        );
+        if (mapRet < 0) return false;
+        frameToSend = qsvFrame;
+      } else {
+        frameToSend = hwFrame;
+      }
+
+      frameToSend.ref
+        ..width = _cfg.width
+        ..height = _cfg.height
+        ..format = _d3dPixFmt
+        ..pts = 0;
+
+      final sendRet = _ff.avcodecSendFrame(_codecCtx, frameToSend);
+      if (sendRet == 0 || sendRet == kAvErrorEAgain) {
+        // Drain any packet the encoder may have produced so the codec
+        // state is clean on close (best effort — ignore errors).
+        try {
+          _ff.avcodecReceivePacket(_codecCtx, _packet);
+          _ff.avPacketUnref(_packet);
+        } catch (_) {
+          /* ignore */
+        }
+        // Send EOF so flush() during close() doesn't hit a weird state.
+        try {
+          _ff.avcodecSendFrame(_codecCtx, nullptr);
+          while (_ff.avcodecReceivePacket(_codecCtx, _packet) >= 0) {
+            _ff.avPacketUnref(_packet);
+          }
+        } catch (_) {
+          /* ignore */
+        }
+        return true;
+      }
+      ffmpegToolsLog(
+        MiniAVLogLevel.info,
+        '[ffmpeg-d3d11] _probeAcceptsHwFrame(${_spec.encoderName}): '
+        'avcodec_send_frame returned $sendRet (${_ff.strError(sendRet)}). '
+        'Vendor likely refuses BGRA D3D11 input — falling back to CPU.',
+      );
+      return false;
+    } catch (e) {
+      ffmpegToolsLog(
+        MiniAVLogLevel.warn,
+        '[ffmpeg-d3d11] _probeAcceptsHwFrame(${_spec.encoderName}) threw: $e',
+      );
+      return false;
+    } finally {
+      if (qsvFrame != nullptr) {
+        _ff.avFrameUnref(qsvFrame);
+        final fp = calloc<Pointer<AVFrame>>()..value = qsvFrame;
+        _ff.avFrameFree(fp);
+        calloc.free(fp);
+      }
+      if (hwFrame != nullptr) {
+        _ff.avFrameUnref(hwFrame);
+        final fp = calloc<Pointer<AVFrame>>()..value = hwFrame;
+        _ff.avFrameFree(fp);
+        calloc.free(fp);
+      }
+    }
+  }
+
+  @override
+  bool get supportsGpuBufferInput => false;
+
+  // D3D11 zero-copy encoder consumes an RGBA D3D11 texture, not YUV420P planes.
+  @override
+  bool get acceptsYuv420pPlanes => false;
+
   @override
   Future<void> close() async {
     if (_closed) return;
@@ -958,6 +1749,24 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
     } finally {
       calloc.free(pp);
       calloc.free(cp);
+    }
+    // Destroy VideoProcessor context before releasing D3D11 device refs.
+    if (_vpContext != nullptr) {
+      _shim.d3d11VpDestroy(_vpContext);
+      _vpContext = nullptr;
+    }
+    // Release derived QSV refs before base D3D11VA refs.
+    if (_qsvHwFramesRef != nullptr) {
+      final wrap = calloc<Pointer<Void>>()..value = _qsvHwFramesRef;
+      _ff.avBufferUnref(wrap);
+      calloc.free(wrap);
+      _qsvHwFramesRef = nullptr;
+    }
+    if (_qsvHwDeviceRef != nullptr) {
+      final wrap = calloc<Pointer<Void>>()..value = _qsvHwDeviceRef;
+      _ff.avBufferUnref(wrap);
+      calloc.free(wrap);
+      _qsvHwDeviceRef = nullptr;
     }
     if (_hwFramesRef != nullptr) {
       final wrap = calloc<Pointer<Void>>()..value = _hwFramesRef;

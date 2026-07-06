@@ -62,7 +62,8 @@ void main() {
   // -------------------------------------------------------------------------
   group('createEncoder — software encoder path', () {
     test(
-      'returns FfmpegSoftwareEncoder for VP9 with hwAccel=forbidden',
+      'returns the isolate-hosted software encoder for VP9 with '
+      'hwAccel=forbidden',
       () async {
         if (!tryLoadFFmpeg()) {
           markTestSkipped('FFmpeg shared libraries not available');
@@ -83,11 +84,11 @@ void main() {
         expect(enc, isNotNull, reason: 'VP9 software encoder must succeed.');
         expect(
           enc,
-          isA<FfmpegSoftwareEncoder>(),
+          isA<IsolateSoftwareEncoder>(),
           reason:
-              'hwAccel=forbidden must return the software encoder path, '
-              'which emits the [ffmpeg] createEncoder: software encoder '
-              'opened log line.',
+              'hwAccel=forbidden must return the software encoder path — '
+              'hosted on a worker isolate by default so libav encode never '
+              'blocks the calling isolate.',
         );
         enc?.close();
       },

@@ -52,8 +52,15 @@ class MiniAVFFIPlatform extends MiniAVPlatformInterface {
 
   @override
   void setLogLevel(int level) {
+    // The platform interface enum index order is: none=0, trace=1, debug=2,
+    // info=3, warn=4, error=5.  The C enum order is: TRACE=0, DEBUG=1,
+    // INFO=2, WARN=3, ERROR=4, NONE=5.  They differ: none is first in Dart
+    // but last in C.  Map by semantic meaning, not by index.
+    //   platform none(0) → C NONE(5), trace(1)→TRACE(0), debug(2)→DEBUG(1),
+    //   info(3)→INFO(2), warn(4)→WARN(3), error(5)→ERROR(4).
+    final cValue = level == 0 ? 5 : level - 1;
     final result = bindings.MiniAV_SetLogLevel(
-      bindings.MiniAVLogLevel.values[level],
+      bindings.MiniAVLogLevel.fromValue(cValue),
     );
     if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
       throw Exception('Failed to set log level');
@@ -117,6 +124,15 @@ class MiniAVFFIPlatform extends MiniAVPlatformInterface {
 
   @override
   Future<void> releaseBuffer(MiniAVBuffer buffer) async {
+    releaseBufferSync(buffer);
+  }
+
+  /// Synchronous buffer release. The underlying C call `MiniAV_ReleaseBuffer`
+  /// is itself synchronous, so this does the work inline with no [Future] /
+  /// microtask allocation — the recorder's per-frame capture callback uses this
+  /// rather than the async [releaseBuffer] to keep the hot path allocation-free.
+  @override
+  void releaseBufferSync(MiniAVBuffer buffer) {
     final nativeHandle = buffer.nativeHandle;
     try {
       if (nativeHandle != null && nativeHandle is ffi.Pointer) {

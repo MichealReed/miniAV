@@ -29,8 +29,9 @@ if(WIN32)
   target_compile_definitions(miniav_tools_ffmpeg_shim PRIVATE WIN32_LEAN_AND_MEAN)
   # d3d11.lib for OpenSharedResource1 / CopyResource; dxguid.lib for
   # IID_ID3D11Device1 / IID_ID3D11Texture2D linked via DEFINE_GUID;
-  # dxgi.lib for IDXGIResource1 (test helpers).
-  target_link_libraries(miniav_tools_ffmpeg_shim PRIVATE d3d11 dxguid dxgi)
+  # dxgi.lib for IDXGIResource1 (test helpers); ole32.lib for
+  # CoInitializeEx (apartment management for QSV / MediaFoundation).
+  target_link_libraries(miniav_tools_ffmpeg_shim PRIVATE d3d11 dxguid dxgi ole32)
 endif()
 
 # --- macOS / iOS: VideoToolbox interop --------------------------------------
@@ -56,7 +57,7 @@ endif()
 # hwcontext_drm.h) are part of the FFmpeg dev install.
 if(UNIX AND NOT APPLE AND NOT ANDROID)
   # Make sure the linker finds libavutil's vaapi symbols when the host
-  # FFmpeg was built with --enable-vaapi (BtbN gpl-shared is).
+  # FFmpeg was built with --enable-vaapi (BtbN lgpl-shared is).
   # No additional libs; left as a section anchor for future flags.
 endif()
 

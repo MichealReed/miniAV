@@ -327,8 +327,33 @@ class FfmpegAudioEncoder implements PlatformAudioEncoder, FfmpegEncoderBridge {
     _checkOpen();
     if (frameCount <= 0) return const [];
 
-    // Establish epoch on first call.
-    _epochUs ??= ptsUs - _samplesToUs(_nextSampleIndex);
+    // Establish or drift-correct the epoch.
+    //
+    // On the first call we anchor the epoch so that all output PTSs share the
+    // same wall-clock reference as video (which uses rec.now()).  On every
+    // subsequent call we slew the epoch toward the value implied by the
+    // incoming wall-clock ptsUs.  This cancels the divergence between the
+    // audio-device oscillator and the CPU clock (typically 10–100 ppm),
+    // which would otherwise accumulate to 36–360 ms of A/V desync per hour.
+    //
+    // Slew rate: _kEpochSlewUs µs per encode() call (one call ≈ 10 ms of
+    // audio), giving a correction speed of ≈5 ms/s — 50× faster than
+    // 100-ppm USB-audio drift (≈0.1 ms/s) while the per-frame PTS step
+    // change is < 0.3 %, well below the threshold of audible artefacts.
+    {
+      const kSlewUs = 50; // max µs applied per encode() call
+      final impliedEpoch = ptsUs - _samplesToUs(_nextSampleIndex);
+      if (_epochUs == null) {
+        _epochUs = impliedEpoch;
+      } else {
+        final delta = impliedEpoch - _epochUs!;
+        if (delta.abs() <= kSlewUs) {
+          _epochUs = impliedEpoch; // small residual → snap
+        } else {
+          _epochUs = _epochUs! + (delta > 0 ? kSlewUs : -kSlewUs);
+        }
+      }
+    }
 
     // Convert input PCM to encoder's destination format width as
     // INTERLEAVED bytes (we deinterleave into planar buffers per-frame
@@ -583,11 +608,28 @@ class FfmpegAudioEncoder implements PlatformAudioEncoder, FfmpegEncoderBridge {
     Float32List srcF;
     switch (srcFormat) {
       case MiniAVAudioFormat.f32:
-        srcF = Float32List.sublistView(
-          pcm.buffer.asByteData(pcm.offsetInBytes, pcm.lengthInBytes),
-        );
-        // Wrap as Float32List directly.
-        srcF = Float32List.view(pcm.buffer, pcm.offsetInBytes, n);
+        // Guard against a channel-count mismatch between the encoder config
+        // and the delivered PCM (e.g. device falls back to mono despite a
+        // stereo configure request, or vice-versa).  We derive the available
+        // float-32 count from pcm.lengthInBytes — which is always within the
+        // backing buffer's valid region — rather than from n, which is based
+        // on _cfg.channels and may exceed the actual data.
+        {
+          final available = pcm.lengthInBytes ~/ Float32List.bytesPerElement;
+          if (available >= n) {
+            // Normal path: buffer holds at least n samples (may have more if
+            // input has more channels than the encoder — take exactly n).
+            srcF = Float32List.view(pcm.buffer, pcm.offsetInBytes, n);
+          } else {
+            // Fewer samples than expected: allocate a correctly-sized buffer
+            // and zero-extend (extra channels are silent).
+            srcF = Float32List(n);
+            srcF.setAll(
+              0,
+              Float32List.view(pcm.buffer, pcm.offsetInBytes, available),
+            );
+          }
+        }
         break;
       case MiniAVAudioFormat.s16:
         final s16 = Int16List.view(pcm.buffer, pcm.offsetInBytes, n);
@@ -610,10 +652,11 @@ class FfmpegAudioEncoder implements PlatformAudioEncoder, FfmpegEncoderBridge {
         }
         break;
       default:
-        throw CodecRuntimeException(
-          'ffmpeg-audio',
-          'unsupported src format: $srcFormat',
-        );
+        // Unknown format (e.g. WASAPI delivering a buffer during audio-engine
+        // format renegotiation). Return silence so the encoder stream keeps
+        // correct timing rather than throwing and breaking the session.
+        srcF = Float32List(n); // zero-filled = silence
+        break;
     }
 
     // Write destination interleaved bytes.

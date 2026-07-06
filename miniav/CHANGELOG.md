@@ -1,5 +1,22 @@
 # miniav CHANGELOG
 
+## 0.5.10
+
+## 0.5.9
+
+- add `MiniAV.releaseBufferSync()`: synchronous, fire-and-forget variant of
+  `releaseBuffer()` for hot paths (e.g. a per-frame capture callback) that must
+  avoid a per-call `Future`/microtask allocation. Delegates to the platform's
+  synchronous release where available.
+
+## 0.5.8
+
+- fix audio buffer allocations and leak issue
+
+## 0.5.7
+
+- Fix logger noisiness
+
 ## 0.5.6
 
 - fix FormatException on non-UTF-8 bytes in MiniAV log callback: use Utf8Decoder(allowMalformed: true) instead of toDartString()

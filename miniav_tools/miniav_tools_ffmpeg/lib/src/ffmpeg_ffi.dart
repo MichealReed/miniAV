@@ -100,9 +100,16 @@ final class AVFormatContextPrefix extends Struct {
   external Pointer<AVIOContext> pb;
 }
 
-/// `AVCodecParameters` partial layout — FFmpeg 8.x (libavcodec 62).
+/// `AVCodecParameters` partial layout — FFmpeg 7.x / 8.x (libavcodec 61+).
 /// Only the prefix we care about for muxing video streams. The struct is
 /// allocated by `avcodec_parameters_alloc()` so we never compute its size.
+///
+/// Field order MUST match the C struct exactly (verified against the FFmpeg
+/// 8.0 doxygen for `codec_par.h`):
+///   codec_type, codec_id, codec_tag, extradata*, extradata_size,
+///   coded_side_data*, nb_coded_side_data, format, bit_rate, ...
+/// Note `coded_side_data` (a pointer) comes BEFORE `nb_coded_side_data`, and
+/// `format` is a real field located right before `bit_rate`.
 final class AVCodecParameters extends Struct {
   @Int32() // enum AVMediaType
   external int codecType;
@@ -382,6 +389,12 @@ typedef _AvOptSetPixelFmt =
 typedef _AvStrErrorC = Int32 Function(Int32, Pointer<Utf8>, IntPtr);
 typedef _AvStrError = int Function(int, Pointer<Utf8>, int);
 
+typedef _AvLogSetLevelC = Void Function(Int32 level);
+typedef _AvLogSetLevel = void Function(int level);
+
+typedef _AvLogSetCallbackC = Void Function(Pointer<Void> callback);
+typedef _AvLogSetCallback = void Function(Pointer<Void> callback);
+
 typedef _AvImageGetBufferSizeC =
     Int32 Function(Int32 fmt, Int32 w, Int32 h, Int32 align);
 typedef _AvImageGetBufferSize = int Function(int fmt, int w, int h, int align);
@@ -533,6 +546,56 @@ typedef _AvBufferUnref = void Function(Pointer<Pointer<Void>> refp);
 typedef _AvHwdeviceFindTypeByNameC = Int32 Function(Pointer<Utf8> name);
 typedef _AvHwdeviceFindTypeByName = int Function(Pointer<Utf8> name);
 
+// av_hwdevice_ctx_create_derived: derive a hwdevice context of a different type
+// from an existing source hwdevice context (e.g. QSV derived from D3D11VA).
+typedef _AvHwdeviceCtxCreateDerivedC =
+    Int32 Function(
+      Pointer<Pointer<Void>> outRef,
+      Int32 type,
+      Pointer<Void> srcRef,
+      Int32 flags,
+    );
+typedef _AvHwdeviceCtxCreateDerived =
+    int Function(
+      Pointer<Pointer<Void>> outRef,
+      int type,
+      Pointer<Void> srcRef,
+      int flags,
+    );
+
+// av_hwframe_ctx_create_derived: create a hwframes context derived from an
+// existing one, re-mapped to a different pixel format / device context.
+typedef _AvHwframeCtxCreateDerivedC =
+    Int32 Function(
+      Pointer<Pointer<Void>> outRef,
+      Int32 format,
+      Pointer<Void> derivedDeviceCtx,
+      Pointer<Void> srcRef,
+      Int32 flags,
+    );
+typedef _AvHwframeCtxCreateDerived =
+    int Function(
+      Pointer<Pointer<Void>> outRef,
+      int format,
+      Pointer<Void> derivedDeviceCtx,
+      Pointer<Void> srcRef,
+      int flags,
+    );
+
+// av_hwframe_map: create a new frame that references the same underlying
+// hardware frame data as src but in a different hardware frame context.
+// dst->hw_frames_ctx must be set to the target hwframes context before calling.
+typedef _AvHwframeMapC =
+    Int32 Function(Pointer<AVFrame> dst, Pointer<AVFrame> src, Int32 flags);
+typedef _AvHwframeMap =
+    int Function(Pointer<AVFrame> dst, Pointer<AVFrame> src, int flags);
+
+// AVHWFrameMap flags.
+const int kAvHwframeMapRead = 1 << 0;
+const int kAvHwframeMapWrite = 1 << 1;
+const int kAvHwframeMapOverwrite = 1 << 2;
+const int kAvHwframeMapDirect = 1 << 3;
+
 // AVHWDeviceType enum (FFmpeg n7/n8 stable subset).
 const int kAvHwdeviceTypeNone = 0;
 const int kAvHwdeviceTypeVdpau = 1;
@@ -620,6 +683,17 @@ class Ffmpeg {
       .lookupFunction<_AvHwdeviceFindTypeByNameC, _AvHwdeviceFindTypeByName>(
         'av_hwdevice_find_type_by_name',
       );
+  late final _AvHwdeviceCtxCreateDerived avHwdeviceCtxCreateDerived = _avutil
+      .lookupFunction<
+        _AvHwdeviceCtxCreateDerivedC,
+        _AvHwdeviceCtxCreateDerived
+      >('av_hwdevice_ctx_create_derived');
+  late final _AvHwframeCtxCreateDerived avHwframeCtxCreateDerived = _avutil
+      .lookupFunction<_AvHwframeCtxCreateDerivedC, _AvHwframeCtxCreateDerived>(
+        'av_hwframe_ctx_create_derived',
+      );
+  late final _AvHwframeMap avHwframeMap = _avutil
+      .lookupFunction<_AvHwframeMapC, _AvHwframeMap>('av_hwframe_map');
 
   // Packet
   late final _AvPacketAlloc avPacketAlloc = _avcodec
@@ -693,6 +767,29 @@ class Ffmpeg {
   // Errors
   late final _AvStrError avStrError = _avutil
       .lookupFunction<_AvStrErrorC, _AvStrError>('av_strerror');
+
+  // Logging (libavutil). Used only for diagnostics — never installs a Dart
+  // NativeCallable, so it is safe to leave active while encoder threads run.
+  late final _AvLogSetLevel avLogSetLevel = _avutil
+      .lookupFunction<_AvLogSetLevelC, _AvLogSetLevel>('av_log_set_level');
+  late final _AvLogSetCallback _avLogSetCallback = _avutil
+      .lookupFunction<_AvLogSetCallbackC, _AvLogSetCallback>(
+        'av_log_set_callback',
+      );
+
+  /// Restore FFmpeg's built-in stderr log handler and crank the verbosity so
+  /// avformat_write_header (mov_init etc.) prints its real rejection reason to
+  /// the process console. No Dart callback is installed, so this cannot crash
+  /// when invoked from native encoder threads.
+  void enableStderrLogging({int level = 48 /* AV_LOG_DEBUG */}) {
+    try {
+      final def = _avutil.lookup<Void>('av_log_default_callback');
+      _avLogSetCallback(def);
+      avLogSetLevel(level);
+    } catch (_) {
+      // Best-effort diagnostic; ignore if symbols are unavailable.
+    }
+  }
 
   // Image helpers
   late final _AvImageGetBufferSize avImageGetBufferSize = _avutil

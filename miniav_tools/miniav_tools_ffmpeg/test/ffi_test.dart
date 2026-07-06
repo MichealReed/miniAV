@@ -65,24 +65,47 @@ void main() {
   );
 
   test(
-    'libx264 encoder is discoverable',
+    'LGPL build: GPL encoders absent, libopenh264 present',
     skip: enabled ? null : 'requires FFmpeg DLLs',
     () async {
       await ensureFFmpegLoaded();
       final ff = Ffmpeg.instance()!;
-      // Use the C string helper from package:ffi.
-      final name = 'libx264'.toNativeUtf8();
-      try {
-        final codec = ff.avcodecFindEncoderByName(name);
-        expect(
-          codec.address,
-          isNot(0),
-          reason:
-              'libx264 not present in this FFmpeg build (needs '
-              '-gpl-shared variant from BtbN; check downloader asset name)',
+
+      bool hasEncoder(String name) {
+        final p = name.toNativeUtf8();
+        try {
+          return ff.avcodecFindEncoderByName(p).address != 0;
+        } finally {
+          calloc.free(p);
+        }
+      }
+
+      // License guard: we ship the BtbN **LGPL** build (kFfmpegLicense). The
+      // GPL-only software encoders must NOT be present — their presence would
+      // mean a `-gpl-shared` build slipped in and downstream products would
+      // inherit GPL copyleft. See ffmpeg_downloader.dart.
+      expect(
+        hasEncoder('libx264'),
+        isFalse,
+        reason:
+            'libx264 is GPL — its presence means a GPL FFmpeg build was '
+            'downloaded. Check kFfmpegLicense == "lgpl".',
+      );
+      expect(
+        hasEncoder('libx265'),
+        isFalse,
+        reason: 'libx265 is GPL — must not be in the LGPL build.',
+      );
+
+      // The LGPL build supplies software H.264 via libopenh264 (Cisco, BSD),
+      // which is the CPU H.264 fallback. Informational — don't hard-fail if a
+      // future BtbN build drops it, but log loudly.
+      if (!hasEncoder('libopenh264')) {
+        // ignore: avoid_print
+        print(
+          'WARN: libopenh264 not present — software H.264 fallback relies on '
+          'MediaFoundation (h264_mf) only on this build.',
         );
-      } finally {
-        calloc.free(name);
       }
     },
   );

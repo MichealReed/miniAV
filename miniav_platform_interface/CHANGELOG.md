@@ -1,5 +1,19 @@
 # miniav_platform_interface CHANGELOG
 
+## 0.5.10
+
+## 0.5.9
+
+- add `releaseBufferSync()` to `MiniAVPlatformInterface` with a default
+  implementation that delegates to `releaseBuffer()` (additive and
+  non-breaking; backends with a genuinely synchronous release should override).
+
+## 0.5.8
+
+- fix audio buffer allocations and leak issue
+## 0.5.7
+
+- Fix logger noisiness
 ## 0.5.6
 
 - fix FormatException on non-UTF-8 bytes in MiniAV log callback: use Utf8Decoder(allowMalformed: true) instead of toDartString()

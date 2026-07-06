@@ -28,3 +28,5 @@ dependency_overrides:
     path: ../../../../minigpu/minigpu_ffi
   minigpu_web:
     path: ../../../../minigpu/minigpu_web
+  miniav_web:
+    path: ../../../miniav_web

@@ -82,4 +82,12 @@ class MiniAV {
   static Future<void> releaseBuffer(MiniAVBuffer buffer) async {
     return _platform.releaseBuffer(buffer);
   }
+
+  /// Synchronous, fire-and-forget variant of [releaseBuffer] for hot paths
+  /// (e.g. a per-frame capture callback) that must avoid a per-call [Future]
+  /// allocation. On the native FFI backend this performs the buffer release
+  /// inline with no allocation; on platforms without a synchronous release it
+  /// delegates to [releaseBuffer] and drops the future.
+  static void releaseBufferSync(MiniAVBuffer buffer) =>
+      _platform.releaseBufferSync(buffer);
 }

@@ -1,16 +1,16 @@
 name: miniav_tools_minigpu
 description: GPU compute codecs (WGSL via minigpu) for miniav_tools.
-version: 0.2.15
+version: 0.5.0
 environment:
   sdk: ^3.11.4
 
 dependencies:
-  miniav_tools_platform_interface: 0.2.15
-  miniav_platform_interface: ^0.5.6
-  minigpu_platform_interface: ^1.4.7
-  minigpu: ^1.4.7
-  gpu_tensor: ^1.4.7
-  gpu_pipeline: ^1.4.7
+  miniav_tools_platform_interface: 0.5.0
+  miniav_platform_interface: ^0.5.10
+  minigpu_platform_interface: ^1.5.5
+  minigpu: ^1.5.5
+  gpu_tensor: ^1.5.5
+  gpu_pipeline: ^1.5.5
   meta: ^1.16.0
 
 dev_dependencies:

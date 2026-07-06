@@ -416,30 +416,67 @@ static void ma_data_callback(ma_device *pDevice, void *pOutput,
     return; // Nothing to do
   }
 
-  MiniAVBuffer buffer;
-  memset(&buffer, 0, sizeof(MiniAVBuffer));
+  // IMPORTANT: ctx->callback is a Dart NativeCallable.listener — it posts to
+  // the Dart event queue and returns immediately.  By the time the Dart isolate
+  // processes the event, miniaudio will have reused pInput for new audio data.
+  // Heap-allocate both the MiniAVBuffer and a copy of the PCM data so they
+  // remain valid until Dart calls MiniAV_ReleaseBuffer.
+  //
+  // Only allocate + dispatch if callbacks are currently enabled, otherwise we
+  // would leak the heap allocations (MiniAV_Dispose / Flutter hot restart
+  // disables callbacks).  Hold the dispatch guard across alloc + post so the
+  // Dart NativeCallable can't be torn down in between.
+  if (!miniav_dispatch_guard_acquire_if_enabled()) {
+    return;
+  }
 
-  buffer.type = MINIAV_BUFFER_TYPE_AUDIO;
-  buffer.timestamp_us = miniav_get_time_us(); // Use utility for timestamp
-  buffer.internal_handle = NULL;
-  buffer.user_data = ctx->callback_user_data;
+  const size_t audio_bytes =
+      (size_t)frameCount *
+      ma_get_bytes_per_frame(pDevice->capture.format, pDevice->capture.channels);
 
-  // --- Populate audio specific data ---
-  buffer.data.audio.info.format =
+  MiniAVNativeBufferInternalPayload *payload =
+      (MiniAVNativeBufferInternalPayload *)miniav_calloc(
+          1, sizeof(MiniAVNativeBufferInternalPayload));
+  MiniAVBuffer *heap_buf =
+      (MiniAVBuffer *)miniav_calloc(1, sizeof(MiniAVBuffer));
+  void *audio_copy =
+      audio_bytes > 0 ? miniav_calloc(audio_bytes, 1) : NULL;
+
+  if (!payload || !heap_buf || (audio_bytes > 0 && !audio_copy)) {
+    miniav_free(payload);
+    miniav_free(heap_buf);
+    miniav_free(audio_copy);
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "Audio: OOM allocating capture buffer — dropping frame.");
+    miniav_dispatch_guard_release();
+    return;
+  }
+
+  if (audio_bytes > 0) {
+    memcpy(audio_copy, pInput, audio_bytes);
+  }
+
+  heap_buf->type = MINIAV_BUFFER_TYPE_AUDIO;
+  heap_buf->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
+  heap_buf->timestamp_us = miniav_get_time_us();
+  heap_buf->user_data = ctx->callback_user_data;
+  heap_buf->data.audio.info.format =
       ma_format_to_miniav_format(pDevice->capture.format);
-  buffer.data.audio.info.channels = pDevice->capture.channels;
-  buffer.data.audio.info.sample_rate =
-      pDevice->sampleRate; // Use the device's actual running sample rate
+  heap_buf->data.audio.info.channels = pDevice->capture.channels;
+  heap_buf->data.audio.info.sample_rate = pDevice->sampleRate;
+  heap_buf->data.audio.frame_count = frameCount;
+  heap_buf->data.audio.info.num_frames = frameCount;
+  heap_buf->data.audio.data = audio_copy;
+  heap_buf->data_size_bytes = audio_bytes;
 
-  buffer.data.audio.frame_count = frameCount;
-  buffer.data.audio.data = (void *)pInput;
-  buffer.data.audio.info.num_frames  = frameCount; 
+  // MiniAV_ReleaseBuffer will free audio_copy + heap_buf via the payload.
+  payload->handle_type = MINIAV_NATIVE_HANDLE_TYPE_AUDIO;
+  payload->native_singular_resource_ptr = audio_copy;
+  payload->parent_miniav_buffer_ptr = heap_buf;
+  heap_buf->internal_handle = payload;
 
-  buffer.data_size_bytes =
-      frameCount * ma_get_bytes_per_frame(pDevice->capture.format,
-                                          pDevice->capture.channels);
-
-  MINIAV_SAFE_DISPATCH(ctx->callback(&buffer, ctx->callback_user_data));
+  ctx->callback(heap_buf, ctx->callback_user_data);
+  miniav_dispatch_guard_release();
 }
 
 // Miniaudio notification callback. Used to detect device loss (mic unplugged,

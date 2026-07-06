@@ -210,9 +210,14 @@ class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
       ffi.Pointer<bindings.MiniAVBuffer> buffer,
       ffi.Pointer<ffi.Void> cbUserData,
     ) {
-      // Check if context was destroyed during callback
+      // Check if context was destroyed during callback.
+      // Still release the buffer to avoid leaking native resources.
       if (_isDestroyed) {
-        return; // Silently ignore if destroyed
+        final handle = buffer.ref.internal_handle;
+        if (handle != ffi.nullptr) {
+          bindings.MiniAV_ReleaseBuffer(handle);
+        }
+        return;
       }
 
       final platformBuffer = MiniAVBufferFFI.fromPointer(buffer);

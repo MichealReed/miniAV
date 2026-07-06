@@ -141,7 +141,9 @@ extension MiniAVBufferFFI on MiniAVBuffer {
       });
       final nativeHandles = List<Object?>.generate(numPlanes, (i) {
         final handle = video.planes[i].data_ptr;
-        return handle.address != 0 ? handle : null;
+        // Store the pointer address as int so StandardMessageCodec can
+        // serialise it across the platform channel (Pointer<> is not supported).
+        return handle.address != 0 ? handle.address : null;
       });
 
       videoBuffer = MiniAVVideoBuffer(

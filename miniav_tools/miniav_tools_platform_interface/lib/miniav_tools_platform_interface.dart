@@ -7,6 +7,7 @@ library;
 export 'src/backend.dart';
 export 'src/backend_context.dart';
 export 'src/codec_types.dart';
+export 'src/cpu_executor.dart';
 export 'src/config.dart';
 export 'src/exceptions.dart';
 export 'src/frame_source.dart';

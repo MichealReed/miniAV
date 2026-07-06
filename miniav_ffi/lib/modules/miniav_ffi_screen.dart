@@ -277,9 +277,14 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
       ffi.Pointer<bindings.MiniAVBuffer> bufferPtr,
       ffi.Pointer<ffi.Void> cbUserData,
     ) {
-      // Check if context was destroyed during callback
+      // Check if context was destroyed during callback.
+      // Still release the buffer to avoid leaking native resources.
       if (_isDestroyed) {
-        return; // Silently ignore if destroyed
+        final handle = bufferPtr.ref.internal_handle;
+        if (handle != ffi.nullptr) {
+          bindings.MiniAV_ReleaseBuffer(handle);
+        }
+        return;
       }
 
       // Important: Check if bufferPtr is not null before dereferencing

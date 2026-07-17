@@ -5,12 +5,17 @@
 library;
 
 export 'src/backend.dart';
+export 'src/color/color_coeffs.dart';
+export 'src/color/rgba_yuv_dart.dart';
 export 'src/backend_context.dart';
+export 'src/capability.dart';
 export 'src/codec_types.dart';
+export 'src/hw_preference.dart';
 export 'src/cpu_executor.dart';
 export 'src/config.dart';
 export 'src/exceptions.dart';
 export 'src/frame_source.dart';
+export 'src/gpu_handle_lease.dart';
 export 'src/packet.dart';
 export 'src/platform.dart';
 export 'src/platform_codec.dart';

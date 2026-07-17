@@ -458,6 +458,25 @@ MiniAVResultCode wasapi_destroy_platform(MiniAVLoopbackContext *ctx) {
   if (ctx->is_running) {
     wasapi_stop_capture(ctx);
   }
+  if (platform_ctx->capture_thread_handle) {
+    // Stop timed out (or was never run) and the capture thread is still
+    // alive — it dereferences platform_ctx, so retry the join and, failing
+    // that, deliberately LEAK the platform context rather than free memory
+    // a live thread uses.
+    if (WaitForSingleObject(platform_ctx->capture_thread_handle, 7000) !=
+        WAIT_OBJECT_0) {
+      // The capture thread was created with the PARENT ctx as its parameter
+      // and dereferences it on every iteration — MINIAV_ERROR_TIMEOUT tells
+      // MiniAV_Loopback_DestroyContext to leak that too.
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI Destroy: capture thread still alive — leaking the "
+                 "context to avoid a use-after-free.");
+      ctx->platform_ctx = NULL;
+      return MINIAV_ERROR_TIMEOUT;
+    }
+    CloseHandle(platform_ctx->capture_thread_handle);
+    platform_ctx->capture_thread_handle = NULL;
+  }
 
   if (platform_ctx->capture_format) {
     CoTaskMemFree(platform_ctx->capture_format);
@@ -1536,7 +1555,17 @@ MiniAVResultCode wasapi_stop_capture(MiniAVLoopbackContext *ctx) {
   }
 
   if (platform_ctx->capture_thread_handle) {
-    WaitForSingleObject(platform_ctx->capture_thread_handle, INFINITE);
+    // Bounded join: an INFINITE wait here could hang StopCapture forever if
+    // the capture thread is wedged inside a WASAPI call. On timeout, leave
+    // the handle set (a later Stop/Destroy retries) and do NOT stop the
+    // audio client out from under the still-running thread.
+    if (WaitForSingleObject(platform_ctx->capture_thread_handle, 5000) !=
+        WAIT_OBJECT_0) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI Stop: capture thread did not exit within 5s — "
+                 "deferring (a later Stop/Destroy will retry).");
+      return MINIAV_ERROR_TIMEOUT;
+    }
     CloseHandle(platform_ctx->capture_thread_handle);
     platform_ctx->capture_thread_handle = NULL;
   }

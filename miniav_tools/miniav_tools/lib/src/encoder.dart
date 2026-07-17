@@ -6,9 +6,21 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 class Encoder {
   final PlatformEncoder _platform;
   final String backendName;
+
+  /// The capability the negotiator chose to open this encoder, or `null` when
+  /// created via a path that didn't negotiate. Consumers read
+  /// [CodecCapability.acceptedInputs] / [CodecCapability.zeroCopy] to pick their
+  /// frame-feed path (e.g. hand a D3D11 texture directly instead of a CPU
+  /// buffer when `acceptedInputs` contains `FrameSourceKind.d3d11Texture`).
+  final CodecCapability? capability;
+
   bool _closed = false;
 
-  Encoder(this._platform, this.backendName);
+  Encoder(this._platform, this.backendName, {this.capability});
+
+  /// Whether the chosen path consumes GPU-resident frames without a CPU
+  /// readback. Convenience over `capability?.zeroCopy`.
+  bool get isZeroCopy => capability?.zeroCopy ?? false;
 
   /// `true` if [close] has been called.
   bool get isClosed => _closed;

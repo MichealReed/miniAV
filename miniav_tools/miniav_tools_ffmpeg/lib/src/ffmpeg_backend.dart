@@ -12,11 +12,15 @@ import 'dart:io';
 import 'package:meta/meta.dart';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
+import 'ffmpeg_audio_decoder.dart';
 import 'ffmpeg_audio_encoder.dart';
 import 'ffmpeg_bindings.dart' as ffi;
 import 'ffmpeg_d3d11_hw_encoder.dart';
 import 'ffmpeg_decoder.dart';
+import 'ffmpeg_demuxer.dart';
 import 'ffmpeg_encoder.dart';
+import 'isolate_decoder.dart';
+import 'isolate_demuxer.dart';
 import 'isolate_software_encoder.dart';
 import 'ffmpeg_hw_encoder.dart';
 import 'ffmpeg_log.dart';
@@ -134,6 +138,21 @@ class FfmpegBackend extends MiniAVToolsBackend {
     VideoCodec.av1, // av1_nvenc on Ada+, av1_qsv on Arc+
   };
 
+  /// Video codecs the FFmpeg software decoder actually maps
+  /// (`_videoCodecToAvId` in ffmpeg_decoder.dart). Kept in lock-step with that
+  /// switch so the negotiator never selects FFmpeg for a codec it will then
+  /// throw on at open. ProRes is deliberately absent: its decoder isn't wired
+  /// and its 4:2:2/10-bit output needs the pixel-format work (a later phase);
+  /// advertising it caused a negotiate-then-CodecInitException crash.
+  static const _swDecode = <VideoCodec>{
+    VideoCodec.h264,
+    VideoCodec.hevc,
+    VideoCodec.mjpeg,
+    VideoCodec.vp8,
+    VideoCodec.vp9,
+    VideoCodec.av1,
+  };
+
   /// Capabilities are advertised optimistically: the FFmpeg backend can
   /// always satisfy these requests *given network access*. The actual lib
   /// load happens lazily inside `create*` via [_ensureAvailable].
@@ -142,7 +161,8 @@ class FfmpegBackend extends MiniAVToolsBackend {
       hwAccel ? _hwEncode.contains(codec) : _swEncode.contains(codec);
 
   @override
-  bool supportsDecode(VideoCodec codec, {bool hwAccel = false}) => true;
+  bool supportsDecode(VideoCodec codec, {bool hwAccel = false}) =>
+      _swDecode.contains(codec);
 
   @override
   bool supportsAudioEncode(AudioCodec codec) =>
@@ -300,57 +320,86 @@ class FfmpegBackend extends MiniAVToolsBackend {
           }
         }
       }
-      if (ffmpegHwEncoderAvailable(config.codec)) {
-        try {
-          final enc = FfmpegHwEncoder.open(config, gpu: context?.sharedGpu);
-          ffmpegToolsLog(
-            MiniAVLogLevel.info,
-            '[ffmpeg] createEncoder: Stage A HW encoder opened '
-            '(${enc.runtimeType}) for ${config.codec} '
-            '${config.width}x${config.height}',
-          );
-          return enc;
-        } on CodecInitException catch (e) {
-          if (config.hwAccel == HwAccelPreference.required) rethrow;
-          // preferred: fall through to software.
-          ffmpegToolsLog(
-            MiniAVLogLevel.warn,
-            '[ffmpeg] createEncoder: Stage A HW encoder failed ($e) — '
-            'falling back to software.',
-          );
-        }
-      } else if (config.hwAccel == HwAccelPreference.required) {
+      // The CPU-fed Stage A hardware attempt now happens on the worker isolate
+      // below — it needs the MTA apartment (QSV / MediaFoundation), which the
+      // STA UI isolate cannot provide, and it must not block the UI thread.
+      // Fall through.
+    }
+
+    // Isolate-hosted encoder. On a dedicated worker isolate it opens either a
+    // CPU-fed hardware encoder (when hardware was requested) or the software
+    // encoder — whichever succeeds. Two reasons this must be off the calling
+    // isolate:
+    //   1. The synchronous libav encode is tens of ms/frame at 720p+, which
+    //      reads as an app freeze while recording.
+    //   2. QSV / MediaFoundation encoder init requires the COM MTA apartment;
+    //      Flutter's UI isolate is STA (`miniav_shim_ensure_mta` →
+    //      RPC_E_CHANGED_MODE), so those vendors can ONLY init on the worker's
+    //      fresh OS thread. This is what lets CPU-fed HW encode work at all in
+    //      a Flutter app.
+    // Frames cross as TransferableTypedData (~1 ms at 720p).
+    //
+    // Escape hatch: backendOptions {'sw_isolate': '0'} keeps the legacy
+    // in-isolate path (used by tests that poke encoder internals directly).
+    if (config.backendOptions['sw_isolate'] != '0') {
+      final hwAvail = wantHw && ffmpegHwEncoderAvailable(config.codec);
+      if (wantHw &&
+          !hwAvail &&
+          config.hwAccel == HwAccelPreference.required) {
         throw CodecInitException(
           backendName,
           'No hardware encoder for ${config.codec} present in the loaded '
           'FFmpeg build (hwAccel=required). Vendors checked: NVENC, QSV, '
           'AMF, VideoToolbox, MediaFoundation, V4L2.',
         );
-      } else {
-        ffmpegToolsLog(
-          MiniAVLogLevel.info,
-          '[ffmpeg] createEncoder: no HW encoder available for ${config.codec}'
-          ' — using software.',
-        );
       }
-      // hwAccel=preferred: silently fall through to software.
-    }
-
-    // Host the software encoder on a worker isolate so the synchronous libav
-    // encode never blocks the calling (UI) isolate — a 720p+ software encode
-    // costs tens of ms per frame, which reads as an app freeze while
-    // recording. Frames cross as TransferableTypedData (~1 ms at 720p).
-    // Escape hatch: backendOptions {'sw_isolate': '0'} keeps the in-isolate
-    // encoder (used by tests that poke encoder internals).
-    if (config.backendOptions['sw_isolate'] != '0') {
-      final enc = await IsolateSoftwareEncoder.open(config);
+      // Adapter-aware CPU-fed vendor order (e.g. MF before AMF on AMD), or
+      // null for a software-only worker.
+      final order = hwAvail
+          ? hwVendorOrderForDevice(context?.d3d11DeviceHandle ?? 0)
+          : null;
+      final enc = await IsolateSoftwareEncoder.open(
+        config,
+        hwVendorOrder: order,
+        requireHardware:
+            order != null && config.hwAccel == HwAccelPreference.required,
+      );
       ffmpegToolsLog(
         MiniAVLogLevel.info,
-        '[ffmpeg] createEncoder: software encoder opened on worker isolate '
-        '(${enc.runtimeType}) for ${config.codec} '
+        '[ffmpeg] createEncoder: isolate encoder '
+        '[${enc.activeEncoderDescription}] for ${config.codec} '
         '${config.width}x${config.height}',
       );
       return enc;
+    }
+
+    // sw_isolate == '0': legacy in-isolate path (tests). Try the CPU-fed HW
+    // encoder on the calling isolate, then in-isolate software.
+    if (wantHw && ffmpegHwEncoderAvailable(config.codec)) {
+      try {
+        final enc = FfmpegHwEncoder.open(config, gpu: context?.sharedGpu);
+        ffmpegToolsLog(
+          MiniAVLogLevel.info,
+          '[ffmpeg] createEncoder: Stage A HW encoder opened '
+          '(${enc.runtimeType}) for ${config.codec} '
+          '${config.width}x${config.height}',
+        );
+        return enc;
+      } on CodecInitException catch (e) {
+        if (config.hwAccel == HwAccelPreference.required) rethrow;
+        ffmpegToolsLog(
+          MiniAVLogLevel.warn,
+          '[ffmpeg] createEncoder: Stage A HW encoder failed ($e) — '
+          'falling back to software.',
+        );
+      }
+    } else if (wantHw && config.hwAccel == HwAccelPreference.required) {
+      throw CodecInitException(
+        backendName,
+        'No hardware encoder for ${config.codec} present in the loaded '
+        'FFmpeg build (hwAccel=required). Vendors checked: NVENC, QSV, '
+        'AMF, VideoToolbox, MediaFoundation, V4L2.',
+      );
     }
     final enc = FfmpegSoftwareEncoder.open(config);
     ffmpegToolsLog(
@@ -448,7 +497,27 @@ class FfmpegBackend extends MiniAVToolsBackend {
     BackendContext? context,
   }) async {
     await _ensureAvailable();
+    // Isolate-hosted by default — the synchronous libav decode is tens of
+    // ms/frame at 1080p+, which would freeze a Flutter UI isolate. Escape
+    // hatch mirrors createEncoder: backendOptions {'sw_isolate': '0'} keeps
+    // the legacy in-isolate path (tests that poke decoder internals).
+    if (config.backendOptions['sw_isolate'] != '0') {
+      return IsolateVideoDecoder.open(config);
+    }
     return FfmpegSoftwareDecoder.open(config);
+  }
+
+  @override
+  Future<PlatformAudioDecoder?> createAudioDecoder(
+    AudioDecoderConfig config, {
+    BackendContext? context,
+  }) async {
+    if (!supportsAudioDecode(config.codec)) return null;
+    await _ensureAvailable();
+    if (config.backendOptions['sw_isolate'] != '0') {
+      return IsolateAudioDecoder.open(config);
+    }
+    return FfmpegAudioDecoder.open(config);
   }
 
   @override
@@ -460,10 +529,23 @@ class FfmpegBackend extends MiniAVToolsBackend {
   @override
   Future<PlatformDemuxer?> createDemuxer(DemuxerConfig config) async {
     await _ensureAvailable();
-    throw const CodecInitException(
-      backendName,
-      'FFmpeg demuxer implementation pending — scaffold only.',
-    );
+    // Isolate-hosted by default: av_read_frame is synchronous FFI, and on
+    // live byte-pipe inputs it BLOCKS until the transport delivers — it must
+    // never run on a UI isolate. Escape hatch mirrors the codecs:
+    // backendOptions {'sw_isolate': '0'} for tests (file/bytes only — the
+    // reader can never starve on those).
+    if (config.backendOptions['sw_isolate'] == '0') {
+      return switch (config.input) {
+        FileDemuxerInput f => FfmpegDemuxer.openUrl(f.path),
+        BytesDemuxerInput b => FfmpegDemuxer.openBytes(b.bytes),
+        StreamDemuxerInput _ => throw const CodecInitException(
+          backendName,
+          'byteStream input requires the isolate-hosted demuxer '
+              "(remove backendOptions {'sw_isolate': '0'})",
+        ),
+      };
+    }
+    return IsolateDemuxer.open(config);
   }
 
   @override

@@ -1,5 +1,14 @@
 # miniav_web CHANGELOG
 
+## 0.7.0
+
+- Implements the new `setIOSAppGroup` interface member (throws
+  `UnsupportedError` — iOS only).
+
+## 0.6.0
+
+## 0.5.11
+
 ## 0.5.10
 
 ## 0.5.9

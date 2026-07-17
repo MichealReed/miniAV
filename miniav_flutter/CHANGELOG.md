@@ -1,3 +1,15 @@
+## 0.6.0
+
+- add Android MediaProjection consent helper (`MiniAVAndroidScreenConsent`):
+  Kotlin MethodChannel plugin + typed `mediaProjection` foreground service +
+  JNI handoff of the projection to the pure-FFI native layer
+  (`MiniAV_Screen_SetAndroidMediaProjection`). Call
+  `MiniAVAndroidScreenConsent.requestScreenCapture()` before starting MiniAV
+  screen capture on Android; listen to `onProjectionStopped` for user/system
+  revoke. This makes `miniav_flutter` an Android plugin (Dart-only elsewhere).
+
+## 0.5.11
+
 ## 0.5.10
 
 ## 0.5.9

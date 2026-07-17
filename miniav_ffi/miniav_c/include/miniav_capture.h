@@ -46,8 +46,13 @@ typedef void (*MiniAVDeviceChangeCallback)(MiniAVDeviceChangeEvent event,
 // unusable; the application should call MiniAV_*_DestroyContext and
 // reconfigure if needed.
 //
-// The callback runs on the capture or watcher thread; treat it like any
-// other capture-thread callback.
+// The callback runs on an internal capture/notification/loop thread; treat it
+// like any other capture-thread callback. IMPORTANT: do NOT synchronously
+// call MiniAV_*_StopCapture / MiniAV_*_DestroyContext from inside the
+// callback — several backends join or drain the very thread/queue delivering
+// it, which would self-deadlock. Post the teardown to your own executor
+// instead. (The Dart FFI shim satisfies this automatically: its
+// NativeCallable.listener delivery is asynchronous.)
 typedef void (*MiniAVContextLostCallback)(int /*MiniAVResultCode*/ reason,
                                           void *user_data);
 
@@ -144,6 +149,31 @@ MINIAV_API MiniAVResultCode MiniAV_Screen_SetContextLostCallback(
     MiniAVScreenContextHandle context, MiniAVContextLostCallback callback,
     void *user_data);
 
+// --- Mobile screen-capture seams (no-ops elsewhere) ---
+// Android: hand miniAV the app-obtained MediaProjection. `jvm` is the
+// process JavaVM* and `media_projection` a GLOBAL-REF jobject of an
+// android.media.projection.MediaProjection the app acquired through the
+// consent Intent (the miniav_flutter helper does this for Flutter apps).
+// Must be called before ConfigureDisplay on Android; miniAV takes ownership
+// of the global ref. Returns MINIAV_ERROR_NOT_SUPPORTED off-Android.
+MINIAV_API MiniAVResultCode MiniAV_Screen_SetAndroidMediaProjection(
+    void *jvm, void *media_projection);
+// iOS: set the App Group identifier used by the broadcast-extension tier
+// (system-wide capture). Must be called before configuring the
+// "system_screen_broadcast" display. Returns NOT_SUPPORTED off-iOS.
+MINIAV_API MiniAVResultCode
+MiniAV_Screen_SetIOSAppGroup(const char *app_group_id);
+
+// Include the mouse cursor in captured screen frames. Off by default (frames
+// are cursor-less). Must be called BEFORE configuring the display/window.
+// Backends: WGC (IsCursorCaptureEnabled), macOS ScreenCaptureKit
+// (showsCursor), Linux PipeWire (portal embedded cursor mode). Windows DXGI
+// Desktop Duplication cannot draw the cursor: if enabled on a DXGI context it
+// logs a warning and captures cursor-less anyway — use the WGC backend when
+// you need the cursor on Windows.
+MINIAV_API MiniAVResultCode
+MiniAV_Screen_SetCaptureCursor(MiniAVScreenContextHandle context, bool enabled);
+
 // --- Audio Capture API ---
 MINIAV_API MiniAVResultCode
 MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices, uint32_t *count);
@@ -165,6 +195,32 @@ MiniAV_Audio_StartCapture(MiniAVAudioContextHandle context,
                           MiniAVBufferCallback callback, void *user_data);
 MINIAV_API MiniAVResultCode
 MiniAV_Audio_StopCapture(MiniAVAudioContextHandle context);
+
+// --- Buffered (pull) capture: web/WASM polling path ---
+//
+// An alternative to the callback-driven capture above for consumers that
+// cannot receive a C function-pointer callback (notably the WASM/browser
+// build). After Configure, call EnableBufferedCapture, then StartCapture with
+// a NULL callback; the captured PCM lands in an internal f32 ring which the
+// consumer drains with ReadFrames on its own cadence. Native callers may use
+// it too, but the classic push path above is unchanged.
+//
+// The flat CreateContextRet / ConfigureFlat shims keep the WASM js_interop
+// side scalar (no struct/out-param marshaling); they wrap the struct-based API.
+MINIAV_API MiniAVAudioContextHandle MiniAV_Audio_CreateContextRet(void);
+MINIAV_API MiniAVResultCode
+MiniAV_Audio_ConfigureFlat(MiniAVAudioContextHandle context, int format,
+                           uint32_t sample_rate, uint32_t channels,
+                           uint32_t num_frames);
+MINIAV_API MiniAVResultCode
+MiniAV_Audio_EnableBufferedCapture(MiniAVAudioContextHandle context,
+                                   uint32_t ring_frames);
+// Returns frames read (>= 0), or a negative MiniAVResultCode on error.
+MINIAV_API int MiniAV_Audio_ReadFrames(MiniAVAudioContextHandle context,
+                                       float *out_interleaved,
+                                       uint32_t max_frames);
+MINIAV_API uint32_t
+MiniAV_Audio_GetAvailableFrames(MiniAVAudioContextHandle context);
 
 // Subscribe for audio capture device add/remove notifications.
 MINIAV_API MiniAVResultCode MiniAV_Audio_SetDeviceChangeCallback(
@@ -241,6 +297,43 @@ MiniAV_Input_StopCapture(MiniAVInputContextHandle context);
 // Subscribe for gamepad add/remove notifications.
 MINIAV_API MiniAVResultCode MiniAV_Input_SetGamepadChangeCallback(
     MiniAVDeviceChangeCallback callback, void *user_data);
+
+// --- Input Injection API (sink twin of input capture) ---
+//
+// Replays synthetic keyboard/mouse events onto the LOCAL machine — the
+// server side of a remote-desktop stack. Injection is SYNCHRONOUS: there is
+// no capture thread and no callback; each Inject_* call performs the event.
+// The same MiniAVKeyboardEvent / MiniAVMouseEvent structs used by capture are
+// replayed here, so a captured event can be injected verbatim.
+//
+// Codes are PLATFORM-NATIVE (Windows VK / macOS keycode / Linux evdev), matching
+// what capture reports; translating between platforms is the caller's job.
+//
+// PERMISSIONS (miniAV never prompts — MINIAV_ERROR_PERMISSION_DENIED otherwise):
+//   - macOS: the process needs Accessibility approval (System Settings >
+//     Privacy & Security > Accessibility).
+//   - Linux: the process needs write access to /dev/uinput (a udev rule or
+//     running as root); the backend creates a virtual input device.
+//   - Windows: no special permission (SendInput); UIPI may block injection
+//     into higher-integrity windows.
+//
+// v1 injects KEYBOARD and MOUSE. Gamepad injection needs a virtual-gamepad
+// driver (ViGEm on Windows, uinput on Linux, unsupported on macOS) and is not
+// included yet.
+MINIAV_API MiniAVResultCode
+MiniAV_Inject_CreateContext(MiniAVInjectContextHandle *context);
+MINIAV_API MiniAVResultCode
+MiniAV_Inject_DestroyContext(MiniAVInjectContextHandle context);
+// Prepare the injector for the given MiniAVInputType bitmask (keyboard/mouse).
+// On Linux this creates the backing uinput virtual device.
+MINIAV_API MiniAVResultCode
+MiniAV_Inject_Configure(MiniAVInjectContextHandle context, uint32_t input_types);
+MINIAV_API MiniAVResultCode
+MiniAV_Inject_Keyboard(MiniAVInjectContextHandle context,
+                       const MiniAVKeyboardEvent *event);
+MINIAV_API MiniAVResultCode
+MiniAV_Inject_Mouse(MiniAVInjectContextHandle context,
+                    const MiniAVMouseEvent *event);
 
 // --- Global Lifecycle ---
 //

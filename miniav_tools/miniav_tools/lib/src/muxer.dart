@@ -3,11 +3,15 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 class Muxer {
   final PlatformMuxer _platform;
   final String backendName;
+
+  /// The capability the negotiator chose, or `null` for a non-negotiated path.
+  final CodecCapability? capability;
+
   bool _closed = false;
   bool _headerWritten = false;
   bool _finished = false;
 
-  Muxer(this._platform, this.backendName);
+  Muxer(this._platform, this.backendName, {this.capability});
 
   bool get isClosed => _closed;
 

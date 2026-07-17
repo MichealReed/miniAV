@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.5.3 (unreleased)
+
+- **Demuxer + live-stream muxing for miniav_player stream/file playback**
+  (shim ABI 14 -> 15):
+  - `FfmpegDemuxer` (was a throwing scaffold) + `IsolateDemuxer` — file / bytes
+    / live byte-stream → `EncodedPacket`s with pts/dts/duration rescaled to
+    microseconds (inverse of the muxer's rescale). `createDemuxer` returns the
+    isolate host by default (`av_read_frame` blocks on live input and must be
+    off the UI isolate); `backendOptions {'sw_isolate': '0'}` = in-isolate
+    (file/bytes only). `durationUs` / `isSeekable` / keyframe `seek`.
+  - Shim **blocking byte pipe** (`miniav_shim_bytepipe_*`) — feeds libavformat
+    from a live `Stream<List<int>>` with pause/resume backpressure; closing the
+    pipe unblocks a natively-stuck `av_read_frame` (the only way — `Isolate.kill`
+    can't preempt synchronous FFI).
+  - Seekable in-memory IO: `miniav_shim_open_input_bytes` (read+seek AVIO over a
+    C-owned copy, so moov-at-end MP4 probes) and `..._memsink_*` (seekable output
+    for `BytesMuxerOutput` so +faststart works). `FfmpegMuxer` now supports
+    `BytesMuxerOutput` (seekable memsink) and `CallbackMuxerOutput` (streaming
+    byte-pipe, streamable containers).
+  - `Container.fmp4` now sets real fragmentation movflags
+    (`+frag_keyframe+empty_moov+default_base_moof` + optional `frag_duration`) —
+    init segment up-front, live-streamable.
+  - Open-timeout robustness: a live stream stalling mid-probe surfaces a
+    `CodecInitException` (default 15 s, `backendOptions {'open_timeout_ms'}`)
+    instead of hanging `open()` forever.
+- **Decode side for the miniav_player work** (shim ABI 13 -> 14):
+  - `FfmpegAudioDecoder` — AAC/Opus/MP3/Vorbis/FLAC -> interleaved f32
+    (planar formats interleaved during the mandatory AVFrame copy-out;
+    stream rate/channels read per-frame via new shim getters
+    `miniav_shim_frame_sample_rate` / `_nb_channels`).
+  - `miniav_shim_codec_set_extradata`: `DecoderConfig.extraData` /
+    `AudioDecoderConfig.extraData` now actually reach the codec context
+    (avcC / hvcC / AAC ASC / OpusHead) instead of being ignored.
+  - `IsolateVideoDecoder` / `IsolateAudioDecoder` — worker-isolate decoder
+    hosts mirroring `IsolateSoftwareEncoder`'s TransferableTypedData
+    protocol; `createDecoder`/`createAudioDecoder` return them by default
+    (`backendOptions {'sw_isolate': '0'}` keeps the in-isolate path).
+  - Fixed `FfmpegSoftwareDecoder` pts: decoded `frame.pts` is already in
+    microseconds (packets are fed us with no time_base), so the old
+    `* (1e6/30)` scaling corrupted timestamps; now passthrough with a
+    delta-extrapolating AV_NOPTS fallback.
+
+## 0.5.2
+
+- Isolate-hosted **CPU-fed hardware** encoder (fixes the recording freeze on
+  the software/CPU-fed path). `IsolateSoftwareEncoder.open` gained
+  `hwVendorOrder` / `requireHardware`: the worker now tries each CPU-fed
+  hardware vendor (looping `FfmpegHwEncoder.openWith`) before the software
+  encoder, all on the worker isolate. Two things this unblocks:
+  - **QSV / MediaFoundation now initialise.** Their COM objects require the
+    MTA apartment; Flutter's UI isolate is STA (`miniav_shim_ensure_mta` →
+    `RPC_E_CHANGED_MODE`), so on the UI isolate they failed at
+    `avcodec_open2`. The worker runs on a fresh OS thread that enters MTA, so
+    e.g. `h264_mf` and `h264_qsv` finally open. (Verified on an AMD iGPU box:
+    the worker opens `h264_mf` where AMF fails its NV12 pool and NVENC has no
+    device.)
+  - **No UI freeze.** The blocking `avcodec_open2` probes and the per-frame
+    encode both run off the calling (UI) isolate; frames cross as
+    `TransferableTypedData` (~1 ms at 720p). Previously the Stage-A hardware
+    open ran synchronously on the UI isolate.
+  `FfmpegBackend.createEncoder` now routes the post-zero-copy path through this
+  isolate encoder (removing the UI-isolate Stage-A open) and derives the
+  vendor order from the capture adapter via the new `hwVendorOrderForDevice`
+  (AMD→MF-before-AMF to dodge AMF's silent-black on AMD, Intel→QSV, NVIDIA→
+  NVENC). `IsolateSoftwareEncoder` reports its actual encoder's
+  `acceptsYuv420pPlanes` and an `activeEncoderDescription`. The `sw_isolate:'0'`
+  escape hatch keeps the legacy in-isolate path.
+
+## 0.5.1
+
+- D3D11 HW-encoder vendor order now follows the injected device's adapter.
+  `FfmpegD3d11HwEncoder.open` with an injected `ID3D11Device` (the recorder's
+  zero-copy path) previously always tried the global default order
+  (NVENC → AMF → QSV → MF), so on an AMD/Intel device it wasted an NVENC
+  `avcodec_open2` — "OpenEncodeSessionEx failed: no encode device" — before
+  falling through to the native vendor. It now derives the order from the
+  device's DXGI vendor (AMD→AMF, Intel→QSV, NVIDIA→NVENC, + MediaFoundation
+  fallback), so the native encoder is tried first and no cross-vendor attempt
+  is made. The adapter-aware helper already backed the probe/warm-up paths;
+  this wires it into `open()` too. `vendorOrder` is now optional; passing it
+  explicitly still overrides.
+
 ## 0.5.0
 
 - Software encoding no longer freezes the app: `createEncoder`'s software

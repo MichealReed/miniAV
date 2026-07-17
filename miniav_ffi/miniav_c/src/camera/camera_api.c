@@ -9,18 +9,27 @@
 
 // --- Backend Table ---
 // Order matters here for default preference.
+// Gate specificity: Android defines __linux__ and iOS defines __APPLE__ —
+// these are independent #if blocks (not an #elif chain), so the mobile
+// platforms are matched first and the desktop entries sit in the #elif arm.
 static const MiniAVCameraBackend g_camera_backends[] = {
 #if defined(_WIN32)
     {"MediaFoundation", &g_camera_ops_win_mf,
      miniav_camera_context_platform_init_windows_mf},
 #endif
-#if defined(__APPLE__)
-{"AVFoundation", &g_camera_ops_macos_avf,
-miniav_camera_context_platform_init_macos_avf},
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    {"AVFoundation-iOS", &g_camera_ops_ios_avf,
+     miniav_camera_context_platform_init_ios_avf},
+#elif defined(__APPLE__)
+    {"AVFoundation", &g_camera_ops_macos_avf,
+     miniav_camera_context_platform_init_macos_avf},
 #endif
-#if defined(__linux__)
-{"pipewire", &g_camera_ops_pipewire,
-miniav_camera_context_platform_init_linux_pipewire},
+#if defined(__ANDROID__)
+    {"Camera2NDK", &g_camera_ops_android_camera2,
+     miniav_camera_context_platform_init_android_camera2},
+#elif defined(__linux__)
+    {"pipewire", &g_camera_ops_pipewire,
+     miniav_camera_context_platform_init_linux_pipewire},
 #endif
     {NULL, NULL, NULL} // Sentinel
 };
@@ -266,7 +275,17 @@ MiniAV_Camera_DestroyContext(MiniAVCameraContextHandle context_handle) {
   }
 
   if (ctx->ops && ctx->ops->destroy_platform) {
-    ctx->ops->destroy_platform(ctx);
+    MiniAVResultCode destroy_res = ctx->ops->destroy_platform(ctx);
+    if (destroy_res == MINIAV_ERROR_TIMEOUT) {
+      // The platform layer could not reap a capture thread and leaked its
+      // platform context. That thread also dereferences THIS parent context
+      // (callbacks, configured format), so it must be leaked too — freeing
+      // it here would be a use-after-free.
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "Camera DestroyContext: platform teardown timed out — "
+                 "leaking the context (a capture thread is still alive).");
+      return destroy_res;
+    }
   } else {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
                "destroy_platform op not available for camera. Freeing "

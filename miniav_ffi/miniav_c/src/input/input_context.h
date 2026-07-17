@@ -46,10 +46,12 @@ struct MiniAVInputContext {
 #include "windows/input_context_win_rawinput.h"
 extern MiniAVResultCode miniav_input_context_platform_init_windows(MiniAVInputContext *ctx);
 extern const InputContextInternalOps g_input_ops_win;
-#elif defined(__linux__)
-// Future: Linux libinput backend
+#elif defined(__linux__) && !defined(__ANDROID__)
+extern MiniAVResultCode miniav_input_context_platform_init_linux(MiniAVInputContext *ctx);
+extern const InputContextInternalOps g_input_ops_linux;
 #elif defined(__APPLE__)
-// Future: macOS IOKit/CGEventTap backend
+extern MiniAVResultCode miniav_input_context_platform_init_macos(MiniAVInputContext *ctx);
+extern const InputContextInternalOps g_input_ops_macos;
 #endif
 
 #ifdef __cplusplus

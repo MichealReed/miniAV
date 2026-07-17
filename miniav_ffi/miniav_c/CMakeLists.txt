@@ -1,10 +1,23 @@
 cmake_minimum_required(VERSION 3.15)
 
+# Must be set before project() to reach the toolchain's version-min flags.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Minimum iOS deployment target")
+endif()
+
 project(miniav_c LANGUAGES C CXX)
 
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
+# Only set our own output dirs for standalone builds. When building under a
+# toolchain that already pins the output location (e.g. the native-assets
+# `native_toolchain_cmake` hook, which places the artifact where it then looks
+# for it), DO NOT override it: appending ${CMAKE_BUILD_TYPE} here on a
+# multi-config generator (Visual Studio) produced bin/Release/Release/… and the
+# hook could not find the DLL to bundle.
+if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/${CMAKE_BUILD_TYPE})
+endif()
 
 # --- Platform Detection ---
 set(MINIAV_PLATFORM_WINDOWS FALSE)
@@ -72,6 +85,14 @@ else()
     message(STATUS "Input capture disabled: not supported on ${MINIAV_PLATFORM_NAME}")
 endif()
 
+# Input injection (event replay) is only supported on desktop platforms
+if(MINIAV_PLATFORM_WINDOWS OR MINIAV_PLATFORM_MACOS OR MINIAV_PLATFORM_LINUX)
+    option(MINIAV_ENABLE_INJECT "Enable Input Injection Module" ON)
+else()
+    set(MINIAV_ENABLE_INJECT OFF CACHE BOOL "Input injection not supported on mobile/web platforms" FORCE)
+    message(STATUS "Input injection disabled: not supported on ${MINIAV_PLATFORM_NAME}")
+endif()
+
 # --- Backend Options ---
 # Windows Backends
 if(MINIAV_PLATFORM_WINDOWS)
@@ -129,20 +150,43 @@ endif()
 
 # --- Library Target ---
 if(MINIAV_PLATFORM_WEB)
-    # For Emscripten, create a static library and an executable that exports functions
-    add_library(miniav_c STATIC)
-    
-    # Create an executable that will generate .js and .wasm files
-    add_executable(miniav_c_web include/miniav.h)
-    target_link_libraries(miniav_c_web PRIVATE miniav_c)
-    
-    # Emscripten-specific link flags for the web executable
+    # OBJECT library (not STATIC): every translation unit is linked into the
+    # wasm module, so EMSCRIPTEN_KEEPALIVE exports on the audio functions
+    # survive — wasm-ld would drop unreferenced objects out of a static archive.
+    add_library(miniav_c OBJECT)
+
+    # Executable that Emscripten turns into miniav_web.js + miniav_web.wasm.
+    add_executable(miniav_c_web)
+    target_sources(miniav_c_web PRIVATE $<TARGET_OBJECTS:miniav_c>)
+    set_target_properties(miniav_c_web PROPERTIES OUTPUT_NAME "miniav_web")
+
+    # Global-Module (no MODULARIZE) to match the proven minigpu_web loader +
+    # js_interop pattern: functions reached via Module.ccall / Module._fn, and
+    # PCM copied through HEAPF32/HEAPU8 views. No pthreads/AudioWorklets — the
+    # miniaudio webaudio backend uses a main-thread ScriptProcessorNode.
+    # AudioWorklet audio path: the callback runs on a Wasm Worker thread, so
+    # this is a shared-memory (SharedArrayBuffer) build and device init/start
+    # suspends via ASYNCIFY. Proven shape: minigpu_web runs the same combo
+    # (growth + shared memory + ASYNCIFY + non-MODULARIZE global Module) with
+    # a plain script-injection loader. The host page MUST be crossOriginIsolated
+    # (COOP: same-origin, COEP: require-corp) or the module won't instantiate.
     target_link_options(miniav_c_web PRIVATE
-        "-sWASM=1"
+        "-O3"
+        "--no-entry"
+        "-sENVIRONMENT=web,worker"          # worklet thread runs as a worker
+        "-sMALLOC=emmalloc"
+        "-sEXPORTED_FUNCTIONS=_malloc,_free"
+        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAP8,HEAP16,HEAP32,HEAPU8,HEAPU16,HEAPU32,HEAPF32,HEAPF64"
         "-sALLOW_MEMORY_GROWTH=1"
-        "-sEXPORTED_FUNCTIONS=['_malloc','_free']"
-        "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
-        "-sMODULARIZE=1"
+        "-sINITIAL_MEMORY=64MB"
+        "-sMAXIMUM_MEMORY=1GB"              # required with growth + shared memory
+        "-sSTACK_SIZE=1MB"
+        "-sEXIT_RUNTIME=0"
+        "-sWASM_BIGINT=1"
+        "-sAUDIO_WORKLET=1"                 # miniaudio AudioWorklet backend
+        "-sWASM_WORKERS=1"                  # worklet thread infrastructure
+        "-sASYNCIFY"                        # device init/start suspends
+        "-sASYNCIFY_STACK_SIZE=16MB"        # 4KB default is too small through device init
         "--emit-symbol-map"
     )
 else()
@@ -192,10 +236,12 @@ elseif(MINIAV_PLATFORM_MACOS)
     
 elseif(MINIAV_PLATFORM_IOS)
     list(APPEND ALL_DEFINITIONS "MINIAV_PLATFORM_IOS")
+    # Metal: camera + broadcast-ring zero-copy texture paths (UMA).
     list(APPEND ALL_LINK_LIBS
         "-framework Foundation"
         "-framework CoreMedia"
         "-framework CoreVideo"
+        "-framework Metal"
         "-framework UIKit"
     )
     
@@ -210,7 +256,17 @@ elseif(MINIAV_PLATFORM_ANDROID)
     
 elseif(MINIAV_PLATFORM_WEB)
     list(APPEND ALL_DEFINITIONS "MINIAV_PLATFORM_WEB")
-    # Emscripten-specific flags will be added later
+    # Enable miniaudio's AudioWorklet backend (runs the audio callback on a
+    # dedicated Wasm Worker thread with a ~128-frame quantum ≈ 2.7ms, vs the
+    # ScriptProcessorNode fallback's ~42ms). Requires the -sAUDIO_WORKLET /
+    # -sWASM_WORKERS / -sASYNCIFY link flags below, and a cross-origin-isolated
+    # host page (COOP/COEP) for SharedArrayBuffer.
+    list(APPEND ALL_DEFINITIONS "MA_ENABLE_AUDIO_WORKLETS")
+    # The objects must carry the atomics + bulk-memory target features or
+    # wasm-ld refuses --shared-memory (which -sWASM_WORKERS enables at link).
+    # This is the compile-time half of the shared-memory build; the audio ring's
+    # ma_atomic ops lower to real wasm atomics over the SharedArrayBuffer heap.
+    list(APPEND ALL_COMPILE_OPTIONS "-matomics" "-mbulk-memory")
 endif()
 
 # --- Audio Module (miniaudio) ---
@@ -226,12 +282,29 @@ if(MINIAV_ENABLE_AUDIO)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/audio"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio"
     )
-    
+
+    # Audio Output (playback sink) — first-party PCM sink on miniaudio's engine.
+    # Shares miniaudio.c with capture; enabled on ALL platforms (incl. Web/WASM)
+    # so the miniav audio sink works natively and in the browser.
+    file(GLOB AUDIO_OUTPUT_SOURCES "src/audio_output/*.c" "src/audio_output/*.h")
+    list(APPEND ALL_SOURCES ${AUDIO_OUTPUT_SOURCES})
+    list(APPEND ALL_PRIVATE_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src/audio_output")
+    list(APPEND ALL_HEADERS "include/miniav_playback.h")
+    list(APPEND ALL_DEFINITIONS "MINIAV_MODULE_AUDIO_OUTPUT_ENABLED")
+
+    # Capture sets MA_NO_DECODING/MA_NO_ENCODING (no file codecs). That in turn
+    # auto-defines MA_NO_RESOURCE_MANAGER inside miniaudio, which is fine: the
+    # output module only uses ma_engine + a data-source sound, never file I/O.
     list(APPEND ALL_DEFINITIONS "MA_NO_DECODING" "MA_NO_ENCODING")
 
     # Platform-specific audio setup
     if(MINIAV_PLATFORM_MACOS OR MINIAV_PLATFORM_IOS)
         list(APPEND ALL_LINK_LIBS "-framework CoreAudio" "-framework AudioToolbox")
+    endif()
+    if(MINIAV_PLATFORM_IOS)
+        # AVAudioSession shim: record-capable category around miniaudio start/stop.
+        list(APPEND ALL_SOURCES "src/audio/ios/miniav_avaudiosession_ios.m")
+        list(APPEND ALL_LINK_LIBS "-framework AVFoundation")
     endif()
 else()
     message(STATUS "Audio module disabled")
@@ -358,7 +431,9 @@ if(MINIAV_ENABLE_SCREEN)
     elseif(MINIAV_PLATFORM_IOS AND MINIAV_BACKEND_IOS_REPLAYKIT)
         message(STATUS "iOS: Enabling ReplayKit for screen recording")
         list(APPEND ALL_SOURCES "src/screen/ios/screen_context_ios_replaykit.mm")
-        list(APPEND ALL_HEADERS "src/screen/ios/screen_context_ios_replaykit.h")
+        list(APPEND ALL_HEADERS
+            "src/screen/ios/screen_context_ios_replaykit.h"
+            "src/screen/ios/miniav_broadcast_protocol.h")
         list(APPEND ALL_LINK_LIBS "-framework ReplayKit")
         list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_IOS_REPLAYKIT_SCREEN_ENABLED")
         
@@ -452,19 +527,68 @@ if(MINIAV_ENABLE_INPUT)
         list(APPEND ALL_HEADERS "src/input/windows/input_context_win_rawinput.h")
         list(APPEND ALL_LINK_LIBS user32 xinput)
         list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_WIN_HOOKS_XINPUT_ENABLED")
+    elseif(MINIAV_PLATFORM_LINUX)
+        message(STATUS "Linux: Enabling evdev input capture (keyboard/mouse/gamepad)")
+        list(APPEND ALL_SOURCES "src/input/linux/input_context_linux_evdev.c")
+        list(APPEND ALL_HEADERS "src/input/linux/input_context_linux_evdev.h")
+        # Pure /dev/input/event* + libudev-free evdev; no extra link libs.
+        list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_LINUX_EVDEV_ENABLED")
+    elseif(MINIAV_PLATFORM_MACOS)
+        message(STATUS "macOS: Enabling CGEventTap + IOKit input capture")
+        list(APPEND ALL_SOURCES "src/input/macos/input_context_macos_cgtap.mm")
+        list(APPEND ALL_HEADERS "src/input/macos/input_context_macos_cgtap.h")
+        list(APPEND ALL_LINK_LIBS "-framework ApplicationServices" "-framework GameController" "-framework Foundation")
+        list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_MACOS_CGTAP_ENABLED")
     endif()
 else()
     message(STATUS "Input capture module disabled")
 endif()
 
+# --- Input Injection Module (Desktop Only) ---
+if(MINIAV_ENABLE_INJECT)
+    message(STATUS "Input injection module enabled")
+    list(APPEND ALL_DEFINITIONS "MINIAV_MODULE_INJECT_ENABLED")
+    list(APPEND ALL_SOURCES "src/inject/inject_api.c")
+    list(APPEND ALL_PRIVATE_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src/inject")
+
+    if(MINIAV_PLATFORM_WINDOWS)
+        message(STATUS "Windows: Enabling SendInput for input injection")
+        list(APPEND ALL_SOURCES "src/inject/windows/inject_context_win_sendinput.c")
+        list(APPEND ALL_HEADERS "src/inject/windows/inject_context_win_sendinput.h")
+        list(APPEND ALL_LINK_LIBS user32)
+        list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_WIN_SENDINPUT_ENABLED")
+    elseif(MINIAV_PLATFORM_LINUX)
+        message(STATUS "Linux: Enabling uinput for input injection")
+        list(APPEND ALL_SOURCES "src/inject/linux/inject_context_linux_uinput.c")
+        list(APPEND ALL_HEADERS "src/inject/linux/inject_context_linux_uinput.h")
+        # Pure /dev/uinput; no extra link libs.
+        list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_LINUX_UINPUT_ENABLED")
+    elseif(MINIAV_PLATFORM_MACOS)
+        message(STATUS "macOS: Enabling CGEventPost for input injection")
+        list(APPEND ALL_SOURCES "src/inject/macos/inject_context_macos_cgevent.mm")
+        list(APPEND ALL_HEADERS "src/inject/macos/inject_context_macos_cgevent.h")
+        list(APPEND ALL_LINK_LIBS "-framework ApplicationServices" "-framework Foundation")
+        list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_MACOS_CGEVENT_ENABLED")
+    endif()
+else()
+    message(STATUS "Input injection module disabled")
+endif()
+
 # --- Android-specific Setup ---
 if(MINIAV_PLATFORM_ANDROID)
-    # Android NDK API level
+    # Android NDK API level. libcamera2ndk.so only exists from API 24, so the
+    # link floor for the camera backend is 24 (runtime gates handle the rest).
     if(NOT ANDROID_NATIVE_API_LEVEL)
-        set(ANDROID_NATIVE_API_LEVEL 21) # Minimum API level for Camera2
+        set(ANDROID_NATIVE_API_LEVEL 24)
     endif()
     
     list(APPEND ALL_DEFINITIONS "MINIAV_ANDROID_API_LEVEL=${ANDROID_NATIVE_API_LEVEL}")
+
+    # Keep the link floor at 24 while calling 26+ APIs (AHardwareBuffer,
+    # ANativeWindow_toSurface) behind runtime android_get_device_api_level()
+    # gates: NDK r26+ turns above-minSdk symbols into weak references with
+    # this define instead of hard compile errors.
+    list(APPEND ALL_DEFINITIONS "__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__")
     
     # JNI support for accessing Java APIs
     find_library(ANDROID_JNI_LIB jnigraphics)
@@ -506,6 +630,13 @@ if(MINIAV_PLATFORM_WINDOWS OR MINIAV_PLATFORM_MACOS OR MINIAV_PLATFORM_LINUX)
         target_include_directories(test_audio_capture PRIVATE ${TEST_INCLUDE_DIRS})
         if(MINIAV_PLATFORM_WINDOWS)
             target_link_libraries(test_audio_capture PRIVATE ole32 user32)
+        endif()
+
+        add_executable(test_audio_output src/audio_output/test/test_audio_output.c)
+        target_link_libraries(test_audio_output PRIVATE miniav_c)
+        target_include_directories(test_audio_output PRIVATE ${TEST_INCLUDE_DIRS})
+        if(MINIAV_PLATFORM_WINDOWS)
+            target_link_libraries(test_audio_output PRIVATE ole32 user32)
         endif()
     endif()
 

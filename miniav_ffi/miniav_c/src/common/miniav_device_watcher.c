@@ -54,6 +54,9 @@ struct MiniAVDeviceWatcher {
   char prev_default_id[MINIAV_DEVICE_ID_MAX_LEN];
 
   volatile int stop_requested;
+  // Set by the poll thread as its very last action so dw_stop_and_join can
+  // bound its wait (a platform enumerate() callback can wedge indefinitely).
+  volatile int thread_exited;
   miniav_dw_mutex_t mutex; // protects prev_devices snapshot + callback ptr
   miniav_dw_event_t wakeup; // signaled to wake the poll thread early
 
@@ -252,6 +255,7 @@ static void *dw_thread_proc(void *param)
     dw_poll_once(watcher);
   }
 
+  watcher->thread_exited = 1; // last action — see dw_stop_and_join
 #if defined(_WIN32)
   return 0;
 #else
@@ -260,6 +264,7 @@ static void *dw_thread_proc(void *param)
 }
 
 static void dw_start_thread(MiniAVDeviceWatcher *watcher) {
+  watcher->thread_exited = 0;
 #if defined(_WIN32)
   watcher->thread = CreateThread(NULL, 0, dw_thread_proc, watcher, 0, NULL);
   watcher->thread_started = (watcher->thread != NULL) ? 1 : 0;
@@ -271,25 +276,56 @@ static void dw_start_thread(MiniAVDeviceWatcher *watcher) {
 #endif
 }
 
-static void dw_stop_and_join(MiniAVDeviceWatcher *watcher) {
+// Returns 0 when the thread was joined; nonzero when it did not exit within
+// the bound (wedged inside a platform enumerate() call) — in that case the
+// thread is still live and still dereferences the watcher.
+static int dw_stop_and_join(MiniAVDeviceWatcher *watcher) {
   if (!watcher->thread_started)
-    return;
+    return 0;
   watcher->stop_requested = 1;
   dw_event_signal(&watcher->wakeup);
 #if defined(_WIN32)
-  WaitForSingleObject(watcher->thread, INFINITE);
+  if (WaitForSingleObject(watcher->thread, 5000) != WAIT_OBJECT_0) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "DeviceWatcher: poll thread did not exit within 5s "
+               "(enumerate() wedged?).");
+    return 1;
+  }
   CloseHandle(watcher->thread);
   watcher->thread = NULL;
 #else
-  pthread_join(watcher->thread, NULL);
+  // Portable bounded join (macOS has no pthread_timedjoin_np): poll the
+  // thread's own exit flag, then join — which returns immediately once set.
+  {
+    int waited_ms = 0;
+    while (!watcher->thread_exited && waited_ms < 5000) {
+      struct timespec ts = {0, 20 * 1000000L}; // 20 ms
+      nanosleep(&ts, NULL);
+      waited_ms += 20;
+    }
+    if (!watcher->thread_exited) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "DeviceWatcher: poll thread did not exit within 5s "
+                 "(enumerate() wedged?).");
+      return 1;
+    }
+    pthread_join(watcher->thread, NULL);
+  }
 #endif
   watcher->thread_started = 0;
+  return 0;
 }
 
 static void dw_destroy(MiniAVDeviceWatcher *watcher) {
   if (!watcher)
     return;
-  dw_stop_and_join(watcher);
+  if (dw_stop_and_join(watcher) != 0) {
+    // The poll thread is still alive and dereferences the watcher —
+    // deliberately LEAK it rather than free memory a live thread uses.
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "DeviceWatcher: leaking watcher (poll thread still alive).");
+    return;
+  }
   if (watcher->prev_devices) {
     miniav_free(watcher->prev_devices);
     watcher->prev_devices = NULL;

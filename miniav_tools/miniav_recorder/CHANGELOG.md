@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.5.2
+
+- Fixed the metronomic stutter in screen recordings: the fps throttle no
+  longer thins a source that is within ~15% of the target rate (e.g. WGC/DXGI
+  capture delivering ~31.4 fps against a 30 fps target — each deleted frame
+  was a double-length presentation hole every ~0.7 s of playback). The
+  throttle now engages only when the source meaningfully outruns the target
+  (e.g. 60→30), thinning evenly via the credit scheduler, and logs its
+  engage/release transitions. Pairs with the `miniav_ffi` 0.5.11
+  capture-pacing fix that removes the over-delivery at its source; both
+  policies live in the new unit-tested `FramePacer`.
+- New **`cfrOutput`** knob on screen sources (`ScreenRecorderSource.cfrOutput`
+  / `RecorderBuilder.addScreen(cfrOutput: ...)`, default false — VFR): output
+  PTS are quantized to the exact rational fps grid and every grid slot is
+  filled exactly once — live frames claim the slot nearest their capture
+  time, slots the capture missed are backfilled with duplicates of the
+  previous frame (zero-copy/direct paths; the idle duplicator fills overdue
+  grid slots too), and surplus frames are dropped. A missed capture becomes
+  an invisible duplicated frame instead of a visible playback hiccup,
+  regardless of source cadence. Verified end-to-end: 6 s real capture →
+  100% of encoded PTS deltas exactly one grid slot.
+- Video stats line now reports `dup=N` (idle-fill + CFR backfill duplicate
+  frames) when non-zero.
+- Fix the scale/effects pipeline (bilinear scale, censor boxes, crop, …) being
+  silently dropped on the CPU-encode path — most visibly with **window (WGC)
+  capture**. Two causes, both fixed:
+  - **Capture output preference.** The GPU processor imports the capture's
+    D3D11 texture handle, but the capture was set to CPU output whenever a GPU
+    encoder wasn't selected (`useGpuOutput=false`), even though a processor was
+    still created for the scale/effects. Window (WGC) capture then returns plain
+    CPU buffers with no handle, so the processor couldn't import them and the
+    whole effects chain was skipped. (Display/DXGI capture happened to still
+    carry a handle, which is why only window capture broke.) The capture now
+    uses GPU output whenever a processor will run — including the CPU-readback
+    path — so the processor always gets a handle.
+  - **Encoder-fallback reconciliation.** When GPU output *was* configured but
+    the encoder that opened is CPU-input (e.g. the isolate-hosted software /
+    CPU-fed HW encoder — zero-copy and the minigpu GPU encoder were unavailable
+    on the adapter), the reconciliation path **nulled the GPU processor**,
+    discarding downscale + effects. It now keeps the processor and switches it
+    to CPU read-back. (Exposed by the isolate CPU-fed HW encoder +
+    `preferCaptureAdapter`, which make CPU-input fallback more common.)
+- Screen recording no longer freezes the app on the CPU-fed encode path, and
+  now uses hardware encode where it previously couldn't. When the zero-copy
+  D3D11 encoder is unavailable (e.g. an AMD iGPU whose AMF NV12 pool fails, or
+  any adapter whose only hardware vendor is QSV / MediaFoundation), the
+  recorder's encoder — via `miniav_tools_ffmpeg` 0.5.2 — now runs a CPU-fed
+  hardware encoder (or the software encoder) on a worker isolate. This both
+  keeps the synchronous encode off the UI isolate AND lets QSV / MediaFoundation
+  initialise (their MTA requirement can't be met on Flutter's STA UI isolate).
+  Requires `miniav_tools_ffmpeg` 0.5.2.
+
+## 0.5.1
+
+- New `Recorder.preferCaptureAdapter()` static (Windows): binds the
+  process-global GPU context to the adapter driving the primary display so
+  capture → GPU processing → HW encode stay on ONE adapter (same-adapter
+  zero-copy). This is what enables iGPU HW encoders (AMD AMF / Intel QSV) on
+  hybrid systems where a discrete GPU is also present — without it, capture
+  frames produced on the display iGPU reach a dGPU-bound pipeline through a
+  per-frame CPU bridge. Must be called at app startup BEFORE any minigpu use
+  (including audio visualizers); logs a warning when it lands too late.
+  Trade-off: all of the process's minigpu compute then runs on the display
+  adapter (`MGPU_ADAPTER_NAME` env var overrides). Requires minigpu 1.5.6.
+
 ## 0.5.0
 
 - GPU-saturation anti-stutter (when another workload, e.g. a game, maxes the GPU):

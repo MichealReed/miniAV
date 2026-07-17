@@ -25,6 +25,18 @@ enum VideoCodec {
 
   /// ProRes — Apple intermediate codec (decode only on most platforms).
   prores,
+
+  /// Extension point for codecs miniav doesn't know about (an app's
+  /// proprietary or experimental codec). The codec's identity is the
+  /// `customCodecName` string carried alongside on [EncoderConfig] /
+  /// [DecoderConfig] / `CodecQuery` / `CodecCapability` — negotiation matches
+  /// capabilities by that name, never by this enum value alone.
+  ///
+  /// The miniav backends never claim [custom]; an app registers its own
+  /// [MiniAVToolsBackend] (overriding `probe`) that answers for its names.
+  /// This keeps third-party codecs on the same negotiation spine (priority,
+  /// pinning, capability ranking) without their implementation living here.
+  custom,
 }
 
 /// Audio codec identifiers.
@@ -63,6 +75,12 @@ enum Container {
 
   /// MPEG Audio Layer III — `.mp3`. Audio-only MP3 container.
   mp3,
+
+  /// ADTS (Audio Data Transport Stream) — `.aac`, per ISO/IEC 13818-7. A raw
+  /// AAC bitstream where every frame carries a self-describing 7/9-byte header
+  /// (profile, sample-rate index, channel config, frame length). Used for live
+  /// AAC and HLS audio segments.
+  adts,
 }
 
 /// Hardware acceleration preference.

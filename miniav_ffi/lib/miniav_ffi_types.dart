@@ -571,8 +571,10 @@ MiniAVMouseEvent mouseEventFromNative(bindings.MiniAVMouseEvent native) {
     deltaX: native.delta_x,
     deltaY: native.delta_y,
     wheelDelta: native.wheel_delta,
+    wheelDeltaX: native.wheel_delta_x,
     action: MiniAVMouseAction.fromValue(native.actionAsInt),
     button: MiniAVMouseButton.fromValue(native.buttonAsInt),
+    isAbsolute: native.is_absolute,
   );
 }
 

@@ -268,6 +268,31 @@ MiniAVResultCode MiniAV_Screen_CreateContext(
   ffi.Pointer<MiniAVScreenContextHandle> context,
 ) => MiniAVResultCode.fromValue(_MiniAV_Screen_CreateContext(context));
 
+@ffi.Native<ffi.Int Function(ffi.Pointer<ffi.Char>)>(
+  symbol: 'MiniAV_Screen_SetIOSAppGroup',
+)
+external int _MiniAV_Screen_SetIOSAppGroup(ffi.Pointer<ffi.Char> app_group_id);
+
+MiniAVResultCode MiniAV_Screen_SetIOSAppGroup(
+  ffi.Pointer<ffi.Char> app_group_id,
+) => MiniAVResultCode.fromValue(_MiniAV_Screen_SetIOSAppGroup(app_group_id));
+
+@ffi.Native<ffi.Int Function(MiniAVScreenContextHandle, ffi.Bool)>(
+  symbol: 'MiniAV_Screen_SetCaptureCursor',
+)
+external int _MiniAV_Screen_SetCaptureCursor(
+  MiniAVScreenContextHandle context,
+  bool enabled,
+);
+
+MiniAVResultCode MiniAV_Screen_SetCaptureCursor(
+  MiniAVScreenContextHandle context,
+  bool enabled,
+) =>
+    MiniAVResultCode.fromValue(
+      _MiniAV_Screen_SetCaptureCursor(context, enabled),
+    );
+
 @ffi.Native<
   ffi.Int Function(
     ffi.Pointer<ffi.Pointer<MiniAVDeviceInfo>>,
@@ -840,6 +865,68 @@ external int _MiniAV_Input_StopCapture(MiniAVInputContextHandle context);
 MiniAVResultCode MiniAV_Input_StopCapture(MiniAVInputContextHandle context) =>
     MiniAVResultCode.fromValue(_MiniAV_Input_StopCapture(context));
 
+// --- Input Injection ---
+@ffi.Native<ffi.Int Function(ffi.Pointer<MiniAVInjectContextHandle>)>(
+  symbol: 'MiniAV_Inject_CreateContext',
+)
+external int _MiniAV_Inject_CreateContext(
+  ffi.Pointer<MiniAVInjectContextHandle> context,
+);
+
+MiniAVResultCode MiniAV_Inject_CreateContext(
+  ffi.Pointer<MiniAVInjectContextHandle> context,
+) => MiniAVResultCode.fromValue(_MiniAV_Inject_CreateContext(context));
+
+@ffi.Native<ffi.Int Function(MiniAVInjectContextHandle)>(
+  symbol: 'MiniAV_Inject_DestroyContext',
+)
+external int _MiniAV_Inject_DestroyContext(MiniAVInjectContextHandle context);
+
+MiniAVResultCode MiniAV_Inject_DestroyContext(
+  MiniAVInjectContextHandle context,
+) => MiniAVResultCode.fromValue(_MiniAV_Inject_DestroyContext(context));
+
+@ffi.Native<ffi.Int Function(MiniAVInjectContextHandle, ffi.Uint32)>(
+  symbol: 'MiniAV_Inject_Configure',
+)
+external int _MiniAV_Inject_Configure(
+  MiniAVInjectContextHandle context,
+  int input_types,
+);
+
+MiniAVResultCode MiniAV_Inject_Configure(
+  MiniAVInjectContextHandle context,
+  int input_types,
+) => MiniAVResultCode.fromValue(
+  _MiniAV_Inject_Configure(context, input_types),
+);
+
+@ffi.Native<
+  ffi.Int Function(MiniAVInjectContextHandle, ffi.Pointer<MiniAVKeyboardEvent>)
+>(symbol: 'MiniAV_Inject_Keyboard')
+external int _MiniAV_Inject_Keyboard(
+  MiniAVInjectContextHandle context,
+  ffi.Pointer<MiniAVKeyboardEvent> event,
+);
+
+MiniAVResultCode MiniAV_Inject_Keyboard(
+  MiniAVInjectContextHandle context,
+  ffi.Pointer<MiniAVKeyboardEvent> event,
+) => MiniAVResultCode.fromValue(_MiniAV_Inject_Keyboard(context, event));
+
+@ffi.Native<
+  ffi.Int Function(MiniAVInjectContextHandle, ffi.Pointer<MiniAVMouseEvent>)
+>(symbol: 'MiniAV_Inject_Mouse')
+external int _MiniAV_Inject_Mouse(
+  MiniAVInjectContextHandle context,
+  ffi.Pointer<MiniAVMouseEvent> event,
+);
+
+MiniAVResultCode MiniAV_Inject_Mouse(
+  MiniAVInjectContextHandle context,
+  ffi.Pointer<MiniAVMouseEvent> event,
+) => MiniAVResultCode.fromValue(_MiniAV_Inject_Mouse(context, event));
+
 // --- Device change subscription bindings ---
 
 @ffi.Native<
@@ -1029,7 +1116,8 @@ enum MiniAVResultCode {
   MINIAV_ERROR_PORTAL_FAILED(-19),
   MINIAV_ERROR_STREAM_FAILED(-20),
   MINIAV_ERROR_PORTAL_CLOSED(-21),
-  MINIAV_ERROR_USER_CANCELLED(-22);
+  MINIAV_ERROR_USER_CANCELLED(-22),
+  MINIAV_ERROR_PERMISSION_DENIED(-23);
 
   final int value;
   const MiniAVResultCode(this.value);
@@ -1058,6 +1146,7 @@ enum MiniAVResultCode {
     -20 => MINIAV_ERROR_STREAM_FAILED,
     -21 => MINIAV_ERROR_PORTAL_CLOSED,
     -22 => MINIAV_ERROR_USER_CANCELLED,
+    -23 => MINIAV_ERROR_PERMISSION_DENIED,
     _ => throw ArgumentError('Unknown value for MiniAVResultCode: $value'),
   };
 }
@@ -1310,6 +1399,10 @@ final class MiniAVInputContext extends ffi.Opaque {}
 
 typedef MiniAVInputContextHandle = ffi.Pointer<MiniAVInputContext>;
 
+final class MiniAVInjectContext extends ffi.Opaque {}
+
+typedef MiniAVInjectContextHandle = ffi.Pointer<MiniAVInjectContext>;
+
 enum MiniAVInputType {
   MINIAV_INPUT_TYPE_KEYBOARD(1),
   MINIAV_INPUT_TYPE_MOUSE(2),
@@ -1415,6 +1508,9 @@ final class MiniAVMouseEvent extends ffi.Struct {
   @ffi.Int32()
   external int wheel_delta;
 
+  @ffi.Int32()
+  external int wheel_delta_x;
+
   @ffi.UnsignedInt()
   external int actionAsInt;
 
@@ -1424,6 +1520,9 @@ final class MiniAVMouseEvent extends ffi.Struct {
   external int buttonAsInt;
 
   MiniAVMouseButton get button => MiniAVMouseButton.fromValue(buttonAsInt);
+
+  @ffi.Bool()
+  external bool is_absolute;
 }
 
 final class MiniAVGamepadEvent extends ffi.Struct {

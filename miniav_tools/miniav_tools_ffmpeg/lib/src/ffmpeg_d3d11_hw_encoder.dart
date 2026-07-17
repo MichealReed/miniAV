@@ -652,14 +652,26 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   /// `texturePtr` must be a `ID3D11Texture2D*` on the encoder's device.
   int get d3dDeviceAddress => _d3dDevice.address;
 
-  /// Open the best D3D11VA encoder for [cfg.codec], honouring [vendorOrder]
-  /// (default: AMF → QSV → MediaFoundation). Throws [CodecInitException]
-  /// on every failure mode (no compatible vendor, shim missing, GPU init
-  /// failure). Callers that want a graceful fall-back to Stage A should
-  /// catch this and try `FfmpegHwEncoder.open(cfg)`.
+  /// Open the best D3D11VA encoder for [cfg.codec].
+  ///
+  /// Vendor selection order:
+  ///   * If [vendorOrder] is given, it is honoured verbatim.
+  ///   * Otherwise, when [existingD3d11Device] is injected, the order is
+  ///     derived from that device's DXGI adapter vendor — AMF-first on AMD,
+  ///     QSV-first on Intel, NVENC-first on NVIDIA (plus MediaFoundation as
+  ///     the universal fallback) — so we never waste a cross-vendor
+  ///     `avcodec_open2` on an adapter the vendor can't use (e.g. attempting
+  ///     NVENC on an AMD iGPU, which fails with "no encode device" and only
+  ///     adds log noise before falling through to AMF).
+  ///   * With no device and no explicit order, the global default
+  ///     (NVENC → AMF → QSV → MediaFoundation) is used.
+  ///
+  /// Throws [CodecInitException] on every failure mode (no compatible vendor,
+  /// shim missing, GPU init failure). Callers that want a graceful fall-back
+  /// to Stage A should catch this and try `FfmpegHwEncoder.open(cfg)`.
   static FfmpegD3d11HwEncoder open(
     EncoderConfig cfg, {
-    List<D3d11HwVendor> vendorOrder = _defaultD3d11Order,
+    List<D3d11HwVendor>? vendorOrder,
     int existingD3d11Device = 0,
     D3d11HwSourceFormat sourceTextureFormat = D3d11HwSourceFormat.bgra,
   }) {
@@ -684,13 +696,33 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
         'FFmpeg not loaded — call ensureFFmpegLoaded() first',
       );
     }
+    // Resolve the vendor order: explicit caller order wins; else derive it
+    // from the injected device's adapter IHV so the native encoder is tried
+    // first (AMD→AMF, Intel→QSV, NVIDIA→NVENC); else the global default.
+    final List<D3d11HwVendor> effectiveOrder;
+    if (vendorOrder != null) {
+      effectiveOrder = vendorOrder;
+    } else if (existingD3d11Device != 0) {
+      final vid = shim.d3d11GetVendorId(
+        Pointer<Void>.fromAddress(existingD3d11Device),
+      );
+      effectiveOrder = _vendorOrderForDxgiVendor(vid);
+      ffmpegToolsLog(
+        MiniAVLogLevel.debug,
+        '[ffmpeg-d3d11] open: injected device vendorID='
+        '0x${vid.toRadixString(16)} → vendor order '
+        '${effectiveOrder.map((v) => v.name).join(' → ')}',
+      );
+    } else {
+      effectiveOrder = _defaultD3d11Order;
+    }
     // Try each vendor in priority order. A vendor whose encoder *symbol*
     // exists may still fail at runtime (e.g. AMF on a non-AMD GPU, QSV
     // without an Intel iGPU). Fall through to the next on CodecInitException.
     final attempted = <String>[];
     Object? lastError;
     StackTrace? lastStack;
-    for (final vendor in vendorOrder) {
+    for (final vendor in effectiveOrder) {
       final spec = _findSpec(vendor, cfg.codec);
       if (spec == null || !_encoderPresent(ff, spec.encoderName)) {
         attempted.add('${vendor.name}(missing)');

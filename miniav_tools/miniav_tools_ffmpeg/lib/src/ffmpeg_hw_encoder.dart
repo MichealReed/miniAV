@@ -320,6 +320,41 @@ List<HwEncoderVendor> _platformVendorOrder() {
   return _defaultVendorOrder;
 }
 
+/// Adapter-aware CPU-fed HW vendor probe order, derived from the DXGI vendor
+/// of [d3d11DeviceHandle] (the recorder's Dawn/capture device address; 0 =
+/// unknown → [_platformVendorOrder]).
+///
+/// Intended for the isolate-hosted CPU-fed encoder, which loops these in
+/// order. Differences from the plain platform order:
+///   * The adapter's native vendor comes first (AMD→AMF*, Intel→QSV,
+///     NVIDIA→NVENC), so we don't burn a doomed cross-vendor `avcodec_open2`.
+///   * On AMD, **MediaFoundation is preferred over AMF**: FFmpeg's
+///     `h264_amf` silently encodes black on some AMD drivers with the CPU-fed
+///     NV12 input, whereas `h264_mf` routes through the AMD hardware MFT (or
+///     the Microsoft software MFT as a safe fallback). AMF is kept last as a
+///     best-effort.
+/// MediaFoundation is always appended as the universal Windows fallback.
+List<HwEncoderVendor> hwVendorOrderForDevice(int d3d11DeviceHandle) {
+  if (!Platform.isWindows || d3d11DeviceHandle == 0) {
+    return _platformVendorOrder();
+  }
+  final shim = FfmpegShim.tryLoad();
+  if (shim == null) return _platformVendorOrder();
+  final vid = shim.d3d11GetVendorId(
+    Pointer<Void>.fromAddress(d3d11DeviceHandle),
+  );
+  switch (vid) {
+    case 0x1002: // AMD — MF before AMF (h264_amf can encode black on AMD).
+      return const [HwEncoderVendor.mediafoundation, HwEncoderVendor.amf];
+    case 0x8086: // Intel
+      return const [HwEncoderVendor.qsv, HwEncoderVendor.mediafoundation];
+    case 0x10DE: // NVIDIA
+      return const [HwEncoderVendor.nvenc, HwEncoderVendor.mediafoundation];
+    default:
+      return _platformVendorOrder();
+  }
+}
+
 /// Returns true if the named encoder is registered in the loaded FFmpeg.
 /// Cheap — pure name lookup, does NOT initialise hardware.
 bool _encoderPresent(Ffmpeg ff, String name) {

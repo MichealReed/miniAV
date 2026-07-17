@@ -4,13 +4,17 @@ import 'dart:typed_data';
 import 'package:miniav_platform_interface/miniav_platform_interface.dart';
 import 'package:web/web.dart' as web;
 
+import 'src/miniav_wasm.dart' as wasm;
+
 export 'package:miniav_platform_interface/miniav_platform_interface.dart';
 
 part 'modules/miniav_web_camera.dart';
 part 'modules/miniav_web_screen.dart';
 part 'modules/miniav_web_audio_input.dart';
+part 'modules/miniav_web_audio_output.dart';
 part 'modules/miniav_web_loopback.dart';
 part 'modules/miniav_web_input.dart';
+part 'modules/miniav_web_inject.dart';
 part './miniav_web_utils.dart';
 part './miniav_web_subscriptions.dart';
 
@@ -22,8 +26,11 @@ class MiniAVWebPlatform extends MiniAVPlatformInterface {
   final MiniScreenPlatformInterface _screen = MiniAVWebScreenPlatform();
   final MiniAudioInputPlatformInterface _audioInput =
       MiniAVWebAudioInputPlatform();
+  final MiniAudioOutputPlatformInterface _audioOutput =
+      MiniAVWebAudioOutputPlatform();
   final MiniLoopbackPlatformInterface _loopback = MiniAVWebLoopbackPlatform();
   final MiniInputPlatformInterface _input = MiniAVWebInputPlatform();
+  final MiniInjectPlatformInterface _inject = MiniAVWebInjectPlatform();
 
   @override
   MiniCameraPlatformInterface get camera => _camera;
@@ -35,10 +42,16 @@ class MiniAVWebPlatform extends MiniAVPlatformInterface {
   MiniAudioInputPlatformInterface get audioInput => _audioInput;
 
   @override
+  MiniAudioOutputPlatformInterface get audioOutput => _audioOutput;
+
+  @override
   MiniLoopbackPlatformInterface get loopback => _loopback;
 
   @override
   MiniInputPlatformInterface get input => _input;
+
+  @override
+  MiniInjectPlatformInterface get inject => _inject;
 
   @override
   String getVersionString() => '1.0.0-web';

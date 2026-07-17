@@ -21,7 +21,20 @@
 ///
 /// That is the only change required.  Remove any manual `reassemble()`
 /// overrides that previously called `MiniAV.dispose()`.
+///
+/// ## Android screen-capture consent
+///
+/// On Android, screen capture requires a MediaProjection consent round-trip
+/// that native code cannot perform.  [MiniAVAndroidScreenConsent] drives that
+/// flow and hands the projection to the native layer:
+///
+/// ```dart
+/// if (await MiniAVAndroidScreenConsent.requestScreenCapture()) {
+///   // MiniAV screen Configure/Start now works on Android.
+/// }
+/// ```
 library;
 
 export 'package:miniav/miniav.dart';
+export 'src/miniav_android_screen_consent.dart';
 export 'src/miniav_flutter_binding.dart';

@@ -488,6 +488,13 @@ typedef _AvInterleavedWriteFrameC =
 typedef _AvInterleavedWriteFrame =
     int Function(Pointer<AVFormatContext>, Pointer<AVPacket>);
 
+typedef _AvReadFrameC = Int32 Function(Pointer<AVFormatContext>, Pointer<AVPacket>);
+typedef _AvReadFrame = int Function(Pointer<AVFormatContext>, Pointer<AVPacket>);
+
+typedef _AvSeekFrameC =
+    Int32 Function(Pointer<AVFormatContext>, Int32, Int64, Int32);
+typedef _AvSeekFrame = int Function(Pointer<AVFormatContext>, int, int, int);
+
 typedef _AvformatFreeContextC = Void Function(Pointer<AVFormatContext>);
 typedef _AvformatFreeContext = void Function(Pointer<AVFormatContext>);
 
@@ -858,6 +865,10 @@ class Ffmpeg {
       .lookupFunction<_AvformatFreeContextC, _AvformatFreeContext>(
         'avformat_free_context',
       );
+  late final _AvReadFrame avReadFrame = _fmt
+      .lookupFunction<_AvReadFrameC, _AvReadFrame>('av_read_frame');
+  late final _AvSeekFrame avSeekFrame = _fmt
+      .lookupFunction<_AvSeekFrameC, _AvSeekFrame>('av_seek_frame');
 
   /// Wrap an AVERROR code into a Dart exception string.
   String strError(int err) {

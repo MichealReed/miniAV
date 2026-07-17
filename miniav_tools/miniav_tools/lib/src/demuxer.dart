@@ -3,9 +3,13 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 class Demuxer {
   final PlatformDemuxer _platform;
   final String backendName;
+
+  /// The capability the negotiator chose, or `null` for a non-negotiated path.
+  final CodecCapability? capability;
+
   bool _closed = false;
 
-  Demuxer(this._platform, this.backendName);
+  Demuxer(this._platform, this.backendName, {this.capability});
 
   bool get isClosed => _closed;
 
@@ -18,11 +22,18 @@ class Demuxer {
     return _platform.readPacket();
   }
 
-  /// Seek to the given timestamp (microseconds).
+  /// Seek to the given timestamp (microseconds). Throws on non-seekable
+  /// inputs — check [isSeekable].
   Future<void> seek(int timestampUs) {
     _checkOpen();
     return _platform.seek(timestampUs);
   }
+
+  /// Container duration in microseconds, or `null` when unknown (live).
+  int? get durationUs => _platform.durationUs;
+
+  /// Whether [seek] is supported by this input.
+  bool get isSeekable => _platform.isSeekable;
 
   Future<void> close() async {
     if (_closed) return;

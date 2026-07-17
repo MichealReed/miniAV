@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.3 (unreleased)
+
+- Audio **decode** contract (the `supportsAudioDecode()` capability existed
+  with no factory): `PlatformAudioDecoder`, `DecodedAudio` (interleaved f32),
+  `AudioDecoderConfig`, and `MiniAVToolsBackend.createAudioDecoder`
+  (default `null` — non-breaking for existing backends).
+- **Demuxer stream support** (for miniav_player stream/file playback):
+  `DemuxerInput.byteStream(Stream<List<int>>)` (`StreamDemuxerInput`) for
+  live/progressive containers; `PlatformDemuxer.durationUs` (nullable) and
+  `PlatformDemuxer.isSeekable` (both default no-op → non-breaking). Packet
+  `trackIndex` on demuxer output indexes into `tracks`.
+- `DecodedFrame.webVideoFrame` (`Object?`, default `null`) — an
+  already-presentable browser `VideoFrame` handle for the web WebCodecs
+  decode path (presented directly, no readback). Native `implements
+  DecodedFrame` classes must return `null`.
+
+## 0.5.2
+
+## 0.5.1
+
 ## 0.5.0
 
 - Version bump to keep the miniav_tools family in lockstep; no changes in this package.

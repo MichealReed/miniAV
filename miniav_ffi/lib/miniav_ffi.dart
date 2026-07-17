@@ -3,8 +3,10 @@ import 'dart:ffi' as ffi;
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 import 'package:miniav_ffi/modules/miniav_ffi_audio_input.dart';
+import 'package:miniav_ffi/modules/miniav_ffi_audio_output.dart';
 import 'package:miniav_ffi/modules/miniav_ffi_loopback.dart';
 import 'package:miniav_ffi/modules/miniav_ffi_input.dart';
+import 'package:miniav_ffi/modules/miniav_ffi_inject.dart';
 import 'miniav_ffi_bindings.dart' as bindings;
 import 'modules/miniav_ffi_camera.dart';
 import 'modules/miniav_ffi_screen.dart';
@@ -14,8 +16,10 @@ import 'package:miniav_platform_interface/miniav_platform_interface.dart';
 export 'modules/miniav_ffi_camera.dart';
 export 'modules/miniav_ffi_screen.dart';
 export 'modules/miniav_ffi_audio_input.dart';
+export 'modules/miniav_ffi_audio_output.dart';
 export 'modules/miniav_ffi_loopback.dart';
 export 'modules/miniav_ffi_input.dart';
+export 'modules/miniav_ffi_inject.dart';
 
 // --- Platform Implementation ---
 
@@ -26,7 +30,10 @@ class MiniAVFFIPlatform extends MiniAVPlatformInterface {
   final MiniFFIScreenPlatform _screen = MiniFFIScreenPlatform();
   final MiniAVFFILoopbackPlatform _loopback = MiniAVFFILoopbackPlatform();
   final MiniAVFFIAudioInputPlatform _audioInput = MiniAVFFIAudioInputPlatform();
+  final MiniAVFFIAudioOutputPlatform _audioOutput =
+      MiniAVFFIAudioOutputPlatform();
   final MiniAVFFIInputPlatform _input = MiniAVFFIInputPlatform();
+  final MiniAVFFIInjectPlatform _inject = MiniAVFFIInjectPlatform();
 
   @override
   MiniCameraPlatformInterface get camera => _camera;
@@ -38,10 +45,16 @@ class MiniAVFFIPlatform extends MiniAVPlatformInterface {
   MiniAudioInputPlatformInterface get audioInput => _audioInput;
 
   @override
+  MiniAudioOutputPlatformInterface get audioOutput => _audioOutput;
+
+  @override
   MiniLoopbackPlatformInterface get loopback => _loopback;
 
   @override
   MiniInputPlatformInterface get input => _input;
+
+  @override
+  MiniInjectPlatformInterface get inject => _inject;
 
   @override
   String getVersionString() {
@@ -101,13 +114,19 @@ class MiniAVFFIPlatform extends MiniAVPlatformInterface {
     }
 
     // NativeCallable.listener dispatches on the Dart event loop, so the Dart
-    // closure can freely use Dart objects (including stderr).
+    // closure can freely use Dart objects (including stderr). The native side
+    // hands over a HEAP-ALLOCATED message (it must outlive the asynchronous
+    // dispatch) which we own and must release via MiniAV_Free after decoding.
     final nc = ffi.NativeCallable<bindings.MiniAVLogCallbackFunction>.listener((
       int levelInt,
       ffi.Pointer<ffi.Char> message,
       ffi.Pointer<ffi.Void> _,
     ) {
-      callback(levelInt, _decodeCString(message));
+      final text = _decodeCString(message);
+      if (message.address != 0) {
+        bindings.MiniAV_Free(message.cast());
+      }
+      callback(levelInt, text);
     });
     bindings.MiniAV_SetLogCallback(nc.nativeFunction, ffi.nullptr);
     _logCallable = nc;

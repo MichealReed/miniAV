@@ -16,6 +16,8 @@ import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:ffi/ffi.dart';
+
 import 'ffmpeg_bindings.dart' as bindings;
 import 'ffmpeg_log.dart';
 
@@ -351,11 +353,143 @@ external int _audioFrameSetup(
 )
 external void _audioFrameSetPts(Pointer<Void> frame, int pts);
 
+// ---- Decoder helpers (cross-platform) ------------------------------------
+
+@Native<Int32 Function(Pointer<Void>, Pointer<Uint8>, Int32)>(
+  symbol: 'miniav_shim_codec_set_extradata',
+)
+external int _codecSetExtradata(Pointer<Void> ctx, Pointer<Uint8> data, int size);
+
+@Native<Int32 Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_frame_sample_rate',
+)
+external int _frameSampleRate(Pointer<Void> frame);
+
+@Native<Int32 Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_frame_nb_channels',
+)
+external int _frameNbChannels(Pointer<Void> frame);
+
+@Native<Int32 Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_frame_colorspace',
+)
+external int _frameColorspace(Pointer<Void> frame);
+
+@Native<Int32 Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_frame_color_range',
+)
+external int _frameColorRange(Pointer<Void> frame);
+
+// ---- Demux byte pipe + open helpers (cross-platform, ABI v15) -------------
+
+@Native<Pointer<Void> Function(Int64)>(symbol: 'miniav_shim_bytepipe_create')
+external Pointer<Void> _bytepipeCreate(int capacity);
+
+@Native<Int32 Function(Pointer<Void>, Pointer<Uint8>, Int32)>(
+  symbol: 'miniav_shim_bytepipe_write',
+)
+external int _bytepipeWrite(Pointer<Void> pipe, Pointer<Uint8> data, int len);
+
+@Native<Int64 Function(Pointer<Void>)>(symbol: 'miniav_shim_bytepipe_buffered')
+external int _bytepipeBuffered(Pointer<Void> pipe);
+
+@Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_bytepipe_close')
+external void _bytepipeClose(Pointer<Void> pipe);
+
+@Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_bytepipe_destroy')
+external void _bytepipeDestroy(Pointer<Void> pipe);
+
+@Native<Int32 Function(Pointer<Void>, Pointer<Uint8>, Int32)>(
+  symbol: 'miniav_shim_bytepipe_read',
+)
+external int _bytepipeRead(Pointer<Void> pipe, Pointer<Uint8> dst, int maxLen);
+
+@Native<Pointer<Void> Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_avio_out_pipe_create',
+)
+external Pointer<Void> _avioOutPipeCreate(Pointer<Void> pipe);
+
+@Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_avio_out_free')
+external void _avioOutFree(Pointer<Void> avio);
+
+@Native<Pointer<Void> Function()>(symbol: 'miniav_shim_memsink_create')
+external Pointer<Void> _memsinkCreate();
+
+@Native<Pointer<Void> Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_avio_out_memsink_create',
+)
+external Pointer<Void> _avioOutMemsinkCreate(Pointer<Void> sink);
+
+@Native<Int64 Function(Pointer<Void>)>(symbol: 'miniav_shim_memsink_size')
+external int _memsinkSize(Pointer<Void> sink);
+
+@Native<Int32 Function(Pointer<Void>, Int64, Pointer<Uint8>, Int32)>(
+  symbol: 'miniav_shim_memsink_read',
+)
+external int _memsinkRead(
+  Pointer<Void> sink,
+  int offset,
+  Pointer<Uint8> dst,
+  int maxLen,
+);
+
+@Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_memsink_destroy')
+external void _memsinkDestroy(Pointer<Void> sink);
+
+@Native<Pointer<Void> Function(Pointer<Void>, Pointer<Int32>)>(
+  symbol: 'miniav_shim_open_input_pipe',
+)
+external Pointer<Void> _openInputPipe(Pointer<Void> pipe, Pointer<Int32> err);
+
+@Native<Pointer<Void> Function(Pointer<Utf8>, Pointer<Int32>)>(
+  symbol: 'miniav_shim_open_input_url',
+)
+external Pointer<Void> _openInputUrl(Pointer<Utf8> url, Pointer<Int32> err);
+
+@Native<Pointer<Void> Function(Pointer<Uint8>, Int64, Pointer<Int32>)>(
+  symbol: 'miniav_shim_open_input_bytes',
+)
+external Pointer<Void> _openInputBytes(
+  Pointer<Uint8> data,
+  int len,
+  Pointer<Int32> err,
+);
+
+@Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_close_input')
+external void _closeInput(Pointer<Void> fmt);
+
+@Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_close_input_bytes')
+external void _closeInputBytes(Pointer<Void> fmt);
+
+@Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_shim_fmt_nb_streams')
+external int _fmtNbStreams(Pointer<Void> fmt);
+
+@Native<Pointer<Void> Function(Pointer<Void>, Int32)>(
+  symbol: 'miniav_shim_fmt_stream',
+)
+external Pointer<Void> _fmtStream(Pointer<Void> fmt, int index);
+
+@Native<Int64 Function(Pointer<Void>)>(symbol: 'miniav_shim_fmt_duration_us')
+external int _fmtDurationUs(Pointer<Void> fmt);
+
+@Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_shim_fmt_is_seekable')
+external int _fmtIsSeekable(Pointer<Void> fmt);
+
+@Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_shim_par_sample_rate')
+external int _parSampleRate(Pointer<Void> par);
+
+@Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_shim_par_nb_channels')
+external int _parNbChannels(Pointer<Void> par);
+
 @Native<Uint32 Function()>(symbol: 'miniav_shim_avcodec_version')
 external int _avcodecVersion();
 
 @Native<Uint32 Function()>(symbol: 'miniav_shim_abi_version')
 external int _abiVersion();
+
+// The Media Foundation hardware decoder (miniav_shim_mfdec_*) moved to the
+// standalone, FFmpeg-free miniav_tools_codecs_native asset — see
+// miniav_tools_codecs/lib/src/codecs_native.dart.
 
 // ---- FFmpeg log forwarding (v8+) ----------------------------------------
 //
@@ -389,7 +523,7 @@ class FfmpegShim {
   FfmpegShim._();
 
   /// Currently expected shim ABI. Bump in lock-step with `shim.c`.
-  static const int kExpectedAbiVersion = 13;
+  static const int kExpectedAbiVersion = 18;
 
   static FfmpegShim? _instance;
   static bool _attemptedLoad = false;
@@ -805,6 +939,164 @@ class FfmpegShim {
   /// Set just `AVFrame::pts`.
   void audioFrameSetPts(Pointer<Void> frame, int pts) =>
       _audioFrameSetPts(frame, pts);
+
+  // ---- Decoder helpers (cross-platform) ------------------------------------
+
+  /// Copy [bytes] into `ctx->extradata` (av_mallocz'd with the decode-side
+  /// padding, owned by the codec context). Call BEFORE `avcodec_open2`.
+  /// Returns 0 on success, negative AVERROR on failure.
+  int codecSetExtradata(Pointer<Void> ctx, Uint8List bytes) {
+    final buf = calloc<Uint8>(bytes.length);
+    try {
+      buf.asTypedList(bytes.length).setAll(0, bytes);
+      return _codecSetExtradata(ctx, buf, bytes.length);
+    } finally {
+      calloc.free(buf);
+    }
+  }
+
+  /// `AVFrame::sample_rate` of a decoded audio frame (0 if unset).
+  int frameSampleRate(Pointer<Void> frame) => _frameSampleRate(frame);
+
+  /// `AVFrame::ch_layout.nb_channels` of a decoded audio frame (0 if unset).
+  int frameNbChannels(Pointer<Void> frame) => _frameNbChannels(frame);
+
+  /// `AVFrame::colorspace` of a decoded video frame — raw AVColorSpace enum
+  /// (BT709=1, UNSPECIFIED=2, BT470BG=5, SMPTE170M=6, BT2020=9/10).
+  int frameColorspace(Pointer<Void> frame) => _frameColorspace(frame);
+
+  /// `AVFrame::color_range` — raw AVColorRange enum (UNSPECIFIED=0,
+  /// MPEG/limited=1, JPEG/full=2).
+  int frameColorRange(Pointer<Void> frame) => _frameColorRange(frame);
+
+  // ---- Demux byte pipe + open helpers --------------------------------------
+
+  /// Allocate a blocking byte pipe (see shim.c). [capacityBytes] <= 0 picks
+  /// the 16 MiB default. Returns nullptr on OOM.
+  Pointer<Void> bytepipeCreate(int capacityBytes) =>
+      _bytepipeCreate(capacityBytes);
+
+  /// Feed bytes. Returns bytes accepted (may be short when the ring is
+  /// full — retry the remainder later), or -1 if the pipe is closed.
+  /// Never blocks; safe from any isolate.
+  int bytepipeWrite(Pointer<Void> pipe, Uint8List data, int offset, int len) {
+    final buf = calloc<Uint8>(len);
+    try {
+      buf.asTypedList(len).setRange(0, len, data, offset);
+      return _bytepipeWrite(pipe, buf, len);
+    } finally {
+      calloc.free(buf);
+    }
+  }
+
+  /// Bytes currently buffered (feed-side backpressure signal).
+  int bytepipeBuffered(Pointer<Void> pipe) => _bytepipeBuffered(pipe);
+
+  /// Signal end-of-stream AND unblock a reader waiting for data. Idempotent.
+  /// Call before closing a demuxer whose worker may be starved.
+  void bytepipeClose(Pointer<Void> pipe) => _bytepipeClose(pipe);
+
+  /// Non-blocking drain (output-pipe side): copies up to [scratch].length
+  /// bytes into [scratch], returns the count (0 when empty).
+  int bytepipeRead(Pointer<Void> pipe, Pointer<Uint8> scratch, int maxLen) =>
+      _bytepipeRead(pipe, scratch, maxLen);
+
+  /// Writable AVIOContext over a byte pipe (muxing to bytes/callback
+  /// outputs). Free with [avioOutFree], never `avio_closep`.
+  Pointer<Void> avioOutPipeCreate(Pointer<Void> pipe) =>
+      _avioOutPipeCreate(pipe);
+
+  void avioOutFree(Pointer<Void> avio) => _avioOutFree(avio);
+
+  // ---- Seekable in-memory output sink (BytesMuxerOutput) -------------------
+
+  Pointer<Void> memsinkCreate() => _memsinkCreate();
+
+  /// Writable + SEEKABLE AVIOContext over a memory sink (plain MP4's moov
+  /// rewrite / +faststart need seeks). Free with [avioOutFree].
+  Pointer<Void> avioOutMemsinkCreate(Pointer<Void> sink) =>
+      _avioOutMemsinkCreate(sink);
+
+  int memsinkSize(Pointer<Void> sink) => _memsinkSize(sink);
+
+  /// Copy the finished container out of the sink.
+  Uint8List memsinkTakeBytes(Pointer<Void> sink) {
+    final size = _memsinkSize(sink);
+    final out = Uint8List(size);
+    if (size == 0) return out;
+    final scratch = calloc<Uint8>(size);
+    try {
+      final n = _memsinkRead(sink, 0, scratch, size);
+      out.setRange(0, n < 0 ? 0 : n, scratch.asTypedList(size));
+      return out;
+    } finally {
+      calloc.free(scratch);
+    }
+  }
+
+  void memsinkDestroy(Pointer<Void> sink) => _memsinkDestroy(sink);
+
+  /// Free the pipe. Only after the demuxer using it is closed.
+  void bytepipeDestroy(Pointer<Void> pipe) => _bytepipeDestroy(pipe);
+
+  /// Open + probe a demuxer over a byte pipe. Returns (fmtCtx, 0) or
+  /// (nullptr, negative AVERROR).
+  (Pointer<Void>, int) openInputPipe(Pointer<Void> pipe) {
+    final err = calloc<Int32>();
+    try {
+      final fmt = _openInputPipe(pipe, err);
+      return (fmt, err.value);
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// Open + probe a demuxer over a file path / URL.
+  (Pointer<Void>, int) openInputUrl(String url) {
+    final p = url.toNativeUtf8();
+    final err = calloc<Int32>();
+    try {
+      final fmt = _openInputUrl(p, err);
+      return (fmt, err.value);
+    } finally {
+      calloc.free(p);
+      calloc.free(err);
+    }
+  }
+
+  /// Open + probe a demuxer over a fully-buffered container. The shim keeps
+  /// a C-owned COPY of [bytes] (freed by [closeInputBytes]) and exposes it
+  /// through a SEEKABLE AVIO — moov-at-end MP4s work.
+  (Pointer<Void>, int) openInputBytes(Uint8List bytes) {
+    final buf = calloc<Uint8>(bytes.length);
+    final err = calloc<Int32>();
+    try {
+      buf.asTypedList(bytes.length).setAll(0, bytes);
+      final fmt = _openInputBytes(buf, bytes.length, err);
+      return (fmt, err.value);
+    } finally {
+      calloc.free(buf);
+      calloc.free(err);
+    }
+  }
+
+  /// Close either open flavour (frees the custom AVIO for pipe inputs).
+  void closeInput(Pointer<Void> fmt) => _closeInput(fmt);
+
+  /// Close a [openInputBytes]-opened input (also frees the C data copy).
+  void closeInputBytes(Pointer<Void> fmt) => _closeInputBytes(fmt);
+
+  int fmtNbStreams(Pointer<Void> fmt) => _fmtNbStreams(fmt);
+  Pointer<Void> fmtStream(Pointer<Void> fmt, int index) =>
+      _fmtStream(fmt, index);
+
+  /// Container duration in µs, or -1 when unknown (live pipes).
+  int fmtDurationUs(Pointer<Void> fmt) => _fmtDurationUs(fmt);
+  bool fmtIsSeekable(Pointer<Void> fmt) => _fmtIsSeekable(fmt) != 0;
+
+  /// `AVCodecParameters` audio fields (beyond the Dart-mapped prefix).
+  int parSampleRate(Pointer<Void> par) => _parSampleRate(par);
+  int parNbChannels(Pointer<Void> par) => _parNbChannels(par);
 
   // ---- FFmpeg log forwarding (v8+) ----------------------------------------
 

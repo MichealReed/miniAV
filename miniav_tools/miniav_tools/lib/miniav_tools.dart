@@ -11,6 +11,7 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 
 import 'src/encoder.dart';
 import 'src/audio_encoder.dart';
+import 'src/audio_decoder.dart';
 import 'src/decoder.dart';
 import 'src/muxer.dart';
 import 'src/demuxer.dart';
@@ -19,6 +20,7 @@ export 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 
 export 'src/encoder.dart';
 export 'src/audio_encoder.dart';
+export 'src/audio_decoder.dart';
 export 'src/decoder.dart';
 export 'src/muxer.dart';
 export 'src/demuxer.dart';
@@ -33,66 +35,107 @@ class MiniAVTools {
   static List<MiniAVToolsBackend> get backends =>
       MiniAVToolsPlatform.instance.backends;
 
-  /// Create a video encoder.
+  /// Create a video encoder — **negotiated** (same probe→filter→rank→open flow
+  /// as [createDecoder]).
   ///
-  /// Throws [NoBackendForCodecException] if no registered backend supports
-  /// [config.codec]. Throws [CodecInitException] if a backend was selected
-  /// but failed to initialise.
+  /// Every eligible backend is probed for its concrete [CodecCapability]s,
+  /// filtered by [hwPreference] (path exclude / zero-copy / HW mode), ranked
+  /// (hardware → explicit path order → zero-copy → score → backend priority →
+  /// init cost), and opened best-first. Each candidate opens on EXACTLY its
+  /// ranked path — `config.copyWith(hwAccel: cap.isHardware ? required :
+  /// forbidden)` — so the [Encoder.capability] attached to the result is honest
+  /// (a backend that reported a HW cap can't silently fall back to SW). A failed
+  /// HW open drops through to the next-ranked candidate.
+  ///
+  /// [hwPreference] defaults to one derived from `config.hwAccel`; pass an
+  /// explicit [HwPreference] for the richer knobs (`order`, `exclude`,
+  /// `requireZeroCopy`). [preference] (`excluded`/`pinned`) is honored
+  /// identically to decode.
+  ///
+  /// Throws [NoBackendForCodecException] if no backend supports [config.codec].
+  /// Throws [CodecInitException] if a candidate was selected but failed to open.
   static Future<Encoder> createEncoder(
     EncoderConfig config, {
     BackendPreference preference = BackendPreference.auto,
     BackendContext? context,
+    HwPreference? hwPreference,
   }) async {
-    final hwWanted =
-        config.hwAccel == HwAccelPreference.required ||
-        config.hwAccel == HwAccelPreference.preferred;
+    final hw = hwPreference ?? HwPreference.fromMode(config.hwAccel);
+    final candidates = await _negotiateCandidates(
+      CodecQuery.video(config.codec, CodecDirection.encode,
+          customName: config.customCodecName),
+      hw,
+      preference,
+    );
 
     Object? lastInitError;
-    for (final backend in MiniAVToolsPlatform.instance.orderedBackends(
-      preference,
-    )) {
-      if (!backend.supportsEncode(config.codec, hwAccel: hwWanted)) {
-        // Allow falling back to SW within this backend if HW is only preferred.
-        if (config.hwAccel != HwAccelPreference.preferred ||
-            !backend.supportsEncode(config.codec, hwAccel: false)) {
-          continue;
-        }
-      }
+    for (final cand in candidates) {
+      final cap = cand.cap;
+      // Honest attach: open on exactly the cap's path so a backend that
+      // reported a HW cap can't silently open SW while we attach a HW cap.
+      //
+      // EXCEPTION — the generic base-probe [HwPath.hardware] cap names no real
+      // path and doesn't know whether the device is actually present. Forcing
+      // `required` on it would (a) fail on boxes without that HW and (b)
+      // pre-empt a backend's own HW→SW fallback and the caller's options that
+      // were tuned to match it (the recorder tunes preset/tune/rate-control by
+      // its requested hwAccel). So for the generic cap we pass the caller's
+      // original config and let the backend decide, exactly as before this
+      // path was negotiated.
+      final openConfig = cap.hwPath == HwPath.hardware
+          ? config
+          : config.copyWith(
+              hwAccel: cap.isHardware
+                  ? HwAccelPreference.required
+                  : HwAccelPreference.forbidden,
+            );
       try {
-        final platform = await backend.createEncoder(config, context: context);
+        final platform =
+            await cand.backend.createEncoder(openConfig, context: context);
         if (platform == null) continue;
-        return Encoder(platform, backend.name);
+        return Encoder(platform, cand.backend.name, capability: cap);
       } on CodecInitException catch (e) {
         lastInitError = e;
-        if (config.hwAccel == HwAccelPreference.required) rethrow;
         continue;
       }
     }
     if (lastInitError is CodecInitException) {
       throw lastInitError;
     }
-    throw NoBackendForCodecException.video(config.codec, hwAccel: hwWanted);
+    throw NoBackendForCodecException.video(
+      config.codec,
+      hwAccel: hw.prefersHardware,
+    );
   }
 
-  /// Create an audio encoder. Throws [NoBackendForCodecException] if no
-  /// registered backend supports [config.codec].
+  /// Create an audio encoder — **negotiated**. Throws
+  /// [NoBackendForCodecException] if no registered backend supports
+  /// [config.codec].
+  ///
+  /// Audio configs carry no `hwAccel`, so the default [HwPreference] (`preferred`)
+  /// lets a backend that reports a hardware/OS audio capability (e.g. a future
+  /// Media Foundation AAC encoder) out-rank a software one; `excluded`/`pinned`
+  /// [preference] and `requireZeroCopy` (via [hwPreference]) work as for decode.
   static Future<AudioEncoder> createAudioEncoder(
     AudioEncoderConfig config, {
     BackendPreference preference = BackendPreference.auto,
     BackendContext? context,
+    HwPreference? hwPreference,
   }) async {
-    Object? lastInitError;
-    for (final backend in MiniAVToolsPlatform.instance.orderedBackends(
+    final candidates = await _negotiateCandidates(
+      CodecQuery.audio(config.codec, CodecDirection.encode),
+      hwPreference ?? const HwPreference(),
       preference,
-    )) {
-      if (!backend.supportsAudioEncode(config.codec)) continue;
+    );
+    Object? lastInitError;
+    for (final cand in candidates) {
       try {
-        final platform = await backend.createAudioEncoder(
+        final platform = await cand.backend.createAudioEncoder(
           config,
           context: context,
         );
         if (platform == null) continue;
-        return AudioEncoder(platform, backend.name);
+        return AudioEncoder(platform, cand.backend.name, capability: cand.cap);
       } on CodecInitException catch (e) {
         lastInitError = e;
         continue;
@@ -104,70 +147,155 @@ class MiniAVTools {
     throw NoBackendForCodecException.audio(config.codec);
   }
 
-  /// Create a video decoder.
-  static Future<Decoder> createDecoder(
-    DecoderConfig config, {
+  /// Create an audio decoder — **negotiated**. Throws
+  /// [NoBackendForCodecException] if no registered backend supports
+  /// [config.codec].
+  ///
+  /// Selection honors `excluded`/`pinned` [preference] and prefers a
+  /// hardware/OS audio capability over software (via the default
+  /// [HwPreference]); the chosen [CodecCapability] is attached to the result.
+  static Future<AudioDecoder> createAudioDecoder(
+    AudioDecoderConfig config, {
     BackendPreference preference = BackendPreference.auto,
     BackendContext? context,
+    HwPreference? hwPreference,
   }) async {
-    final hwWanted =
-        config.hwAccel == HwAccelPreference.required ||
-        config.hwAccel == HwAccelPreference.preferred;
-
-    Object? lastInitError;
-    for (final backend in MiniAVToolsPlatform.instance.orderedBackends(
+    final candidates = await _negotiateCandidates(
+      CodecQuery.audio(config.codec, CodecDirection.decode),
+      hwPreference ?? const HwPreference(),
       preference,
-    )) {
-      if (!backend.supportsDecode(config.codec, hwAccel: hwWanted)) {
-        if (config.hwAccel != HwAccelPreference.preferred ||
-            !backend.supportsDecode(config.codec, hwAccel: false)) {
-          continue;
-        }
-      }
+    );
+    Object? lastInitError;
+    for (final cand in candidates) {
       try {
-        final platform = await backend.createDecoder(config, context: context);
+        final platform = await cand.backend.createAudioDecoder(
+          config,
+          context: context,
+        );
         if (platform == null) continue;
-        return Decoder(platform, backend.name);
+        return AudioDecoder(platform, cand.backend.name, capability: cand.cap);
       } on CodecInitException catch (e) {
         lastInitError = e;
-        if (config.hwAccel == HwAccelPreference.required) rethrow;
         continue;
       }
     }
     if (lastInitError is CodecInitException) {
       throw lastInitError;
     }
-    throw NoBackendForCodecException.video(config.codec, hwAccel: hwWanted);
+    throw NoBackendForCodecException.audio(config.codec);
   }
 
-  /// Create a container muxer.
+  /// Create a video decoder — **negotiated**.
+  ///
+  /// Rather than the plain priority scan the other factories use, this probes
+  /// every eligible backend for its concrete [CodecCapability]s, filters them
+  /// by [hwPreference] (path exclude / zero-copy / HW mode), ranks them
+  /// (hardware → explicit path order → zero-copy → score → backend priority →
+  /// init cost), and opens them best-first. The chosen capability is attached
+  /// to the returned [Decoder] (`decoder.capability`) so consumers pick their
+  /// frame path deterministically — e.g. take the GPU-texture branch when
+  /// `producedOutputs` contains `d3d11Texture`, with no first-frame probing.
+  ///
+  /// [hwPreference] defaults to one derived from `config.hwAccel`, so existing
+  /// callers keep working unchanged. Pass an explicit [HwPreference] to use the
+  /// richer knobs (path `order`, `exclude`, `requireZeroCopy`).
+  static Future<Decoder> createDecoder(
+    DecoderConfig config, {
+    BackendPreference preference = BackendPreference.auto,
+    BackendContext? context,
+    HwPreference? hwPreference,
+  }) async {
+    final hw = hwPreference ?? HwPreference.fromMode(config.hwAccel);
+    final candidates = await _negotiateCandidates(
+      CodecQuery.video(config.codec, CodecDirection.decode,
+          customName: config.customCodecName),
+      hw,
+      preference,
+    );
+
+    Object? lastInitError;
+    for (final cand in candidates) {
+      // Open the candidate on EXACTLY its ranked path so the attached
+      // capability is honest: pin hwAccel to the cap's HW/SW-ness (a backend
+      // that reported a HW cap must open HW, not silently fall back to SW).
+      // A HW open that fails drops through to the next-ranked candidate below.
+      final openConfig = config.copyWith(
+        hwAccel: cand.cap.isHardware
+            ? HwAccelPreference.required
+            : HwAccelPreference.forbidden,
+      );
+      try {
+        final platform = await cand.backend.createDecoder(
+          openConfig,
+          context: context,
+        );
+        if (platform == null) continue;
+        return Decoder(platform, cand.backend.name, capability: cand.cap);
+      } on CodecInitException catch (e) {
+        // Don't give up on the first failure — the next-ranked path may open
+        // (e.g. nvdec fails → d3d11va succeeds). Only surface the error if
+        // nothing opens at all.
+        lastInitError = e;
+        continue;
+      }
+    }
+    if (lastInitError is CodecInitException) {
+      throw lastInitError;
+    }
+    throw NoBackendForCodecException.video(
+      config.codec,
+      hwAccel: hw.prefersHardware,
+    );
+  }
+
+  /// Create a container muxer — **negotiated** (honors `excluded`/`pinned`
+  /// [preference] so a first-party muxer is selectable over FFmpeg).
   static Future<Muxer> createMuxer(
     MuxerConfig config, {
     BackendPreference preference = BackendPreference.auto,
   }) async {
-    for (final backend in MiniAVToolsPlatform.instance.orderedBackends(
+    final candidates = await _negotiateCandidates(
+      CodecQuery.container(config.container, CodecDirection.mux),
+      const HwPreference(),
       preference,
-    )) {
-      if (!backend.supportsMux(config.container)) continue;
-      final platform = await backend.createMuxer(config);
+    );
+    for (final cand in candidates) {
+      final platform = await cand.backend.createMuxer(config);
       if (platform == null) continue;
-      return Muxer(platform, backend.name);
+      return Muxer(platform, cand.backend.name, capability: cand.cap);
     }
     throw NoBackendForCodecException.container(config.container);
   }
 
   /// Create a container demuxer.
+  ///
+  /// When [config.container] is known this is **negotiated** (honors
+  /// `excluded`/`pinned` [preference] so a first-party demuxer is selectable
+  /// over FFmpeg). When it is `null` (auto-probe), the container can't be
+  /// negotiated up front, so we fall back to an ordered scan and let each
+  /// backend sniff the input.
   static Future<Demuxer> createDemuxer(
     DemuxerConfig config, {
     BackendPreference preference = BackendPreference.auto,
   }) async {
+    if (config.container != null) {
+      final candidates = await _negotiateCandidates(
+        CodecQuery.container(config.container!, CodecDirection.demux),
+        const HwPreference(),
+        preference,
+      );
+      for (final cand in candidates) {
+        final platform = await cand.backend.createDemuxer(config);
+        if (platform == null) continue;
+        return Demuxer(platform, cand.backend.name, capability: cand.cap);
+      }
+      throw NoBackendForCodecException.container(config.container!);
+    }
+
+    // Auto-probe: container unknown, so let each backend sniff the input.
     for (final backend in MiniAVToolsPlatform.instance.orderedBackends(
       preference,
     )) {
-      if (config.container != null &&
-          !backend.supportsDemux(config.container!)) {
-        continue;
-      }
       final platform = await backend.createDemuxer(config);
       if (platform == null) continue;
       return Demuxer(platform, backend.name);
@@ -175,6 +303,82 @@ class MiniAVTools {
     throw NoBackendForCodecException.container(
       config.container ?? Container.mp4,
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // Negotiation engine (probe → filter → rank)
+  // -------------------------------------------------------------------------
+
+  /// Probe every eligible backend for [query], flatten their capabilities,
+  /// filter by [hw], and rank best-first. The caller opens candidates in order
+  /// and attaches the chosen [CodecCapability] to the returned wrapper.
+  static Future<List<_RankedCap>> _negotiateCandidates(
+    CodecQuery query,
+    HwPreference hw,
+    BackendPreference pref,
+  ) async {
+    final ordered = MiniAVToolsPlatform.instance.orderedBackends(pref).toList();
+    final byName = {for (final b in ordered) b.name: b};
+
+    final cands = <_RankedCap>[];
+    for (final b in ordered) {
+      for (final cap in await MiniAVToolsPlatform.instance.cachedProbe(
+        b,
+        query,
+      )) {
+        // Trust the capability's self-reported backend name (a backend may
+        // report on behalf of a delegate); fall back to the probed backend.
+        cands.add(_RankedCap(byName[cap.backendName] ?? b, cap));
+      }
+    }
+
+    final filtered = cands.where((rc) {
+      final c = rc.cap;
+      // Custom codecs match by NAME: a capability for a different custom
+      // codec (or a query for one) never pairs up.
+      if (query.customName != c.customName) return false;
+      if (hw.exclude.contains(c.hwPath)) return false;
+      if (hw.requireZeroCopy && !c.zeroCopy) return false;
+      if (hw.forbidsHardware && c.isHardware) return false;
+      if (hw.requiresHardware && !c.isHardware) return false;
+      return true;
+    }).toList();
+
+    filtered.sort((a, b) => _compareCaps(a, b, hw));
+    return filtered;
+  }
+
+  /// Best-first comparator for two candidates under preference [hw].
+  static int _compareCaps(_RankedCap a, _RankedCap b, HwPreference hw) {
+    final ca = a.cap, cb = b.cap;
+    // 1. Hardware first — but only when the caller actually wants HW. In
+    //    `allowed`/`forbidden` modes HW gets no inherent edge here.
+    if (hw.prefersHardware && ca.isHardware != cb.isHardware) {
+      return ca.isHardware ? -1 : 1;
+    }
+    // 2. Explicit path order, e.g. [nvdec, d3d11va]. Listed paths beat
+    //    unlisted; unlisted paths tie at the end.
+    final oa = _orderIndex(hw.order, ca.hwPath);
+    final ob = _orderIndex(hw.order, cb.hwPath);
+    if (oa != ob) return oa - ob;
+    // 3. Zero-copy (GPU-resident) paths before readback paths.
+    if (ca.zeroCopy != cb.zeroCopy) return ca.zeroCopy ? -1 : 1;
+    // 4. Higher backend-defined quality/preference score.
+    if (ca.score != cb.score) return cb.score - ca.score;
+    // 5. Higher effective backend priority (respects setBackendPriority).
+    final pa = MiniAVToolsPlatform.instance.priorityOf(a.backend);
+    final pb = MiniAVToolsPlatform.instance.priorityOf(b.backend);
+    if (pa != pb) return pb - pa;
+    // 6. Cheaper to open wins remaining ties.
+    return ca.initCostHint - cb.initCostHint;
+  }
+
+  /// Rank of [p] within an explicit [order]; unlisted paths sort last, and a
+  /// null order makes every path tie (so later keys decide).
+  static int _orderIndex(List<HwPath>? order, HwPath p) {
+    if (order == null) return 0;
+    final i = order.indexOf(p);
+    return i < 0 ? order.length : i;
   }
 
   // -------------------------------------------------------------------------
@@ -262,4 +466,12 @@ class MiniAVTools {
 
     return ctrl.stream;
   }
+}
+
+/// A filtered, ranked negotiation candidate: the backend that will open it and
+/// the [CodecCapability] the facade chose (attached to the returned wrapper).
+class _RankedCap {
+  final MiniAVToolsBackend backend;
+  final CodecCapability cap;
+  const _RankedCap(this.backend, this.cap);
 }

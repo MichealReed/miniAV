@@ -1,10 +1,13 @@
 /// Tests for [IsolateSoftwareEncoder] — the worker-isolate host for the
 /// software encoder (the fix for the recorder's software fallback freezing
-/// the UI isolate). Exercises a REAL encode on the worker: open, extraData,
-/// YUV420P-plane and RGBA-bytes inputs, keyframe request, flush, close.
+/// the UI isolate) AND the CPU-fed hardware encoder (the fix for QSV /
+/// MediaFoundation init failing on Flutter's STA UI isolate). Exercises a
+/// REAL encode on the worker: open, extraData, YUV420P-plane and RGBA-bytes
+/// inputs, keyframe request, flush, close.
 @TestOn('vm')
 library;
 
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
@@ -98,6 +101,76 @@ void main() {
         );
         expect(bytes, greaterThan(0));
         print('isolate AV1: $packets packets, $bytes bytes');
+      } finally {
+        await enc.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 3)));
+
+    test('CPU-fed HW-first on the worker: opens a HW vendor (or falls back to '
+        'SW) and encodes — HW init works on the worker MTA thread', () async {
+      if (!ready) {
+        print('SKIP: FFmpeg not available');
+        return;
+      }
+      if (!Platform.isWindows) {
+        print('SKIP: CPU-fed HW vendors under test are Windows-only here');
+        return;
+      }
+      // Windows order with MediaFoundation last as the universal fallback;
+      // MF before AMF mirrors hwVendorOrderForDevice() on AMD (AMF can encode
+      // black there). The worker LOOPS this order, so a registered-but-
+      // nonfunctional vendor (e.g. NVENC with no NVIDIA GPU) falls through.
+      final enc = await IsolateSoftwareEncoder.open(
+        const EncoderConfig(
+          codec: VideoCodec.h264,
+          width: _w,
+          height: _h,
+          bitrateBps: 2_000_000,
+          frameRateNumerator: 30,
+          frameRateDenominator: 1,
+          bFrameCount: 0,
+          hwAccel: HwAccelPreference.preferred,
+        ),
+        hwVendorOrder: const [
+          HwEncoderVendor.mediafoundation,
+          HwEncoderVendor.amf,
+          HwEncoderVendor.qsv,
+          HwEncoderVendor.nvenc,
+        ],
+      );
+      try {
+        // Whatever opened, it must report a description and a consistent input
+        // contract: HW encoders want RGBA (acceptsYuv420pPlanes == false), the
+        // software fallback wants YUV420P planes (== true).
+        print('worker opened: ${enc.activeEncoderDescription} '
+            '(yuv420p=${enc.acceptsYuv420pPlanes})');
+        expect(enc.activeEncoderDescription, isNotEmpty);
+
+        var packets = 0, bytes = 0;
+        for (var i = 0; i < 6; i++) {
+          // Feed RGBA regardless: the software encoder also accepts CPU RGBA,
+          // and the CPU-fed HW encoder converts RGBA→NV12 on the worker.
+          final pkt = await enc.encode(
+            FrameSource.cpu(
+              bytes: _rgba(i),
+              pixelFormat: MiniAVPixelFormat.rgba32,
+              width: _w,
+              height: _h,
+              timestampUs: i * 33333,
+            ),
+          );
+          if (pkt != null) {
+            packets++;
+            bytes += pkt.data.length;
+          }
+        }
+        for (final p in await enc.flush()) {
+          packets++;
+          bytes += p.data.length;
+        }
+        expect(packets, greaterThan(0),
+            reason: 'worker encoder (HW or SW) must emit packets');
+        expect(bytes, greaterThan(0));
       } finally {
         await enc.close();
       }

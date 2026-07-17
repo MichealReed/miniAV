@@ -16,7 +16,8 @@ set_target_properties(miniav_tools_ffmpeg_shim PROPERTIES C_STANDARD 11)
 
 target_include_directories(miniav_tools_ffmpeg_shim PRIVATE "${FFMPEG_INCLUDE_DIR}")
 target_link_directories(miniav_tools_ffmpeg_shim PRIVATE "${FFMPEG_LIB_DIR}")
-target_link_libraries(miniav_tools_ffmpeg_shim PRIVATE avcodec avutil)
+# avformat: demux open/byte-pipe helpers (shim ABI v15+).
+target_link_libraries(miniav_tools_ffmpeg_shim PRIVATE avcodec avutil avformat)
 
 # Hide internal symbols on POSIX (matches MIO_API visibility on Windows).
 if(NOT WIN32)
@@ -30,7 +31,8 @@ if(WIN32)
   # d3d11.lib for OpenSharedResource1 / CopyResource; dxguid.lib for
   # IID_ID3D11Device1 / IID_ID3D11Texture2D linked via DEFINE_GUID;
   # dxgi.lib for IDXGIResource1 (test helpers); ole32.lib for
-  # CoInitializeEx (apartment management for QSV / MediaFoundation).
+  # CoInitializeEx (apartment management for QSV / MediaFoundation encode).
+  # (The MF hardware DECODER moved to miniav_tools_codecs — no mfplat/mfuuid.)
   target_link_libraries(miniav_tools_ffmpeg_shim PRIVATE d3d11 dxguid dxgi ole32)
 endif()
 

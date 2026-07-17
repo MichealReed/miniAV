@@ -19,8 +19,8 @@ dependencies:
   miniav_tools_platform_interface: ^0.1.0
 
   # GPU colour-space conversion + D3D11 texture import
-  miniav_tools_minigpu: ^0.1.0
-  minigpu: ^1.5.5
+  miniav_tools_codecs: ^0.1.0
+  minigpu: ^1.5.7
 
   ffi: ^2.1.4
 

@@ -17,6 +17,7 @@ import 'package:minigpu/minigpu.dart';
 import 'adaptive_gpu_throttle.dart';
 import 'bounded_write_queue.dart';
 import 'container_utils.dart';
+import 'frame_pacer.dart';
 import 'gpu_screen_processor.dart';
 import 'recorder_log.dart';
 import 'recorder_sink.dart';
@@ -274,6 +275,37 @@ class Recorder {
   // -----------------------------------------------------------------------
   // Static GPU lifecycle (process-global)
   // -----------------------------------------------------------------------
+
+  /// Bind the process-global GPU context to the adapter driving the PRIMARY
+  /// display (Windows), so screen capture → GPU processing → HW encode all
+  /// stay on one adapter (same-adapter zero-copy). On hybrid systems where a
+  /// discrete GPU is also present this routes the pipeline through the
+  /// display GPU — e.g. an AMD/Intel iGPU showing the desktop — which is the
+  /// only topology where that iGPU's HW encoder (AMF/QSV) can be fed
+  /// zero-copy.
+  ///
+  /// MUST be called before ANY minigpu use in the process (including
+  /// unrelated features such as audio visualizers): the native context is
+  /// created once per process and its adapter cannot change afterwards.
+  /// Returns `true` when the hint was applied before the context existed;
+  /// `false` (with a warning log) when it was too late or the platform has
+  /// no adapter selection.
+  ///
+  /// Trade-off: ALL of this process's minigpu compute then runs on the
+  /// display adapter. The `MGPU_ADAPTER_NAME` env var overrides this hint.
+  static bool preferCaptureAdapter({bool enable = true}) {
+    if (!Platform.isWindows) return false;
+    final applied = Minigpu.preferDisplayAdapter(enable);
+    if (!applied && enable) {
+      _log(
+        'preferCaptureAdapter: GPU context already initialized — the hint '
+        'must be set before any minigpu use (call this at app startup). '
+        'Current adapter kept; capture may take the cross-adapter path.',
+        RecorderLogLevel.warning,
+      );
+    }
+    return applied;
+  }
 
   /// Idempotently initialise the process-global shared [Minigpu] + Dawn
   /// `ID3D11Device`. Returns once the singleton is ready (or no-ops on
@@ -787,21 +819,37 @@ class Recorder {
               b.acceptedFrameSources.contains(FrameSourceKind.gpuTexture),
         );
     final useGpuOutput = hasD3d11Encoder || hasMinigpuGpuEncoder;
+    // The GPU processor (bilinear scale + effects chain) imports the capture's
+    // D3D11 texture handle. So the capture must produce GPU output whenever a
+    // processor will run — INCLUDING the CPU-readback path (useGpuOutput=false
+    // but a scale policy or effects are configured). This was previously gated
+    // on useGpuOutput alone, so on that path the capture was set to CPU output;
+    // window (WGC) capture then hands back plain CPU buffers with no D3D11
+    // handle, the processor can't import them, and the entire scale/effects
+    // chain (e.g. censor boxes + crop) is silently skipped. Display (DXGI)
+    // capture happened to still carry a handle, which is why this only bit
+    // window capture.
+    final hasGpuWork =
+        cfg.scale.targetSize(videoFormat.width, videoFormat.height) != null ||
+        cfg.effects.isNotEmpty;
+    final captureUsesGpu =
+        _backendContext != null && (useGpuOutput || hasGpuWork);
     // For the log label: minigpu GPU buffer path takes precedence over D3D11
     // when both are available (encoder priority already ensures minigpu wins).
-    final captureLabel = !useGpuOutput
+    final captureLabel = !captureUsesGpu
         ? 'CPU'
-        : hasMinigpuGpuEncoder
-        ? 'GPU (minigpu buffer)'
-        : 'GPU (D3D11 zero-copy)';
+        : useGpuOutput
+        ? (hasMinigpuGpuEncoder ? 'GPU (minigpu buffer)' : 'GPU (D3D11 zero-copy)')
+        : 'GPU (processor → CPU readback)';
     Recorder._log(
       'screen capture output: $captureLabel '
       '— backendContext=${_backendContext != null}, '
       'd3d11Encoder=$hasD3d11Encoder, '
       'minigpuEncoder=$hasMinigpuGpuEncoder, '
+      'gpuWork=$hasGpuWork, '
       'd3d11Device=0x${(_backendContext?.d3d11DeviceHandle ?? 0).toRadixString(16)}',
     );
-    final outputPref = useGpuOutput
+    final outputPref = captureUsesGpu
         ? MiniAVOutputPreference.gpu
         : MiniAVOutputPreference.cpu;
     if (cfg.width != null &&
@@ -1025,9 +1073,7 @@ class Recorder {
     //    NT handle goes straight to the encoder; zero shader-core work/frame.
     //  - GPU work present                → pipelined two-stage encode: GPU
     //    stage of frame N+1 overlaps the encode of frame N (ring depth 2).
-    final hasGpuWork =
-        cfg.scale.targetSize(videoFormat.width, videoFormat.height) != null ||
-        cfg.effects.isNotEmpty;
+    // (`hasGpuWork` computed above with the capture-output decision.)
     final zeroCopyD3d11 =
         effectiveProcessor != null &&
         !effectiveCpuReadback &&
@@ -1050,46 +1096,28 @@ class Recorder {
         !processorCpuReadback &&
         !isD3d11Encoder &&
         !isGpuBufferEncoder) {
+      // The pre-check expected a GPU-capable encoder (D3D11 zero-copy or a
+      // minigpu GPU-buffer encoder), so capture was configured for GPU output
+      // and the processor for the zero-copy path. The encoder that actually
+      // opened is a CPU-input encoder — e.g. the isolate-hosted software /
+      // CPU-fed HW encoder, because zero-copy and the minigpu GPU encoder were
+      // both unavailable on this adapter.
+      //
+      // Keep the GPU processor and switch it to the CPU-readback path — do NOT
+      // drop it. The processor still imports the capture's D3D11 handle, runs
+      // the bilinear downscale + the effects chain on the GPU, and reads the
+      // result back to feed the CPU encoder. Nulling `effectiveProcessor` here
+      // (the old behaviour) silently dropped the entire scale/effects pipeline.
+      // Capture stays on GPU output (the processor needs the D3D11 handle), and
+      // the already-selected encoder accepts CPU frames as-is, so there is no
+      // need to reconfigure capture or reopen the encoder.
       Recorder._log(
-        'screen: GPU output was configured but selected encoder supports '
-        'neither D3D11 shared textures nor GPU buffer input — reconfiguring '
-        'capture for CPU output (zero-copy disabled). This is unexpected; '
-        'check the log for details.',
+        'screen: selected encoder is CPU-input (no D3D11 shared-texture / '
+        'GPU-buffer support); keeping the GPU processor on the CPU-readback '
+        'path so downscale + effects still apply.',
         RecorderLogLevel.warning,
       );
-      effectiveProcessor = null;
-      effectiveCpuReadback = false;
-      final cpuFormat = MiniAVVideoInfo(
-        width: videoFormat.width,
-        height: videoFormat.height,
-        pixelFormat: videoFormat.pixelFormat,
-        frameRateNumerator: videoFormat.frameRateNumerator,
-        frameRateDenominator: videoFormat.frameRateDenominator,
-        outputPreference: MiniAVOutputPreference.cpu,
-      );
-      if (resolvedDisplayId != null) {
-        await ctx.configureDisplay(resolvedDisplayId, cpuFormat);
-      } else {
-        await ctx.configureWindow(cfg.windowId!, cpuFormat);
-      }
-      // Also re-open a plain CPU encoder (no BackendContext) so the selected
-      // codec still gets the best available Stage-A hardware path.
-      encResult = await _openVideoEncoder(
-        MiniAVVideoInfo(
-          width: videoFormat.width,
-          height: videoFormat.height,
-          pixelFormat: videoFormat.pixelFormat,
-          frameRateNumerator: videoFormat.frameRateNumerator,
-          frameRateDenominator: videoFormat.frameRateDenominator,
-          outputPreference: MiniAVOutputPreference.cpu,
-        ),
-        cfg.codec,
-        cfg.bitrateBps,
-        cfg.hwAccel,
-        quality: cfg.quality,
-        encoderOptions: cfg.encoderOptions,
-        noContext: true,
-      );
+      effectiveCpuReadback = true;
     }
 
     return _VideoTrackRuntime(
@@ -1107,6 +1135,7 @@ class Recorder {
       processorGpuBuffer: effectiveGpuBuffer,
       idleFramePolicy: cfg.idleFramePolicy,
       adaptiveGpuThrottle: cfg.adaptiveGpuThrottle,
+      cfrOutput: cfg.cfrOutput,
       directD3d11Passthrough: zeroCopyD3d11 && !hasGpuWork,
       pipelinedZeroCopy: zeroCopyD3d11 && hasGpuWork,
       startFn: (cb) => ctx.startCapture(cb),
@@ -1579,6 +1608,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
     this.adaptiveGpuThrottle = true,
     this.directD3d11Passthrough = false,
     this.pipelinedZeroCopy = false,
+    this.cfrOutput = false,
   });
 
   final Encoder encoder;
@@ -1643,6 +1673,21 @@ class _VideoTrackRuntime extends _TrackRuntime {
   /// the stage-1 write never touches the texture stage 2 is reading.
   final bool pipelinedZeroCopy;
 
+  /// When true, output PTS are quantized to the exact fps grid and every grid
+  /// slot is filled exactly once — live frames claim their nearest slot,
+  /// missed slots are backfilled with duplicates of the previous frame, and
+  /// surplus frames are dropped. See [FramePacer] for the full semantics.
+  /// Default false = VFR (frames keep capture timestamps; near-target source
+  /// cadence passes through untouched).
+  final bool cfrOutput;
+
+  /// Pacing policy: near-target VFR tolerance + CFR grid slotting.
+  late final FramePacer _pacer = FramePacer(
+    frameRateNum: frameRateNum,
+    frameRateDen: frameRateDen,
+    cfr: cfrOutput,
+  );
+
   /// Last live frame retained for the duplicator on the direct-passthrough
   /// path (swap-released when the next live frame lands; released on stop).
   MiniAVBuffer? _lastDirectBuffer;
@@ -1667,14 +1712,6 @@ class _VideoTrackRuntime extends _TrackRuntime {
   bool _stopping = false;
   bool _firstChunkSent = false;
   int _lastVideoPtsUs = -1;
-
-  /// Ideal schedule timestamp for the SW fps throttle. Advanced by exactly
-  /// [_minFrameIntervalUs] each time a frame is accepted, rather than reset
-  /// to the actual clock. This prevents the drop-every-other-frame problem
-  /// when the capture device runs slightly faster than the target fps:
-  /// e.g. 31.5 fps capture + 30 fps limit → 15 fps with a `= now` reset,
-  /// but ~30 fps with the `+= interval` advance.
-  int _lastThrottleUs = -1;
 
   // -------- Frame duplicator (zero-copy GPU path only) ------------------
   //
@@ -1726,6 +1763,9 @@ class _VideoTrackRuntime extends _TrackRuntime {
   // alone are expected. Logged separately by [_maybeLogStats].
   int _statsThrottleDropped = 0;
   int _statsBusyDropped = 0;
+  // Duplicate frames emitted (idle fill + CFR backfill). Counted inside
+  // _statsPacketsOut as well; shown separately as dup= when non-zero.
+  int _statsDupFrames = 0;
   int _statsPacketsOut = 0;
   int _statsEncodeErrors = 0;
   int _statsMinPktBytes = 0x7fffffff;
@@ -1802,37 +1842,39 @@ class _VideoTrackRuntime extends _TrackRuntime {
       }
       _statsFramesIn++;
       _maybeLogStats();
-      // Wall-clock acceptance time. Used both for the throttle and, when the
+      // Wall-clock acceptance time. Used both for the pacer and, when the
       // frame is accepted, as its capture timestamp (see [_PendingVideoFrame]).
       final nowUs = rec.now();
-      // SW fps throttle: drop frames arriving faster than the target rate.
-      // Works even when the capture device ignores the fps hint (e.g. DXGI
-      // always delivers at display refresh rate). Audio sync is not affected
-      // because both tracks use independent wall-clock µs timestamps.
-      //
-      // _lastThrottleUs is advanced by exactly minInterval on each accepted
-      // frame (not reset to rec.now()). This avoids the drop-every-other-frame
-      // bug: when capture delivers at 31.5 fps and target is 30 fps, resetting
-      // to now() causes every subsequent frame to arrive ~31.75 ms after the
-      // last accept — always below the 33.33 ms threshold — dropping half.
-      // With += minInterval, accumulated credit from any skipped gap allows
-      // the scheduler to converge to the target rate over ~20-frame windows.
-      // Effective interval = base interval × the adaptive GPU-pressure divisor.
-      // Under sustained GPU saturation the divisor rises (2, 4), spacing live
-      // frames evenly at a reduced rate — throttle drops instead of uneven
-      // busy drops — while the duplicator keeps the output at the target fps.
-      final minInterval = adaptiveGpuThrottle
-          ? _minFrameIntervalUs * _gpuAdapt.divisor
-          : _minFrameIntervalUs;
-      if (minInterval > 0) {
-        if (_lastThrottleUs >= 0 && nowUs - _lastThrottleUs < minInterval) {
-          _statsThrottleDropped++; // by design — capture outruns target fps
-          MiniAV.releaseBufferSync(buffer);
-          return;
-        }
-        _lastThrottleUs = _lastThrottleUs < 0
-            ? nowUs
-            : _lastThrottleUs + minInterval;
+      // Frame pacing (see [FramePacer]): in VFR mode the fps throttle engages
+      // only when the source meaningfully outruns the target rate — a source
+      // within ~15% of target (e.g. DXGI delivering ~31.4 fps against 30)
+      // passes through untouched, because deleting frames from a near-target
+      // cadence turns one frame per ~20 into a double-length presentation
+      // hole: a metronomic visible stutter. In CFR mode this drops frames
+      // whose output grid slot is already spoken for. Under sustained GPU
+      // saturation the adaptive divisor (2, 4) thins live frames evenly
+      // either way, and the duplicator/backfill keeps the output cadence.
+      // Audio sync is unaffected: both tracks use master-clock µs timestamps.
+      final divisor = adaptiveGpuThrottle ? _gpuAdapt.divisor : 1;
+      final wasThrottling = _pacer.throttleActive;
+      final drop = _pacer.shouldDropOnArrival(nowUs, divisor: divisor);
+      if (_pacer.throttleActive != wasThrottling) {
+        Recorder._log(
+          _pacer.throttleActive
+              ? '$label fps throttle engaged — source cadence '
+                    '${_pacer.arrivalEmaMs.toStringAsFixed(1)}ms outruns the '
+                    '${(_minFrameIntervalUs / 1000).toStringAsFixed(1)}ms '
+                    'target; thinning evenly to the target rate.'
+              : '$label fps throttle released — source cadence '
+                    '${_pacer.arrivalEmaMs.toStringAsFixed(1)}ms ≈ target; '
+                    'passing all frames through (VFR).',
+          RecorderLogLevel.info,
+        );
+      }
+      if (drop) {
+        _statsThrottleDropped++; // surplus vs target rate (or slot taken)
+        MiniAV.releaseBufferSync(buffer);
+        return;
       }
       // Bounded-queue back-pressure (replaces the depth-1 `_busy` gate). Enqueue
       // and let the serialized pump drain it. Only a SUSTAINED overrun (queue
@@ -1958,7 +2000,17 @@ class _VideoTrackRuntime extends _TrackRuntime {
     ({SharedOutputTexture tex, int captureUs}) ready,
   ) async {
     try {
-      var ptsUs = ready.captureUs;
+      final claim = _pacer.claimPts(ready.captureUs);
+      if (claim == null) {
+        // CFR: the frame's grid slot was filled while it waited in the
+        // pipeline (idle filler race) — drop it.
+        _statsThrottleDropped++;
+        return;
+      }
+      // CFR: fill grid slots the capture missed with duplicates of the
+      // PREVIOUS frame — must run before _lastSharedTex is updated below.
+      await _emitBackfill(rec, claim.backfillPtsUs);
+      var ptsUs = claim.ptsUs;
       if (ptsUs <= _lastVideoPtsUs) ptsUs = _lastVideoPtsUs + 1;
       _lastVideoPtsUs = ptsUs;
       final proc = processor!;
@@ -2024,17 +2076,19 @@ class _VideoTrackRuntime extends _TrackRuntime {
               '/${(_statsEncUsMax / 1000).toStringAsFixed(1)}ms'
         : '';
     final adaptStr = _gpuAdapt.divisor > 1 ? ' adapt=÷${_gpuAdapt.divisor}' : '';
+    final dupStr = _statsDupFrames > 0 ? ' dup=${_statsDupFrames}' : '';
     Recorder._log(
       '$label video stats over ${secs.toStringAsFixed(1)}s: '
       'in=${_statsFramesIn} (${(_statsFramesIn / secs).toStringAsFixed(1)} fps) '
       'thr_drop=${_statsThrottleDropped} busy_drop=${_statsBusyDropped} '
       'encoded=${_statsPacketsOut} '
       '(${(_statsPacketsOut / secs).toStringAsFixed(1)} fps) '
-      'pkt=$pktRange$gpuStr$encStr$adaptStr$errStr',
+      'pkt=$pktRange$gpuStr$encStr$adaptStr$dupStr$errStr',
     );
     _statsFramesIn = 0;
     _statsThrottleDropped = 0;
     _statsBusyDropped = 0;
+    _statsDupFrames = 0;
     _statsPacketsOut = 0;
     _statsEncodeErrors = 0;
     _statsMinPktBytes = 0x7fffffff;
@@ -2058,11 +2112,23 @@ class _VideoTrackRuntime extends _TrackRuntime {
     // duplicator's source instead of being released in the finally below.
     var retainBuffer = false;
     try {
-      // Prefer the capture-time timestamp recorded at enqueue (evenly spaced by
-      // the throttle); fall back to now() if the frame was encoded outside the
-      // queue. This keeps PTS spacing stable even when the serialized encoder
-      // briefly stalls and then drains several queued frames back-to-back.
-      var ptsUs = captureUs ?? rec.now();
+      // PTS from the pacer: the capture-time timestamp recorded at enqueue in
+      // VFR mode (falling back to now() if the frame was encoded outside the
+      // queue), the claimed grid-slot time in CFR mode. This keeps PTS spacing
+      // stable even when the serialized encoder briefly stalls and then
+      // drains several queued frames back-to-back.
+      final claim = _pacer.claimPts(captureUs ?? rec.now());
+      if (claim == null) {
+        // CFR: the frame's grid slot was filled while it waited in the
+        // pipeline (idle filler race) — drop it (finally releases the buffer).
+        _statsThrottleDropped++;
+        return;
+      }
+      // CFR: fill grid slots the capture missed with duplicates of the
+      // PREVIOUS frame — must run before the branches below update the
+      // retained duplicator sources (_lastDirectBuffer / _lastSharedTex).
+      await _emitBackfill(rec, claim.backfillPtsUs);
+      var ptsUs = claim.ptsUs;
       // Guarantee strict monotonic increase even on sub-µs frame deltas.
       if (ptsUs <= _lastVideoPtsUs) ptsUs = _lastVideoPtsUs + 1;
       _lastVideoPtsUs = ptsUs;
@@ -2078,7 +2144,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
           // directly without any CPU round-trip.
           final gpuBuf = await _gpuStage(() => proc.processToGpuBuffer(buffer));
           if (gpuBuf != null) {
-            // encoder.platform is GpuCodecEncoder (from miniav_tools_minigpu)
+            // encoder.platform is GpuCodecEncoder (from miniav_tools_codecs)
             // which we cannot import here (would create a circular dep).
             // Use dynamic dispatch — safe because processorGpuBuffer is only
             // ever set to true when encoder.platform.supportsGpuBufferInput=true.
@@ -2345,6 +2411,28 @@ class _VideoTrackRuntime extends _TrackRuntime {
 
   // ---- Frame duplicator implementation --------------------------------
 
+  /// CFR backfill: emit a duplicate of the previous frame at each missed grid
+  /// slot PTS (oldest first) so the output timeline has no presentation
+  /// holes. Uses whichever duplicator source the active path retains; on
+  /// paths that retain nothing (CPU readback / GPU-buffer encode) the slots
+  /// are left unfilled — same scope as the idle duplicator, which is
+  /// zero-copy-path only. Runs inside the already-serialized encode stage.
+  Future<void> _emitBackfill(Recorder rec, List<int> ptsList) async {
+    for (final pts in ptsList) {
+      final directBuf = _lastDirectBuffer;
+      if (directBuf != null) {
+        await _encodeDuplicateDirect(rec, directBuf, pts);
+        continue;
+      }
+      final tex = _lastSharedTex;
+      if (tex != null && tex.isValid) {
+        await _encodeDuplicate(rec, tex, pts);
+        continue;
+      }
+      break; // nothing retained yet (first frames) — leave the hole
+    }
+  }
+
   void _startDupTimer(Recorder rec) {
     if (idleFramePolicy == VideoIdleFramePolicy.none) return;
     _recForDup = rec;
@@ -2377,11 +2465,28 @@ class _VideoTrackRuntime extends _TrackRuntime {
     final intervalUs = _minFrameIntervalUs;
     if (intervalUs <= 0) return;
     final nowUs = rec.now();
-    // Only fill if a frame hasn't been emitted within ~1.5 intervals —
-    // i.e. the live capture path is currently keeping up.
-    if (_lastVideoPtsUs < 0 ||
-        nowUs - _lastVideoPtsUs < (intervalUs * 3) ~/ 2) {
-      return;
+    int fillPtsUs;
+    if (cfrOutput) {
+      // CFR: fill the next unfilled grid slot once its claim window has
+      // passed (see FramePacer.claimIdleSlot). Check that a fill source
+      // exists BEFORE claiming — a claimed slot we cannot fill would become
+      // a permanent timeline hole.
+      final hasSource =
+          idleFramePolicy == VideoIdleFramePolicy.black ||
+          _lastDirectBuffer != null ||
+          (_lastSharedTex?.isValid ?? false);
+      if (!hasSource) return;
+      final slotPts = _pacer.claimIdleSlot(nowUs);
+      if (slotPts == null) return;
+      fillPtsUs = slotPts;
+    } else {
+      // VFR: only fill if a frame hasn't been emitted within ~1.5 intervals —
+      // i.e. the live capture path is currently keeping up.
+      if (_lastVideoPtsUs < 0 ||
+          nowUs - _lastVideoPtsUs < (intervalUs * 3) ~/ 2) {
+        return;
+      }
+      fillPtsUs = nowUs;
     }
     if (idleFramePolicy == VideoIdleFramePolicy.duplicate) {
       // Direct-passthrough mode retains the last live capture buffer instead
@@ -2389,7 +2494,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
       final directBuf = _lastDirectBuffer;
       if (directBuf != null) {
         _encoding = true;
-        final fut = _encodeDuplicateDirect(rec, directBuf, nowUs);
+        final fut = _encodeDuplicateDirect(rec, directBuf, fillPtsUs);
         _inFlight.add(fut);
         fut.whenComplete(() {
           _inFlight.remove(fut);
@@ -2407,7 +2512,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
         return;
       }
       _encoding = true;
-      final fut = _encodeDuplicate(rec, tex, nowUs);
+      final fut = _encodeDuplicate(rec, tex, fillPtsUs);
       _inFlight.add(fut);
       fut.whenComplete(() {
         _inFlight.remove(fut);
@@ -2417,7 +2522,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
       });
     } else if (idleFramePolicy == VideoIdleFramePolicy.black) {
       _encoding = true;
-      final fut = _encodeBlack(rec, nowUs);
+      final fut = _encodeBlack(rec, fillPtsUs);
       _inFlight.add(fut);
       fut.whenComplete(() {
         _inFlight.remove(fut);
@@ -2450,6 +2555,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
       final pkt = await encoder.encode(src);
       if (pkt != null) {
         _statsPacketsOut++;
+        _statsDupFrames++;
         _statsTotalPktBytes += pkt.data.length;
         if (pkt.data.length < _statsMinPktBytes)
           _statsMinPktBytes = pkt.data.length;
@@ -2490,6 +2596,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
       final pkt = await encoder.encode(src);
       if (pkt != null) {
         _statsPacketsOut++;
+        _statsDupFrames++;
         _statsTotalPktBytes += pkt.data.length;
         if (pkt.data.length < _statsMinPktBytes)
           _statsMinPktBytes = pkt.data.length;
@@ -2529,6 +2636,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
       final pkt = await encoder.encode(src);
       if (pkt != null) {
         _statsPacketsOut++;
+        _statsDupFrames++;
         _statsTotalPktBytes += pkt.data.length;
         if (pkt.data.length < _statsMinPktBytes)
           _statsMinPktBytes = pkt.data.length;

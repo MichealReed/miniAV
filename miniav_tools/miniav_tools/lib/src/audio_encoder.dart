@@ -7,9 +7,14 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 class AudioEncoder {
   final PlatformAudioEncoder _platform;
   final String backendName;
+
+  /// The capability the negotiator chose to open this encoder, or `null` when
+  /// created via a non-negotiated path.
+  final CodecCapability? capability;
+
   bool _closed = false;
 
-  AudioEncoder(this._platform, this.backendName);
+  AudioEncoder(this._platform, this.backendName, {this.capability});
 
   bool get isClosed => _closed;
 

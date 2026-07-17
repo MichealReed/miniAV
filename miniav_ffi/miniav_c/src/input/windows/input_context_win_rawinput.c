@@ -26,6 +26,7 @@ typedef struct InputPlatformWin {
   // Gamepad polling thread
   HANDLE gamepad_thread;
   volatile LONG gamepad_stop_requested;
+  HANDLE gamepad_stop_event; // auto-reset event to wake the poll wait promptly
 
   // Configuration snapshot (read by threads)
   uint32_t input_types;
@@ -47,20 +48,23 @@ typedef struct InputPlatformWin {
   bool gamepad_was_connected[MINIAV_INPUT_MAX_GAMEPADS];
 } InputPlatformWin;
 
-// --- Thread-local storage for callback routing ---
-// We store the platform pointer in a global so the hook procs can reach it.
-// Only one input context can be active at a time per process with this approach.
+// --- Global callback routing ---
+// Low-level hook procs are process-global and cannot carry a user pointer, so
+// the active platform is published here. Because it is a single slot, only ONE
+// input context can capture at a time per process; a second concurrent start
+// is rejected (InterlockedCompareExchangePointer guard in start_capture)
+// rather than silently hijacking the first context's callbacks.
 static InputPlatformWin *g_active_input_platform = NULL;
+
+// Forward declaration (destroy_platform calls stop_capture, defined later).
+static MiniAVResultCode input_win_stop_capture(MiniAVInputContext *ctx);
 
 // --- Helpers ---
 
-static uint64_t win_get_timestamp_us(void) {
-  LARGE_INTEGER freq, counter;
-  QueryPerformanceFrequency(&freq);
-  QueryPerformanceCounter(&counter);
-  return (uint64_t)((double)counter.QuadPart / (double)freq.QuadPart *
-                    1000000.0);
-}
+// Use the shared canonical clock (cached QPC frequency, integer/overflow-safe
+// math) rather than a per-call float conversion, so input timestamps share the
+// exact same timeline as every other capture module.
+static uint64_t win_get_timestamp_us(void) { return miniav_get_time_us(); }
 
 // --- Keyboard Hook Proc ---
 
@@ -104,6 +108,9 @@ static LRESULT CALLBACK mouse_hook_proc(int nCode, WPARAM wParam,
   event.timestamp_us = win_get_timestamp_us();
   event.x = ms->pt.x;
   event.y = ms->pt.y;
+  // The low-level mouse hook always delivers absolute screen coordinates in
+  // ms->pt, so every emitted event carries valid absolute x/y.
+  event.is_absolute = true;
 
   switch (wParam) {
   case WM_MOUSEMOVE:
@@ -159,7 +166,15 @@ static LRESULT CALLBACK mouse_hook_proc(int nCode, WPARAM wParam,
     break;
   case WM_MOUSEWHEEL:
     event.action = MINIAV_MOUSE_ACTION_WHEEL;
+    // Vertical wheel delta is the signed high word of mouseData (+ = up/away).
     event.wheel_delta = (int32_t)((short)HIWORD(ms->mouseData));
+    break;
+  case WM_MOUSEHWHEEL:
+    event.action = MINIAV_MOUSE_ACTION_WHEEL;
+    // Horizontal wheel delta is likewise the signed high word (+ = right).
+    // Emitted as a WHEEL action just like the vertical case, with the value
+    // carried in wheel_delta_x so injection can replay it via MOUSEEVENTF_HWHEEL.
+    event.wheel_delta_x = (int32_t)((short)HIWORD(ms->mouseData));
     break;
 
   default:
@@ -234,13 +249,20 @@ static DWORD WINAPI hook_thread_proc(LPVOID param) {
 
 static DWORD WINAPI gamepad_poll_thread_proc(LPVOID param) {
   InputPlatformWin *plat = (InputPlatformWin *)param;
-  DWORD poll_interval_ms =
-      (plat->gamepad_poll_hz > 0) ? (1000 / plat->gamepad_poll_hz) : 16;
+  const uint32_t hz = plat->gamepad_poll_hz > 0 ? plat->gamepad_poll_hz : 60;
+
+  // Absolute-deadline pacing (QPC), matching the screen-capture fix: the old
+  // `Sleep(1000/hz)` truncated the rational rate (60Hz -> 16ms = 62.5Hz) AND
+  // drifted (period = sleep + poll cost). Wait on the stop event so shutdown
+  // is immediate instead of up to one interval late.
+  LARGE_INTEGER qpc_freq;
+  QueryPerformanceFrequency(&qpc_freq);
+  const LONGLONG interval_ticks = qpc_freq.QuadPart / hz;
+  LARGE_INTEGER deadline;
+  QueryPerformanceCounter(&deadline);
 
   miniav_log(MINIAV_LOG_LEVEL_INFO,
-             "Gamepad polling started at ~%u Hz (interval %lu ms).",
-             plat->gamepad_poll_hz ? plat->gamepad_poll_hz : 60,
-             poll_interval_ms);
+             "Gamepad polling started at %u Hz (absolute-scheduled).", hz);
 
   while (!InterlockedCompareExchange(&plat->gamepad_stop_requested, 0, 0)) {
     uint64_t ts = win_get_timestamp_us();
@@ -280,7 +302,25 @@ static DWORD WINAPI gamepad_poll_thread_proc(LPVOID param) {
       }
     }
 
-    Sleep(poll_interval_ms);
+    // Advance the absolute deadline; wait the remainder on the stop event so
+    // a stop wakes us immediately. Resync if we fell more than one interval
+    // behind (long callback / scheduler stall) instead of bursting.
+    deadline.QuadPart += interval_ticks;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    LONGLONG remaining = deadline.QuadPart - now.QuadPart;
+    DWORD wait_ms = 0; // 0 also serves as a prompt stop-event check on the
+                       // resync / already-behind paths (was: only the top-of-
+                       // loop flag caught stop there).
+    if (remaining < -interval_ticks) {
+      deadline = now; // resync
+    } else if (remaining > 0) {
+      wait_ms = (DWORD)((remaining * 1000) / qpc_freq.QuadPart);
+    }
+    if (WaitForSingleObject(plat->gamepad_stop_event, wait_ms) ==
+        WAIT_OBJECT_0) {
+      break; // stop requested
+    }
   }
 
   miniav_log(MINIAV_LOG_LEVEL_INFO, "Gamepad polling stopped.");
@@ -298,11 +338,25 @@ static MiniAVResultCode input_win_destroy_platform(MiniAVInputContext *ctx) {
   if (ctx->platform_ctx) {
     InputPlatformWin *plat = (InputPlatformWin *)ctx->platform_ctx;
 
-    // Clear global pointer if it matches
-    if (g_active_input_platform == plat) {
-      g_active_input_platform = NULL;
+    // If capture is still running, stop it first. A stop timeout means a
+    // thread is still alive and dereferences plat — leak rather than free.
+    if (plat->hook_thread || plat->gamepad_thread) {
+      if (input_win_stop_capture(ctx) == MINIAV_ERROR_TIMEOUT) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "Input: a capture thread survived stop — leaking the "
+                   "platform context to avoid a use-after-free.");
+        return MINIAV_ERROR_TIMEOUT;
+      }
     }
 
+    // Release the process-wide active slot if it is still ours.
+    InterlockedCompareExchangePointer(
+        (void *volatile *)&g_active_input_platform, NULL, plat);
+
+    if (plat->gamepad_stop_event) {
+      CloseHandle(plat->gamepad_stop_event);
+      plat->gamepad_stop_event = NULL;
+    }
     miniav_free(plat);
     ctx->platform_ctx = NULL;
   }
@@ -392,11 +446,21 @@ static MiniAVResultCode input_win_start_capture(MiniAVInputContext *ctx) {
     return MINIAV_ERROR_NOT_INITIALIZED;
   }
 
-  // Set as the active platform for hook procs
-  g_active_input_platform = plat;
+  // Claim the single process-wide active slot. If another input context is
+  // already capturing, reject rather than hijack its callbacks.
+  if (InterlockedCompareExchangePointer((void *volatile *)&g_active_input_platform,
+                                        plat, NULL) != NULL) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "Input: another capture context is already active in this "
+               "process — only one is supported.");
+    return MINIAV_ERROR_ALREADY_RUNNING;
+  }
 
   InterlockedExchange(&plat->stop_requested, 0);
   InterlockedExchange(&plat->gamepad_stop_requested, 0);
+  if (plat->gamepad_stop_event) {
+    ResetEvent(plat->gamepad_stop_event);
+  }
 
   // Start hook thread for keyboard/mouse if needed
   if (plat->input_types & (MINIAV_INPUT_TYPE_KEYBOARD | MINIAV_INPUT_TYPE_MOUSE)) {
@@ -405,7 +469,8 @@ static MiniAVResultCode input_win_start_capture(MiniAVInputContext *ctx) {
     if (!plat->hook_thread) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "Failed to create hook thread, error: %lu", GetLastError());
-      g_active_input_platform = NULL;
+      InterlockedExchangePointer((void *volatile *)&g_active_input_platform,
+                                 NULL);
       return MINIAV_ERROR_SYSTEM_CALL_FAILED;
     }
   }
@@ -422,15 +487,16 @@ static MiniAVResultCode input_win_start_capture(MiniAVInputContext *ctx) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
                  "Failed to create gamepad polling thread, error: %lu",
                  GetLastError());
-      // Stop the hook thread if it was started
-      if (plat->hook_thread) {
-        InterlockedExchange(&plat->stop_requested, 1);
-        PostThreadMessageW(plat->hook_thread_id, WM_QUIT, 0, 0);
-        WaitForSingleObject(plat->hook_thread, 3000);
-        CloseHandle(plat->hook_thread);
-        plat->hook_thread = NULL;
+      // Roll back the (possibly-live) hook thread through stop_capture so it
+      // uses the retry-and-never-TerminateThread/never-CloseHandle-a-live-hook
+      // logic — the old inline single WM_QUIT + unconditional CloseHandle could
+      // close the handle of a hook thread still holding a systemwide hook.
+      // stop_capture also releases the active-context slot. (gamepad_thread is
+      // NULL here, so its branch is skipped.)
+      MiniAVResultCode stop_res = input_win_stop_capture(ctx);
+      if (stop_res == MINIAV_ERROR_TIMEOUT) {
+        return stop_res; // hook thread survived — caller must leak, not free
       }
-      g_active_input_platform = NULL;
       return MINIAV_ERROR_SYSTEM_CALL_FAILED;
     }
   }
@@ -444,38 +510,55 @@ static MiniAVResultCode input_win_stop_capture(MiniAVInputContext *ctx) {
     return MINIAV_ERROR_NOT_INITIALIZED;
   }
 
-  // Signal hook thread to stop
+  // Signal hook thread to stop. The thread is blocked in
+  // MsgWaitForMultipleObjects/PeekMessage, so a WM_QUIT reliably wakes it —
+  // retry the post a few times if the thread hasn't created its message queue
+  // yet, and NEVER TerminateThread it: a forced kill would skip
+  // UnhookWindowsHookEx and leave a dangling systemwide hook pointing at
+  // freed code.
   if (plat->hook_thread) {
     InterlockedExchange(&plat->stop_requested, 1);
-    PostThreadMessageW(plat->hook_thread_id, WM_QUIT, 0, 0);
-    DWORD wait_result = WaitForSingleObject(plat->hook_thread, 5000);
-    if (wait_result == WAIT_TIMEOUT) {
-      miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "Hook thread did not exit in time, terminating.");
-      TerminateThread(plat->hook_thread, 1);
+    BOOL exited = FALSE;
+    for (int attempt = 0; attempt < 10 && !exited; ++attempt) {
+      PostThreadMessageW(plat->hook_thread_id, WM_QUIT, 0, 0);
+      if (WaitForSingleObject(plat->hook_thread, 1000) == WAIT_OBJECT_0) {
+        exited = TRUE;
+      }
+    }
+    if (!exited) {
+      // Do NOT TerminateThread (would leak the OS hook). Leave the thread and
+      // handle; signal the caller so DestroyContext leaks the context rather
+      // than freeing memory the thread still uses.
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "Input: hook thread did not exit — leaving it to avoid a "
+                 "dangling systemwide hook.");
+      return MINIAV_ERROR_TIMEOUT;
     }
     CloseHandle(plat->hook_thread);
     plat->hook_thread = NULL;
     plat->hook_thread_id = 0;
   }
 
-  // Signal gamepad thread to stop
+  // Signal gamepad thread to stop (the poll wait watches gamepad_stop_event,
+  // so this wakes immediately).
   if (plat->gamepad_thread) {
     InterlockedExchange(&plat->gamepad_stop_requested, 1);
-    DWORD wait_result = WaitForSingleObject(plat->gamepad_thread, 5000);
-    if (wait_result == WAIT_TIMEOUT) {
-      miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "Gamepad thread did not exit in time, terminating.");
-      TerminateThread(plat->gamepad_thread, 1);
+    if (plat->gamepad_stop_event) {
+      SetEvent(plat->gamepad_stop_event);
+    }
+    if (WaitForSingleObject(plat->gamepad_thread, 5000) != WAIT_OBJECT_0) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "Input: gamepad thread did not exit — leaving it rather than "
+                 "force-terminating.");
+      return MINIAV_ERROR_TIMEOUT;
     }
     CloseHandle(plat->gamepad_thread);
     plat->gamepad_thread = NULL;
   }
 
-  // Clear global pointer
-  if (g_active_input_platform == plat) {
-    g_active_input_platform = NULL;
-  }
+  // Release the process-wide active slot.
+  InterlockedCompareExchangePointer((void *volatile *)&g_active_input_platform,
+                                    NULL, plat);
 
   return MINIAV_SUCCESS;
 }
@@ -497,6 +580,16 @@ miniav_input_context_platform_init_windows(MiniAVInputContext *ctx) {
       (InputPlatformWin *)miniav_calloc(1, sizeof(InputPlatformWin));
   if (!plat) {
     return MINIAV_ERROR_OUT_OF_MEMORY;
+  }
+
+  // Auto-reset event so stop_capture can wake the gamepad poll wait promptly.
+  plat->gamepad_stop_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+  if (!plat->gamepad_stop_event) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "Input: failed to create gamepad stop event: %lu",
+               GetLastError());
+    miniav_free(plat);
+    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
   }
 
   ctx->platform_ctx = plat;

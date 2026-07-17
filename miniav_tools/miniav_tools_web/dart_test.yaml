@@ -1,9 +1,0 @@
-tags:
-  # Tests tagged 'browser' run only on Chrome/browser platforms.
-  # Run with: dart test -p chrome --tags browser
-  browser:
-    test_on: browser
-
-  # Tests tagged 'webgpu' require --enable-unsafe-webgpu (or a capable GPU).
-  webgpu:
-    test_on: chrome

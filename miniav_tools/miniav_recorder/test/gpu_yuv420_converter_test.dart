@@ -1,6 +1,8 @@
-/// Byte-parity test for [GpuYuv420Converter]: the minigpu RGBA→YUV420P (BT.601
-/// limited, u8) compute shader must produce output byte-identical to the legacy
-/// CPU per-pixel conversion in `miniav_tools_ffmpeg` (`_rgbaToYuv420p`).
+/// Byte-parity test for [GpuYuv420Converter] (now the canonical
+/// `GpuRgbaToYuv420Converter` from miniav_tools_codecs): the compute shader
+/// must produce output byte-identical to the shared pure-Dart reference
+/// (`dartRgbaToI420`, itself byte-exact against the C converter) — one
+/// canonical BT.601-limited encode-side conversion across CPU, C and GPU.
 ///
 /// Runs the real minigpu compute path headless on the VM. Skips gracefully if a
 /// GPU/Dawn device is unavailable in the environment.
@@ -11,48 +13,10 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:miniav_recorder/miniav_recorder.dart';
+import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart'
+    show dartRgbaToI420;
 import 'package:miniav_recorder/src/gpu_yuv420_converter.dart';
 import 'package:test/test.dart';
-
-/// CPU reference — copied verbatim (RGBA path) from
-/// miniav_tools_ffmpeg/lib/src/pixel_convert.dart `_rgbaToYuv420p`. BT.601
-/// limited, ×8192 fixed-point. If that implementation changes, update this.
-({Uint8List y, Uint8List u, Uint8List v}) _cpuYuv420(
-  Uint8List rgba,
-  int w,
-  int h,
-) {
-  int c255(int x) => x < 0 ? 0 : (x > 255 ? 255 : x);
-  final cw = w ~/ 2;
-  final ch = h ~/ 2;
-  final y = Uint8List(w * h);
-  final u = Uint8List(cw * ch);
-  final v = Uint8List(cw * ch);
-  for (var row = 0; row < h; row++) {
-    for (var col = 0; col < w; col++) {
-      final p = (row * w + col) * 4;
-      final r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
-      y[row * w + col] =
-          c255((2105 * r + 4128 * g + 803 * b + (16 << 13) + 4096) >> 13);
-    }
-  }
-  for (var row = 0; row < ch; row++) {
-    for (var col = 0; col < cw; col++) {
-      final p0 = (row * 2 * w + col * 2) * 4;
-      final p1 = p0 + 4;
-      final p2 = ((row * 2 + 1) * w + col * 2) * 4;
-      final p3 = p2 + 4;
-      final r = (rgba[p0] + rgba[p1] + rgba[p2] + rgba[p3]) >> 2;
-      final g = (rgba[p0 + 1] + rgba[p1 + 1] + rgba[p2 + 1] + rgba[p3 + 1]) >> 2;
-      final b = (rgba[p0 + 2] + rgba[p1 + 2] + rgba[p2 + 2] + rgba[p3 + 2]) >> 2;
-      u[row * cw + col] =
-          c255((-1212 * r - 2384 * g + 3596 * b + (128 << 13) + 4096) >> 13);
-      v[row * cw + col] =
-          c255((3596 * r - 3015 * g - 581 * b + (128 << 13) + 4096) >> 13);
-    }
-  }
-  return (y: y, u: u, v: v);
-}
 
 Uint8List _syntheticRgba(int w, int h) {
   final rgba = Uint8List(w * h * 4);
@@ -101,7 +65,7 @@ void main() {
       const w = 64;
       const h = 32;
       final rgba = _syntheticRgba(w, h);
-      final expected = _cpuYuv420(rgba, w, h);
+      final expected = dartRgbaToI420(rgba, w, h);
 
       final conv = GpuYuv420Converter(gpu);
       final gotY = Uint8List(GpuYuv420Converter.ySize(w, h));
@@ -125,26 +89,30 @@ void main() {
       }
     });
 
-    test('rejects odd dimensions', () async {
+    test('odd dimensions edge-replicate to match the CPU reference',
+        () async {
       await Recorder.ensureSharedGpu();
       final gpu = Recorder.sharedGpu;
       if (gpu == null) {
         markTestSkipped('No GPU/Dawn device available in this environment');
         return;
       }
+      const w = 63, h = 31;
+      final rgba = Uint8List(w * h * 4);
+      for (var i = 0; i < rgba.length; i++) {
+        rgba[i] = (i * 37) & 0xff;
+      }
+      final expected = dartRgbaToI420(rgba, w, h);
       final conv = GpuYuv420Converter(gpu);
       addTearDown(conv.dispose);
-      expect(
-        () => conv.convertFromBytes(
-          Uint8List(63 * 32 * 4),
-          63,
-          32,
-          outY: Uint8List(63 * 32),
-          outU: Uint8List(31 * 16),
-          outV: Uint8List(31 * 16),
-        ),
-        throwsArgumentError,
-      );
+      final gotY = Uint8List(GpuYuv420Converter.ySize(w, h));
+      final gotU = Uint8List(GpuYuv420Converter.uvSize(w, h));
+      final gotV = Uint8List(GpuYuv420Converter.uvSize(w, h));
+      await conv.convertFromBytes(rgba, w, h,
+          outY: gotY, outU: gotU, outV: gotV);
+      expect(gotY, equals(expected.y));
+      expect(gotU, equals(expected.u));
+      expect(gotV, equals(expected.v));
     });
   });
 }

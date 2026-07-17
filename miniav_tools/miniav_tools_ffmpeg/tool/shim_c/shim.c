@@ -15,6 +15,7 @@
  */
 
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
 #include <libavutil/buffer.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/frame.h>
@@ -25,6 +26,10 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef _WIN32
+  #include <pthread.h>
+#endif
 
 #ifdef _WIN32
   #define COBJMACROS
@@ -954,6 +959,620 @@ MIO_API void miniav_shim_audio_frame_set_pts(AVFrame* f, int64_t pts) {
     if (f) f->pts = pts;
 }
 
+/* Copy [size] bytes of codec-private data (H.264 avcC, AAC ASC, OpusHead,
+ * …) into ctx->extradata, av_mallocz'd with the decode-side padding
+ * libavcodec requires. The context owns the allocation —
+ * avcodec_free_context() frees it. Call BEFORE avcodec_open2(). */
+MIO_API int miniav_shim_codec_set_extradata(AVCodecContext* ctx,
+                                            const uint8_t* data,
+                                            int size) {
+    if (!ctx || !data || size <= 0) return AVERROR(EINVAL);
+    uint8_t* buf =
+        (uint8_t*)av_mallocz((size_t)size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!buf) return AVERROR(ENOMEM);
+    memcpy(buf, data, (size_t)size);
+    av_freep(&ctx->extradata);
+    ctx->extradata = buf;
+    ctx->extradata_size = size;
+    return 0;
+}
+
+/* Audio field readers for decoded AVFrames. The Dart-side AVFrame struct
+ * mapping stops at pkt_dts; sample_rate / ch_layout live beyond it, so
+ * read them here where the compiler knows the real layout. */
+MIO_API int miniav_shim_frame_sample_rate(const AVFrame* f) {
+    return f ? f->sample_rate : 0;
+}
+
+MIO_API int miniav_shim_frame_nb_channels(const AVFrame* f) {
+    return f ? f->ch_layout.nb_channels : 0;
+}
+
+/* Colour metadata for decoded VIDEO AVFrames (same beyond-pkt_dts reasoning
+ * as the audio readers above). Returns the raw AVColorSpace / AVColorRange
+ * enum values (stable public API ints: colorspace BT709=1, UNSPECIFIED=2,
+ * BT470BG=5, SMPTE170M=6, BT2020_NCL=9/CL=10; range MPEG/limited=1,
+ * JPEG/full=2) so the Dart side can pick the matching YUV->RGB matrix. */
+MIO_API int miniav_shim_frame_colorspace(const AVFrame* f) {
+    return f ? (int)f->colorspace : 2 /* AVCOL_SPC_UNSPECIFIED */;
+}
+
+MIO_API int miniav_shim_frame_color_range(const AVFrame* f) {
+    return f ? (int)f->color_range : 0 /* AVCOL_RANGE_UNSPECIFIED */;
+}
+
+/* --- Demux: blocking byte pipe + custom-IO open helpers (ABI v15) --------
+ *
+ * The pipe feeds libavformat from a live byte stream (progressive fMP4/MKV
+ * from the network, a recorder chunk stream, …). The FEED side (any thread /
+ * the Dart main isolate via FFI) writes without blocking — a full ring
+ * returns a short count. The READ side is `mio_pipe_read_cb`, called by
+ * libavformat inside `av_read_frame` on the demuxer's worker isolate; it
+ * BLOCKS until bytes arrive or the pipe is closed (→ AVERROR_EOF). Closing
+ * the pipe is therefore also the way to unblock a starved worker before
+ * shutting the demuxer down.
+ */
+
+typedef struct MioBytePipe {
+    uint8_t* buf;
+    size_t cap;
+    size_t head;   /* read position */
+    size_t count;  /* bytes buffered */
+    int closed;
+#ifdef _WIN32
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE cv;
+#else
+    pthread_mutex_t lock;
+    pthread_cond_t cv;
+#endif
+} MioBytePipe;
+
+static void mio_pipe_lock(MioBytePipe* p) {
+#ifdef _WIN32
+    EnterCriticalSection(&p->lock);
+#else
+    pthread_mutex_lock(&p->lock);
+#endif
+}
+
+static void mio_pipe_unlock(MioBytePipe* p) {
+#ifdef _WIN32
+    LeaveCriticalSection(&p->lock);
+#else
+    pthread_mutex_unlock(&p->lock);
+#endif
+}
+
+static void mio_pipe_wait(MioBytePipe* p) {
+#ifdef _WIN32
+    SleepConditionVariableCS(&p->cv, &p->lock, INFINITE);
+#else
+    pthread_cond_wait(&p->cv, &p->lock);
+#endif
+}
+
+static void mio_pipe_signal(MioBytePipe* p) {
+#ifdef _WIN32
+    WakeAllConditionVariable(&p->cv);
+#else
+    pthread_cond_broadcast(&p->cv);
+#endif
+}
+
+MIO_API void* miniav_shim_bytepipe_create(int64_t capacity) {
+    if (capacity <= 0) capacity = 16LL * 1024 * 1024;
+    MioBytePipe* p = (MioBytePipe*)calloc(1, sizeof(MioBytePipe));
+    if (!p) return NULL;
+    p->buf = (uint8_t*)malloc((size_t)capacity);
+    if (!p->buf) {
+        free(p);
+        return NULL;
+    }
+    p->cap = (size_t)capacity;
+#ifdef _WIN32
+    InitializeCriticalSection(&p->lock);
+    InitializeConditionVariable(&p->cv);
+#else
+    pthread_mutex_init(&p->lock, NULL);
+    pthread_cond_init(&p->cv, NULL);
+#endif
+    return p;
+}
+
+/* Copy up to [len] bytes in; returns bytes accepted (0 = ring full — retry
+ * later), or -1 if the pipe was already closed. Never blocks. */
+MIO_API int32_t miniav_shim_bytepipe_write(void* pipe,
+                                           const uint8_t* data,
+                                           int32_t len) {
+    MioBytePipe* p = (MioBytePipe*)pipe;
+    if (!p || !data || len < 0) return -1;
+    mio_pipe_lock(p);
+    if (p->closed) {
+        mio_pipe_unlock(p);
+        return -1;
+    }
+    size_t space = p->cap - p->count;
+    size_t n = ((size_t)len < space) ? (size_t)len : space;
+    if (n > 0) {
+        size_t wpos = (p->head + p->count) % p->cap;
+        size_t first = p->cap - wpos;
+        if (first > n) first = n;
+        memcpy(p->buf + wpos, data, first);
+        if (n > first) memcpy(p->buf, data + first, n - first);
+        p->count += n;
+        mio_pipe_signal(p);
+    }
+    mio_pipe_unlock(p);
+    return (int32_t)n;
+}
+
+MIO_API int64_t miniav_shim_bytepipe_buffered(void* pipe) {
+    MioBytePipe* p = (MioBytePipe*)pipe;
+    if (!p) return 0;
+    mio_pipe_lock(p);
+    int64_t v = (int64_t)p->count;
+    mio_pipe_unlock(p);
+    return v;
+}
+
+/* End-of-stream: the reader drains what is buffered, then sees EOF. Also
+ * unblocks a reader currently waiting for data. Idempotent. */
+MIO_API void miniav_shim_bytepipe_close(void* pipe) {
+    MioBytePipe* p = (MioBytePipe*)pipe;
+    if (!p) return;
+    mio_pipe_lock(p);
+    p->closed = 1;
+    mio_pipe_signal(p);
+    mio_pipe_unlock(p);
+}
+
+/* Free the pipe. Only call after the demuxer using it has been closed
+ * (no reader can be blocked inside the pipe). */
+MIO_API void miniav_shim_bytepipe_destroy(void* pipe) {
+    MioBytePipe* p = (MioBytePipe*)pipe;
+    if (!p) return;
+#ifdef _WIN32
+    DeleteCriticalSection(&p->lock);
+#else
+    pthread_mutex_destroy(&p->lock);
+    pthread_cond_destroy(&p->cv);
+#endif
+    free(p->buf);
+    free(p);
+}
+
+/* Non-blocking read (drain side of an OUTPUT pipe — the muxer's write
+ * callback fills the ring, Dart drains it after every muxer call).
+ * Returns bytes copied (0 when empty), or -1 on bad args. */
+MIO_API int32_t miniav_shim_bytepipe_read(void* pipe,
+                                          uint8_t* dst,
+                                          int32_t max_len) {
+    MioBytePipe* p = (MioBytePipe*)pipe;
+    if (!p || !dst || max_len <= 0) return -1;
+    mio_pipe_lock(p);
+    size_t n = ((size_t)max_len < p->count) ? (size_t)max_len : p->count;
+    if (n > 0) {
+        size_t first = p->cap - p->head;
+        if (first > n) first = n;
+        memcpy(dst, p->buf + p->head, first);
+        if (n > first) memcpy(dst + first, p->buf, n - first);
+        p->head = (p->head + n) % p->cap;
+        p->count -= n;
+    }
+    mio_pipe_unlock(p);
+    return (int32_t)n;
+}
+
+/* AVIO read callback over a MioBytePipe. Blocks until ≥1 byte or EOF. */
+static int mio_pipe_read_cb(void* opaque, uint8_t* dst, int dst_size) {
+    MioBytePipe* p = (MioBytePipe*)opaque;
+    if (!p || !dst || dst_size <= 0) return AVERROR(EINVAL);
+    mio_pipe_lock(p);
+    while (p->count == 0 && !p->closed) {
+        mio_pipe_wait(p);
+    }
+    if (p->count == 0) { /* closed + drained */
+        mio_pipe_unlock(p);
+        return AVERROR_EOF;
+    }
+    size_t n = ((size_t)dst_size < p->count) ? (size_t)dst_size : p->count;
+    size_t first = p->cap - p->head;
+    if (first > n) first = n;
+    memcpy(dst, p->buf + p->head, first);
+    if (n > first) memcpy(dst + first, p->buf, n - first);
+    p->head = (p->head + n) % p->cap;
+    p->count -= n;
+    mio_pipe_unlock(p);
+    return (int)n;
+}
+
+/* AVIO write callback over a MioBytePipe (muxer → pipe → Dart drain).
+ * All-or-error: a full ring means the drain cadence / capacity is wrong —
+ * surface ENOSPC rather than silently truncating the container. */
+#if LIBAVFORMAT_VERSION_MAJOR >= 61
+static int mio_pipe_write_cb(void* opaque, const uint8_t* buf, int buf_size) {
+#else
+static int mio_pipe_write_cb(void* opaque, uint8_t* buf, int buf_size) {
+#endif
+    if (buf_size <= 0) return 0;
+    int32_t w = miniav_shim_bytepipe_write(opaque, buf, buf_size);
+    if (w < 0) return AVERROR_EOF;
+    if (w != buf_size) return AVERROR(ENOSPC);
+    return buf_size;
+}
+
+/* --- Seekable in-memory output sink (BytesMuxerOutput) -------------------
+ * Plain MP4 (moov rewrite / +faststart) requires a SEEKABLE output; a whole
+ * in-memory file is naturally seekable, so bytes outputs mux into this
+ * growable buffer instead of the streaming ring. */
+
+typedef struct MioMemSink {
+    uint8_t* buf;
+    size_t size; /* high-water mark = file size */
+    size_t cap;
+    size_t pos;  /* current write position */
+} MioMemSink;
+
+MIO_API void* miniav_shim_memsink_create(void) {
+    MioMemSink* s = (MioMemSink*)calloc(1, sizeof(MioMemSink));
+    return s;
+}
+
+static int mio_memsink_ensure(MioMemSink* s, size_t need) {
+    if (need <= s->cap) return 0;
+    size_t cap = s->cap ? s->cap : (256 * 1024);
+    while (cap < need) cap *= 2;
+    uint8_t* nb = (uint8_t*)realloc(s->buf, cap);
+    if (!nb) return -1;
+    /* zero the gap so sparse seeks past EOF read as zeros */
+    memset(nb + s->cap, 0, cap - s->cap);
+    s->buf = nb;
+    s->cap = cap;
+    return 0;
+}
+
+#if LIBAVFORMAT_VERSION_MAJOR >= 61
+static int mio_memsink_write_cb(void* opaque, const uint8_t* buf, int n) {
+#else
+static int mio_memsink_write_cb(void* opaque, uint8_t* buf, int n) {
+#endif
+    MioMemSink* s = (MioMemSink*)opaque;
+    if (n <= 0) return 0;
+    if (mio_memsink_ensure(s, s->pos + (size_t)n) != 0) {
+        return AVERROR(ENOMEM);
+    }
+    memcpy(s->buf + s->pos, buf, (size_t)n);
+    s->pos += (size_t)n;
+    if (s->pos > s->size) s->size = s->pos;
+    return n;
+}
+
+static int64_t mio_memsink_seek_cb(void* opaque, int64_t offset, int whence) {
+    MioMemSink* s = (MioMemSink*)opaque;
+    if (whence & AVSEEK_SIZE) return (int64_t)s->size;
+    whence &= ~AVSEEK_FORCE;
+    int64_t next;
+    switch (whence) {
+        case SEEK_SET: next = offset; break;
+        case SEEK_CUR: next = (int64_t)s->pos + offset; break;
+        case SEEK_END: next = (int64_t)s->size + offset; break;
+        default: return AVERROR(EINVAL);
+    }
+    if (next < 0) return AVERROR(EINVAL);
+    s->pos = (size_t)next;
+    return next;
+}
+
+/* mov's +faststart pass reads back what it just wrote (shift_data), so the
+ * sink AVIO must be readable too. */
+static int mio_memsink_read_cb(void* opaque, uint8_t* dst, int dst_size) {
+    MioMemSink* s = (MioMemSink*)opaque;
+    if (!s || !dst || dst_size <= 0) return AVERROR(EINVAL);
+    if (s->pos >= s->size) return AVERROR_EOF;
+    size_t n = s->size - s->pos;
+    if (n > (size_t)dst_size) n = (size_t)dst_size;
+    memcpy(dst, s->buf + s->pos, n);
+    s->pos += n;
+    return (int)n;
+}
+
+MIO_API AVIOContext* miniav_shim_avio_out_memsink_create(void* sink) {
+    const int kIoBufSize = 64 * 1024;
+    if (!sink) return NULL;
+    uint8_t* iobuf = (uint8_t*)av_malloc(kIoBufSize);
+    if (!iobuf) return NULL;
+    AVIOContext* avio = avio_alloc_context(iobuf, kIoBufSize, /*write*/ 1,
+                                           sink, mio_memsink_read_cb,
+                                           mio_memsink_write_cb,
+                                           mio_memsink_seek_cb);
+    if (!avio) {
+        av_free(iobuf);
+        return NULL;
+    }
+    return avio;
+}
+
+/* --- Seekable in-memory INPUT (bytes demuxing) ----------------------------
+ * A fully-buffered container must be SEEKABLE (a moov-at-end MP4 cannot be
+ * probed through a forward-only pipe), so bytes inputs demux from a C-owned
+ * copy with read+seek callbacks. */
+
+typedef struct MioMemSrc {
+    uint8_t* buf;
+    size_t size;
+    size_t pos;
+} MioMemSrc;
+
+static int mio_memsrc_read_cb(void* opaque, uint8_t* dst, int dst_size) {
+    MioMemSrc* s = (MioMemSrc*)opaque;
+    if (!s || !dst || dst_size <= 0) return AVERROR(EINVAL);
+    if (s->pos >= s->size) return AVERROR_EOF;
+    size_t n = s->size - s->pos;
+    if (n > (size_t)dst_size) n = (size_t)dst_size;
+    memcpy(dst, s->buf + s->pos, n);
+    s->pos += n;
+    return (int)n;
+}
+
+static int64_t mio_memsrc_seek_cb(void* opaque, int64_t offset, int whence) {
+    MioMemSrc* s = (MioMemSrc*)opaque;
+    if (whence & AVSEEK_SIZE) return (int64_t)s->size;
+    whence &= ~AVSEEK_FORCE;
+    int64_t next;
+    switch (whence) {
+        case SEEK_SET: next = offset; break;
+        case SEEK_CUR: next = (int64_t)s->pos + offset; break;
+        case SEEK_END: next = (int64_t)s->size + offset; break;
+        default: return AVERROR(EINVAL);
+    }
+    if (next < 0 || (size_t)next > s->size) return AVERROR(EINVAL);
+    s->pos = (size_t)next;
+    return next;
+}
+
+/* Open + probe a demuxer over a C-owned COPY of [data]. Close with
+ * miniav_shim_close_input_bytes (frees the copy). */
+MIO_API AVFormatContext* miniav_shim_open_input_bytes(const uint8_t* data,
+                                                      int64_t len,
+                                                      int32_t* err_out) {
+    const int kIoBufSize = 64 * 1024;
+    if (err_out) *err_out = AVERROR(EINVAL);
+    if (!data || len <= 0) return NULL;
+    MioMemSrc* src = (MioMemSrc*)calloc(1, sizeof(MioMemSrc));
+    if (!src) {
+        if (err_out) *err_out = AVERROR(ENOMEM);
+        return NULL;
+    }
+    src->buf = (uint8_t*)malloc((size_t)len);
+    if (!src->buf) {
+        free(src);
+        if (err_out) *err_out = AVERROR(ENOMEM);
+        return NULL;
+    }
+    memcpy(src->buf, data, (size_t)len);
+    src->size = (size_t)len;
+
+    uint8_t* iobuf = (uint8_t*)av_malloc(kIoBufSize);
+    AVIOContext* avio = iobuf
+        ? avio_alloc_context(iobuf, kIoBufSize, 0, src, mio_memsrc_read_cb,
+                             NULL, mio_memsrc_seek_cb)
+        : NULL;
+    AVFormatContext* fmt = avio ? avformat_alloc_context() : NULL;
+    if (!fmt) {
+        if (avio) {
+            av_freep(&avio->buffer);
+            avio_context_free(&avio);
+        } else if (iobuf) {
+            av_free(iobuf);
+        }
+        free(src->buf);
+        free(src);
+        if (err_out) *err_out = AVERROR(ENOMEM);
+        return NULL;
+    }
+    fmt->pb = avio;
+    fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    int ret = avformat_open_input(&fmt, NULL, NULL, NULL);
+    if (ret < 0) {
+        av_freep(&avio->buffer);
+        avio_context_free(&avio);
+        free(src->buf);
+        free(src);
+        if (err_out) *err_out = ret;
+        return NULL;
+    }
+    ret = avformat_find_stream_info(fmt, NULL);
+    if (ret < 0) {
+        AVIOContext* pb = fmt->pb;
+        avformat_close_input(&fmt);
+        av_freep(&pb->buffer);
+        avio_context_free(&pb);
+        free(src->buf);
+        free(src);
+        if (err_out) *err_out = ret;
+        return NULL;
+    }
+    if (err_out) *err_out = 0;
+    return fmt;
+}
+
+/* Close a bytes-opened input: also frees the C-owned data copy. */
+MIO_API void miniav_shim_close_input_bytes(AVFormatContext* fmt) {
+    if (!fmt) return;
+    AVIOContext* pb = (fmt->flags & AVFMT_FLAG_CUSTOM_IO) ? fmt->pb : NULL;
+    MioMemSrc* src = pb ? (MioMemSrc*)pb->opaque : NULL;
+    avformat_close_input(&fmt);
+    if (pb) {
+        av_freep(&pb->buffer);
+        avio_context_free(&pb);
+    }
+    if (src) {
+        free(src->buf);
+        free(src);
+    }
+}
+
+MIO_API int64_t miniav_shim_memsink_size(void* sink) {
+    MioMemSink* s = (MioMemSink*)sink;
+    return s ? (int64_t)s->size : 0;
+}
+
+MIO_API int32_t miniav_shim_memsink_read(void* sink,
+                                         int64_t offset,
+                                         uint8_t* dst,
+                                         int32_t max_len) {
+    MioMemSink* s = (MioMemSink*)sink;
+    if (!s || !dst || offset < 0 || max_len <= 0) return -1;
+    if ((size_t)offset >= s->size) return 0;
+    size_t n = s->size - (size_t)offset;
+    if (n > (size_t)max_len) n = (size_t)max_len;
+    memcpy(dst, s->buf + offset, n);
+    return (int32_t)n;
+}
+
+MIO_API void miniav_shim_memsink_destroy(void* sink) {
+    MioMemSink* s = (MioMemSink*)sink;
+    if (!s) return;
+    free(s->buf);
+    free(s);
+}
+
+/* Writable AVIOContext over a byte pipe, for muxing to bytes/callback
+ * outputs. Wire into AVFormatContext.pb; free with
+ * miniav_shim_avio_out_free (never avio_closep — we own the buffer). */
+MIO_API AVIOContext* miniav_shim_avio_out_pipe_create(void* pipe) {
+    const int kIoBufSize = 64 * 1024;
+    if (!pipe) return NULL;
+    uint8_t* iobuf = (uint8_t*)av_malloc(kIoBufSize);
+    if (!iobuf) return NULL;
+    AVIOContext* avio = avio_alloc_context(iobuf, kIoBufSize, /*write*/ 1,
+                                           pipe, NULL, mio_pipe_write_cb,
+                                           NULL);
+    if (!avio) {
+        av_free(iobuf);
+        return NULL;
+    }
+    return avio;
+}
+
+MIO_API void miniav_shim_avio_out_free(AVIOContext* avio) {
+    if (!avio) return;
+    av_freep(&avio->buffer);
+    avio_context_free(&avio);
+}
+
+/* Open a demuxer over a byte pipe (custom AVIO, non-seekable) and probe
+ * streams. Returns NULL with *err_out set on failure. */
+MIO_API AVFormatContext* miniav_shim_open_input_pipe(void* pipe,
+                                                     int32_t* err_out) {
+    const int kIoBufSize = 64 * 1024;
+    if (err_out) *err_out = AVERROR(EINVAL);
+    if (!pipe) return NULL;
+    uint8_t* iobuf = (uint8_t*)av_malloc(kIoBufSize);
+    if (!iobuf) {
+        if (err_out) *err_out = AVERROR(ENOMEM);
+        return NULL;
+    }
+    AVIOContext* avio = avio_alloc_context(iobuf, kIoBufSize, 0, pipe,
+                                           mio_pipe_read_cb, NULL, NULL);
+    if (!avio) {
+        av_free(iobuf);
+        if (err_out) *err_out = AVERROR(ENOMEM);
+        return NULL;
+    }
+    AVFormatContext* fmt = avformat_alloc_context();
+    if (!fmt) {
+        av_freep(&avio->buffer);
+        avio_context_free(&avio);
+        if (err_out) *err_out = AVERROR(ENOMEM);
+        return NULL;
+    }
+    fmt->pb = avio;
+    fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    int ret = avformat_open_input(&fmt, NULL, NULL, NULL);
+    if (ret < 0) {
+        /* avformat_open_input frees fmt on failure; the avio is ours. */
+        av_freep(&avio->buffer);
+        avio_context_free(&avio);
+        if (err_out) *err_out = ret;
+        return NULL;
+    }
+    ret = avformat_find_stream_info(fmt, NULL);
+    if (ret < 0) {
+        AVIOContext* pb = fmt->pb;
+        avformat_close_input(&fmt);
+        av_freep(&pb->buffer);
+        avio_context_free(&pb);
+        if (err_out) *err_out = ret;
+        return NULL;
+    }
+    if (err_out) *err_out = 0;
+    return fmt;
+}
+
+/* Open a demuxer over a URL/file path and probe streams. */
+MIO_API AVFormatContext* miniav_shim_open_input_url(const char* url,
+                                                    int32_t* err_out) {
+    if (err_out) *err_out = AVERROR(EINVAL);
+    if (!url) return NULL;
+    AVFormatContext* fmt = NULL;
+    int ret = avformat_open_input(&fmt, url, NULL, NULL);
+    if (ret < 0) {
+        if (err_out) *err_out = ret;
+        return NULL;
+    }
+    ret = avformat_find_stream_info(fmt, NULL);
+    if (ret < 0) {
+        avformat_close_input(&fmt);
+        if (err_out) *err_out = ret;
+        return NULL;
+    }
+    if (err_out) *err_out = 0;
+    return fmt;
+}
+
+/* Close either flavour. Frees the custom AVIO for pipe inputs (with
+ * AVFMT_FLAG_CUSTOM_IO, avformat_close_input leaves pb to the caller). */
+MIO_API void miniav_shim_close_input(AVFormatContext* fmt) {
+    if (!fmt) return;
+    AVIOContext* pb = (fmt->flags & AVFMT_FLAG_CUSTOM_IO) ? fmt->pb : NULL;
+    avformat_close_input(&fmt);
+    if (pb) {
+        av_freep(&pb->buffer);
+        avio_context_free(&pb);
+    }
+}
+
+/* Field readers beyond the Dart-mapped AVFormatContext prefix. */
+MIO_API int32_t miniav_shim_fmt_nb_streams(const AVFormatContext* f) {
+    return f ? (int32_t)f->nb_streams : 0;
+}
+
+MIO_API AVStream* miniav_shim_fmt_stream(const AVFormatContext* f, int32_t i) {
+    if (!f || i < 0 || (unsigned)i >= f->nb_streams) return NULL;
+    return f->streams[i];
+}
+
+/* Container duration in µs (AV_TIME_BASE == 1e6), or -1 if unknown
+ * (typical for live pipe inputs). */
+MIO_API int64_t miniav_shim_fmt_duration_us(const AVFormatContext* f) {
+    return (f && f->duration > 0) ? f->duration : -1;
+}
+
+MIO_API int32_t miniav_shim_fmt_is_seekable(const AVFormatContext* f) {
+    return (f && f->pb && f->pb->seekable) ? 1 : 0;
+}
+
+/* AVCodecParameters audio fields — beyond the Dart-mapped prefix. */
+MIO_API int32_t miniav_shim_par_sample_rate(const AVCodecParameters* p) {
+    return p ? p->sample_rate : 0;
+}
+
+MIO_API int32_t miniav_shim_par_nb_channels(const AVCodecParameters* p) {
+    return p ? p->ch_layout.nb_channels : 0;
+}
+
 /* --- Sanity / version ------------------------------------------------- */
 
 MIO_API unsigned miniav_shim_avcodec_version(void) {
@@ -1354,7 +1973,12 @@ MIO_API void miniav_shim_d3d11va_frames_set_bind_flags(AVBufferRef* ref,
 #endif /* _WIN32 (VP section) */
 
 MIO_API unsigned miniav_shim_abi_version(void) {
-    return 13u;
+    /* v17: the mf_decoder.c hardware H.264/HEVC → D3D11 NV12 decode session
+     * (miniav_shim_mfdec_*) MOVED to the standalone, FFmpeg-free
+     * miniav_tools_codecs_native asset — this shim no longer exports it. */
+    /* v18: miniav_shim_frame_colorspace / _color_range (AVFrame colour
+     * metadata readers for the BT.601/709 + limited/full matrix selection). */
+    return 18u;
 }
 
 /* --- FFmpeg log forwarding ------------------------------------------------

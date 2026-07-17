@@ -13,3 +13,5 @@ dependency_overrides:
     path: ../../../minigpu/minigpu
   minigpu_ffi:
     path: ../../../minigpu/minigpu_ffi
+  minigpu_web:
+    path: ../../../minigpu/minigpu_web

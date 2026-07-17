@@ -28,8 +28,14 @@ export 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 export 'src/ffmpeg_backend.dart' show FfmpegBackend;
 export 'src/ffmpeg_bindings.dart'
     show ensureFFmpegLoaded, tryLoadFFmpeg, ffmpegLoadedLibDir;
+export 'src/ffmpeg_audio_decoder.dart' show FfmpegAudioDecoder;
 export 'src/ffmpeg_audio_encoder.dart' show FfmpegAudioEncoder;
+export 'src/ffmpeg_decoder.dart' show FfmpegSoftwareDecoder;
+export 'src/ffmpeg_demuxer.dart' show FfmpegDemuxer;
 export 'src/ffmpeg_encoder.dart' show FfmpegSoftwareEncoder;
+export 'src/isolate_decoder.dart'
+    show IsolateVideoDecoder, IsolateAudioDecoder;
+export 'src/isolate_demuxer.dart' show IsolateDemuxer;
 export 'src/isolate_software_encoder.dart' show IsolateSoftwareEncoder;
 export 'src/ffmpeg_muxer.dart' show FfmpegMuxer, FfmpegEncoderBridge;
 export 'src/ffmpeg_nvenc_encoder.dart'
@@ -72,6 +78,9 @@ import 'src/ffmpeg_backend.dart';
 ///
 /// Must be called before `MiniAVTools.createEncoder` / `MiniAVTools.warmup()`
 /// can pick this backend. `miniav_recorder` calls it automatically.
+///
+/// The Media Foundation hardware **decode** backend moved to
+/// `miniav_tools_codecs` (`registerMfDecodeBackend`) — it's FFmpeg-free.
 bool registerFfmpegBackend() {
   final existing = MiniAVToolsPlatform.instance.backends.any(
     (b) => b.name == FfmpegBackend.backendName,

@@ -298,9 +298,19 @@ class MiniAVMouseEvent {
   final int y;
   final int deltaX;
   final int deltaY;
+
+  /// Vertical scroll wheel delta (+ = up/away).
   final int wheelDelta;
+
+  /// Horizontal scroll wheel delta (+ = right).
+  final int wheelDeltaX;
   final MiniAVMouseAction action;
   final MiniAVMouseButton button;
+
+  /// Capture always reports absolute coords (true). For injection: true = move
+  /// to absolute (x, y); false = move by (deltaX, deltaY). Ignored for
+  /// button/wheel actions.
+  final bool isAbsolute;
 
   MiniAVMouseEvent({
     required this.timestampUs,
@@ -311,6 +321,8 @@ class MiniAVMouseEvent {
     required this.wheelDelta,
     required this.action,
     required this.button,
+    this.wheelDeltaX = 0,
+    this.isAbsolute = true,
   });
 }
 

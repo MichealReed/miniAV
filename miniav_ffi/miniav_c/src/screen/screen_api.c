@@ -4,7 +4,15 @@
 #include "screen_context.h"
 #include <string.h> // For memset, memcpy
 
-// Platform-specific includes and external declarations for backend table
+// Platform-specific includes and external declarations for backend table.
+// Gate specificity: Android defines __linux__ and iOS defines __APPLE__ —
+// the mobile backends take the #if arm and desktop entries sit in the #elif
+// arm (a bare gate would reference desktop ops symbols not compiled on
+// mobile → link error).
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #ifdef _WIN32
 #include "windows/screen_context_win_wgc.h"
 extern const ScreenContextInternalOps g_screen_ops_win_wgc;
@@ -15,13 +23,24 @@ extern const ScreenContextInternalOps g_screen_ops_win_dxgi;
 extern MiniAVResultCode
 miniav_screen_context_platform_init_windows_dxgi(MiniAVScreenContext *ctx);
 #endif
-#ifdef __linux__
+#if defined(__ANDROID__)
+#include "android/screen_context_android_mediaprojection.h"
+extern const ScreenContextInternalOps g_screen_ops_android_mediaprojection;
+extern MiniAVResultCode
+miniav_screen_context_platform_init_android_mediaprojection(
+    MiniAVScreenContext *ctx);
+#elif defined(__linux__)
 #include "linux/screen_context_linux_pipewire.h" // Ensure this header declares the ops and init function
 extern const ScreenContextInternalOps g_screen_ops_linux_pipewire;
 extern MiniAVResultCode
 miniav_screen_context_platform_init_linux_pipewire(MiniAVScreenContext *ctx);
 #endif
-#ifdef __APPLE__
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#include "ios/screen_context_ios_replaykit.h"
+extern const ScreenContextInternalOps g_screen_ops_ios_replaykit;
+extern MiniAVResultCode
+miniav_screen_context_platform_init_ios_replaykit(MiniAVScreenContext *ctx);
+#elif defined(__APPLE__)
 #include "macos/screen_context_macos_cg.h" // Ensure this header declares the ops and init function
 extern const ScreenContextInternalOps g_screen_ops_macos_cg;
 extern MiniAVResultCode
@@ -38,13 +57,19 @@ static const MiniAVScreenBackend g_screen_backends[] = {
     {"DXGI", &g_screen_ops_win_dxgi,
      miniav_screen_context_platform_init_windows_dxgi},
 #endif
-#ifdef __linux__
+#if defined(__ANDROID__)
+    {"MediaProjection", &g_screen_ops_android_mediaprojection,
+     miniav_screen_context_platform_init_android_mediaprojection},
+#elif defined(__linux__)
     {"Pipewire", &g_screen_ops_linux_pipewire,
      miniav_screen_context_platform_init_linux_pipewire}, // This function now
                                                           // acts as
                                                           // platform_init_for_selection
 #endif
-#ifdef __APPLE__
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    {"ReplayKit", &g_screen_ops_ios_replaykit,
+     miniav_screen_context_platform_init_ios_replaykit},
+#elif defined(__APPLE__)
     {"CoreGraphics", &g_screen_ops_macos_cg,
      miniav_screen_context_platform_init_macos_cg},
 #endif
@@ -160,7 +185,17 @@ MiniAVResultCode MiniAV_Screen_DestroyContext(MiniAVScreenContext *ctx) {
   }
 
   if (ctx->ops && ctx->ops->destroy_platform) {
-    ctx->ops->destroy_platform(ctx);
+    MiniAVResultCode destroy_res = ctx->ops->destroy_platform(ctx);
+    if (destroy_res == MINIAV_ERROR_TIMEOUT) {
+      // The platform layer could not reap a capture thread and leaked its
+      // platform context. That thread also dereferences THIS parent context
+      // (callbacks, configured format), so it must be leaked too — freeing
+      // it here would be a use-after-free.
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "Screen DestroyContext: platform teardown timed out — "
+                 "leaking the context (a capture thread is still alive).");
+      return destroy_res;
+    }
   } else {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
                "destroy_platform op not available or ops not set. Freeing "
@@ -528,5 +563,59 @@ MiniAVResultCode MiniAV_Screen_SetContextLostCallback(
   if (!ctx) return MINIAV_ERROR_INVALID_ARG;
   ctx->lost_cb = callback;
   ctx->lost_cb_user_data = user_data;
+  return MINIAV_SUCCESS;
+}
+
+// --- Mobile seams: thin dispatch to the platform backends (no-ops off
+// their platform so the FFI surface stays uniform). The platform functions
+// are defined in the respective backend files.
+
+#if defined(__ANDROID__)
+extern MiniAVResultCode
+miniav_screen_android_set_media_projection(void *jvm, void *media_projection);
+#endif
+
+MiniAVResultCode MiniAV_Screen_SetAndroidMediaProjection(
+    void *jvm, void *media_projection) {
+#if defined(__ANDROID__)
+  return miniav_screen_android_set_media_projection(jvm, media_projection);
+#else
+  MINIAV_UNUSED(jvm);
+  MINIAV_UNUSED(media_projection);
+  return MINIAV_ERROR_NOT_SUPPORTED;
+#endif
+}
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+extern MiniAVResultCode
+miniav_screen_ios_set_app_group(const char *app_group_id);
+#endif
+
+MiniAVResultCode MiniAV_Screen_SetIOSAppGroup(const char *app_group_id) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  return miniav_screen_ios_set_app_group(app_group_id);
+#else
+  MINIAV_UNUSED(app_group_id);
+  return MINIAV_ERROR_NOT_SUPPORTED;
+#endif
+}
+
+MiniAVResultCode MiniAV_Screen_SetCaptureCursor(
+    MiniAVScreenContextHandle context, bool enabled) {
+  MiniAVScreenContext *ctx = (MiniAVScreenContext *)context;
+  if (!ctx) {
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+  if (ctx->is_configured) {
+    // Backends read capture_cursor when they build the session at configure
+    // time; toggling afterward would not take effect uniformly.
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "MiniAV_Screen_SetCaptureCursor called after configure; call it "
+               "before ConfigureDisplay/Window.");
+    return MINIAV_ERROR_INVALID_OPERATION;
+  }
+  ctx->capture_cursor = enabled;
+  miniav_log(MINIAV_LOG_LEVEL_DEBUG, "Screen: capture_cursor = %d.",
+             enabled ? 1 : 0);
   return MINIAV_SUCCESS;
 }

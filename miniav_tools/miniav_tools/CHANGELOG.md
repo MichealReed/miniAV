@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.3 (unreleased)
+
+- `MiniAVTools.createAudioDecoder` + `AudioDecoder` facade wrapper
+  (routes by `supportsAudioDecode`, mirrors `createAudioEncoder`).
+- `Demuxer` facade exposes `durationUs` / `isSeekable`; `seek` documents that
+  it throws on non-seekable (live) inputs.
+
+## 0.5.2
+
+## 0.5.1
+
 ## 0.5.0
 
 - Version bump to keep the miniav_tools family in lockstep; no changes in this package.

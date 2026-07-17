@@ -1,8 +1,10 @@
 /// FFmpeg libavformat muxer (Phase C).
 ///
-/// MVP scope:
-///   - File output ([FileMuxerOutput]) only — bytes/callback outputs require
-///     a custom AVIOContext and are deferred.
+/// Scope:
+///   - File output ([FileMuxerOutput]) via `avio_open`; [BytesMuxerOutput]
+///     and [CallbackMuxerOutput] via a shim byte-pipe AVIOContext (the
+///     muxer writes into a native ring, which is drained to the sink after
+///     every muxer call — used e.g. to serve live fMP4 to `miniav_player`).
 ///   - Single video track per file (most common case for MP4 from a single
 ///     encoder). Audio + multi-track come later.
 ///   - Input packet timestamps are always in microseconds (1/1_000_000).
@@ -16,6 +18,7 @@
 library;
 
 import 'dart:ffi';
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
@@ -82,9 +85,42 @@ String _containerName(Container c) {
       return 'ipod'; // libavformat's name for the MPEG-4 audio (.m4a) muxer
     case Container.mp3:
       return 'mp3';
+    case Container.adts:
+      return 'adts';
     case Container.raw:
-      return 'mpegts'; // not really right; raw needs codec-specific fmt
+      return 'data'; // generic; the mux path resolves raw via _rawFormatName
   }
+}
+
+/// For [Container.raw] (a bare elementary stream), pick the FFmpeg muxer name
+/// from the track codec — Annex-B for H.264/HEVC, OBU for AV1, IVF for VP8/9,
+/// MJPEG, or the codec's elementary audio format. Falls back to `data`.
+String _rawFormatName(MuxerConfig cfg) {
+  for (final t in cfg.tracks) {
+    if (t is VideoTrackInfo) {
+      return switch (t.codec) {
+        VideoCodec.h264 => 'h264',
+        VideoCodec.hevc => 'hevc',
+        VideoCodec.av1 => 'obu',
+        VideoCodec.vp8 || VideoCodec.vp9 => 'ivf',
+        VideoCodec.mjpeg => 'mjpeg',
+        VideoCodec.prores || VideoCodec.custom => 'data',
+      };
+    }
+  }
+  for (final t in cfg.tracks) {
+    if (t is AudioTrackInfo) {
+      return switch (t.codec) {
+        AudioCodec.aac => 'adts',
+        AudioCodec.mp3 => 'mp3',
+        AudioCodec.flac => 'flac',
+        AudioCodec.opus => 'ogg', // raw Opus is carried in an Ogg wrapper
+        AudioCodec.vorbis => 'ogg',
+        AudioCodec.pcmS16le || AudioCodec.pcmF32le => 'data',
+      };
+    }
+  }
+  return 'data';
 }
 
 /// Map our [VideoCodec] enum to AVCodecID.
@@ -128,6 +164,17 @@ class FfmpegMuxer implements PlatformMuxer {
   /// Tracked AVIOContext so we can close it explicitly on tear-down.
   Pointer<AVIOContext> _avio = nullptr;
 
+  /// Callback outputs: the shim byte-pipe backing [_avio], drained to the
+  /// sink after every muxer call. nullptr otherwise.
+  Pointer<Void> _outPipe = nullptr;
+
+  /// Bytes outputs: the shim's SEEKABLE memory sink backing [_avio] (plain
+  /// MP4 moov rewrite / +faststart require seeks). nullptr otherwise.
+  Pointer<Void> _memSink = nullptr;
+  FfmpegShim? _outShim;
+  Pointer<Uint8> _drainScratch = nullptr;
+  static const int _kDrainScratchLen = 256 * 1024;
+
   bool _headerWritten = false;
   bool _trailerWritten = false;
   bool _closed = false;
@@ -162,16 +209,30 @@ class FfmpegMuxer implements PlatformMuxer {
     }
     final out = cfg.output;
     if (out is! FileMuxerOutput) {
-      throw CodecInitException(
-        'ffmpeg',
-        'FfmpegMuxer MVP only supports FileMuxerOutput; got ${out.runtimeType}',
-      );
+      // Bytes/callback outputs mux through a shim byte-pipe AVIOContext.
+      final shim = FfmpegShim.tryLoad();
+      if (shim == null) {
+        throw CodecInitException(
+          'ffmpeg',
+          '${out.runtimeType} requires the miniav_tools_ffmpeg shim '
+              '(byte-pipe AVIO) — run `dart pub get` to rebuild',
+        );
+      }
     }
 
     // 1. avformat_alloc_output_context2(&fmtCtx, NULL, fmtName, filename)
     final pFmtCtx = calloc<Pointer<AVFormatContext>>();
-    final fmtName = _containerName(cfg.container).toNativeUtf8();
-    final filename = out.path.toNativeUtf8();
+    // `raw` = a bare elementary stream; the right FFmpeg format is codec-
+    // specific (Annex-B h264/hevc, OBU for AV1, IVF for VP8/9, ADTS for AAC…),
+    // which the generic container map can't know — so resolve it from the
+    // track codec here rather than mis-routing everything to mpegts.
+    final fmtName = (cfg.container == Container.raw
+            ? _rawFormatName(cfg)
+            : _containerName(cfg.container))
+        .toNativeUtf8();
+    final filename = out is FileMuxerOutput
+        ? out.path.toNativeUtf8()
+        : nullptr;
     final extradataAllocs = <Pointer<Uint8>>[];
     final streams = <Pointer<AVStream>>[];
     Pointer<AVFormatContext> fmtCtx = nullptr;
@@ -214,7 +275,12 @@ class FfmpegMuxer implements PlatformMuxer {
       // NOTE: do NOT apply this to fmp4 (fragmented MP4) because fragmented
       // streams use a different movflags set and moov is written up-front
       // anyway via the fragment mechanism.
-      if (cfg.container == Container.mp4 || cfg.container == Container.m4a) {
+      // Only for FILE outputs: the faststart pass re-reads the written file
+      // (mov shift_data), which the plain write-side file AVIO supports but
+      // custom in-memory sinks do not. Bytes outputs keep moov at the end —
+      // consumers (incl. our seekable bytes demux input) handle that fine.
+      if ((cfg.container == Container.mp4 || cfg.container == Container.m4a) &&
+          out is FileMuxerOutput) {
         final privData = fmtCtx.cast<AVFormatContextPrefix>().ref.privData;
         if (privData != nullptr) {
           final optName = 'movflags'.toNativeUtf8();
@@ -224,6 +290,36 @@ class FfmpegMuxer implements PlatformMuxer {
           } finally {
             calloc.free(optName);
             calloc.free(optVal);
+          }
+        }
+      }
+
+      // fMP4: actually turn on fragmentation (the format name is plain
+      // "mp4"; without these movflags the mov muxer writes a normal MP4 and
+      // then demands a SEEKABLE output — which live chunk streams are not).
+      // empty_moov writes the init segment up-front; default_base_moof keeps
+      // fragments self-contained (what MSE/streaming consumers expect);
+      // frag_keyframe cuts at keyframes, and frag_duration (if configured)
+      // caps fragment length.
+      if (cfg.container == Container.fmp4) {
+        final privData = fmtCtx.cast<AVFormatContextPrefix>().ref.privData;
+        if (privData != nullptr) {
+          final optName = 'movflags'.toNativeUtf8();
+          final optVal =
+              '+frag_keyframe+empty_moov+default_base_moof'.toNativeUtf8();
+          try {
+            ff.avOptSet(privData, optName, optVal, 0);
+          } finally {
+            calloc.free(optName);
+            calloc.free(optVal);
+          }
+          if (cfg.fragmentDurationUs > 0) {
+            final fragName = 'frag_duration'.toNativeUtf8();
+            try {
+              ff.avOptSetInt(privData, fragName, cfg.fragmentDurationUs, 0);
+            } finally {
+              calloc.free(fragName);
+            }
           }
         }
       }
@@ -284,7 +380,7 @@ class FfmpegMuxer implements PlatformMuxer {
     } finally {
       calloc.free(pFmtCtx);
       calloc.free(fmtName);
-      calloc.free(filename);
+      if (filename != nullptr) calloc.free(filename);
     }
   }
 
@@ -346,27 +442,71 @@ class FfmpegMuxer implements PlatformMuxer {
   Future<void> writeHeader() async {
     _checkOpen();
     if (_headerWritten) return;
-    final out = _cfg.output as FileMuxerOutput;
+    final out = _cfg.output;
 
-    // Open the output file via avio_open. (We only reach this for non-
-    // AVFMT_NOFILE muxers — mp4/mkv/webm all need it.)
-    final pIo = calloc<Pointer<AVIOContext>>();
-    final fname = out.path.toNativeUtf8();
-    try {
-      final r = _ff.avioOpen(pIo, fname, kAvioFlagWrite);
-      if (r < 0) {
-        throw CodecInitException(
+    if (out is FileMuxerOutput) {
+      // Open the output file via avio_open. (We only reach this for non-
+      // AVFMT_NOFILE muxers — mp4/mkv/webm all need it.)
+      final pIo = calloc<Pointer<AVIOContext>>();
+      final fname = out.path.toNativeUtf8();
+      try {
+        final r = _ff.avioOpen(pIo, fname, kAvioFlagWrite);
+        if (r < 0) {
+          throw CodecInitException(
+            'ffmpeg',
+            'avio_open(${out.path}) failed: ${_ff.strError(r)} ($r)',
+          );
+        }
+        _avio = pIo.value;
+        // Wire the AVIOContext into AVFormatContext.pb directly (it's a
+        // plain struct field, not an AVOption).
+        _fmtCtx.cast<AVFormatContextPrefix>().ref.pb = _avio;
+      } finally {
+        calloc.free(fname);
+        calloc.free(pIo);
+      }
+    } else if (out is BytesMuxerOutput) {
+      // Whole-container-in-memory: a SEEKABLE memory sink, so moov-rewriting
+      // muxers (plain MP4, +faststart) work. getBytes() reads it at finish.
+      final shim = FfmpegShim.tryLoad()!; // gated in open()
+      _outShim = shim;
+      _memSink = shim.memsinkCreate();
+      if (_memSink == nullptr) {
+        throw const CodecInitException('ffmpeg', 'memsink OOM');
+      }
+      final avio = shim.avioOutMemsinkCreate(_memSink);
+      if (avio == nullptr) {
+        shim.memsinkDestroy(_memSink);
+        _memSink = nullptr;
+        throw const CodecInitException(
           'ffmpeg',
-          'avio_open(${out.path}) failed: ${_ff.strError(r)} ($r)',
+          'avio_out_memsink_create failed',
         );
       }
-      _avio = pIo.value;
-      // Wire the AVIOContext into AVFormatContext.pb directly (it's a
-      // plain struct field, not an AVOption).
+      _avio = avio.cast<AVIOContext>();
       _fmtCtx.cast<AVFormatContextPrefix>().ref.pb = _avio;
-    } finally {
-      calloc.free(fname);
-      calloc.free(pIo);
+    } else {
+      // Callback (chunk-stream) output: mux into a NON-seekable shim byte
+      // pipe, drained after every muxer call. Use a streamable container
+      // (fmp4 / mkv / mpegts) — moov-rewriting formats will reject this.
+      final shim = FfmpegShim.tryLoad()!; // gated in open()
+      _outShim = shim;
+      _outPipe = shim.bytepipeCreate(32 * 1024 * 1024);
+      if (_outPipe == nullptr) {
+        throw const CodecInitException('ffmpeg', 'output bytepipe OOM');
+      }
+      final avio = shim.avioOutPipeCreate(_outPipe);
+      if (avio == nullptr) {
+        shim.bytepipeDestroy(_outPipe);
+        _outPipe = nullptr;
+        throw const CodecInitException(
+          'ffmpeg',
+          'avio_out_pipe_create failed',
+        );
+      }
+      _avio = avio.cast<AVIOContext>();
+      _drainScratch = calloc<Uint8>(_kDrainScratchLen);
+      _fmtCtx.cast<AVFormatContextPrefix>().ref.pb = _avio;
     }
 
     // Capture FFmpeg's own log output (via the shim's formatted callback) so
@@ -412,6 +552,7 @@ class FfmpegMuxer implements PlatformMuxer {
       );
     }
     _headerWritten = true;
+    _drainOutput(); // fMP4 init segment must reach live consumers promptly
 
     // Snapshot the actual per-stream time_bases. avformat_write_header may
     // have replaced our 1/1_000_000 with a codec-native value (e.g. 1/48000
@@ -496,6 +637,22 @@ class FfmpegMuxer implements PlatformMuxer {
       calloc.free(pp);
       calloc.free(buf);
     }
+    _drainOutput();
+  }
+
+  /// Callback outputs: move whatever the muxer wrote into the pipe to the
+  /// chunk callback. No-op for file/bytes outputs.
+  void _drainOutput() {
+    final shim = _outShim;
+    final out = _cfg.output;
+    if (shim == null || _outPipe == nullptr || out is! CallbackMuxerOutput) {
+      return;
+    }
+    while (true) {
+      final n = shim.bytepipeRead(_outPipe, _drainScratch, _kDrainScratchLen);
+      if (n <= 0) break;
+      out.onChunk(Uint8List.fromList(_drainScratch.asTypedList(n)));
+    }
   }
 
   @override
@@ -516,6 +673,7 @@ class FfmpegMuxer implements PlatformMuxer {
       );
     }
     _trailerWritten = true;
+    _drainOutput();
   }
 
   @override
@@ -523,13 +681,31 @@ class FfmpegMuxer implements PlatformMuxer {
     if (_closed) return;
     _closed = true;
     if (_avio != nullptr) {
-      final pp = calloc<Pointer<AVIOContext>>()..value = _avio;
-      try {
-        _ff.avioClosep(pp);
-      } finally {
-        calloc.free(pp);
+      final shim = _outShim;
+      if (shim != null) {
+        // Pipe-backed AVIO: we own the buffer + context (never avio_closep).
+        shim.avioOutFree(_avio.cast<Void>());
+      } else {
+        final pp = calloc<Pointer<AVIOContext>>()..value = _avio;
+        try {
+          _ff.avioClosep(pp);
+        } finally {
+          calloc.free(pp);
+        }
       }
       _avio = nullptr;
+    }
+    if (_outPipe != nullptr) {
+      _outShim!.bytepipeDestroy(_outPipe);
+      _outPipe = nullptr;
+    }
+    if (_memSink != nullptr) {
+      _outShim!.memsinkDestroy(_memSink);
+      _memSink = nullptr;
+    }
+    if (_drainScratch != nullptr) {
+      calloc.free(_drainScratch);
+      _drainScratch = nullptr;
     }
     if (_fmtCtx != nullptr) {
       _ff.avformatFreeContext(_fmtCtx);
@@ -543,7 +719,10 @@ class FfmpegMuxer implements PlatformMuxer {
   }
 
   @override
-  List<int>? getBytes() => null;
+  List<int>? getBytes() {
+    if (_cfg.output is! BytesMuxerOutput || _memSink == nullptr) return null;
+    return _outShim!.memsinkTakeBytes(_memSink);
+  }
 
   void _checkOpen() {
     if (_closed) {

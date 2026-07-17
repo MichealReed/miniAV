@@ -131,6 +131,21 @@ class MiniFFIScreenPlatform implements MiniScreenPlatformInterface {
   }
 
   @override
+  Future<void> setIOSAppGroup(String appGroupId) async {
+    final idPtr = appGroupId.toNativeUtf8();
+    try {
+      final result = bindings.MiniAV_Screen_SetIOSAppGroup(
+        idPtr.cast<ffi.Char>(),
+      );
+      if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+        throw Exception('Failed to set iOS App Group: ${result.name}');
+      }
+    } finally {
+      calloc.free(idPtr);
+    }
+  }
+
+  @override
   Future<MiniScreenContextPlatformInterface> createContext() async {
     final contextPtr = calloc<bindings.MiniAVScreenContextHandle>();
     try {
@@ -175,6 +190,15 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
 
   /// Whether this context has been destroyed
   bool get isDestroyed => _isDestroyed;
+
+  @override
+  Future<void> setCaptureCursor(bool enabled) async {
+    _ensureNotDestroyed();
+    final result = bindings.MiniAV_Screen_SetCaptureCursor(_context!, enabled);
+    if (result != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+      throw Exception('Failed to set capture cursor: ${result.name}');
+    }
+  }
 
   @override
   Future<void> configureDisplay(

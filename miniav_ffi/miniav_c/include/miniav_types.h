@@ -33,6 +33,11 @@ typedef enum {
   MINIAV_ERROR_STREAM_FAILED = -20,
   MINIAV_ERROR_PORTAL_CLOSED = -21,
   MINIAV_ERROR_USER_CANCELLED = -22,
+  // The OS denied a required runtime permission (camera/microphone/screen
+  // consent, Accessibility/Input Monitoring, ...). miniAV never triggers
+  // permission PROMPTS itself — request permission app-side first, then
+  // configure. Mobile backends map their platform denial errors here.
+  MINIAV_ERROR_PERMISSION_DENIED = -23,
 } MiniAVResultCode;
 
 // --- Device Info ---
@@ -162,8 +167,10 @@ typedef struct MiniAVLoopbackTargetInfo {
 typedef struct MiniAVCameraContext *MiniAVCameraContextHandle;
 typedef struct MiniAVScreenContext *MiniAVScreenContextHandle;
 typedef struct MiniAVAudioContext *MiniAVAudioContextHandle;
+typedef struct MiniAVAudioOutputContext *MiniAVAudioOutputContextHandle;
 typedef struct MiniAVLoopbackContext *MiniAVLoopbackContextHandle;
 typedef struct MiniAVInputContext *MiniAVInputContextHandle;
+typedef struct MiniAVInjectContext *MiniAVInjectContextHandle;
 
 // --- Input Capture Types ---
 
@@ -206,16 +213,22 @@ typedef struct {
   MiniAVKeyAction action;
 } MiniAVKeyboardEvent;
 
-// Mouse event
+// Mouse event. Used by BOTH input capture (source) and input injection (sink);
+// for injection the same struct is replayed onto the local machine.
 typedef struct {
   uint64_t timestamp_us;
   int32_t x;              // Absolute screen X
   int32_t y;              // Absolute screen Y
   int32_t delta_x;        // Relative movement X
   int32_t delta_y;        // Relative movement Y
-  int32_t wheel_delta;    // Scroll wheel delta
+  int32_t wheel_delta;    // Vertical scroll wheel delta (+ = up/away)
+  int32_t wheel_delta_x;  // Horizontal scroll wheel delta (+ = right)
   MiniAVMouseAction action;
   MiniAVMouseButton button;
+  // Capture always reports absolute coords, so it sets this true. For
+  // injection: true = MOVE to absolute (x, y); false = MOVE by (delta_x,
+  // delta_y). Ignored for BUTTON_* / WHEEL actions.
+  bool is_absolute;
 } MiniAVMouseEvent;
 
 // Gamepad event
@@ -261,6 +274,12 @@ typedef enum {
   MINIAV_LOG_LEVEL_NONE
 } MiniAVLogLevel;
 
+// Receives formatted log messages when registered via MiniAV_SetLogCallback.
+// OWNERSHIP: `message` is heap-allocated and OWNED BY THE RECEIVER — release
+// it with MiniAV_Free once consumed. (It must outlive the call because
+// receivers may dispatch it asynchronously to another thread, e.g. the Dart
+// FFI shim's NativeCallable.listener.) May be invoked from any capture or
+// worker thread.
 typedef void (*MiniAVLogCallback)(MiniAVLogLevel level, const char *message,
                                   void *user_data);
 

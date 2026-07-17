@@ -363,7 +363,7 @@ dxgi_init_d3d_and_duplication(DXGIScreenPlatformContext *dxgi_ctx,
 
   D3D_FEATURE_LEVEL feature_levels[] = {
       D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
-  hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
+  hr = D3D11CreateDevice((IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
                          feature_levels, ARRAYSIZE(feature_levels),
                          D3D11_SDK_VERSION, &dxgi_ctx->d3d_device, NULL,
                          &dxgi_ctx->d3d_context);
@@ -624,8 +624,7 @@ dxgi_get_configured_video_formats(MiniAVScreenContext *ctx,
     memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
   }
 
-  if (!ctx->is_configured) { // is_configured is set by the main API after
-                             // successful configure_xxx
+  if (!ctx->is_configured) { // set at the end of dxgi_configure_display
     miniav_log(MINIAV_LOG_LEVEL_WARN,
                "DXGI GetConfiguredFormats: Context not configured.");
     return MINIAV_ERROR_NOT_INITIALIZED;
@@ -667,8 +666,7 @@ dxgi_get_configured_video_formats(MiniAVScreenContext *ctx,
 
 static MiniAVResultCode dxgi_configure_display(MiniAVScreenContext *ctx,
                                                const char *display_id_utf8,
-                                               const MiniAVVideoInfo *format,
-                                               bool *audio_enabled) {
+                                               const MiniAVVideoInfo *format) {
   if (!ctx || !ctx->platform_ctx || !display_id_utf8 || !format)
     return MINIAV_ERROR_INVALID_ARG;
   DXGIScreenPlatformContext *dxgi_ctx =
@@ -697,6 +695,17 @@ static MiniAVResultCode dxgi_configure_display(MiniAVScreenContext *ctx,
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "DXGI: Cannot configure while streaming.");
     return MINIAV_ERROR_ALREADY_RUNNING;
+  }
+
+  // DXGI Desktop Duplication delivers the desktop image WITHOUT the cursor
+  // composited in (the pointer arrives separately as a shape+position we do not
+  // blend). If the app asked for the cursor, warn and proceed cursor-less
+  // rather than fail — the WGC backend is the way to get a visible cursor on
+  // Windows.
+  if (ctx->capture_cursor) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "DXGI cannot render the cursor; frames will be cursor-less — "
+               "use the WGC backend for a visible cursor.");
   }
 
   // Clean up previous audio context if any
@@ -800,6 +809,10 @@ static MiniAVResultCode dxgi_configure_display(MiniAVScreenContext *ctx,
   }
   // --- End Audio Loopback Configuration ---
 
+  // Mark configured so GetConfiguredFormats works on this backend (WGC and
+  // the Linux/macOS backends set this the same way; nothing in screen_api.c
+  // sets it for us despite the older comment near the read site).
+  ctx->is_configured = true;
   LeaveCriticalSection(&dxgi_ctx->critical_section);
   miniav_log(MINIAV_LOG_LEVEL_INFO,
              "DXGI: Configured for display %s. Actual resolution: %ux%u, "
@@ -1084,6 +1097,11 @@ static MiniAVResultCode dxgi_release_buffer(MiniAVScreenContext *ctx,
   }
 }
 
+// Available since Windows 10 1803; guard for older SDK headers.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
 static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
   DXGIScreenPlatformContext *dxgi_ctx = (DXGIScreenPlatformContext *)param;
   if (!dxgi_ctx)
@@ -1098,11 +1116,51 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
   if (frame_timeout_ms == 0)
     frame_timeout_ms = 16;
 
-  // Wall-clock pacing state. We pace from the time the previous frame was
-  // delivered rather than sleeping a fixed interval while still holding the
-  // duplication frame (the old behaviour, which capped producer FPS because
-  // Desktop Duplication will not compose the next frame until ReleaseFrame).
-  ULONGLONG last_deliver_ms = 0;
+  // Wall-clock pacing state. Deliveries are paced against an ABSOLUTE
+  // schedule (deadline += exact interval) measured with QueryPerformanceCounter
+  // and slept on a high-resolution waitable timer. The previous
+  // GetTickCount64 + relative-Sleep pacing had ~15.6 ms measurement
+  // granularity and a truncated integer-ms interval (33 ms for 30 fps), which
+  // made the loop systematically run ~5% fast (≈31.4 fps against a 30 fps
+  // target) with tick-boundary jitter — the consumer's fps throttle then
+  // deleted the excess frame every ~20 frames, i.e. a 2×-length presentation
+  // hole every ~0.7 s: a metronomic, very visible stutter in the recording.
+  // The wait runs AFTER the duplication frame was released, so it never
+  // blocks Desktop Duplication from composing the next frame. The interval is
+  // computed from the requested rational frame rate (falling back to the
+  // integral target_fps) so the schedule carries no cumulative rounding drift.
+  LARGE_INTEGER pace_qpc_freq;
+  QueryPerformanceFrequency(&pace_qpc_freq);
+  LONGLONG pace_interval_ticks;
+  {
+    UINT pace_num = dxgi_ctx->configured_video_format.frame_rate_numerator;
+    UINT pace_den = dxgi_ctx->configured_video_format.frame_rate_denominator;
+    if (pace_num == 0 || pace_den == 0) {
+      pace_num = dxgi_ctx->target_fps;
+      pace_den = 1;
+    }
+    pace_interval_ticks =
+        (LONGLONG)((ULONGLONG)pace_qpc_freq.QuadPart * pace_den / pace_num);
+    if (pace_interval_ticks <= 0)
+      pace_interval_ticks = pace_qpc_freq.QuadPart / 30;
+  }
+  LONGLONG pace_next_deadline = 0;
+  HANDLE pace_timer = CreateWaitableTimerExW(
+      NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  if (!pace_timer) {
+    // Pre-1803 Windows: a plain waitable timer (system-tick resolution, but
+    // the absolute QPC schedule still removes the systematic fast bias).
+    pace_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "DXGI: high-resolution pacing timer unavailable (err=%lu) — "
+               "using standard waitable timer (system-tick resolution).",
+               GetLastError());
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+               "DXGI: pacing with high-resolution waitable timer, interval "
+               "%lld QPC ticks.",
+               (long long)pace_interval_ticks);
+  }
   // Tracks whether we currently hold an acquired duplication frame that still
   // needs IDXGIOutputDuplication_ReleaseFrame. Set right after a successful
   // AcquireNextFrame and cleared the moment the frame is released (either mid-
@@ -1303,13 +1361,36 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
                 ID3D11DeviceContext_End(
                     dxgi_ctx->d3d_context, (ID3D11Asynchronous *)copy_done);
                 ID3D11DeviceContext_Flush(dxgi_ctx->d3d_context);
+                // Wait up to ~16 ms (one 60 fps frame) for the GPU to commit,
+                // then proceed. The cap bounds the capture thread's stall
+                // under contention; a timeout is now LOGGED (rate-limited)
+                // instead of silently proceeding — a persistent timeout is a
+                // real black-frame risk worth surfacing. (True fence handoff
+                // to the consumer is deferred — see NATIVE_AUDIT.md.)
                 ULONGLONG poll_start = GetTickCount64();
-                while (ID3D11DeviceContext_GetData(
-                           dxgi_ctx->d3d_context,
-                           (ID3D11Asynchronous *)copy_done, NULL, 0, 0) ==
-                       S_FALSE) {
-                  if (GetTickCount64() - poll_start > 5) break;
+                BOOL fence_done = FALSE;
+                for (;;) {
+                  if (ID3D11DeviceContext_GetData(
+                          dxgi_ctx->d3d_context,
+                          (ID3D11Asynchronous *)copy_done, NULL, 0, 0) !=
+                      S_FALSE) {
+                    fence_done = TRUE;
+                    break;
+                  }
+                  if (GetTickCount64() - poll_start > 16)
+                    break;
                   YieldProcessor();
+                }
+                if (!fence_done) {
+                  static ULONGLONG s_last_fence_warn_ms = 0;
+                  ULONGLONG now_ms = GetTickCount64();
+                  if (now_ms - s_last_fence_warn_ms > 2000) {
+                    s_last_fence_warn_ms = now_ms;
+                    miniav_log(MINIAV_LOG_LEVEL_WARN,
+                               "DXGI: GPU sync fence did not signal within "
+                               "16ms — sharing anyway (possible torn/black "
+                               "frame under GPU contention).");
+                  }
                 }
                 ID3D11Query_Release(copy_done);
               } else {
@@ -1503,21 +1584,52 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
       miniav_free(buffer);
     }
 
-    // Pace by wall clock from the previous delivery — sleep = max(0, interval -
-    // elapsed). This runs AFTER the frame was released above, so the sleep no
-    // longer blocks Desktop Duplication from producing the next frame.
-    // (AcquireNextFrame's 500 ms timeout is unrelated to this cadence, so the
-    // pacing has to be explicit.)
+    // Pace against the absolute QPC schedule (see pacing state above). Runs
+    // AFTER the frame was released, so the wait never blocks Desktop
+    // Duplication from producing the next frame. (AcquireNextFrame's 500 ms
+    // timeout is unrelated to this cadence, so the pacing has to be explicit.)
+    // The wait also watches the stop event so shutdown stays responsive
+    // mid-interval.
     {
-      UINT interval_ms = frame_timeout_ms > 0 ? frame_timeout_ms : 1;
-      ULONGLONG now_ms = GetTickCount64();
-      if (last_deliver_ms != 0) {
-        ULONGLONG elapsed = now_ms - last_deliver_ms;
-        if (elapsed < interval_ms) {
-          Sleep((DWORD)(interval_ms - elapsed));
+      LARGE_INTEGER pace_now;
+      QueryPerformanceCounter(&pace_now);
+      if (pace_next_deadline == 0) {
+        pace_next_deadline = pace_now.QuadPart + pace_interval_ticks;
+      } else {
+        pace_next_deadline += pace_interval_ticks;
+        if (pace_now.QuadPart - pace_next_deadline > pace_interval_ticks) {
+          // More than a full interval behind (idle stretch on a static
+          // screen, or a stalled iteration under GPU contention): resync
+          // instead of bursting stale catch-up deliveries. Being behind by
+          // LESS than an interval intentionally skips the wait once, which
+          // pulls the next delivery back onto the schedule.
+          pace_next_deadline = pace_now.QuadPart;
         }
       }
-      last_deliver_ms = GetTickCount64();
+      while (dxgi_ctx->is_streaming) {
+        QueryPerformanceCounter(&pace_now);
+        LONGLONG pace_remaining = pace_next_deadline - pace_now.QuadPart;
+        if (pace_remaining <= 0)
+          break;
+        LONGLONG pace_remaining_100ns =
+            pace_remaining * 10000000LL / pace_qpc_freq.QuadPart;
+        if (pace_remaining_100ns < 5000) // <0.5 ms — close enough
+          break;
+        if (pace_timer) {
+          LARGE_INTEGER pace_due;
+          pace_due.QuadPart = -pace_remaining_100ns; // negative = relative
+          if (SetWaitableTimer(pace_timer, &pace_due, 0, NULL, NULL, FALSE)) {
+            HANDLE pace_waits[2] = {dxgi_ctx->stop_event_handle, pace_timer};
+            DWORD pace_w = WaitForMultipleObjects(
+                2, pace_waits, FALSE,
+                (DWORD)(pace_remaining_100ns / 10000) + 50);
+            if (pace_w == WAIT_OBJECT_0)
+              break; // stop requested — outer loop exits at its top check
+            continue; // timer fired (or timed out) — re-check the deadline
+          }
+        }
+        Sleep((DWORD)(pace_remaining_100ns / 10000) + 1);
+      }
     }
   }
 
@@ -1527,6 +1639,9 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
   }
   if (dxgi_ctx->output_duplication) {
     IDXGIOutputDuplication_ReleaseFrame(dxgi_ctx->output_duplication);
+  }
+  if (pace_timer) {
+    CloseHandle(pace_timer);
   }
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "DXGI: Capture thread finished.");

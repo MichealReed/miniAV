@@ -70,6 +70,7 @@ class RecorderBuilder {
     Map<String, String> encoderOptions = const {},
     VideoIdleFramePolicy idleFramePolicy = VideoIdleFramePolicy.duplicate,
     bool adaptiveGpuThrottle = true,
+    bool cfrOutput = false,
   }) {
     _sources.add(
       ScreenRecorderSource(
@@ -87,6 +88,7 @@ class RecorderBuilder {
         encoderOptions: encoderOptions,
         idleFramePolicy: idleFramePolicy,
         adaptiveGpuThrottle: adaptiveGpuThrottle,
+        cfrOutput: cfrOutput,
       ),
     );
   }

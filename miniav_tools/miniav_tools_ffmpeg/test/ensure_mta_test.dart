@@ -2,7 +2,14 @@
 /// added in ABI v12 to unblock QSV and MediaFoundation encoder init on Windows.
 ///
 /// Validates:
-///   1. [FfmpegShim.kExpectedAbiVersion] is 13.
+///   1. [FfmpegShim.kExpectedAbiVersion] is 18 (v14 added the decoder
+///      helpers: codec_set_extradata + frame audio field readers; v15 added
+///      the demux byte pipe + open helpers + stream/par getters; v16 added
+///      the mf_decoder.c hardware H.264/HEVC → D3D11 NV12 decode session;
+///      v17 REMOVED it — the MF decoder moved to the FFmpeg-free
+///      `miniav_tools_codecs` native asset, leaving this shim FFmpeg-only;
+///      v18 added the frame colorspace/color_range readers so the decoder
+///      can tag frames with the real colour matrix + range).
 ///   2. On Windows with a loaded shim: [ensureMta] returns 0 (S_OK) or -1
 ///      (RPC_E_CHANGED_MODE — STA thread); never throws.
 ///   3. Calling [ensureMta] twice on the same thread is safe (idempotent in
@@ -19,8 +26,8 @@ import 'package:test/test.dart';
 
 void main() {
   group('FfmpegShim.ensureMta', () {
-    test('kExpectedAbiVersion is 13', () {
-      expect(FfmpegShim.kExpectedAbiVersion, equals(13));
+    test('kExpectedAbiVersion is 18', () {
+      expect(FfmpegShim.kExpectedAbiVersion, equals(18));
     });
 
     test('returns 0 on non-Windows (no-op)', () {

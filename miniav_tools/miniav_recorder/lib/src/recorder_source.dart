@@ -100,6 +100,22 @@ class ScreenRecorderSource extends RecorderSource {
   /// than stuttering. Restores automatically when GPU pressure clears.
   final bool adaptiveGpuThrottle;
 
+  /// When true, the encoded stream is constant-frame-rate: output PTS are
+  /// quantized to the exact fps grid and every grid slot is filled exactly
+  /// once — live frames claim the slot nearest their capture time, slots the
+  /// capture missed (GPU contention, drops) are backfilled with duplicates of
+  /// the previous frame, and surplus frames are dropped. A missed capture
+  /// becomes an invisible duplicated frame instead of a visible playback
+  /// hiccup, regardless of the source cadence.
+  ///
+  /// Default false = VFR: frames keep their capture timestamps, and a source
+  /// within ~15% of the target rate passes through untouched.
+  ///
+  /// Backfill/idle fill needs a retained frame, which the zero-copy D3D11
+  /// paths keep; on CPU-fed paths CFR still grid-aligns PTS but missed slots
+  /// stay unfilled. Requires [idleFramePolicy] != none for idle-gap fill.
+  final bool cfrOutput;
+
   const ScreenRecorderSource({
     this.displayId,
     this.windowId,
@@ -115,6 +131,7 @@ class ScreenRecorderSource extends RecorderSource {
     this.encoderOptions = const {},
     this.idleFramePolicy = VideoIdleFramePolicy.duplicate,
     this.adaptiveGpuThrottle = true,
+    this.cfrOutput = false,
   });
 }
 

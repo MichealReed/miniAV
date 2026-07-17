@@ -1,5 +1,15 @@
 # miniav CHANGELOG
 
+## 0.7.0
+
+- `MiniScreen.setIOSAppGroup(String)` — register the App Group shared with
+  the iOS Broadcast Upload Extension before configuring the
+  `system_screen_broadcast` display.
+
+## 0.6.0
+
+## 0.5.11
+
 ## 0.5.10
 
 ## 0.5.9

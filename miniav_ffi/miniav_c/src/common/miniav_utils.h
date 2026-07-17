@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if defined(__linux__) && !defined(__ANDROID__) // glibc-only (pthread_timedjoin_np); Bionic lacks it
+#include <pthread.h> // for miniav_timed_join (kept OUTSIDE the extern "C")
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -49,6 +53,14 @@ void miniav_dispatch_set_enabled(int enabled); /* 0 = off, 1 = on */
       miniav_dispatch_guard_release();                      \
     }                                                       \
   } while (0)
+
+#if defined(__linux__) && !defined(__ANDROID__)
+// Bounded pthread_join (pthread_timedjoin_np): returns 0 when joined,
+// nonzero when the thread did not exit within timeout_ms. On timeout the
+// thread is left JOINABLE so a later Stop/Destroy can retry — callers must
+// NOT free state the thread references until a join succeeds.
+int miniav_timed_join(pthread_t thread, unsigned timeout_ms);
+#endif
 
 #ifdef __cplusplus
 }

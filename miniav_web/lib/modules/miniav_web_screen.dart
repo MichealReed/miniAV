@@ -47,6 +47,10 @@ class MiniAVWebScreenPlatform implements MiniScreenPlatformInterface {
     // Web does not enumerate windows.
     return () {};
   }
+
+  @override
+  Future<void> setIOSAppGroup(String appGroupId) =>
+      throw UnsupportedError('setIOSAppGroup is only available on iOS.');
 }
 
 /// Web implementation of [MiniScreenContextPlatformInterface]
@@ -55,6 +59,13 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
   void Function() addLostListener(MiniAVContextLostListener listener) {
     // Web getDisplayMedia tracks ending is not currently propagated.
     return () {};
+  }
+
+  @override
+  Future<void> setCaptureCursor(bool enabled) async {
+    // getDisplayMedia includes the cursor by default and does not expose a
+    // reliable post-hoc toggle here; accept the call so cross-platform code
+    // works, but it is a no-op on web.
   }
 
   // Media

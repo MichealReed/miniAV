@@ -1,16 +1,18 @@
-/// CPU pixel-format helpers.
+/// CPU pixel-format helpers for the FFmpeg encode/preview paths.
 ///
-/// We only convert what the FFmpeg software encoder needs. For the MVP that
-/// is RGBA/BGRA → YUV420P (BT.601 limited range) and a passthrough for
-/// already-NV12/I420 inputs.
-///
-/// A real implementation would call libswscale; doing it in Dart keeps the
-/// dependency surface small until we need scaling/cropping.
+/// All COLOUR math (RGB<->YCbCr coefficients) is delegated to the canonical
+/// shared converters in `miniav_tools_platform_interface` (`dartRgbaToI420` /
+/// `dartI420ToRgba` / `dartI422ToRgba` — BT.601 limited by default, byte-exact
+/// twins of the C/GPU converters in miniav_tools_codecs). This file only keeps
+/// FORMAT plumbing: plane splitting/deinterleaving (NV12, YUY2) and channel
+/// widening — data movement, not colour conversion.
 library;
 
 import 'dart:typed_data';
 
 import 'package:miniav_platform_interface/miniav_platform_types.dart';
+import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart'
+    show dartI420ToRgba, dartI422ToRgba, dartRgbaToI420;
 
 /// Result of preparing a frame for an FFmpeg encoder.
 ///
@@ -65,21 +67,11 @@ PreparedYuv420p toYuv420p({
     case MiniAVPixelFormat.yuy2:
       return _yuy2ToI420(src, width, height, strides);
     case MiniAVPixelFormat.rgba32:
-      return _rgbaToYuv420p(
-        src,
-        width,
-        height,
-        srcBgrA: false,
-        strides: strides,
-      );
+      return _rgbaToYuv420p(src, width, height,
+          srcBgrA: false, strides: strides);
     case MiniAVPixelFormat.bgra32:
-      return _rgbaToYuv420p(
-        src,
-        width,
-        height,
-        srcBgrA: true,
-        strides: strides,
-      );
+      return _rgbaToYuv420p(src, width, height,
+          srcBgrA: true, strides: strides);
     case MiniAVPixelFormat.rgb24:
       return _rgbToYuv420p(src, width, height, srcBgr: false);
     case MiniAVPixelFormat.bgr24:
@@ -204,54 +196,11 @@ PreparedYuv420p _rgbaToYuv420p(
       'need ${srcStride * h} (stride=$srcStride, h=$h)',
     );
   }
-
-  final ySize = w * h;
-  final cw = w ~/ 2;
-  final ch = h ~/ 2;
-  final y = Uint8List(ySize);
-  final u = Uint8List(cw * ch);
-  final v = Uint8List(cw * ch);
-
-  // BT.601 limited-range coefficients (×8192 for fixed-point).
-  // Y =  0.257 R + 0.504 G + 0.098 B + 16
-  // U = -0.148 R - 0.291 G + 0.439 B + 128
-  // V =  0.439 R - 0.368 G - 0.071 B + 128
-  for (var row = 0; row < h; row++) {
-    final srcRow = row * srcStride;
-    final dstRow = row * w;
-    for (var col = 0; col < w; col++) {
-      final p = srcRow + col * 4;
-      final r = srcBgrA ? src[p + 2] : src[p];
-      final g = src[p + 1];
-      final b = srcBgrA ? src[p] : src[p + 2];
-      y[dstRow +
-          col] = ((2105 * r + 4128 * g + 803 * b + (16 << 13) + 4096) >> 13)
-          .clamp(0, 255);
-    }
-  }
-  // Subsample U/V (simple 2x2 average then convert).
-  for (var row = 0; row < ch; row++) {
-    for (var col = 0; col < cw; col++) {
-      final p0 = row * 2 * srcStride + col * 2 * 4;
-      final p1 = p0 + 4;
-      final p2 = (row * 2 + 1) * srcStride + col * 2 * 4;
-      final p3 = p2 + 4;
-      final r = srcBgrA
-          ? (src[p0 + 2] + src[p1 + 2] + src[p2 + 2] + src[p3 + 2]) >> 2
-          : (src[p0] + src[p1] + src[p2] + src[p3]) >> 2;
-      final g = (src[p0 + 1] + src[p1 + 1] + src[p2 + 1] + src[p3 + 1]) >> 2;
-      final b = srcBgrA
-          ? (src[p0] + src[p1] + src[p2] + src[p3]) >> 2
-          : (src[p0 + 2] + src[p1 + 2] + src[p2 + 2] + src[p3 + 2]) >> 2;
-      u[row * cw +
-          col] = ((-1212 * r - 2384 * g + 3596 * b + (128 << 13) + 4096) >> 13)
-          .clamp(0, 255);
-      v[row * cw +
-          col] = ((3596 * r - 3015 * g - 581 * b + (128 << 13) + 4096) >> 13)
-          .clamp(0, 255);
-    }
-  }
-  return PreparedYuv420p(y: y, u: u, v: v, width: w, height: h);
+  // Canonical shared converter (BT.601 limited) — byte-identical to the C /
+  // GPU encode-side converters, so a CPU<->GPU path switch can't shift colour.
+  final p = dartRgbaToI420(src, w, h,
+      bgra: srcBgrA, srcStrideBytes: srcStride);
+  return PreparedYuv420p(y: p.y, u: p.u, v: p.v, width: w, height: h);
 }
 
 PreparedYuv420p _rgbToYuv420p(
@@ -282,29 +231,9 @@ Uint8List yuv420pToRgba({
   int yStride = 0,
   int uStride = 0,
   int vStride = 0,
-}) {
-  final ys = yStride == 0 ? width : yStride;
-  final us = uStride == 0 ? width ~/ 2 : uStride;
-  final vs = vStride == 0 ? width ~/ 2 : vStride;
-  final out = Uint8List(width * height * 4);
-  for (var row = 0; row < height; row++) {
-    for (var col = 0; col < width; col++) {
-      final yv = y[row * ys + col] - 16;
-      final uv = u[(row >> 1) * us + (col >> 1)] - 128;
-      final vv = v[(row >> 1) * vs + (col >> 1)] - 128;
-      final c = 1192 * yv;
-      final r = (c + 1634 * vv) >> 10;
-      final g = (c - 401 * uv - 833 * vv) >> 10;
-      final b = (c + 2066 * uv) >> 10;
-      final p = (row * width + col) * 4;
-      out[p] = r.clamp(0, 255);
-      out[p + 1] = g.clamp(0, 255);
-      out[p + 2] = b.clamp(0, 255);
-      out[p + 3] = 255;
-    }
-  }
-  return out;
-}
+}) =>
+    dartI420ToRgba(y, u, v, width, height,
+        strideY: yStride, strideU: uStride, strideV: vStride);
 
 /// Convert YUY2 / NV12 / I420 (or pass through RGBA/BGRA) to tightly-packed
 /// BGRA32 (b, g, r, 0xff per pixel). Used by HW encoders that take a packed
@@ -349,79 +278,44 @@ Uint8List _swapRb(Uint8List src, int w, int h) {
   return out;
 }
 
-// BT.601 limited-range YUV → RGB (×8192 fixed-point).
-//   R = 1.164*(Y-16)               + 1.596*(V-128)
-//   G = 1.164*(Y-16) - 0.392*(U-128) - 0.813*(V-128)
-//   B = 1.164*(Y-16) + 2.017*(U-128)
-void _yuvToBgraPixel(int y, int u, int v, Uint8List out, int p) {
-  final c = (y - 16) * 9539; // 1.164 * 8192
-  final d = u - 128;
-  final e = v - 128;
-  final r = (c + 13074 * e + 4096) >> 13;
-  final g = (c - 3210 * d - 6660 * e + 4096) >> 13;
-  final b = (c + 16525 * d + 4096) >> 13;
-  out[p] = b < 0 ? 0 : (b > 255 ? 255 : b);
-  out[p + 1] = g < 0 ? 0 : (g > 255 ? 255 : g);
-  out[p + 2] = r < 0 ? 0 : (r > 255 ? 255 : r);
-  out[p + 3] = 0xff;
-}
-
 Uint8List _yuy2ToBgra32(Uint8List src, int w, int h, List<int>? strides) {
   final yStride = (strides != null && strides.isNotEmpty) ? strides[0] : w * 2;
-  final out = Uint8List(w * h * 4);
+  // Deinterleave to I422 planes (keeps FULL vertical chroma resolution — no
+  // 4:2:0 downsample), then one shared-converter pass straight to BGRA.
+  final cw = (w + 1) >> 1;
+  final y = Uint8List(w * h);
+  final u = Uint8List(cw * h);
+  final v = Uint8List(cw * h);
   for (var row = 0; row < h; row++) {
     final srcRow = row * yStride;
-    final dstRow = row * w * 4;
-    for (var col = 0; col < w; col += 2) {
-      final p = srcRow + col * 2;
-      final y0 = src[p];
-      final u = src[p + 1];
-      final y1 = src[p + 2];
-      final v = src[p + 3];
-      _yuvToBgraPixel(y0, u, v, out, dstRow + col * 4);
-      _yuvToBgraPixel(y1, u, v, out, dstRow + (col + 1) * 4);
+    final yRow = row * w;
+    final cRow = row * cw;
+    for (var col = 0; col < cw; col++) {
+      final p = srcRow + col * 4;
+      y[yRow + col * 2] = src[p];
+      if (col * 2 + 1 < w) y[yRow + col * 2 + 1] = src[p + 2];
+      u[cRow + col] = src[p + 1];
+      v[cRow + col] = src[p + 3];
     }
   }
-  return out;
+  return dartI422ToRgba(y, u, v, w, h, bgra: true);
 }
 
 Uint8List _nv12ToBgra32(Uint8List src, int w, int h, List<int>? strides) {
-  final yStride = (strides != null && strides.isNotEmpty) ? strides[0] : w;
-  final uvStride = (strides != null && strides.length >= 2) ? strides[1] : w;
-  // For miniav buffers, planes are separately allocated; for tightly packed
-  // input, UV starts at `yStride * h`.
-  final yPlane = src;
-  final uvBase = yStride * h;
-  final out = Uint8List(w * h * 4);
-  for (var row = 0; row < h; row++) {
-    final yRow = row * yStride;
-    final uvRow = uvBase + (row ~/ 2) * uvStride;
-    final dstRow = row * w * 4;
-    for (var col = 0; col < w; col++) {
-      final y = yPlane[yRow + col];
-      final u = src[uvRow + (col & ~1)];
-      final v = src[uvRow + (col & ~1) + 1];
-      _yuvToBgraPixel(y, u, v, out, dstRow + col * 4);
-    }
-  }
-  return out;
+  final p = _nv12ToI420(src, w, h, strides);
+  return dartI420ToRgba(p.y, p.u, p.v, w, h, bgra: true);
 }
 
 Uint8List _i420ToBgra32(Uint8List src, int w, int h) {
   final ySize = w * h;
   final cw = w ~/ 2;
   final cSize = cw * (h ~/ 2);
-  final out = Uint8List(w * h * 4);
-  for (var row = 0; row < h; row++) {
-    final yRow = row * w;
-    final cRow = (row ~/ 2) * cw;
-    final dstRow = row * w * 4;
-    for (var col = 0; col < w; col++) {
-      final y = src[yRow + col];
-      final u = src[ySize + cRow + (col ~/ 2)];
-      final v = src[ySize + cSize + cRow + (col ~/ 2)];
-      _yuvToBgraPixel(y, u, v, out, dstRow + col * 4);
-    }
-  }
-  return out;
+  return dartI420ToRgba(
+    Uint8List.sublistView(src, 0, ySize),
+    Uint8List.sublistView(src, ySize, ySize + cSize),
+    Uint8List.sublistView(src, ySize + cSize, ySize + 2 * cSize),
+    w,
+    h,
+    bgra: true,
+  );
 }

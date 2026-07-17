@@ -20,17 +20,23 @@ For dart, each run must contain the
 
 | Module | Windows | Linux | macOS | Web | Android | iOS |
 |--------|---------|-------|-------|-----|---------|-----|
-| **Camera** | ✅ | ✅ | ✅ | ✅ | 🚧 | 🚧 |
-| **Screen Capture** | ✅ | ✅ | ✅ | ✅ | 🚧 | 🚧 |
-| **Audio Input** | ✅ | ✅ | ✅ | ✅ | 🚧 | 🚧 |
-| **Audio Loopback** | ✅ | ✅ | ✅ 15+ | ❌ | ❌ | ❌ |
-| **Input Capture** | ✅ | 🚧 | 🚧 | 🚧 | ❌ | ❌ |
+| **Camera** | ✅ | ✅ | ✅ | ✅ | ✅* 24+ | ✅* 13+ |
+| **Screen Capture** | ✅ | ✅ | ✅ | ✅ | ✅* 26+ | ✅* 13+ |
+| **Audio Input** | ✅ | ✅ | ✅ | ✅ | ✅* | ✅* |
+| **Audio Loopback** | ✅ | ✅ | ✅ 15+ | ❌ | 🚧 | ❌ |
+| **Input Capture** | ✅ | ✅* | ✅* | 🚧 | ❌ | ❌ |
 
-**Legend:** ✅ Supported • ❌ Not Available • 🚧 Planned
+**Legend:** ✅ Supported • ✅\* New in 0.7.0 — implemented and adversarially reviewed; on-device verification still in progress • ❌ Not Available • 🚧 Planned
+
+Mobile notes: Android screen capture requires API 26+ (camera works from 24); iOS
+supports **both** in-app capture and system-wide capture via a Broadcast Upload
+Extension (see the iOS Permissions section). Android loopback (AudioPlaybackCapture)
+is planned on top of the same MediaProjection consent flow. Mobile input capture is
+deliberately out of scope (no OS-sanctioned global hooks on mobile).
 
 ### (Maybe) Planned Features
 
-- **Android/iOS**: Full support on mobile platforms
+- **Android loopback**: system-audio capture via AudioPlaybackCapture (API 29+), reusing the MediaProjection consent flow
 - **GPU Interop**: Helpers to easily manage handles and shared fences for GPU processing
 - **Permission Management**: Simplified APIs for handling platform-specific permissions
 - **macOS/Linux context-lost wiring**: Per-context device-loss callbacks for non-Windows platforms (currently handled via the polling watcher)
@@ -86,7 +92,16 @@ No other changes are needed — all `MiniAV.*` APIs are available from the same 
  cd miniav/example/flutter_example
  flutter config --enable-native-assets
  flutter run -d chrome/windows/linux
+
+ flutter mobile:
+ flutter run -d <android-device>/<ios-device>
 ```
+
+Mobile builds compile the native library through the same native-assets hook:
+Android needs the Android SDK + NDK, CMake, and Ninja (all installable via
+Android Studio's SDK Manager); iOS needs Xcode + CMake and builds for
+deployment target 13.0+. First mobile builds are slow — the whole C library is
+compiled per-ABI.
 
 ## Example
 
@@ -330,6 +345,11 @@ MiniAVInputConfig(
 
 ## Permissions
 
+**miniAV never shows permission prompts itself.** Your app is responsible for
+requesting OS permissions *before* configuring a capture context — if a
+permission is missing, configuration/start fails with
+`MiniAVResultCode.errorPermissionDenied` and a log explaining what to request.
+
 ### macOS
 
 Add to `macos/Runner/Info.plist`:
@@ -341,7 +361,12 @@ Add to `macos/Runner/Info.plist`:
 <string>This app uses the microphone for audio recording</string>
 ```
 
-For screen recording, manually enable in System Preferences > Security & Privacy > Privacy > Screen Recording.
+For screen recording, manually enable in System Settings > Privacy & Security > Screen Recording.
+
+For input capture (CGEventTap keyboard/mouse), the app additionally needs
+**Accessibility** and (macOS 10.15+) **Input Monitoring** approval under
+System Settings > Privacy & Security. Gamepads (GameController framework) need
+no permission.
 
 ### Windows
 
@@ -349,21 +374,96 @@ Camera and microphone access controlled via Windows 10+ Privacy Settings. Screen
 
 ### Linux
 
-User must be in `video` and `audio` groups:
+User must be in `video` and `audio` groups (and `input` for input capture,
+which reads `/dev/input/event*`):
 
 ```bash
-sudo usermod -a -G audio,video $USER
+sudo usermod -a -G audio,video,input $USER
 ```
 
 Install required development packages:
 
 ```bash
 # Ubuntu/Debian
-sudo apt install libasound2-dev libpulse-dev libpipewire-0.3-dev libv4l-dev
+sudo apt install libasound2-dev libpulse-dev libpipewire-0.3-dev libglib2.0-dev libv4l-dev
 
 # Fedora
-sudo dnf install alsa-lib-devel pulseaudio-libs-devel pipewire-devel libv4l-devel
+sudo dnf install alsa-lib-devel pulseaudio-libs-devel pipewire-devel glib2-devel libv4l-devel
 ```
+
+(`libglib2.0-dev`/`glib2-devel` provides `gio-unix-2.0`, used by the screen-capture portal path.)
+
+### Android
+
+Declare what you use in your app's `android/app/src/main/AndroidManifest.xml`:
+
+```xml
+<uses-permission android:name="android.permission.CAMERA" />
+<uses-permission android:name="android.permission.RECORD_AUDIO" />
+```
+
+Request them at runtime (e.g. with the `permission_handler` package) **before**
+configuring a camera or audio context — miniAV does not prompt.
+
+**Screen capture** (API 26+) requires the user's MediaProjection consent and a
+`mediaProjection`-typed foreground service. With `miniav_flutter` this is one
+call — the plugin shows the system consent dialog, starts the required
+foreground service (its manifest entries merge into your app automatically),
+and hands the projection to the native layer:
+
+```dart
+import 'package:miniav_flutter/miniav_flutter.dart';
+
+final granted = await MiniAVAndroidScreenConsent.requestScreenCapture();
+if (granted) {
+  // Now MiniScreen.createContext() / configure / startCapture work.
+}
+
+// The user can revoke via the system status-bar chip at any time:
+MiniAVAndroidScreenConsent.onProjectionStopped.listen((_) {
+  // stop your capture UI; the active context also fires its lost callback
+});
+
+// When you are done:
+await MiniAVAndroidScreenConsent.stopScreenCapture();
+```
+
+Non-Flutter embedders pass a consented `MediaProjection` global ref through
+the C seam `MiniAV_Screen_SetAndroidMediaProjection(JavaVM*, jobject)` before
+configuring the display (see `include/miniav_capture.h`).
+
+### iOS
+
+Add to `ios/Runner/Info.plist`:
+
+```xml
+<key>NSCameraUsageDescription</key>
+<string>This app uses the camera for video capture</string>
+<key>NSMicrophoneUsageDescription</key>
+<string>This app uses the microphone for audio recording</string>
+```
+
+The app must obtain AVFoundation authorization (e.g. via `permission_handler`)
+before configuring camera/mic — a not-yet-requested permission also reports
+`errorPermissionDenied`. Camera frames are delivered in sensor-native
+orientation in v1 (rotate downstream if needed).
+
+**Screen capture** exposes two pseudo-displays from `MiniScreen.enumerateDisplays()`:
+
+- `app_screen` — in-app capture (ReplayKit). iOS shows its own consent dialog
+  when capture starts; no plist key needed.
+- `system_screen_broadcast` — system-wide capture via a **Broadcast Upload
+  Extension** you add to your app (started by the user from Control Center).
+  Requires an App Group shared between your app and the extension. The full
+  Xcode walkthrough — extension target, App Group, compiling the provided
+  `miniav_broadcast_sender` + `SampleHandler.swift` — lives at
+  `miniav_ffi/miniav_c/src/screen/ios/broadcast_extension/SETUP.md`.
+  The host app registers its App Group before configuring this display:
+
+  ```dart
+  await MiniScreen.setIOSAppGroup('group.com.example.yourapp');
+  // then configure + start the 'system_screen_broadcast' display
+  ```
 
 ### Web
 
@@ -599,22 +699,29 @@ await context.configure(deviceId, preferredFormat);
 
 ### Error Handling
 
+Failed operations throw an `Exception` whose message ends with the native
+result-code name (e.g. `MINIAV_ERROR_NOT_SUPPORTED`,
+`MINIAV_ERROR_PERMISSION_DENIED`, `MINIAV_ERROR_DEVICE_BUSY`):
+
 ```dart
 try {
+  await context.configure(deviceId, format);
   await context.startCapture(callback);
-} on MiniAVException catch (e) {
-  switch (e.code) {
-    case MiniAVResultCode.errorNotSupported:
-      // Handle unsupported operation
-      break;
-    case MiniAVResultCode.errorInvalidArg:
-      // Handle invalid parameters
-      break;
-    default:
-      print('Capture error: ${e.message}');
+} on Exception catch (e) {
+  final msg = e.toString();
+  if (msg.contains('MINIAV_ERROR_PERMISSION_DENIED')) {
+    // The app has not obtained the OS permission / consent flow for this
+    // capture type — see the Permissions section, then retry.
+  } else if (msg.contains('MINIAV_ERROR_NOT_SUPPORTED')) {
+    // This module/tier is unavailable on the current platform.
+  } else {
+    print('Capture error: $e');
   }
 }
 ```
+
+Prefer requesting permissions up front (see Permissions) so these paths are
+exceptional rather than routine.
 
 ## Performance Tips
 
@@ -629,14 +736,18 @@ try {
 ### Native Dependencies
 
 - **Windows**: Media Foundation, DirectX 11, WASAPI, XInput
-- **macOS**: AVFoundation, Core Graphics, Core Audio
-- **Linux**: PipeWire, PulseAudio, ALSA, V4L2
+- **macOS**: AVFoundation, ScreenCaptureKit, Core Audio, ApplicationServices/GameController (input)
+- **Linux**: PipeWire, PulseAudio, ALSA, V4L2, evdev (input)
+- **Android**: Camera2 NDK (API 24+), MediaProjection + AImageReader (API 26+), AAudio/OpenSL via miniaudio
+- **iOS**: AVFoundation, ReplayKit, Metal, AVAudioSession
 
 ### Build Dependencies
 
 - CMake 3.15+
 - Platform-appropriate C++ compiler
 - pkg-config (Linux)
+- Android SDK + NDK r26+, Ninja (Android)
+- Xcode (iOS/macOS)
 
 ## Troubleshooting
 

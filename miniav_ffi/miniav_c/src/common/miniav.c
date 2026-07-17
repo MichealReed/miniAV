@@ -12,9 +12,12 @@
 #include <string.h>
 
 // Version info
+// Keep in lockstep with miniav_ffi's pubspec version (was stale at 0.1.0
+// for years while the packages moved on — meaningless self-reporting).
 #define MINIAV_VERSION_MAJOR 0
-#define MINIAV_VERSION_MINOR 1
+#define MINIAV_VERSION_MINOR 7
 #define MINIAV_VERSION_PATCH 0
+#define MINIAV_VERSION_STRING "0.7.0"
 
 // --- Error Strings ---
 static const char *miniav_error_string(MiniAVResultCode code) {
@@ -47,6 +50,26 @@ static const char *miniav_error_string(MiniAVResultCode code) {
     return "Out of memory";
   case MINIAV_ERROR_TIMEOUT:
     return "Timeout";
+  case MINIAV_ERROR_DEVICE_LOST:
+    return "Device lost";
+  case MINIAV_ERROR_FORMAT_NOT_SUPPORTED:
+    return "Format not supported";
+  case MINIAV_ERROR_INVALID_OPERATION:
+    return "Invalid operation";
+  case MINIAV_ERROR_NOT_IMPLEMENTED:
+    return "Not implemented";
+  case MINIAV_ERROR_NOT_CONFIGURED:
+    return "Not configured";
+  case MINIAV_ERROR_PORTAL_FAILED:
+    return "Desktop portal request failed";
+  case MINIAV_ERROR_STREAM_FAILED:
+    return "Stream failed";
+  case MINIAV_ERROR_PORTAL_CLOSED:
+    return "Desktop portal session closed";
+  case MINIAV_ERROR_USER_CANCELLED:
+    return "Cancelled by user";
+  case MINIAV_ERROR_PERMISSION_DENIED:
+    return "Permission denied (request the OS permission app-side first)";
   default:
     return "Unrecognized error code";
   }
@@ -64,7 +87,7 @@ MiniAVResultCode MiniAV_GetVersion(uint32_t *major, uint32_t *minor,
   return MINIAV_SUCCESS;
 }
 
-const char *MiniAV_GetVersionString(void) { return "0.1.0"; }
+const char *MiniAV_GetVersionString(void) { return MINIAV_VERSION_STRING; }
 
 const char *MiniAV_GetErrorString(MiniAVResultCode code) {
   return miniav_error_string(code);
@@ -102,9 +125,12 @@ MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
       res = cam_ctx->ops->release_buffer(cam_ctx, payload);
     } else {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "Invalid camera context or release_buffer op for payload %p.",
+                 "Invalid camera context or release_buffer op for payload %p. "
+                 "Freeing the payload wrapper only (native resources may "
+                 "leak).",
                  payload);
-      res = MINIAV_ERROR_INVALID_HANDLE;
+      miniav_free(payload);
+      return MINIAV_ERROR_INVALID_HANDLE;
     }
   } else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN) {
     MiniAVScreenContext *screen_ctx =
@@ -113,9 +139,12 @@ MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
       res = screen_ctx->ops->release_buffer(screen_ctx, payload);
     } else {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "Invalid screen context or release_buffer op for payload %p.",
+                 "Invalid screen context or release_buffer op for payload %p. "
+                 "Freeing the payload wrapper only (native resources may "
+                 "leak).",
                  payload);
-      res = MINIAV_ERROR_INVALID_HANDLE;
+      miniav_free(payload);
+      return MINIAV_ERROR_INVALID_HANDLE;
     }
   } else if (payload->handle_type == MINIAV_NATIVE_HANDLE_TYPE_AUDIO) {
     // Free the heap-copied PCM data (native_singular_resource_ptr) and the
@@ -135,21 +164,20 @@ MiniAVResultCode MiniAV_ReleaseBuffer(void *internal_handle_payload_ptr) {
   }
    else {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "Unsupported payload handle_type: %d for payload %p.",
+               "Unsupported payload handle_type: %d for payload %p. Freeing "
+               "the payload wrapper only (native resources may leak).",
                payload->handle_type, payload);
-    res = MINIAV_ERROR_INVALID_HANDLE; // Or a more specific error
+    miniav_free(payload);
+    return MINIAV_ERROR_INVALID_HANDLE;
   }
 
+  // NOTE: the platform release op owns and frees `payload` — do not touch it
+  // (even for logging its address) past this point.
   if (res == MINIAV_SUCCESS) {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "Platform release_buffer successful for payload: %p. Freeing "
-               "internal payload.",
-               payload);
+    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "Platform release_buffer successful.");
   } else {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "Platform release_buffer failed for payload: %p. Freeing "
-               "internal payload anyway.",
-               payload);
+               "Platform release_buffer failed (%d).", (int)res);
   }
   return res;
 }

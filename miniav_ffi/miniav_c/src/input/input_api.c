@@ -11,6 +11,12 @@ static const MiniAVInputBackend g_input_backends[] = {
 #if defined(_WIN32)
     {"WindowsHooks+XInput", &g_input_ops_win,
      miniav_input_context_platform_init_windows},
+#elif defined(__linux__) && !defined(__ANDROID__)
+    {"LinuxEvdev", &g_input_ops_linux,
+     miniav_input_context_platform_init_linux},
+#elif defined(__APPLE__)
+    {"macOSEventTap+IOKit", &g_input_ops_macos,
+     miniav_input_context_platform_init_macos},
 #endif
     {NULL, NULL, NULL} // Sentinel
 };
@@ -168,7 +174,16 @@ MiniAV_Input_DestroyContext(MiniAVInputContextHandle context_handle) {
   }
 
   if (ctx->ops && ctx->ops->destroy_platform) {
-    ctx->ops->destroy_platform(ctx);
+    MiniAVResultCode destroy_res = ctx->ops->destroy_platform(ctx);
+    if (destroy_res == MINIAV_ERROR_TIMEOUT) {
+      // A capture thread survived teardown and still dereferences THIS parent
+      // context (callbacks, config) — leak it too rather than free memory a
+      // live thread uses.
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "Input DestroyContext: platform teardown timed out — "
+                 "leaking the context (a capture thread is still alive).");
+      return destroy_res;
+    }
   } else {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
                "destroy_platform op not available for input. Freeing "

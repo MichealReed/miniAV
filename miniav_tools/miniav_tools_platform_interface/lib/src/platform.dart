@@ -2,6 +2,7 @@
 library;
 
 import 'backend.dart';
+import 'capability.dart';
 import 'codec_types.dart';
 
 /// User preference for backend selection on a per-call basis.
@@ -45,20 +46,50 @@ class MiniAVToolsPlatform {
   final List<MiniAVToolsBackend> _backends = [];
   final Map<String, int> _priorityOverrides = {};
 
+  /// Memoized [MiniAVToolsBackend.probe] results, keyed by backend + query.
+  /// Probe results are stable for a fixed backend set (a backend reports the
+  /// same capabilities for the same codec/direction each time — including
+  /// native availability checks that don't change within a process), so the
+  /// negotiator can reuse them instead of re-probing (and re-loading libs) on
+  /// every `createDecoder`/`createEncoder`. Invalidated whenever the registry
+  /// changes.
+  final Map<String, List<CodecCapability>> _probeCache = {};
+
   /// Register a backend. Idempotent by backend name.
   void register(MiniAVToolsBackend backend) {
     if (_backends.any((b) => b.name == backend.name)) return;
     _backends.add(backend);
+    _probeCache.clear();
   }
 
   /// Unregister all backends with the given name. Mainly for tests.
   void unregisterByName(String name) {
     _backends.removeWhere((b) => b.name == name);
+    _probeCache.clear();
   }
 
   /// Override the priority of a registered backend by name.
   void setBackendPriority(String name, int priority) {
     _priorityOverrides[name] = priority;
+    // Priority feeds ranking, not probe() output, but clear anyway so nothing
+    // stale can ever linger.
+    _probeCache.clear();
+  }
+
+  /// [MiniAVToolsBackend.probe] with memoization (see [_probeCache]). The
+  /// negotiator calls this instead of `backend.probe` directly.
+  Future<List<CodecCapability>> cachedProbe(
+    MiniAVToolsBackend backend,
+    CodecQuery query,
+  ) async {
+    final key = '${backend.name}|${query.direction.name}|'
+        '${query.videoCodec?.name}|${query.audioCodec?.name}|'
+        '${query.container?.name}|${query.customName}';
+    final hit = _probeCache[key];
+    if (hit != null) return hit;
+    final caps = List<CodecCapability>.unmodifiable(await backend.probe(query));
+    _probeCache[key] = caps;
+    return caps;
   }
 
   /// Snapshot of installed backends (read-only).
@@ -66,6 +97,11 @@ class MiniAVToolsPlatform {
 
   int _priorityOf(MiniAVToolsBackend b) =>
       _priorityOverrides[b.name] ?? b.priority;
+
+  /// Effective priority of [b] including any override set via
+  /// [setBackendPriority]. Exposed so the facade's negotiator can tie-break
+  /// ranked capabilities deterministically (`List.sort` is not stable).
+  int priorityOf(MiniAVToolsBackend b) => _priorityOf(b);
 
   /// Backends in priority order (highest first), filtered by [pref].
   Iterable<MiniAVToolsBackend> orderedBackends(BackendPreference pref) sync* {

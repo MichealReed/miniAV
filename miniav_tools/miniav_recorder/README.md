@@ -2,7 +2,31 @@
 
 High-level multi-source A/V recorder for Dart.  Combines screen, camera, microphone and loopback sources into one or more MP4/MKV/M4A/MP3 outputs (or live chunked streams) with a shared master clock.
 
-Built on [`miniav`](../miniAV/miniav/) + [`miniav_tools`](../miniav_tools/) + [`miniav_tools_ffmpeg`](../miniav_tools_ffmpeg/).
+Built on [`miniav`](../miniAV/miniav/) + [`miniav_tools`](../miniav_tools/) +
+[`miniav_tools_codecs`](../miniav_tools_codecs/) +
+[`miniav_tools_ffmpeg`](../miniav_tools_ffmpeg/).
+
+## Codec backends
+
+`Recorder.start()` registers both the first-party backends and FFmpeg before
+negotiating — **you do not need to call anything**. On Windows that means
+H.264/HEVC go to the OS hardware encoder MFT (NVENC / AMF / QSV) and AAC to the
+OS codec, with no FFmpeg in the encode path; MP4 is written by the first-party
+muxer.
+
+FFmpeg stays registered as the cross-platform floor and still wins wherever it
+is genuinely the better path — selection is by reported capability, ranking
+`isHardware` above `zeroCopy` above `priority`, not by registration order. On
+Linux/macOS the same code falls back to FFmpeg automatically.
+
+The `video stats` log line reports which encoder was chosen, along with encoded
+vs incoming fps — the first place to look if output is not what you expect. To
+force a choice:
+
+```dart
+BackendPreference.pinned('mf_encode');
+BackendPreference.excluded({'mf_encode'});
+```
 
 ---
 
@@ -166,9 +190,18 @@ When recording a screen source on Windows with a compatible hardware encoder (NV
 1. Initialises a shared **Dawn D3D12** context via [minigpu](../../minigpu/minigpu/).
 2. Creates a matching **`ID3D11Device`** on the same GPU adapter.
 3. Requests **GPU output** (`MiniAVOutputPreference.gpu`) from the DXGI capture so each frame arrives as a D3D11 NT shared handle — no pixel data crosses PCIe.
-4. Passes the shared device handle to the FFmpeg backend, which opens `FfmpegD3d11HwEncoder` with `existingD3d11Device`.  The encoder reads the texture directly without any CPU copy.
+4. Hands that handle to the negotiated encoder, which reads the texture directly with no CPU copy.
 
 Falls back silently to the CPU-upload path on any failure (unsupported GPU, non-Windows, no HW encoder).
+
+Two GPU-resident frame shapes reach the encoder, and which one you get depends on whether there is GPU work to do:
+
+| Situation | Frame handed over | Requirement |
+|-----------|-------------------|-------------|
+| No scale policy, no effects | the capture's shared NT handle, straight through | `supportsD3d11SharedHandleInput` |
+| Scale and/or effects active | an `ID3D11Texture2D` on the GPU processor's device | `supportsD3d11TextureInput` |
+
+Negotiation is restricted to backends that accept the shape the recorder has already committed to producing. Without that, a higher-priority encoder taking only shared handles could win, trip the safety net, and reintroduce the very CPU readback the GPU path exists to avoid — strictly worse than the backend it displaced. Ranking alone cannot see this: it compares hardware / zero-copy / priority, not what is about to be handed over.
 
 ### Process-global GPU singleton & hot restart
 

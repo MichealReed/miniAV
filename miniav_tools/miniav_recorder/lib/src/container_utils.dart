@@ -53,3 +53,26 @@ Container containerForTrackMix({
   }
   return Container.mkv; // mixed or unknown codecs
 }
+
+/// Whether the first-party (FFmpeg-free) muxer can write this combination.
+///
+/// This is a capability question with a coupling behind it. `FfmpegMuxer`
+/// requires a live `AVCodecContext` per audio track to fill codecpar —
+/// `ch_layout` is not reachable from the Dart-side `AVCodecParameters` prefix —
+/// which means it can only mux audio that FFmpeg itself encoded. The
+/// first-party writer takes already-encoded packets and needs no encoder
+/// handle at all, so preferring it removes a dependency between the muxer and
+/// whichever backend happened to win the audio negotiation.
+///
+/// Kept deliberately narrow: it answers `false` for anything the ISO-BMFF
+/// writer does not handle (MKV above all), and those fall to FFmpeg as before.
+bool firstPartyMuxerCanWrite({
+  required Container container,
+  required Iterable<VideoCodec> videoCodecs,
+  required Iterable<AudioCodec> audioCodecs,
+}) {
+  if (container != Container.mp4 && container != Container.m4a) return false;
+  const video = {VideoCodec.h264, VideoCodec.hevc, VideoCodec.av1};
+  return videoCodecs.every(video.contains) &&
+      audioCodecs.every((c) => c == AudioCodec.aac);
+}

@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.5.7
+
+- Idle/CFR duplicate frames now ask the encoder to repeat its last frame rather
+  than re-encoding the GPU processor's `SharedOutputTexture`. The old approach
+  failed whenever that texture was not part of the live path — notably direct
+  BGRA passthrough (`gpuWork=false`), where nothing writes it — producing a
+  steady stream of encode errors from a timer while live encoding was perfectly
+  healthy. Falls back to the old path for encoders without the capability, and a
+  declined repeat now leaves the slot unfilled instead of raising.
+
+## 0.5.6
+
+- **Muxing prefers the first-party writer.** `FfmpegMuxer` requires a live
+  `AVCodecContext` per audio track to fill codecpar (`ch_layout` is not
+  reachable from the Dart-side `AVCodecParameters` prefix), so it can only mux
+  audio that FFmpeg itself encoded. Once AAC moved to the OS codec by default in
+  0.5.3, that coupling broke clip saving outright: the temporary encoder opened
+  purely to obtain an `FfmpegEncoderBridge` was no longer an FFmpeg one, the
+  bridge map came back empty, and the muxer threw "Audio tracks must be bound to
+  a FfmpegAudioEncoder". Both the clip path and the main file sink now use the
+  first-party ISO-BMFF writer for MP4/M4A with H.264/HEVC/AV1 + AAC, which takes
+  already-encoded packets and needs no encoder handle at all. Anything it does
+  not cover -- MKV above all -- still goes to FFmpeg exactly as before.
+- The clip path no longer requires a caller-supplied `muxerFactory`, and no
+  longer restricts the first-party writer to AV1. That restriction was correct
+  when the Dart writer only understood AV1; it now writes H.264/HEVC too
+  (Annex-B to length-prefixed samples, plus the `avcC`/`hvcC` record), so the
+  gate had outlived its reason.
+- New `firstPartyMuxerCanWrite()` in `container_utils.dart` holds that policy in
+  one place rather than duplicating it across the two muxing sites.
+
+## 0.5.5
+
+- **Internal pins are now caret ranges, not exact versions.** Exact pins made
+  every patch cascade: publishing `miniav_tools_platform_interface` 0.5.3 made
+  the already-published `miniav_tools` 0.5.3 and `miniav_tools_ffmpeg` 0.5.3
+  unsatisfiable next to it, because they pinned 0.5.2 exactly and nothing in the
+  set could move independently. `dart pub publish` warns about this. `release.py
+  sync` now normalises to caret so it cannot recur.
+
+## 0.5.4
+
+- Picks up `miniav_tools_codecs` 0.6.2 (0.6.1 could not build its native assets
+  downstream). No recorder code change.
+- README: the zero-copy section still said the shared handle goes to the FFmpeg
+  backend's `FfmpegD3d11HwEncoder`, which has not been the default since 0.5.3.
+  Now documents the two GPU-resident frame shapes, which capability each needs,
+  and why negotiation is restricted to backends that accept the shape the
+  recorder has already committed to producing.
+
+## 0.5.3
+
+- **The FFmpeg-free path is now the default.** `_prepare` calls
+  `registerFirstPartyBackends()` before negotiating, so on Windows H.264/HEVC
+  goes to the OS hardware encoder MFT (NVENC / AMF / QSV) and AAC to the OS
+  codec, with no per-app registration. FFmpeg is still registered and still
+  wins wherever it is genuinely the better path — capability is reported
+  honestly and `isHardware` outranks priority. Pin or exclude explicitly with
+  `BackendPreference.pinned` / `.excluded` if a specific backend is required.
+
+- Encoder negotiation is now restricted to backends that accept the frame kind
+  the caller has already committed to producing. With scale/effects on, the
+  screen path hands over a D3D11 *texture*; without this a higher-priority
+  encoder that takes only shared handles wins, trips the safety net, and adds
+  back the CPU readback the GPU path existed to avoid — strictly worse than the
+  backend it displaced. Ranking cannot see this: it compares
+  hardware/zero-copy/priority, not what is about to be handed over.
+
+- **Screen zero-copy is gated on encoder capabilities, not on a concrete type.**
+  The check was `encoder.platform is FfmpegD3d11HwEncoder`, so any other
+  GPU-capable encoder failed it, tripped the safety net, and was silently forced
+  onto the CPU-readback path — a full frame readback per frame at screen
+  resolution, with no error anywhere. It now asks
+  `supportsD3d11SharedHandleInput` (capture NT handle → direct passthrough) and
+  `supportsD3d11TextureInput` (processor texture → pipelined), which are gated
+  separately: an encoder that takes a handle but not a foreign-device texture
+  now gets passthrough when there is no scale/effects work, and falls back only
+  when there is. Capture also configures GPU output when a registered backend
+  accepts `miniavBufferD3D11`, so the handle exists to pass through.
+
+- Warn at GPU init when the loaded minigpu native binary predates the event-drain
+  fix (`Minigpu.drainSpinBudgetMs` null or 0), and expose it as
+  `Recorder.gpuDrainFixPresent`. Without that fix every GPU wait costs a ~15.6 ms
+  Windows timer quantum; the per-frame GPU stage then overruns the frame budget
+  on its own, the adaptive throttle reads that as a saturated GPU and steps the
+  live capture rate down — so a stale native artifact presents as recording
+  stutter with no error anywhere. The bundled DLL is a build artifact and a stale
+  one loads perfectly happily, which is what makes this worth a runtime check.
+- Screen effect chain now uses fire-and-forget dispatch: one synchronization
+  point per frame instead of one per effect. The texture downscale stays awaited
+  on purpose — its per-frame texture bind has no ordered variant and the texture
+  is destroyed as soon as the call returns.
+- Requires `minigpu: ^1.5.9`, where buffer binds are ordered against
+  `dispatchFire`. On 1.5.8 the same code would silently bind wrong.
+
 ## 0.5.2
 
 - Fixed the metronomic stutter in screen recordings: the fps throttle no

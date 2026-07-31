@@ -1,10 +1,16 @@
 /* mf_encoder.c — Windows Media Foundation H.264/HEVC video ENCODE.
  *
- * The encode analogue of mf_decoder.c. This first cut is the verifiable core:
- * a SYNC encoder MFT (the MS software H.264/HEVC encoder) consuming
- * system-memory NV12 and emitting an elementary bitstream + SPS/PPS. Zero
- * FFmpeg. D3D11 zero-copy texture input, async/hardware encoders, and the MTA
- * isolate host are follow-ups (the sync CPU path proves the codec + pipeline).
+ * The encode analogue of mf_decoder.c. Prefers a HARDWARE (async) encoder MFT
+ * and falls back to the sync MS software MFT, consuming system-memory NV12 and
+ * emitting an elementary bitstream + SPS/PPS. Zero FFmpeg.
+ *
+ * Hardware MFTs are ASYNC: they must be unlocked, then driven through their
+ * IMFMediaEventGenerator (one ProcessInput per METransformNeedInput, one
+ * ProcessOutput per METransformHaveOutput). Enumerating with SYNCMFT alone
+ * filters every hardware encoder out, which is what kept this software-only.
+ *
+ * Still a follow-up: D3D11 zero-copy TEXTURE input (input is CPU NV12, so a GPU
+ * frame is read back before it reaches the encoder).
  *
  * Reuses the lessons from mf_aac.c: output-type-before-input for encoders, and
  * PRE-ALLOCATE the output IMFSample (the MS encoders don't provide their own →
@@ -25,7 +31,12 @@
 #include <mfidl.h>
 #include <mfobjects.h>
 #include <mftransform.h>
+#include <d3d11.h>
+#include <d3d11_1.h> /* ID3D11Device1 / OpenSharedResource1 (NT handles) */
+#include <dxgi1_2.h> /* IDXGIResource1::CreateSharedHandle (NT-handle sharing) */
+#include <mfobjects.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,6 +45,15 @@
 /* MF packs FRAME_SIZE / FRAME_RATE / PAR as a UINT64 = (hi << 32) | lo. This
  * avoids linking MFSetAttributeSize/Ratio. */
 #define PACK64(hi, lo) (((UINT64)(UINT32)(hi) << 32) | (UINT32)(lo))
+
+/* NV12 staging slots. A hardware encoder MFT signals NeedInput only when it has
+ * a free input slot, so the number of samples it holds at once is small; four
+ * is comfortably above that and costs ~11 MB of VRAM at 4K. */
+#define MFENC_NV12_RING 4
+/* Imported source textures kept open. The GPU processor feeding this path
+ * recycles a shallow output ring, so a handful of entries turns the per-frame
+ * OpenSharedResource into a pointer compare. */
+#define MFENC_IMPORT_CACHE 4
 
 typedef struct {
   uint8_t *data; /* malloc'd elementary bitstream; caller frees */
@@ -50,7 +70,156 @@ typedef struct {
   uint8_t extradata[256];  /* SPS/PPS (MF_MT_MPEG_SEQUENCE_HEADER) */
   int extradata_len;
   int started;
+
+  /* Hardware / async MFT state. A hardware encoder MFT is an ASYNC MFT: it
+   * does not answer ProcessInput/ProcessOutput on demand, it raises
+   * METransformNeedInput / METransformHaveOutput on its event generator and we
+   * may only call the matching method once per event. Sync software MFTs leave
+   * all of this NULL/0 and take the original straight-line path. */
+  IMFMediaEventGenerator *event_gen;
+  int is_async;
+  int is_hardware;
+  int need_input;  /* unconsumed METransformNeedInput count */
+  int have_output; /* unconsumed METransformHaveOutput count */
+  int drain_done;
+  char mft_name[128]; /* MFT_FRIENDLY_NAME_Attribute, for diagnostics/tests */
+
+  /* D3D11 zero-copy input. Present only on the hardware path: the MFT is bound
+   * to this device via MFT_MESSAGE_SET_D3D_MANAGER *before* the media types are
+   * set, which is what lets it consume a texture instead of system memory. */
+  ID3D11Device *device;
+  /* 0 when the device was injected by the caller -- we hold a reference either
+   * way, so teardown is identical; this only records provenance. */
+  int owns_device;
+  IMFDXGIDeviceManager *dxgi_mgr;
+  UINT reset_token;
+
+  /* D3D11 VideoProcessor, for RGBA/BGRA texture input (the recorder's
+   * scale/effects path). Built lazily on the first texture frame: a session
+   * that only ever sees NV12 never pays for it.
+   *
+   * EVERYTHING here is built once and reused. The per-frame path must allocate
+   * nothing: opening a shared resource is a kernel-object operation and
+   * creating a processor view is a driver allocation, and paying either one
+   * 60 times a second is exactly the kind of overhead that shows up as frame
+   * pacing jitter rather than as a number in a profile. */
+  ID3D11DeviceContext *ctx;
+  ID3D11VideoDevice *vdev;
+  ID3D11VideoContext *vctx;
+  ID3D11VideoProcessorEnumerator *vp_enum;
+  ID3D11VideoProcessor *vp;
+
+  /* NV12 staging RING, not a single texture.
+   *
+   * A single shared staging texture is a read-write hazard: ProcessInput hands
+   * the MFT a sample that merely REFERENCES the texture, and an async hardware
+   * MFT reads it whenever it gets to it — so blitting the next frame into the
+   * same surface can overwrite a picture the encoder is still consuming. That
+   * is a tear, and it is intermittent and load-dependent, which is the worst
+   * kind. The ring gives the encoder room to hold a couple of frames in
+   * flight; [mfenc_pick_nv12] refuses to reuse a slot the MFT still holds. */
+  ID3D11Texture2D *nv12_tex[MFENC_NV12_RING];
+  ID3D11VideoProcessorOutputView *nv12_ov[MFENC_NV12_RING];
+  /* Reference count of a slot that nothing but this session holds, sampled
+   * once at construction. It is not necessarily 1: an output view keeps a
+   * reference to its resource too, and how many is a driver detail. Calibrate
+   * rather than assume. */
+  unsigned long nv12_base_rc[MFENC_NV12_RING];
+  int nv12_next;
+  int nv12_last;       /* slot most recently blitted — read by the diagnostic */
+  int nv12_busy_streak; /* consecutive "no free slot" answers; see below */
+
+  /* One reusable fence for the blt, and the imported-source cache. */
+  ID3D11Query *blt_fence;
+
+  /* The surface handed to the MFT most recently, retained.
+   *
+   * A duplicate frame -- what the recorder emits to fill an idle CFR slot -- is
+   * the SAME picture with a new timestamp. Re-importing the producer's texture
+   * to express that is both wasteful and fragile: the producer owns that
+   * surface's lifetime and may have recycled or released it by the time the
+   * idle timer fires, which is exactly how duplicates ended up failing while
+   * live frames succeeded. Holding our own reference makes a repeat
+   * self-contained. */
+  ID3D11Texture2D *last_sub;
+
+  /* Why the most recent import failed. Diagnostics, but load-bearing ones:
+   * "could not import" is the same message for a QueryInterface miss, a
+   * refused CreateSharedHandle and a cross-adapter OpenSharedResource, and
+   * those have completely different fixes. Guessing between them from the
+   * outside is what turned this into several wrong fixes in a row. */
+  char imp_err[224];
+  struct {
+    void *key;     /* caller's ID3D11Texture2D* — identity only, not a ref */
+    HANDLE handle; /* its shared handle, so pointer reuse after a free misses */
+    ID3D11Texture2D *tex;
+    ID3D11VideoProcessorInputView *iv;
+    IDXGIKeyedMutex *km; /* NULL for MISC_SHARED sources, which have none */
+  } imp[MFENC_IMPORT_CACHE];
+  int imp_next;
 } MfVidEnc;
+
+/* Drain every queued event without blocking, tallying the ones we act on.
+ * GetEvent has no timeout parameter, so NO_WAIT + an explicit sleep in the
+ * caller is the only way to bound the wait. */
+static void mfenc_pump(MfVidEnc *s) {
+  if (!s->event_gen) return;
+  for (;;) {
+    IMFMediaEvent *ev = NULL;
+    HRESULT hr = IMFMediaEventGenerator_GetEvent(s->event_gen,
+                                                 MF_EVENT_FLAG_NO_WAIT, &ev);
+    if (FAILED(hr) || !ev) break;
+    MediaEventType met = 0;
+    IMFMediaEvent_GetType(ev, &met);
+    if (met == METransformNeedInput) {
+      s->need_input++;
+    } else if (met == METransformHaveOutput) {
+      s->have_output++;
+    } else if (met == METransformDrainComplete) {
+      s->drain_done = 1;
+    }
+    IMFMediaEvent_Release(ev);
+  }
+}
+
+/* Wait (bounded) for the MFT to raise any event we care about.
+ *
+ * Two failure modes to avoid, both hit during development:
+ *   - A BLOCKING GetEvent (flags=0) deadlocks whenever the expected event never
+ *     comes — e.g. draining with nothing left to drain.
+ *   - Polling with Sleep(1) costs a ~15.6 ms Windows timer quantum per
+ *     iteration, which measured 3.05 s PER FRAME.
+ * So: yield-spin (no timer involved) for a short budget, then degrade to coarse
+ * sleeping, and give up rather than hang. Same shape as minigpu's event drain.
+ * Returns 0 if an event of interest landed, -1 on timeout/closed generator. */
+static int mfenc_wait_event(MfVidEnc *s) {
+  if (!s->event_gen) return -1;
+
+  /* An async MFT stops issuing METransformNeedInput until we take the output it
+   * already has. Waiting for NeedInput while output is pending therefore stalls
+   * until the timeout — report "not accepting" so the caller drains first. */
+  mfenc_pump(s);
+  if (s->need_input || s->drain_done) return 0;
+  if (s->have_output) return 1;
+
+  /* Budget the spin in TIME, not iterations: SwitchToThread returns in ~ns when
+   * nothing else is runnable, so an iteration count elapses instantly and drops
+   * into the sleep path, where every Sleep(1) costs a ~15.6 ms timer quantum. */
+  LARGE_INTEGER freq, t0, now;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&t0);
+  const double budget_s = 0.008; /* 8 ms — well inside a 30 fps frame */
+  for (;;) {
+    mfenc_pump(s);
+    if (s->need_input || s->drain_done) return 0;
+    if (s->have_output) return 1;
+    QueryPerformanceCounter(&now);
+    if ((double)(now.QuadPart - t0.QuadPart) / (double)freq.QuadPart > budget_s)
+      break;
+    SwitchToThread();
+  }
+  return -1;
+}
 
 static int mfenc_started;
 
@@ -76,7 +245,109 @@ static const GUID kCODECAPI_AVEncMPVDefaultBPictureCount = {
     0x4200,
     {0xb5, 0x7f, 0x81, 0x4d, 0x04, 0xba, 0xba, 0xb2}};
 
+/* ===================== MTA worker thread =====================
+ *
+ * Media Foundation requires MTA. A thread already initialised as STA makes
+ * CoInitializeEx(COINIT_MULTITHREADED) fail with RPC_E_CHANGED_MODE, and
+ * Flutter's UI thread IS STA — so every entry point below used to return
+ * "no MFT" inside any Flutter app, and the encoder silently lost every
+ * negotiation. Measured on an STA thread before this existed:
+ *     mfenc_has_mft(h264) = 0 , mfenc_list_hw(h264) = -1
+ *
+ * Fix: own a dedicated thread that has never been CoInitialized, make it MTA
+ * once, and marshal EVERY public call onto it. Chosen over hosting the encoder
+ * in a Dart isolate because D3D11 shared handles are process-wide — they cross
+ * a thread hop for free, so zero-copy survives — while an isolate would force
+ * frame data across an isolate boundary.
+ *
+ * ALL calls go through here, including on threads that are already MTA. That
+ * costs one hop but buys thread affinity: the MFT is created, driven and
+ * destroyed on a single thread, which is what the async event model wants.
+ *
+ * Jobs run ONE AT A TIME. Encode calls for a session are already serialised by
+ * the Dart side; concurrent *sessions* will contend on this lock. That is a
+ * known limit, not an oversight — revisit with a per-session worker if a
+ * multi-encoder workload ever needs it.
+ */
+
+typedef int (*mfenc_job_fn)(void *arg);
+
+static CRITICAL_SECTION mfenc_w_lock;      /* guards the single job slot     */
+static CRITICAL_SECTION mfenc_w_gate;      /* serialises submitters          */
+static CONDITION_VARIABLE mfenc_w_todo;    /* signalled when a job is posted */
+static CONDITION_VARIABLE mfenc_w_done;    /* signalled when a job finished  */
+static HANDLE mfenc_w_thread = NULL;
+static INIT_ONCE mfenc_w_once = INIT_ONCE_STATIC_INIT;
+static mfenc_job_fn mfenc_w_fn = NULL;
+static void *mfenc_w_arg = NULL;
+static int mfenc_w_result = 0;
+static int mfenc_w_pending = 0;
+static int mfenc_w_ready = 0; /* worker reached its MTA loop */
+
+static DWORD WINAPI mfenc_worker_main(LPVOID unused) {
+  (void)unused;
+  /* This thread has never been CoInitialized, so MTA always succeeds here. */
+  HRESULT co = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+  EnterCriticalSection(&mfenc_w_lock);
+  mfenc_w_ready = SUCCEEDED(co) ? 1 : -1;
+  WakeAllConditionVariable(&mfenc_w_done);
+  for (;;) {
+    while (!mfenc_w_pending)
+      SleepConditionVariableCS(&mfenc_w_todo, &mfenc_w_lock, INFINITE);
+    mfenc_job_fn fn = mfenc_w_fn;
+    void *arg = mfenc_w_arg;
+    LeaveCriticalSection(&mfenc_w_lock);
+
+    int r = fn ? fn(arg) : 0;
+
+    EnterCriticalSection(&mfenc_w_lock);
+    mfenc_w_result = r;
+    mfenc_w_pending = 0;
+    mfenc_w_fn = NULL;
+    WakeAllConditionVariable(&mfenc_w_done);
+  }
+}
+
+static BOOL CALLBACK mfenc_worker_init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
+  (void)o; (void)p; (void)ctx;
+  InitializeCriticalSection(&mfenc_w_lock);
+  InitializeCriticalSection(&mfenc_w_gate);
+  InitializeConditionVariable(&mfenc_w_todo);
+  InitializeConditionVariable(&mfenc_w_done);
+  mfenc_w_thread = CreateThread(NULL, 0, mfenc_worker_main, NULL, 0, NULL);
+  if (!mfenc_w_thread) return FALSE;
+  /* Wait for the apartment to be established before anyone posts work. */
+  EnterCriticalSection(&mfenc_w_lock);
+  while (!mfenc_w_ready)
+    SleepConditionVariableCS(&mfenc_w_done, &mfenc_w_lock, INFINITE);
+  LeaveCriticalSection(&mfenc_w_lock);
+  return TRUE;
+}
+
+/* Run `fn(arg)` on the MTA worker and return its result. `fail` is returned if
+ * the worker could not be started at all (never expected in practice). */
+static int mfenc_on_worker(mfenc_job_fn fn, void *arg, int fail) {
+  if (!InitOnceExecuteOnce(&mfenc_w_once, mfenc_worker_init, NULL, NULL))
+    return fail;
+  if (mfenc_w_ready != 1) return fail;
+
+  EnterCriticalSection(&mfenc_w_gate); /* one submitter at a time */
+  EnterCriticalSection(&mfenc_w_lock);
+  mfenc_w_fn = fn;
+  mfenc_w_arg = arg;
+  mfenc_w_pending = 1;
+  WakeAllConditionVariable(&mfenc_w_todo);
+  while (mfenc_w_pending)
+    SleepConditionVariableCS(&mfenc_w_done, &mfenc_w_lock, INFINITE);
+  int r = mfenc_w_result;
+  LeaveCriticalSection(&mfenc_w_lock);
+  LeaveCriticalSection(&mfenc_w_gate);
+  return r;
+}
+
 static int mf_up(void) {
+  /* Always runs on the worker (MTA), so this now succeeds; S_FALSE for an
+   * already-initialised thread is not a failure. */
   HRESULT co = CoInitializeEx(NULL, COINIT_MULTITHREADED);
   if (co == RPC_E_CHANGED_MODE) return -1;
   if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) return -1;
@@ -92,13 +363,16 @@ static void mf_down(void) {
 }
 
 /* Availability: is there a video encoder MFT for this codec? codec 0=H264 1=HEVC */
-MFENC_API int miniav_shim_mfenc_has_mft(int codec) {
+static int mfenc_has_mft_impl(int codec) {
   if (mf_up() != 0) return 0;
   MFT_REGISTER_TYPE_INFO out = {MFMediaType_Video,
                                 codec == 1 ? MFVideoFormat_HEVC
                                            : MFVideoFormat_H264};
-  UINT32 flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT |
-                 MFT_ENUM_FLAG_TRANSCODE_ONLY | MFT_ENUM_FLAG_SORTANDFILTER;
+  /* Must mirror create()'s union of passes, or availability disagrees with
+   * what actually opens. */
+  UINT32 flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT |
+                 MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT |
+                 MFT_ENUM_FLAG_SORTANDFILTER;
   IMFActivate **acts = NULL;
   UINT32 count = 0;
   HRESULT hr =
@@ -111,9 +385,55 @@ MFENC_API int miniav_shim_mfenc_has_mft(int codec) {
   return (SUCCEEDED(hr) && count > 0) ? 1 : 0;
 }
 
-MFENC_API void *miniav_shim_mfenc_create(int codec, int width, int height,
-                                         int bitrate_bps, int fps_num,
-                                         int fps_den, int gop) {
+/* Diagnostic: list the HARDWARE video-encoder MFTs the OS exposes for a codec.
+ * Writes "name|name|..." into out. Returns the count. Hardware MF encode is not
+ * universal — notably NVIDIA does not ship an NVENC MFT on many systems — so a
+ * caller needs to be able to see the real list rather than infer from a
+ * fallback. */
+static int mfenc_list_hw_impl(int codec, char *out, int cap) {
+  if (out && cap > 0) out[0] = 0;
+  if (mf_up() != 0) return -1;
+  MFT_REGISTER_TYPE_INFO ot = {MFMediaType_Video,
+                               codec == 1 ? MFVideoFormat_HEVC
+                                          : MFVideoFormat_H264};
+  IMFActivate **acts = NULL;
+  UINT32 count = 0;
+  HRESULT hr = MFTEnumEx(
+      MFT_CATEGORY_VIDEO_ENCODER,
+      MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+      NULL, &ot, &acts, &count);
+  int used = 0;
+  if (SUCCEEDED(hr) && acts) {
+    for (UINT32 i = 0; i < count; i++) {
+      LPWSTR wname = NULL;
+      UINT32 wlen = 0;
+      if (out && SUCCEEDED(IMFActivate_GetAllocatedString(
+                     acts[i], &MFT_FRIENDLY_NAME_Attribute, &wname, &wlen)) &&
+          wname) {
+        char tmp[128];
+        WideCharToMultiByte(CP_UTF8, 0, wname, -1, tmp, sizeof(tmp) - 1, NULL, NULL);
+        tmp[sizeof(tmp) - 1] = 0;
+        int n = (int)strlen(tmp);
+        if (used + n + 2 < cap) {
+          if (used) out[used++] = '|';
+          memcpy(out + used, tmp, (size_t)n);
+          used += n;
+          out[used] = 0;
+        }
+        CoTaskMemFree(wname);
+      }
+      IMFActivate_Release(acts[i]);
+    }
+    CoTaskMemFree(acts);
+  }
+  mf_down();
+  return SUCCEEDED(hr) ? (int)count : -1;
+}
+
+static void *mfenc_create_impl(int codec, int width, int height,
+                               int bitrate_bps, int fps_num, int fps_den,
+                               int gop, int want_hardware, int candidate,
+                               void *existing_device) {
   if (width <= 0 || height <= 0) return NULL;
   if (bitrate_bps <= 0) bitrate_bps = 4000000;
   if (fps_num <= 0) fps_num = 30;
@@ -129,13 +449,24 @@ MFENC_API void *miniav_shim_mfenc_create(int codec, int width, int height,
   s->height = height;
   s->frame_dur_100ns = (int64_t)10000000 * fps_den / fps_num;
 
-  /* Enumerate a SYNC encoder MFT. */
+  /* Enumerate an encoder MFT of the requested class.
+   *
+   * A hardware encoder is an ASYNC MFT, so MFT_ENUM_FLAG_HARDWARE must be
+   * paired with ASYNCMFT — asking for SYNCMFT only (as this used to) filters
+   * every hardware encoder out by construction, which is what kept this
+   * software-only. TRANSCODE_ONLY is dropped from the hardware pass: it
+   * restricts the list to MFTs registered for transcode and some vendor
+   * encoders do not carry that registration. */
   {
     MFT_REGISTER_TYPE_INFO out = {MFMediaType_Video,
                                   codec == 1 ? MFVideoFormat_HEVC
                                              : MFVideoFormat_H264};
-    UINT32 flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT |
-                   MFT_ENUM_FLAG_TRANSCODE_ONLY | MFT_ENUM_FLAG_SORTANDFILTER;
+    UINT32 flags = want_hardware
+                       ? (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT |
+                          MFT_ENUM_FLAG_SORTANDFILTER)
+                       : (MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT |
+                          MFT_ENUM_FLAG_TRANSCODE_ONLY |
+                          MFT_ENUM_FLAG_SORTANDFILTER);
     IMFActivate **acts = NULL;
     UINT32 count = 0;
     if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, NULL, &out, &acts,
@@ -144,14 +475,111 @@ MFENC_API void *miniav_shim_mfenc_create(int codec, int width, int height,
       if (acts) CoTaskMemFree(acts);
       goto fail;
     }
+    int seen = 0;
     for (UINT32 i = 0; i < count; i++) {
-      if (!s->mft && FAILED(IMFActivate_ActivateObject(
-                         acts[i], &IID_IMFTransform, (void **)&s->mft)))
-        s->mft = NULL;
+      if (!s->mft && (int)i >= candidate) {
+        seen = 1;
+        if (SUCCEEDED(IMFActivate_ActivateObject(acts[i], &IID_IMFTransform,
+                                                 (void **)&s->mft)) &&
+            s->mft) {
+          s->is_hardware = want_hardware;
+          /* Record the friendly name so a caller can prove WHICH MFT ran —
+           * "it produced a bitstream" is not evidence of hardware. */
+          LPWSTR wname = NULL;
+          UINT32 wlen = 0;
+          if (SUCCEEDED(IMFActivate_GetAllocatedString(
+                  acts[i], &MFT_FRIENDLY_NAME_Attribute, &wname, &wlen)) &&
+              wname) {
+            WideCharToMultiByte(CP_UTF8, 0, wname, -1, s->mft_name,
+                                (int)sizeof(s->mft_name) - 1, NULL, NULL);
+            CoTaskMemFree(wname);
+          }
+        } else {
+          s->mft = NULL;
+        }
+      }
       IMFActivate_Release(acts[i]);
     }
     CoTaskMemFree(acts);
+    (void)seen;
     if (!s->mft) goto fail;
+  }
+
+  /* An async MFT refuses every call until it is unlocked, and this must happen
+   * before the media types are set. */
+  {
+    IMFAttributes *attrs = NULL;
+    if (SUCCEEDED(IMFTransform_GetAttributes(s->mft, &attrs)) && attrs) {
+      UINT32 is_async = 0;
+      IMFAttributes_GetUINT32(attrs, &MF_TRANSFORM_ASYNC, &is_async);
+      if (is_async) {
+        s->is_async = 1;
+        IMFAttributes_SetUINT32(attrs, &MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+      }
+      IMFAttributes_Release(attrs);
+    }
+  }
+
+  /* D3D11 device + DXGI manager, bound BEFORE the media types so the MFT can
+   * negotiate a texture input pool. Hardware only; a failure here is not fatal
+   * — the encoder still works from system memory. */
+  if (want_hardware) {
+    static const D3D_FEATURE_LEVEL kLevels[] = {D3D_FEATURE_LEVEL_11_1,
+                                                D3D_FEATURE_LEVEL_11_0};
+    UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    /* Prefer the caller's device.
+     *
+     * Creating our own means D3D11CreateDevice(NULL, ...) picks the DEFAULT
+     * adapter, which is not necessarily the one the frames live on -- and even
+     * on the same adapter it is a DIFFERENT device, so every frame has to be
+     * shared and re-opened. When the producer hands us the device its textures
+     * already live on, the import disappears entirely: the texture is simply
+     * ours. That is both faster and one less thing that can fail. */
+    /* An injected device is only usable if it can actually do the work.
+     *
+     * The texture path converts RGBA->NV12 with a VideoProcessor, which needs
+     * to allocate an NV12 RENDER TARGET on this device. A device created
+     * without D3D11_CREATE_DEVICE_VIDEO_SUPPORT -- which is the normal case for
+     * a rendering device such as Dawn's -- QueryInterfaces to ID3D11VideoDevice
+     * quite happily and then fails that allocation. Adopting it regardless
+     * bought a same-device import and lost the conversion, which is the worse
+     * half of the trade. Check before committing. */
+    if (existing_device) {
+      UINT sup = 0;
+      HRESULT hs = ID3D11Device_CheckFormatSupport(
+          (ID3D11Device *)existing_device, DXGI_FORMAT_NV12, &sup);
+      const UINT need =
+          D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_RENDER_TARGET;
+      if (SUCCEEDED(hs) && (sup & need) == need) {
+        s->device = (ID3D11Device *)existing_device;
+        ID3D11Device_AddRef(s->device);
+        s->owns_device = 0;
+      }
+    }
+    if (!s->device && SUCCEEDED(D3D11CreateDevice(
+                   NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags, kLevels,
+                   ARRAYSIZE(kLevels), D3D11_SDK_VERSION, &s->device, NULL,
+                   NULL))) {
+      s->owns_device = 1;
+    }
+    if (s->device) {
+      /* The MFT encodes on its own threads — without this the device is not
+       * safe to share and drivers intermittently corrupt or crash. */
+      ID3D10Multithread *mt = NULL;
+      if (SUCCEEDED(ID3D11Device_QueryInterface(s->device, &IID_ID3D10Multithread,
+                                                (void **)&mt)) && mt) {
+        ID3D10Multithread_SetMultithreadProtected(mt, TRUE);
+        ID3D10Multithread_Release(mt);
+      }
+      if (SUCCEEDED(MFCreateDXGIDeviceManager(&s->reset_token, &s->dxgi_mgr)) &&
+          s->dxgi_mgr) {
+        if (SUCCEEDED(IMFDXGIDeviceManager_ResetDevice(
+                s->dxgi_mgr, (IUnknown *)s->device, s->reset_token))) {
+          IMFTransform_ProcessMessage(s->mft, MFT_MESSAGE_SET_D3D_MANAGER,
+                                      (ULONG_PTR)s->dxgi_mgr);
+        }
+      }
+    }
   }
 
   /* OUTPUT type first (encoders require it). */
@@ -169,7 +597,9 @@ MFENC_API void *miniav_shim_mfenc_create(int codec, int width, int height,
     IMFMediaType_SetUINT64(ot, &MF_MT_PIXEL_ASPECT_RATIO, PACK64(1, 1));
     IMFMediaType_SetUINT32(
         ot, &MF_MT_MPEG2_PROFILE,
-        codec == 1 ? eAVEncH265VProfile_Main_420_8 : eAVEncH264VProfile_Base);
+        codec == 1 ? eAVEncH265VProfile_Main_420_8
+                   : (want_hardware ? eAVEncH264VProfile_Main
+                                    : eAVEncH264VProfile_Base));
     HRESULT hr = IMFTransform_SetOutputType(s->mft, 0, ot, 0);
     IMFMediaType_Release(ot);
     if (FAILED(hr)) goto fail;
@@ -238,20 +668,53 @@ MFENC_API void *miniav_shim_mfenc_create(int codec, int width, int height,
     }
   }
 
+  if (s->is_async) {
+    if (FAILED(IMFTransform_QueryInterface(s->mft, &IID_IMFMediaEventGenerator,
+                                           (void **)&s->event_gen)) ||
+        !s->event_gen) {
+      /* Async MFT with no event generator is unusable — there is no legal way
+       * to drive it. Fail here rather than deadlock on the first frame. */
+      goto fail;
+    }
+  }
+
   IMFTransform_ProcessMessage(s->mft, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
   IMFTransform_ProcessMessage(s->mft, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
   s->started = 1;
   return s;
 
 fail:
+  if (s->event_gen) IMFMediaEventGenerator_Release(s->event_gen);
+  if (s->dxgi_mgr) IMFDXGIDeviceManager_Release(s->dxgi_mgr);
+  if (s->device) ID3D11Device_Release(s->device);
   if (s->mft) IMFTransform_Release(s->mft);
   free(s);
   mf_down();
   return NULL;
 }
 
-MFENC_API int miniav_shim_mfenc_get_extradata(void *session, uint8_t *out,
-                                              int cap) {
+/* Hardware first, then software. The retry covers the WHOLE attempt, not just
+ * activation: a vendor MFT that activates and then rejects our media types
+ * (profile, frame rate, resolution) must still leave a working encoder, or a
+ * machine with hardware would end up worse off than one without. */
+static void *mfenc_create_pub_impl(int codec, int width, int height,
+                                   int bitrate_bps, int fps_num, int fps_den,
+                                   int gop, void *existing_device) {
+  /* Try EVERY hardware candidate before giving up on hardware. A box can list
+   * several vendor MFTs (e.g. an AMD entry from a driver whose GPU is absent,
+   * plus the NVIDIA one); activation succeeds for all of them, but only the one
+   * matching real silicon will accept our media types. Stopping at the first
+   * failure is what left this on the software encoder. */
+  for (int cand = 0; cand < 8; cand++) {
+    void *s = mfenc_create_impl(codec, width, height, bitrate_bps, fps_num,
+                                fps_den, gop, 1, cand, existing_device);
+    if (s) return s;
+  }
+  return mfenc_create_impl(codec, width, height, bitrate_bps, fps_num, fps_den,
+                           gop, 0, 0, existing_device);
+}
+
+static int mfenc_get_extradata_impl(void *session, uint8_t *out, int cap) {
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s) return -1;
   if (!out) return s->extradata_len;
@@ -261,9 +724,9 @@ MFENC_API int miniav_shim_mfenc_get_extradata(void *session, uint8_t *out,
 }
 
 /* Feed one system-memory NV12 frame (size must be width*height*3/2). */
-MFENC_API int miniav_shim_mfenc_send_nv12(void *session, const uint8_t *nv12,
-                                          int nv12_size, int64_t pts_us,
-                                          int force_keyframe) {
+static int mfenc_send_nv12_impl(void *session, const uint8_t *nv12,
+                                int nv12_size, int64_t pts_us,
+                                int force_keyframe) {
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s || !nv12) return -1;
   int need = s->width * s->height * 3 / 2;
@@ -292,17 +755,596 @@ MFENC_API int miniav_shim_mfenc_send_nv12(void *session, const uint8_t *nv12,
   if (force_keyframe) {
     IMFSample_SetUINT32(smp, &MFSampleExtension_CleanPoint, 1);
   }
+  /* An async MFT accepts exactly one input per METransformNeedInput. Calling
+   * ProcessInput without one is an error, so wait (bounded) for the credit and
+   * report "not accepting" if it never arrives — the caller retries. */
+  if (s->is_async) {
+    while (s->need_input == 0) {
+      if (mfenc_wait_event(s) != 0) break; /* output pending, or timed out */
+    }
+    if (s->need_input == 0) {
+      IMFSample_Release(smp);
+      return 1; /* caller drains via receive(), then retries this frame */
+    }
+    s->need_input--;
+  }
+
   HRESULT hr = IMFTransform_ProcessInput(s->mft, 0, smp, 0);
   IMFSample_Release(smp);
   if (FAILED(hr) && hr != MF_E_NOTACCEPTING) return -1;
   return (hr == MF_E_NOTACCEPTING) ? 1 : 0;
 }
 
+/* Feed one frame as a D3D11 texture opened from a shared NT handle — the
+ * zero-copy path: no readback, no memcpy, the encoder samples the texture.
+ *
+ * The handle is opened onto OUR device (the one the MFT is bound to). Caller
+ * keeps ownership of the handle; miniav closes it in releaseBuffer, so the
+ * import here must complete before the caller releases the buffer. Returns
+ * 0 accepted, 1 not accepting (drain then retry), -1 error / no D3D path. */
+/* Wrap an NV12 texture already living on OUR device as an IMFSample and feed it
+ * through the same NeedInput credit contract the CPU path uses.
+ * 0 = accepted, 1 = drain and retry, -1 = error. */
+static int mfenc_submit_texture(MfVidEnc *s, ID3D11Texture2D *tex,
+                                int64_t pts_us, int force_keyframe) {
+  if (tex != s->last_sub) {
+    if (s->last_sub) ID3D11Texture2D_Release(s->last_sub);
+    s->last_sub = tex;
+    ID3D11Texture2D_AddRef(s->last_sub);
+  }
+  IMFMediaBuffer *buf = NULL;
+  HRESULT hr = MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)tex,
+                                         0, FALSE, &buf);
+  if (FAILED(hr) || !buf) return -1;
+
+  /* A DXGI surface buffer starts with CURRENT LENGTH 0. An MFT reading it then
+   * sees an empty buffer and encodes a blank frame — no error anywhere, real
+   * packets out, constant picture. That is exactly the symptom the gradient vs
+   * flat-grey differential test caught. IMF2DBuffer::GetContiguousLength is the
+   * only way to learn the right size for a GPU surface. */
+  IMF2DBuffer *b2 = NULL;
+  if (SUCCEEDED(IMFMediaBuffer_QueryInterface(buf, &IID_IMF2DBuffer,
+                                              (void **)&b2)) &&
+      b2) {
+    DWORD len = 0;
+    if (SUCCEEDED(IMF2DBuffer_GetContiguousLength(b2, &len)) && len > 0)
+      IMFMediaBuffer_SetCurrentLength(buf, len);
+    IMF2DBuffer_Release(b2);
+  }
+
+  IMFSample *smp = NULL;
+  if (FAILED(MFCreateSample(&smp))) {
+    IMFMediaBuffer_Release(buf);
+    return -1;
+  }
+  IMFSample_AddBuffer(smp, buf);
+  IMFMediaBuffer_Release(buf);
+  IMFSample_SetSampleTime(smp, (LONGLONG)pts_us * 10);
+  IMFSample_SetSampleDuration(smp, s->frame_dur_100ns);
+  if (force_keyframe) IMFSample_SetUINT32(smp, &MFSampleExtension_CleanPoint, 1);
+
+  if (s->is_async) {
+    while (s->need_input == 0) {
+      if (mfenc_wait_event(s) != 0) break;
+    }
+    if (s->need_input == 0) {
+      IMFSample_Release(smp);
+      return 1;
+    }
+    s->need_input--;
+  }
+  hr = IMFTransform_ProcessInput(s->mft, 0, smp, 0);
+  IMFSample_Release(smp);
+  if (FAILED(hr) && hr != MF_E_NOTACCEPTING) return -1;
+  return (hr == MF_E_NOTACCEPTING) ? 1 : 0;
+}
+
+/* Lazily build the VideoProcessor, its staging ring and everything else the
+ * per-frame path needs. 0 on success. Only called on the texture path.
+ *
+ * Every step is guarded on its own output, so a partial build can be resumed by
+ * the next call instead of leaking the pieces that did succeed. Readiness is
+ * "the processor AND at least one staging slot" — `s->vp` alone would memoise a
+ * half-built session as ready and quietly drop every frame thereafter. */
+static int mfenc_ensure_vp(MfVidEnc *s) {
+  if (s->vp && s->nv12_tex[0]) return 0;
+  if (!s->device) return -1;
+
+  if (!s->ctx) ID3D11Device_GetImmediateContext(s->device, &s->ctx);
+  if (!s->ctx) return -1;
+
+  if (!s->vdev &&
+      (FAILED(ID3D11Device_QueryInterface(s->device, &IID_ID3D11VideoDevice,
+                                          (void **)&s->vdev)) ||
+       !s->vdev))
+    return -1; /* device lacks D3D11_CREATE_DEVICE_VIDEO_SUPPORT */
+  if (!s->vctx &&
+      (FAILED(ID3D11DeviceContext_QueryInterface(
+           s->ctx, &IID_ID3D11VideoContext, (void **)&s->vctx)) ||
+       !s->vctx))
+    return -1;
+
+  D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd;
+  ZeroMemory(&cd, sizeof(cd));
+  cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+  cd.InputFrameRate.Numerator = 60;
+  cd.InputFrameRate.Denominator = 1;
+  cd.InputWidth = (UINT)s->width;
+  cd.InputHeight = (UINT)s->height;
+  cd.OutputFrameRate.Numerator = 60;
+  cd.OutputFrameRate.Denominator = 1;
+  cd.OutputWidth = (UINT)s->width;
+  cd.OutputHeight = (UINT)s->height;
+  cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+  if (!s->vp_enum &&
+      (FAILED(ID3D11VideoDevice_CreateVideoProcessorEnumerator(
+           s->vdev, &cd, &s->vp_enum)) ||
+       !s->vp_enum))
+    return -1;
+  if (!s->vp && (FAILED(ID3D11VideoDevice_CreateVideoProcessor(
+                     s->vdev, s->vp_enum, 0, &s->vp)) ||
+                 !s->vp))
+    return -1;
+
+  /* The NV12 destination ring. RENDER_TARGET is required for a VP output view.
+   * Each slot's output view is built here, once: the destination never changes,
+   * so rebuilding the view per frame was pure per-frame driver allocation. */
+  /* NV12 subsamples chroma 2x2, so a DXGI NV12 surface MUST have even width
+   * and height -- CreateTexture2D returns E_INVALIDARG for anything else, and
+   * capture sizes are arbitrary (a window at 2576x1119 has an odd height). Pad
+   * up to even; the blt below writes only the real w x h region via the stream
+   * rects, and the MFT reads the frame size from its media type, so the spare
+   * row/column is simply never looked at. */
+  D3D11_TEXTURE2D_DESC td;
+  ZeroMemory(&td, sizeof(td));
+  td.Width = (UINT)((s->width + 1) & ~1);
+  td.Height = (UINT)((s->height + 1) & ~1);
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.Format = DXGI_FORMAT_NV12;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  td.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+  D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd;
+  ZeroMemory(&ovd, sizeof(ovd));
+  ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+  ovd.Texture2D.MipSlice = 0;
+
+  /* A short ring still works — it just leaves less slack for frames in flight —
+   * so a failure part-way through stops allocating rather than failing the
+   * session. Zero slots is the only fatal case. */
+  int built = 0;
+  for (int i = 0; i < MFENC_NV12_RING; i++) {
+    if (s->nv12_tex[i]) {
+      built++;
+      continue;
+    }
+    HRESULT ht =
+        ID3D11Device_CreateTexture2D(s->device, &td, NULL, &s->nv12_tex[i]);
+    if (FAILED(ht) || !s->nv12_tex[i]) {
+      s->nv12_tex[i] = NULL;
+      if (i == 0) {
+        UINT sup = 0;
+        ID3D11Device_CheckFormatSupport(s->device, DXGI_FORMAT_NV12, &sup);
+        snprintf(s->imp_err, sizeof(s->imp_err),
+                 "NV12 staging CreateTexture2D=0x%08lX (NV12 support=0x%X) -- "
+                 "the encoder device cannot allocate an NV12 render target",
+                 (unsigned long)ht, (unsigned)sup);
+      }
+      break;
+    }
+    if (FAILED(ID3D11VideoDevice_CreateVideoProcessorOutputView(
+            s->vdev, (ID3D11Resource *)s->nv12_tex[i], s->vp_enum, &ovd,
+            &s->nv12_ov[i])) ||
+        !s->nv12_ov[i]) {
+      ID3D11Texture2D_Release(s->nv12_tex[i]);
+      s->nv12_tex[i] = NULL;
+      s->nv12_ov[i] = NULL;
+      break;
+    }
+    /* Calibrate the idle reference count now that every long-lived holder
+     * exists. See the field comment: this is a measurement, not a constant. */
+    ID3D11Texture2D_AddRef(s->nv12_tex[i]);
+    s->nv12_base_rc[i] = ID3D11Texture2D_Release(s->nv12_tex[i]);
+    built++;
+  }
+  if (built == 0) return -1;
+
+  /* One reusable fence. Only one blt is ever outstanding — the send path waits
+   * for it before returning — so a single query covers the whole ring. */
+  {
+    D3D11_QUERY_DESC qd;
+    qd.Query = D3D11_QUERY_EVENT;
+    qd.MiscFlags = 0;
+    if (!s->blt_fence)
+      ID3D11Device_CreateQuery(s->device, &qd, &s->blt_fence); /* optional */
+  }
+
+  /* Full-range RGB in, limited-range BT.709 YCbCr out — what H.264/HEVC
+   * encoders expect. Set once; the VP keeps the state. */
+  D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs;
+  ZeroMemory(&cs, sizeof(cs));
+  cs.RGB_Range = 0; /* full 0-255 */
+  cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+  ID3D11VideoContext_VideoProcessorSetStreamColorSpace(s->vctx, s->vp, 0, &cs);
+  ZeroMemory(&cs, sizeof(cs));
+  cs.Usage = 1;        /* video/encoder output */
+  cs.YCbCr_Matrix = 1; /* BT.709 */
+  cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+  ID3D11VideoContext_VideoProcessorSetOutputColorSpace(s->vctx, s->vp, &cs);
+
+  /* Rects are sticky VP state, so they belong here rather than in the blt.
+   * They must be set EXPLICITLY: a VideoProcessor built from a CONTENT_DESC
+   * still defaults its source/destination rectangles to EMPTY on some drivers,
+   * and an empty rect blits nothing while returning S_OK. */
+  {
+    RECT r;
+    r.left = 0;
+    r.top = 0;
+    r.right = s->width;
+    r.bottom = s->height;
+    ID3D11VideoContext_VideoProcessorSetStreamSourceRect(s->vctx, s->vp, 0, TRUE,
+                                                         &r);
+    ID3D11VideoContext_VideoProcessorSetStreamDestRect(s->vctx, s->vp, 0, TRUE,
+                                                       &r);
+    ID3D11VideoContext_VideoProcessorSetOutputTargetRect(s->vctx, s->vp, TRUE,
+                                                         &r);
+  }
+  return 0;
+}
+
+/* Measurement escapes, read once. Both exist so the cost of a design decision
+ * can be measured on the SAME binary rather than argued about: an A/B against
+ * an older build measures the older build, not the change.
+ *   MINIAV_MFENC_NO_CACHE — reopen and re-view the source texture every frame
+ *   MINIAV_MFENC_NO_FENCE — return from the blt without waiting for it */
+static int mfenc_no_cache = -1, mfenc_no_fence = -1;
+static void mfenc_read_env(void) {
+  if (mfenc_no_cache < 0) {
+    mfenc_no_cache = getenv("MINIAV_MFENC_NO_CACHE") ? 1 : 0;
+    mfenc_no_fence = getenv("MINIAV_MFENC_NO_FENCE") ? 1 : 0;
+  }
+}
+
+/* Open the caller's texture on our device and build its VP input view, or
+ * return a cached one. Result is an index into `s->imp`, or -1.
+ *
+ * The cache is keyed on BOTH the pointer and the shared handle. The pointer
+ * alone is not an identity: a freed texture's address can be handed back for a
+ * different texture, and a stale hit would silently encode the wrong picture.
+ * GetSharedHandle is a cheap accessor on an already-shared resource; the
+ * expensive half is OpenSharedResource, and that is what the cache removes. */
+static int mfenc_import_slot(MfVidEnc *s, ID3D11Texture2D *foreign) {
+  mfenc_read_env();
+  s->imp_err[0] = 0;
+  if (!mfenc_no_cache)
+    for (int i = 0; i < MFENC_IMPORT_CACHE; i++)
+      if (s->imp[i].iv && s->imp[i].key == (void *)foreign) return i;
+
+  /* Resolve the caller's texture onto OUR device. Three shapes, in order of
+   * cost -- and the order matters for correctness as much as speed, because
+   * asking the wrong way returns a plain failure rather than a hint.
+   *
+   *   0. SAME DEVICE. The producer may have built its texture on the very
+   *      device we are encoding with, in which case there is nothing to import
+   *      and nothing that can fail.
+   *   1. NT HANDLE (IDXGIResource1::CreateSharedHandle + OpenSharedResource1).
+   *      This is what a modern D3D12/Dawn-backed producer publishes, and it is
+   *      what minigpu's shared output texture documents.
+   *   2. LEGACY handle (GetSharedHandle + OpenSharedResource), for producers
+   *      created with the old D3D11_RESOURCE_MISC_SHARED flag.
+   *
+   * Only trying (2) is what made this path fail against a real GPU processor
+   * while passing a test whose source texture was deliberately created legacy
+   * -- the test agreed with the code instead of with the producer. */
+  ID3D11Texture2D *src = NULL;
+
+  {
+    ID3D11Device *owner = NULL;
+    ID3D11Texture2D_GetDevice(foreign, &owner);
+    if (owner) {
+      int same = (owner == s->device);
+      ID3D11Device_Release(owner);
+      if (same) {
+        src = foreign;
+        ID3D11Texture2D_AddRef(src); /* cache owns a reference either way */
+      } else {
+        snprintf(s->imp_err, sizeof(s->imp_err),
+                    "texture device=%p encoder device=%p (different)",
+                    (void *)owner, (void *)s->device);
+      }
+    }
+  }
+
+  if (!src) {
+    IDXGIResource1 *res1 = NULL;
+    if (SUCCEEDED(ID3D11Texture2D_QueryInterface(foreign, &IID_IDXGIResource1,
+                                                 (void **)&res1)) &&
+        res1) {
+      HANDLE nt = NULL;
+      HRESULT hr = IDXGIResource1_CreateSharedHandle(
+          res1, NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+          NULL, &nt);
+      IDXGIResource1_Release(res1);
+      if (FAILED(hr))
+        snprintf(s->imp_err + strlen(s->imp_err),
+                    sizeof(s->imp_err) - strlen(s->imp_err),
+                    "; CreateSharedHandle=0x%08lX", (unsigned long)hr);
+      if (SUCCEEDED(hr) && nt) {
+        ID3D11Device1 *dev1 = NULL;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(s->device, &IID_ID3D11Device1,
+                                                  (void **)&dev1)) &&
+            dev1) {
+          HRESULT ho = ID3D11Device1_OpenSharedResource1(
+              dev1, nt, &IID_ID3D11Texture2D, (void **)&src);
+          if (FAILED(ho))
+            snprintf(s->imp_err + strlen(s->imp_err),
+                        sizeof(s->imp_err) - strlen(s->imp_err),
+                        "; OpenSharedResource1=0x%08lX", (unsigned long)ho);
+          ID3D11Device1_Release(dev1);
+        }
+        /* CreateSharedHandle mints a NEW handle per call; the opened texture
+         * holds its own reference, so ours is closed immediately rather than
+         * leaked once per cached import. */
+        CloseHandle(nt);
+      }
+    }
+  }
+
+  if (!src) {
+    IDXGIResource *res = NULL;
+    if (SUCCEEDED(ID3D11Texture2D_QueryInterface(foreign, &IID_IDXGIResource,
+                                                 (void **)&res)) &&
+        res) {
+      HANDLE shared = NULL;
+      HRESULT hr = IDXGIResource_GetSharedHandle(res, &shared);
+      IDXGIResource_Release(res);
+      if (FAILED(hr))
+        snprintf(s->imp_err + strlen(s->imp_err),
+                    sizeof(s->imp_err) - strlen(s->imp_err),
+                    "; GetSharedHandle=0x%08lX", (unsigned long)hr);
+      if (SUCCEEDED(hr) && shared) {
+        HRESULT ho = ID3D11Device_OpenSharedResource(
+            s->device, shared, &IID_ID3D11Texture2D, (void **)&src);
+        if (FAILED(ho))
+          snprintf(s->imp_err + strlen(s->imp_err),
+                      sizeof(s->imp_err) - strlen(s->imp_err),
+                      "; OpenSharedResource=0x%08lX", (unsigned long)ho);
+      }
+    }
+  }
+
+  if (!src) return -1;
+
+  D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd;
+  ZeroMemory(&ivd, sizeof(ivd));
+  ivd.FourCC = 0;
+  ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+  ivd.Texture2D.MipSlice = 0;
+  ID3D11VideoProcessorInputView *iv = NULL;
+  {
+    HRESULT hv = ID3D11VideoDevice_CreateVideoProcessorInputView(
+        s->vdev, (ID3D11Resource *)src, s->vp_enum, &ivd, &iv);
+    if (FAILED(hv) || !iv) {
+      D3D11_TEXTURE2D_DESC td;
+      ID3D11Texture2D_GetDesc(src, &td);
+      snprintf(s->imp_err, sizeof(s->imp_err),
+                  "imported OK, but CreateVideoProcessorInputView=0x%08lX "
+                  "(fmt=%u %ux%u misc=0x%X bind=0x%X)",
+                  (unsigned long)hv, (unsigned)td.Format, (unsigned)td.Width,
+                  (unsigned)td.Height, (unsigned)td.MiscFlags,
+                  (unsigned)td.BindFlags);
+      ID3D11Texture2D_Release(src);
+      return -1;
+    }
+  }
+
+  IDXGIKeyedMutex *km = NULL;
+  if (FAILED(ID3D11Texture2D_QueryInterface(src, &IID_IDXGIKeyedMutex,
+                                            (void **)&km)))
+    km = NULL;
+
+  int i = s->imp_next;
+  s->imp_next = (s->imp_next + 1) % MFENC_IMPORT_CACHE;
+  if (s->imp[i].km) IDXGIKeyedMutex_Release(s->imp[i].km);
+  if (s->imp[i].iv) ID3D11VideoProcessorInputView_Release(s->imp[i].iv);
+  if (s->imp[i].tex) ID3D11Texture2D_Release(s->imp[i].tex);
+  s->imp[i].key = (void *)foreign;
+  s->imp[i].handle = NULL;
+  s->imp[i].tex = src;
+  s->imp[i].iv = iv;
+  s->imp[i].km = km;
+  return i;
+}
+
+/* Choose a staging slot the encoder is no longer reading from.
+ *
+ * MFCreateDXGISurfaceBuffer keeps a reference on the texture for as long as the
+ * MFT holds the sample, so a slot back at its calibrated idle count is one the
+ * encoder has finished with. Returns -1 when every slot is still in flight,
+ * which the caller turns into "drain and retry" — draining output is exactly
+ * what makes the MFT release its input samples, so the condition is
+ * self-clearing.
+ *
+ * The refcount test is a heuristic about someone else's object, so it gets a
+ * backstop: after two consecutive refusals we take the next slot anyway. If the
+ * calibration were ever wrong, that degrades to the old behaviour (a possible
+ * tear) instead of dropping every frame forever. */
+static int mfenc_pick_nv12(MfVidEnc *s) {
+  for (int n = 0; n < MFENC_NV12_RING; n++) {
+    int i = (s->nv12_next + n) % MFENC_NV12_RING;
+    if (!s->nv12_tex[i]) continue;
+    ID3D11Texture2D_AddRef(s->nv12_tex[i]);
+    if (ID3D11Texture2D_Release(s->nv12_tex[i]) != s->nv12_base_rc[i]) continue;
+    s->nv12_next = (i + 1) % MFENC_NV12_RING;
+    s->nv12_busy_streak = 0;
+    return i;
+  }
+  if (++s->nv12_busy_streak < 3) return -1;
+  s->nv12_busy_streak = 0;
+  for (int n = 0; n < MFENC_NV12_RING; n++) {
+    int i = (s->nv12_next + n) % MFENC_NV12_RING;
+    if (s->nv12_tex[i]) {
+      s->nv12_next = (i + 1) % MFENC_NV12_RING;
+      return i;
+    }
+  }
+  return -1;
+}
+
+/* Encode from a raw ID3D11Texture2D* that lives on ANOTHER device (the GPU
+ * processor's / Dawn's), RGBA or BGRA.
+ *
+ * This is the recorder's scale/effects path. The source is imported here rather
+ * than read back: minigpu creates its output textures with
+ * D3D11_RESOURCE_MISC_SHARED, so GetSharedHandle + OpenSharedResource brings it
+ * onto our device, and a VideoProcessor blt converts it to NV12 in VRAM. The
+ * same technique already ships in the FFmpeg shim's d3d11_vp_bgra_to_nv12.
+ *
+ * 0 = accepted, 1 = drain and retry, -1 = error. */
+/* Import a foreign-device RGBA/BGRA texture and VideoProcessor-blt it into the
+ * session's NV12 staging texture. 0 on success. Split out of the send path so
+ * the diagnostic below measures exactly this code. */
+static int mfenc_blt_texture_to_nv12(MfVidEnc *s, ID3D11Texture2D *foreign) {
+  int im = mfenc_import_slot(s, foreign);
+  if (im < 0) return -1;
+  int slot = mfenc_pick_nv12(s);
+  if (slot < 0) return -2; /* every staging surface still in flight */
+
+  IDXGIKeyedMutex *km = s->imp[im].km;
+  if (km) {
+    /* Bounded, never INFINITE. This runs on the encoder's worker thread with
+     * the calling isolate blocked behind it, so a producer that never releases
+     * would hang the recording rather than drop a frame. */
+    HRESULT a = IDXGIKeyedMutex_AcquireSync(km, 0, 8);
+    if (a != S_OK) km = NULL; /* includes WAIT_TIMEOUT: skip the lock, not the frame */
+  }
+
+  D3D11_VIDEO_PROCESSOR_STREAM st;
+  ZeroMemory(&st, sizeof(st));
+  st.Enable = TRUE;
+  st.OutputIndex = 0;
+  st.InputFrameOrField = 0;
+  st.pInputSurface = s->imp[im].iv;
+  HRESULT hr = ID3D11VideoContext_VideoProcessorBlt(s->vctx, s->vp,
+                                                    s->nv12_ov[slot], 0, 1, &st);
+
+  /* Wait for the blt to COMPLETE before returning, not merely to be submitted.
+   * The reason is the SOURCE, not the destination: the caller's texture belongs
+   * to a shallow ring the GPU processor recycles, and it is free to draw over
+   * it as soon as this call returns. Reading a surface while its owner redraws
+   * it is a tear.
+   *
+   * Steady-state cost is one blt's worth of GPU time (a fraction of a
+   * millisecond), so spin rather than sleep — a Sleep(1) costs a ~15.6 ms timer
+   * quantum, the trap that once made this encoder 3 s/frame. Past a short spin
+   * the GPU is genuinely backed up and burning a core no longer helps anyone,
+   * so yield to whatever else is ready; SwitchToThread returns immediately when
+   * nothing is, which degrades cleanly back to a spin. */
+  if (SUCCEEDED(hr) && s->blt_fence && !mfenc_no_fence) {
+    ID3D11DeviceContext_End(s->ctx, (ID3D11Asynchronous *)s->blt_fence);
+    ID3D11DeviceContext_Flush(s->ctx);
+    LARGE_INTEGER freq, t0, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+      if (ID3D11DeviceContext_GetData(s->ctx, (ID3D11Asynchronous *)s->blt_fence,
+                                      NULL, 0, 0) != S_FALSE)
+        break;
+      QueryPerformanceCounter(&now);
+      double el = (double)(now.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
+      if (el > 0.033) break; /* two frames at 60 Hz; something else is wrong */
+      if (el > 0.001)
+        SwitchToThread();
+      else
+        YieldProcessor();
+    }
+  } else if (SUCCEEDED(hr)) {
+    ID3D11DeviceContext_Flush(s->ctx);
+  }
+
+  if (km) IDXGIKeyedMutex_ReleaseSync(km, 0);
+  if (FAILED(hr)) return -1;
+  s->nv12_last = slot;
+  return slot;
+}
+
+/* Encode from a raw ID3D11Texture2D* on ANOTHER device (the GPU processor's /
+ * Dawn's), RGBA or BGRA. Imported + converted in VRAM — no readback.
+ * 0 = accepted, 1 = drain and retry, -1 = error. */
+static int mfenc_send_d3d11_texture_impl(void *session, void *texture_ptr,
+                                         int64_t pts_us, int force_keyframe) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  if (!s || !texture_ptr || !s->device) return -1;
+  if (mfenc_ensure_vp(s) != 0) {
+    /* Distinguish "the VideoProcessor could not be built" from "the texture
+     * could not be imported" -- otherwise an empty reason is ambiguous and the
+     * reader assumes the import, which is the wrong half to investigate. */
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "mfenc_ensure_vp failed (device=%p vdev=%p vctx=%p vp=%p nv12[0]=%p)",
+             (void *)s->device, (void *)s->vdev, (void *)s->vctx, (void *)s->vp,
+             (void *)s->nv12_tex[0]);
+    return -1;
+  }
+  int slot = mfenc_blt_texture_to_nv12(s, (ID3D11Texture2D *)texture_ptr);
+  /* -2 is "all staging surfaces are still in the encoder": the same condition
+   * ProcessInput reports as MF_E_NOTACCEPTING, and it wants the same cure. */
+  if (slot == -2) return 1;
+  if (slot < 0) return -1;
+  return mfenc_submit_texture(s, s->nv12_tex[slot], pts_us, force_keyframe);
+}
+
+/* Re-send the most recently submitted surface under a new timestamp.
+ * 0 = accepted, 1 = drain and retry, -1 = nothing to repeat. */
+static int mfenc_repeat_last_impl(void *session, int64_t pts_us,
+                                  int force_keyframe) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  if (!s || !s->last_sub) return -1;
+  return mfenc_submit_texture(s, s->last_sub, pts_us, force_keyframe);
+}
+
+static int mfenc_send_d3d11_impl(void *session, void *shared_handle,
+                                 int64_t pts_us, int force_keyframe) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  if (!s || !shared_handle || !s->device) return -1;
+
+  ID3D11Texture2D *tex = NULL;
+  ID3D11Device1 *dev1 = NULL;
+  if (FAILED(ID3D11Device_QueryInterface(s->device, &IID_ID3D11Device1,
+                                         (void **)&dev1)) ||
+      !dev1)
+    return -1;
+  HRESULT hr = ID3D11Device1_OpenSharedResource1(dev1, (HANDLE)shared_handle,
+                                                 &IID_ID3D11Texture2D,
+                                                 (void **)&tex);
+  ID3D11Device1_Release(dev1);
+  if (FAILED(hr) || !tex) return -1;
+
+  int r = mfenc_submit_texture(s, tex, pts_us, force_keyframe);
+  ID3D11Texture2D_Release(tex);
+  return r;
+}
+
+/* 1 when the session has a D3D11 device bound (zero-copy input available). */
+static int mfenc_has_d3d11_impl(void *session) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  return (s && s->device && s->dxgi_mgr) ? 1 : 0;
+}
+
 /* Pull one encoded frame. 1 = frame, 0 = need more input, 2 = stream change. */
-MFENC_API int miniav_shim_mfenc_receive(void *session, MiniAVMfEncFrame *out) {
+static int mfenc_receive_impl(void *session, MiniAVMfEncFrame *out) {
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s || !out) return -1;
   memset(out, 0, sizeof(*out));
+
+  /* Async: ProcessOutput is only legal after METransformHaveOutput. Without
+   * this gate the call returns E_UNEXPECTED on every hardware MFT. */
+  if (s->is_async) {
+    mfenc_pump(s);
+    if (s->have_output == 0) return 0;
+    s->have_output--;
+  }
 
   MFT_OUTPUT_STREAM_INFO si;
   memset(&si, 0, sizeof(si));
@@ -373,16 +1415,77 @@ MFENC_API int miniav_shim_mfenc_receive(void *session, MiniAVMfEncFrame *out) {
   return out->data ? 1 : 0;
 }
 
-MFENC_API int miniav_shim_mfenc_drain(void *session) {
+static int mfenc_drain_impl(void *session) {
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s) return -1;
   IMFTransform_ProcessMessage(s->mft, MFT_MESSAGE_COMMAND_DRAIN, 0);
+  /* Async MFTs keep raising METransformHaveOutput after the drain command and
+   * finish with METransformDrainComplete; pump so those land in have_output and
+   * the caller's receive() loop can flush them. Bounded so a wedged MFT cannot
+   * hang the caller. */
+  if (s->is_async) {
+    s->drain_done = 0;
+    mfenc_pump(s);
+    /* Deadline-bounded: mfenc_wait_event returns 0 for METransformNeedInput
+     * too, and the MFT keeps raising it, so a loop keyed only on
+     * drain_done/have_output spins forever. That was the hang. */
+    LARGE_INTEGER dfreq, d0, dnow;
+    QueryPerformanceFrequency(&dfreq);
+    QueryPerformanceCounter(&d0);
+    while (!s->drain_done && !s->have_output) {
+      mfenc_wait_event(s);
+      QueryPerformanceCounter(&dnow);
+      if ((double)(dnow.QuadPart - d0.QuadPart) / (double)dfreq.QuadPart > 1.0)
+        break; /* 1 s cap */
+    }
+  }
   return 0;
 }
 
-MFENC_API void miniav_shim_mfenc_destroy(void *session) {
+/* 1 when the session is running a hardware MFT. "It produced a bitstream" is
+ * not evidence of hardware — this is. */
+static int mfenc_is_hardware_impl(void *session) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  return s ? s->is_hardware : 0;
+}
+
+/* MFT friendly name (e.g. "NVIDIA H.264 Encoder MFT"). Returns bytes written. */
+static int mfenc_get_mft_name_impl(void *session, char *out, int cap) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  if (!s || !out || cap <= 0) return 0;
+  int n = (int)strlen(s->mft_name);
+  if (n >= cap) n = cap - 1;
+  memcpy(out, s->mft_name, (size_t)n);
+  out[n] = 0;
+  return n;
+}
+
+static void mfenc_destroy_impl(void *session) {
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s) return;
+  /* Release the generator before the MFT: it is obtained from the MFT and
+   * holds a reference back to it. */
+  if (s->event_gen) IMFMediaEventGenerator_Release(s->event_gen);
+  /* VideoProcessor chain before the device that produced it. Views first: they
+   * hold references to the resources they were built on. */
+  for (int i = 0; i < MFENC_IMPORT_CACHE; i++) {
+    if (s->imp[i].km) IDXGIKeyedMutex_Release(s->imp[i].km);
+    if (s->imp[i].iv) ID3D11VideoProcessorInputView_Release(s->imp[i].iv);
+    if (s->imp[i].tex) ID3D11Texture2D_Release(s->imp[i].tex);
+  }
+  if (s->last_sub) ID3D11Texture2D_Release(s->last_sub);
+  if (s->blt_fence) ID3D11Query_Release(s->blt_fence);
+  for (int i = 0; i < MFENC_NV12_RING; i++) {
+    if (s->nv12_ov[i]) ID3D11VideoProcessorOutputView_Release(s->nv12_ov[i]);
+    if (s->nv12_tex[i]) ID3D11Texture2D_Release(s->nv12_tex[i]);
+  }
+  if (s->vp) ID3D11VideoProcessor_Release(s->vp);
+  if (s->vp_enum) ID3D11VideoProcessorEnumerator_Release(s->vp_enum);
+  if (s->vctx) ID3D11VideoContext_Release(s->vctx);
+  if (s->vdev) ID3D11VideoDevice_Release(s->vdev);
+  if (s->ctx) ID3D11DeviceContext_Release(s->ctx);
+  if (s->dxgi_mgr) IMFDXGIDeviceManager_Release(s->dxgi_mgr);
+  if (s->device) ID3D11Device_Release(s->device);
   if (s->mft) {
     IMFTransform_ProcessMessage(s->mft, MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     IMFTransform_Release(s->mft);
@@ -391,6 +1494,353 @@ MFENC_API void miniav_shim_mfenc_destroy(void *session) {
   mf_down();
 }
 
+/* ===================== public API — all marshalled to the MTA worker =====
+ *
+ * Each entry packs its arguments into a struct, runs the *_impl body on the
+ * worker, and returns its result. `mfenc_free` is deliberately NOT marshalled:
+ * it is a plain free() of a buffer we malloc'd and touches no MF/COM state.
+ */
+
+typedef struct { int codec; } ArgCodec;
+static int job_has_mft(void *vp) {
+  ArgCodec *a = (ArgCodec *)vp;
+  return mfenc_has_mft_impl(a->codec);
+}
+MFENC_API int miniav_shim_mfenc_has_mft(int codec) {
+  ArgCodec a = {codec};
+  return mfenc_on_worker(job_has_mft, &a, 0);
+}
+
+typedef struct { int codec; char *out; int cap; } ArgListHw;
+static int job_list_hw(void *vp) {
+  ArgListHw *a = (ArgListHw *)vp;
+  return mfenc_list_hw_impl(a->codec, a->out, a->cap);
+}
+MFENC_API int miniav_shim_mfenc_list_hw(int codec, char *out, int cap) {
+  ArgListHw a = {codec, out, cap};
+  return mfenc_on_worker(job_list_hw, &a, -1);
+}
+
+/* create returns a pointer, so the result travels in the arg struct. */
+typedef struct {
+  int codec, width, height, bitrate_bps, fps_num, fps_den, gop;
+  void *existing_device;
+  void *result;
+} ArgCreate;
+static int job_create(void *vp) {
+  ArgCreate *a = (ArgCreate *)vp;
+  a->result = mfenc_create_pub_impl(a->codec, a->width, a->height,
+                                    a->bitrate_bps, a->fps_num, a->fps_den,
+                                    a->gop, a->existing_device);
+  return 0;
+}
+MFENC_API void *miniav_shim_mfenc_create(int codec, int width, int height,
+                                         int bitrate_bps, int fps_num,
+                                         int fps_den, int gop,
+                                         void *existing_device) {
+  ArgCreate a = {codec,   width, height,          bitrate_bps, fps_num,
+                 fps_den, gop,   existing_device, NULL};
+  if (mfenc_on_worker(job_create, &a, -1) != 0) return NULL;
+  return a.result;
+}
+
+typedef struct { void *s; uint8_t *out; int cap; } ArgExtra;
+static int job_extradata(void *vp) {
+  ArgExtra *a = (ArgExtra *)vp;
+  return mfenc_get_extradata_impl(a->s, a->out, a->cap);
+}
+MFENC_API int miniav_shim_mfenc_get_extradata(void *session, uint8_t *out,
+                                              int cap) {
+  ArgExtra a = {session, out, cap};
+  return mfenc_on_worker(job_extradata, &a, -1);
+}
+
+typedef struct {
+  void *s; const uint8_t *nv12; int size; int64_t pts; int force;
+} ArgSendNv12;
+static int job_send_nv12(void *vp) {
+  ArgSendNv12 *a = (ArgSendNv12 *)vp;
+  return mfenc_send_nv12_impl(a->s, a->nv12, a->size, a->pts, a->force);
+}
+MFENC_API int miniav_shim_mfenc_send_nv12(void *session, const uint8_t *nv12,
+                                          int nv12_size, int64_t pts_us,
+                                          int force_keyframe) {
+  ArgSendNv12 a = {session, nv12, nv12_size, pts_us, force_keyframe};
+  return mfenc_on_worker(job_send_nv12, &a, -1);
+}
+
+typedef struct { void *s; void *handle; int64_t pts; int force; } ArgSendTex;
+static int job_send_d3d11(void *vp) {
+  ArgSendTex *a = (ArgSendTex *)vp;
+  return mfenc_send_d3d11_impl(a->s, a->handle, a->pts, a->force);
+}
+MFENC_API int miniav_shim_mfenc_send_d3d11(void *session, void *shared_handle,
+                                           int64_t pts_us, int force_key) {
+  ArgSendTex a = {session, shared_handle, pts_us, force_key};
+  return mfenc_on_worker(job_send_d3d11, &a, -1);
+}
+
+static int job_send_d3d11_texture(void *vp) {
+  ArgSendTex *a = (ArgSendTex *)vp;
+  return mfenc_send_d3d11_texture_impl(a->s, a->handle, a->pts, a->force);
+}
+typedef struct {
+  void *s;
+  int64_t pts;
+  int force;
+} MfencRepeatArgs;
+static int job_repeat_last(void *vp) {
+  MfencRepeatArgs *a = (MfencRepeatArgs *)vp;
+  return mfenc_repeat_last_impl(a->s, a->pts, a->force);
+}
+/* Last import failure reason. Not marshalled: it only reads memory the worker
+ * has already finished writing, ordered by the job's own completion. */
+MFENC_API int miniav_shim_mfenc_last_import_error(void *session, char *out,
+                                                  int cap) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  if (!s || !out || cap <= 0) return 0;
+  int n = (int)strlen(s->imp_err);
+  if (n > cap) n = cap;
+  memcpy(out, s->imp_err, (size_t)n);
+  return n;
+}
+
+MFENC_API int miniav_shim_mfenc_repeat_last(void *session, int64_t pts_us,
+                                            int force_keyframe) {
+  MfencRepeatArgs a = {session, pts_us, force_keyframe};
+  return mfenc_on_worker(job_repeat_last, &a, -1);
+}
+
+MFENC_API int miniav_shim_mfenc_send_d3d11_texture(void *session,
+                                                   void *texture_ptr,
+                                                   int64_t pts_us,
+                                                   int force_key) {
+  ArgSendTex a = {session, texture_ptr, pts_us, force_key};
+  return mfenc_on_worker(job_send_d3d11_texture, &a, -1);
+}
+
+typedef struct { void *s; } ArgSession;
+static int job_has_d3d11(void *vp) {
+  return mfenc_has_d3d11_impl(((ArgSession *)vp)->s);
+}
+MFENC_API int miniav_shim_mfenc_has_d3d11(void *session) {
+  ArgSession a = {session};
+  return mfenc_on_worker(job_has_d3d11, &a, 0);
+}
+
+typedef struct { void *s; MiniAVMfEncFrame *out; } ArgReceive;
+static int job_receive(void *vp) {
+  ArgReceive *a = (ArgReceive *)vp;
+  return mfenc_receive_impl(a->s, a->out);
+}
+MFENC_API int miniav_shim_mfenc_receive(void *session, MiniAVMfEncFrame *out) {
+  ArgReceive a = {session, out};
+  return mfenc_on_worker(job_receive, &a, -1);
+}
+
+static int job_drain(void *vp) {
+  return mfenc_drain_impl(((ArgSession *)vp)->s);
+}
+MFENC_API int miniav_shim_mfenc_drain(void *session) {
+  ArgSession a = {session};
+  return mfenc_on_worker(job_drain, &a, -1);
+}
+
+static int job_is_hardware(void *vp) {
+  return mfenc_is_hardware_impl(((ArgSession *)vp)->s);
+}
+MFENC_API int miniav_shim_mfenc_is_hardware(void *session) {
+  ArgSession a = {session};
+  return mfenc_on_worker(job_is_hardware, &a, 0);
+}
+
+typedef struct { void *s; char *out; int cap; } ArgName;
+static int job_mft_name(void *vp) {
+  ArgName *a = (ArgName *)vp;
+  return mfenc_get_mft_name_impl(a->s, a->out, a->cap);
+}
+MFENC_API int miniav_shim_mfenc_get_mft_name(void *session, char *out,
+                                             int cap) {
+  ArgName a = {session, out, cap};
+  return mfenc_on_worker(job_mft_name, &a, 0);
+}
+
+static int job_destroy(void *vp) {
+  mfenc_destroy_impl(((ArgSession *)vp)->s);
+  return 0;
+}
+MFENC_API void miniav_shim_mfenc_destroy(void *session) {
+  ArgSession a = {session};
+  mfenc_on_worker(job_destroy, &a, 0);
+}
+
 MFENC_API void miniav_shim_mfenc_free(void *p) { free(p); }
+
+/* ---- test-only: a shared BGRA texture on its OWN device ------------------
+ *
+ * Exists so `mfenc_send_d3d11_texture` can be exercised for real: it needs a
+ * source that lives on a DIFFERENT device and carries
+ * D3D11_RESOURCE_MISC_SHARED, which is exactly the shape minigpu's GPU
+ * processor output has. Without this the cross-device import + VideoProcessor
+ * conversion could only be verified by running the whole recorder.
+ *
+ * Returns an ID3D11Texture2D* (device kept alive by the texture's reference).
+ * Free with miniav_shim_mfenc_test_texture_release. */
+/* `nt`: 0 = legacy D3D11_RESOURCE_MISC_SHARED (GetSharedHandle), 1 = NT-handle
+ * sharing (IDXGIResource1::CreateSharedHandle), which D3D11 only permits
+ * together with a keyed mutex.
+ *
+ * Both exist because the encoder must accept both, and a test that only ever
+ * builds the legacy shape agrees with the importer instead of with real
+ * producers -- which is exactly how the NT-handle path shipped broken while
+ * this test passed. */
+MFENC_API void *miniav_shim_mfenc_test_shared_fmt(int width, int height,
+                                                  int pattern, int nt, int fmt);
+
+MFENC_API void *miniav_shim_mfenc_test_shared_bgra_ex(int width, int height,
+                                                      int pattern, int nt) {
+  return miniav_shim_mfenc_test_shared_fmt(width, height, pattern, nt, 0);
+}
+
+/* fmt: 0 = B8G8R8A8_UNORM, 1 = R8G8B8A8_UNORM. The recorder's GPU processor
+ * hands over RGBA; a VideoProcessor input view does not necessarily accept it,
+ * and testing only BGRA cannot tell you that. */
+MFENC_API void *miniav_shim_mfenc_test_shared_fmt(int width, int height,
+                                                  int pattern, int nt,
+                                                  int fmt) {
+  ID3D11Device *dev = NULL;
+  ID3D11DeviceContext *ctx = NULL;
+  D3D_FEATURE_LEVEL fl;
+  if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                               D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
+                               D3D11_SDK_VERSION, &dev, &fl, &ctx)) ||
+      !dev)
+    return NULL;
+
+  D3D11_TEXTURE2D_DESC td;
+  ZeroMemory(&td, sizeof(td));
+  td.Width = (UINT)width;
+  td.Height = (UINT)height;
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.Format = fmt ? DXGI_FORMAT_R8G8B8A8_UNORM
+                  : DXGI_FORMAT_B8G8R8A8_UNORM;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  td.MiscFlags = nt ? (D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                       D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
+                    : D3D11_RESOURCE_MISC_SHARED;
+
+  /* Fill with a non-uniform pattern so the encoder has real work and a broken
+   * colour conversion is at least visible in the output size. */
+  UINT32 *pix = (UINT32 *)malloc((size_t)width * height * 4);
+  if (!pix) {
+    if (ctx) ID3D11DeviceContext_Release(ctx);
+    ID3D11Device_Release(dev);
+    return NULL;
+  }
+  for (int y = 0; y < height; y++)
+    for (int x = 0; x < width; x++)
+      pix[y * width + x] =
+          pattern ? (0xFF000000u | ((UINT32)(x & 0xFF) << 16) |
+                     ((UINT32)(y & 0xFF) << 8) | (UINT32)((x + y) & 0xFF))
+                  : 0xFF808080u; /* flat grey — encodes to almost nothing */
+  D3D11_SUBRESOURCE_DATA srd;
+  ZeroMemory(&srd, sizeof(srd));
+  srd.pSysMem = pix;
+  srd.SysMemPitch = (UINT)width * 4;
+
+  ID3D11Texture2D *tex = NULL;
+  HRESULT hr = ID3D11Device_CreateTexture2D(dev, &td, &srd, &tex);
+  free(pix);
+  /* FLUSH before the importing device opens this. A shared resource's contents
+   * are only guaranteed visible to another device after the producing context
+   * has been flushed — without it the consumer legitimately sees an empty
+   * surface, which is indistinguishable from "the blt did not run". */
+  if (ctx) {
+    ID3D11DeviceContext_Flush(ctx);
+    ID3D11DeviceContext_Release(ctx);
+  }
+  ID3D11Device_Release(dev); /* texture holds its own ref to the device */
+  if (FAILED(hr)) return NULL;
+  return tex;
+}
+
+MFENC_API void *miniav_shim_mfenc_test_shared_bgra(int width, int height,
+                                                   int pattern) {
+  return miniav_shim_mfenc_test_shared_bgra_ex(width, height, pattern, 0);
+}
+
+/* A D3D11 device created WITHOUT video support -- the shape of a rendering
+ * device such as Dawn's, used to prove the encoder declines one it cannot
+ * convert on. */
+MFENC_API void *miniav_shim_mfenc_test_plain_device(void) {
+  ID3D11Device *dev = NULL;
+  if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                               D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
+                               D3D11_SDK_VERSION, &dev, NULL, NULL)))
+    return NULL;
+  return dev;
+}
+
+MFENC_API void miniav_shim_mfenc_test_device_release(void *dev) {
+  if (dev) ID3D11Device_Release((ID3D11Device *)dev);
+}
+
+MFENC_API void miniav_shim_mfenc_test_texture_release(void *tex) {
+  if (tex) ID3D11Texture2D_Release((ID3D11Texture2D *)tex);
+}
+
+/* ---- diagnostic: did the VideoProcessor blt actually write? --------------
+ *
+ * Runs the SAME import + blt as mfenc_send_d3d11_texture_impl, then reads the
+ * NV12 staging texture back to the CPU and returns the sum of its luma bytes.
+ * This isolates the two suspects: if the sum varies with the source picture the
+ * blt works and the fault is downstream in mfenc_submit_texture / the MFT; if
+ * it does not, the blt itself is the problem.
+ *
+ * Test-only — it stalls the GPU on a Map, which is exactly what the real path
+ * exists to avoid. Returns -1 on failure. */
+MFENC_API int64_t miniav_shim_mfenc_test_blt_luma_sum(void *session,
+                                                      void *texture_ptr) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  if (!s || !texture_ptr || !s->device) return -1;
+  if (mfenc_ensure_vp(s) != 0) return -1;
+
+  /* Reuse the production path so we measure the real blt, then read back. */
+  int slot = mfenc_blt_texture_to_nv12(s, (ID3D11Texture2D *)texture_ptr);
+  if (slot < 0) return -1;
+  ID3D11Texture2D *nv12 = s->nv12_tex[slot];
+
+  D3D11_TEXTURE2D_DESC td;
+  ID3D11Texture2D_GetDesc(nv12, &td);
+  td.Usage = D3D11_USAGE_STAGING;
+  td.BindFlags = 0;
+  td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  td.MiscFlags = 0;
+  ID3D11Texture2D *stage = NULL;
+  if (FAILED(ID3D11Device_CreateTexture2D(s->device, &td, NULL, &stage)) ||
+      !stage)
+    return -1;
+
+  ID3D11DeviceContext_CopyResource(s->ctx, (ID3D11Resource *)stage,
+                                   (ID3D11Resource *)nv12);
+  D3D11_MAPPED_SUBRESOURCE map;
+  int64_t sum = -1;
+  if (SUCCEEDED(ID3D11DeviceContext_Map(s->ctx, (ID3D11Resource *)stage, 0,
+                                        D3D11_MAP_READ, 0, &map))) {
+    sum = 0;
+    const uint8_t *p = (const uint8_t *)map.pData;
+    for (int y = 0; y < s->height; y++) {
+      const uint8_t *row = p + (size_t)y * map.RowPitch;
+      for (int x = 0; x < s->width; x++) sum += row[x]; /* luma plane only */
+    }
+    ID3D11DeviceContext_Unmap(s->ctx, (ID3D11Resource *)stage, 0);
+  }
+  ID3D11Texture2D_Release(stage);
+  return sum;
+}
+
 
 #endif /* _WIN32 */

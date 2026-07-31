@@ -1,6 +1,23 @@
 # Changelog
 
-## 0.5.3 (unreleased)
+## 0.5.4
+
+- **Internal pins are now caret ranges, not exact versions.** Exact pins made
+  every patch cascade: publishing `miniav_tools_platform_interface` 0.5.3 made
+  the already-published `miniav_tools` 0.5.3 and `miniav_tools_ffmpeg` 0.5.3
+  unsatisfiable next to it, because they pinned 0.5.2 exactly and nothing in the
+  set could move independently. `dart pub publish` warns about this. `release.py
+  sync` now normalises to caret so it cannot recur.
+- Republished: 0.5.3 shipped pinning `miniav_tools_platform_interface: 0.5.2`,
+  which cannot resolve alongside any package needing 0.5.3.
+
+## 0.5.3
+
+- Declare the new `PlatformEncoder` GPU-input capabilities.
+  `FfmpegD3d11HwEncoder` reports both `supportsD3d11SharedHandleInput` and
+  `supportsD3d11TextureInput`; the CPU-fed encoders report neither. Behaviour is
+  unchanged — this replaces the recorder's `platform is FfmpegD3d11HwEncoder`
+  check with the same answer, expressed as a capability other encoders can give.
 
 - **Demuxer + live-stream muxing for miniav_player stream/file playback**
   (shim ABI 14 -> 15):

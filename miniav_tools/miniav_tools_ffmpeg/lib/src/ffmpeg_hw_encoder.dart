@@ -964,6 +964,13 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   @override
   bool get acceptsYuv420pPlanes => false;
 
+  // No D3D11 GPU-frame input: this encoder takes CPU frames.
+  @override
+  bool get supportsD3d11SharedHandleInput => false;
+
+  @override
+  bool get supportsD3d11TextureInput => false;
+
   @override
   Future<void> close() async {
     if (_closed) return;

@@ -23,6 +23,8 @@ import 'dart:math' show min;
 import 'dart:typed_data';
 
 import 'package:miniav_tools/miniav_tools.dart';
+import 'package:miniav_tools_codecs/miniav_tools_codecs.dart'
+    show ContainerFramingBackend;
 import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
@@ -378,10 +380,21 @@ class ClipBuffer {
               .toSet(),
         );
 
-    // 7. Decide muxer strategy. The caller-supplied muxerFactory (the
-    //    pure-Dart Av1Mp4Muxer for the minigpu path) can handle MP4 clips
-    //    with exactly one AV1 video track plus any number of AAC audio
-    //    tracks — no FFmpeg round-trip and no temporary audio encoders.
+    // 7. Decide muxer strategy — prefer the FIRST-PARTY writer.
+    //
+    //    It muxes already-encoded packets and needs no encoder handle at all.
+    //    FfmpegMuxer, by contrast, requires a live AVCodecContext per audio
+    //    track to fill codecpar, because ch_layout is not reachable from the
+    //    Dart-side AVCodecParameters prefix. That requirement is a coupling
+    //    between the muxer and *which backend encoded the audio*, and it broke
+    //    the moment AAC stopped encoding on FFmpeg by default: the temporary
+    //    encoder opened below is an FFmpeg one or it is worthless.
+    //
+    //    The previous gate also demanded AV1 and a caller-supplied factory.
+    //    Both have outlived their reasons: the Dart MP4 writer now handles
+    //    H.264/HEVC as well (it converts Annex-B to length-prefixed samples and
+    //    builds the avcC/hvcC record), and it is registered by the recorder
+    //    itself, so no app needs to hand one in.
     final videoMetas = presentIndices
         .map((i) => _meta[i]!)
         .where((m) => m.kind == TrackKind.video)
@@ -390,12 +403,14 @@ class ClipBuffer {
         .map((i) => _meta[i]!)
         .where((m) => m.kind == TrackKind.audio)
         .toList();
-    final useDartMuxer =
-        muxerFactory != null &&
-        effectiveContainer == Container.mp4 &&
-        videoMetas.length == 1 &&
-        videoMetas.first.videoCodec == VideoCodec.av1 &&
-        audioMetas.every((m) => m.audioCodec == AudioCodec.aac);
+    // No cap on video-track count: the writer keeps a sample table per track
+    // and `test/mp4_multitrack_test.dart` (codecs) round-trips 2 video + 2
+    // audio byte-exactly. The old `== 1` came from the AV1-only gate.
+    final useDartMuxer = firstPartyMuxerCanWrite(
+      container: effectiveContainer,
+      videoCodecs: videoMetas.map((m) => m.videoCodec!),
+      audioCodecs: audioMetas.map((m) => m.audioCodec!),
+    );
 
     // 8. Build track-info list. For the FFmpeg path we open a temporary audio
     //    encoder per audio track purely so FfmpegMuxer can call
@@ -456,20 +471,41 @@ class ClipBuffer {
         }
       }
 
-      // Open muxer: Dart muxer for the AV1(+AAC) MP4 path, FFmpeg otherwise.
+      // Open the muxer. Everything below drives the `Muxer` facade, which has
+      // the same writeHeader/writePacket/finish/close surface as a
+      // PlatformMuxer — so the three sources differ only here.
       final muxerConfig = MuxerConfig(
         container: effectiveContainer,
         output: FileMuxerOutput(path),
         tracks: trackInfos,
       );
-      final PlatformMuxer muxer = useDartMuxer
-          ? muxerFactory!(muxerConfig)
-          : FfmpegMuxer.open(
-              muxerConfig,
-              encoderForTrack: encoderForTrack.isNotEmpty
-                  ? encoderForTrack
-                  : null,
-            );
+      final Muxer muxer;
+      if (useDartMuxer) {
+        muxer = muxerFactory != null
+            // An explicit factory is a deliberate override; honour it.
+            ? Muxer(muxerFactory!(muxerConfig), 'caller')
+            // PIN rather than negotiate. The track infos built above carry no
+            // encoder, which FfmpegMuxer rejects outright — so if it won the
+            // negotiation the failure would surface as a confusing throw inside
+            // writeHeader instead of as a decision made here. Pinning keeps the
+            // choice and its consequences in one place.
+            : await MiniAVTools.createMuxer(
+                muxerConfig,
+                preference: BackendPreference.pinned(
+                  ContainerFramingBackend.backendName,
+                ),
+              );
+      } else {
+        muxer = Muxer(
+          FfmpegMuxer.open(
+            muxerConfig,
+            encoderForTrack: encoderForTrack.isNotEmpty
+                ? encoderForTrack
+                : null,
+          ),
+          'ffmpeg',
+        );
+      }
 
       // 9. Write header. After this the muxer no longer needs the encoder
       //    bridges, so we can close the temp encoders immediately.

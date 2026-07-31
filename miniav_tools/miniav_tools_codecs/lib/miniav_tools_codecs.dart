@@ -41,6 +41,8 @@ export 'src/framing/ogg_container.dart' show OggDemuxer, OggMuxer;
 export 'src/framing/adts_container.dart'
     show AdtsDemuxer, AdtsMuxer, ascToAdtsParams, adtsSampleRates;
 export 'src/framing/mp4_container.dart' show Mp4Demuxer, Mp4Muxer;
+export 'src/framing/annexb.dart'
+    show isAnnexB, splitAnnexB, buildAvcC, buildHvcC, annexBToLengthPrefixed;
 export 'src/sw_audio/sw_audio_backend.dart' show SwAudioBackend;
 export 'src/sw_audio/sw_audio_decoder.dart' show SwAudioDecoder;
 export 'src/sw_audio/sw_audio_stream_decoder.dart' show SwAudioStreamDecoder;
@@ -80,8 +82,37 @@ import 'src/opus/opus_backend.dart';
 import 'src/pcm/pcm_backend.dart';
 import 'src/sw_audio/sw_audio_backend.dart';
 
-// ignore: unused_element
-final _registered = registerMinigpuBackend();
+/// Register every first-party backend at once (idempotent, safe to call
+/// repeatedly; each entry no-ops on platforms it does not serve).
+///
+/// This exists because **Dart has no import side-effect**. A top-level
+/// `final x = register();` looks like initialisation but is lazy — it runs on
+/// first *read*, and nothing reads it — so a library cannot make itself the
+/// default just by being imported. Registration has to happen on a code path
+/// that actually executes. `miniav_recorder` calls this before it negotiates an
+/// encoder, which is what makes the first-party path the default for recording
+/// apps without any per-app boilerplate; anything else should call it from
+/// `main()`.
+///
+/// Registering is not the same as winning. The negotiator ranks `isHardware`
+/// above priority, and each backend reports capability honestly — so on a box
+/// with no hardware MFT, FFmpeg's hardware path still takes H.264. To pin a
+/// specific backend, name it at the call site (`EncoderConfig.backend`);
+/// there is no unregister.
+///
+/// Covers: minigpu, MF encode + decode, OS AAC, Opus, PCM, software audio
+/// (MP3/FLAC/Vorbis) and container framing (WAV/Ogg/ADTS/MP4).
+bool registerFirstPartyBackends() {
+  var any = registerMinigpuBackend();
+  any = registerMfEncodeBackend() || any;
+  any = registerMfDecodeBackend() || any;
+  any = registerAacBackend() || any;
+  any = registerOpusBackend() || any;
+  any = registerPcmBackend() || any;
+  any = registerSwAudioBackend() || any;
+  any = registerContainerFramingBackend() || any;
+  return any;
+}
 
 bool registerMinigpuBackend() {
   final existing = MiniAVToolsPlatform.instance.backends.any(
@@ -122,9 +153,10 @@ bool registerMfDecodeBackend() {
 }
 
 /// Register the first-party MF video-encode backend (Windows only, idempotent;
-/// no-op elsewhere). H.264/HEVC via the OS encoder MFT. Priority 45 (below
-/// FFmpeg) — opt-in via `excluded({'ffmpeg'})` until the D3D11/HW/isolate
-/// follow-ups land; first cut is sync SW + CPU-NV12 input.
+/// no-op elsewhere). H.264/HEVC on the OS **hardware** encoder MFT (NVENC /
+/// AMF / QSV) with a software-MFT fallback — no FFmpeg. Priority 55, and it
+/// reports a hardware capability only where the OS actually lists a hardware
+/// MFT, so software-only boxes still rank below a real hardware FFmpeg path.
 bool registerMfEncodeBackend() {
   if (!Platform.isWindows) return false;
   final existing = MiniAVToolsPlatform.instance.backends.any(

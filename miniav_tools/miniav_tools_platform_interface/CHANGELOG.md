@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.5.3 (unreleased)
+## 0.5.3
+
+- `PlatformEncoder` gains two GPU-input capability getters, both defaulting to
+  `false`: `supportsD3d11SharedHandleInput` (a `FrameSource.miniavBuffer` whose
+  `nativeHandles[0]` is a D3D11 shared NT handle, opened on the encoder's own
+  device) and `supportsD3d11TextureInput` (a `D3D11TextureFrameSource` — a raw
+  texture pointer on the *processor's* device, so strictly stronger). They let
+  the recorder pick its zero-copy screen path by capability instead of by
+  concrete encoder type. **Implementers use `implements PlatformEncoder`, so
+  these must be declared explicitly** — the defaults do not carry.
 
 - Audio **decode** contract (the `supportsAudioDecode()` capability existed
   with no factory): `PlatformAudioDecoder`, `DecodedAudio` (interleaved f32),

@@ -343,11 +343,23 @@ final class MfEncFrame extends Struct {
 @Native<Int32 Function(Int32)>(symbol: 'miniav_shim_mfenc_has_mft')
 external int mfencHasMft(int codec);
 
-@Native<Pointer<Void> Function(Int32, Int32, Int32, Int32, Int32, Int32, Int32)>(
+@Native<
+    Pointer<Void> Function(
+        Int32, Int32, Int32, Int32, Int32, Int32, Int32, Pointer<Void>)>(
   symbol: 'miniav_shim_mfenc_create',
 )
-external Pointer<Void> mfencCreate(int codec, int width, int height,
-    int bitrateBps, int fpsNum, int fpsDen, int gop);
+external Pointer<Void> mfencCreate(
+    int codec,
+    int width,
+    int height,
+    int bitrateBps,
+    int fpsNum,
+    int fpsDen,
+    int gop,
+    /// An existing `ID3D11Device*` to encode on, or `nullptr` to create one.
+    /// Passing the device the frames already live on removes the per-frame
+    /// shared-handle import entirely.
+    Pointer<Void> existingDevice);
 
 @Native<Int32 Function(Pointer<Void>, Pointer<Uint8>, Int32)>(
   symbol: 'miniav_shim_mfenc_get_extradata',
@@ -367,6 +379,16 @@ external int mfencReceive(Pointer<Void> s, Pointer<MfEncFrame> out);
 
 @Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_shim_mfenc_drain')
 external int mfencDrain(Pointer<Void> s);
+
+/// 1 when the session activated a hardware MFT rather than the software one.
+@Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_shim_mfenc_is_hardware')
+external int mfencIsHardware(Pointer<Void> s);
+
+/// MFT friendly name, e.g. "NVIDIA H.264 Encoder MFT". Returns bytes written.
+@Native<Int32 Function(Pointer<Void>, Pointer<Uint8>, Int32)>(
+  symbol: 'miniav_shim_mfenc_get_mft_name',
+)
+external int mfencGetMftName(Pointer<Void> s, Pointer<Uint8> out, int cap);
 
 @Native<Void Function(Pointer<Void>)>(symbol: 'miniav_shim_mfenc_destroy')
 external void mfencDestroy(Pointer<Void> s);
@@ -676,3 +698,99 @@ void rgbaToI420(
 }) =>
     _rgbaToI420Native(rgba, stride, width, height, y, u, v, fullRange ? 1 : 0,
         matrix, bgra ? 1 : 0);
+
+/// Diagnostic: names of HARDWARE video-encoder MFTs the OS exposes, "a|b|c".
+@Native<Int32 Function(Int32, Pointer<Uint8>, Int32)>(
+  symbol: 'miniav_shim_mfenc_list_hw',
+)
+external int mfencListHw(int codec, Pointer<Uint8> out, int cap);
+
+/// Feed one frame as a D3D11 texture (shared NT handle) — zero-copy.
+/// 0 accepted, 1 not accepting (drain then retry), -1 error/no D3D path.
+@Native<Int32 Function(Pointer<Void>, Pointer<Void>, Int64, Int32)>(
+  symbol: 'miniav_shim_mfenc_send_d3d11',
+)
+external int mfencSendD3d11(
+    Pointer<Void> s, Pointer<Void> sharedHandle, int ptsUs, int forceKey);
+
+/// Feed one frame as a raw `ID3D11Texture2D*` living on ANOTHER device (the GPU
+/// processor's / Dawn's), RGBA or BGRA. Imported cross-device via
+/// `GetSharedHandle` + `OpenSharedResource` — which needs
+/// `D3D11_RESOURCE_MISC_SHARED` on the source, as minigpu's output textures
+/// have — then converted to NV12 in VRAM by a D3D11 VideoProcessor. No readback.
+/// 0 accepted, 1 not accepting (drain then retry), -1 error/no D3D path.
+@Native<Int32 Function(Pointer<Void>, Pointer<Void>, Int64, Int32)>(
+  symbol: 'miniav_shim_mfenc_send_d3d11_texture',
+)
+external int mfencSendD3d11Texture(
+    Pointer<Void> s, Pointer<Void> texturePtr, int ptsUs, int forceKey);
+
+/// 1 when a D3D11 device is bound, i.e. zero-copy texture input is available.
+@Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_shim_mfenc_has_d3d11')
+external int mfencHasD3d11(Pointer<Void> s);
+
+/// Why the last D3D11 texture import failed — step and HRESULT. Empty when the
+/// most recent import succeeded.
+@Native<Int32 Function(Pointer<Void>, Pointer<Uint8>, Int32)>(
+  symbol: 'miniav_shim_mfenc_last_import_error',
+)
+external int mfencLastImportError(
+    Pointer<Void> session, Pointer<Uint8> out, int cap);
+
+/// Re-send the surface most recently given to the MFT under a new timestamp —
+/// a duplicate frame without re-importing anything. Returns 0 accepted,
+/// 1 drain-and-retry, -1 nothing to repeat.
+@Native<Int32 Function(Pointer<Void>, Int64, Int32)>(
+  symbol: 'miniav_shim_mfenc_repeat_last',
+)
+external int mfencRepeatLast(Pointer<Void> session, int ptsUs, int force);
+
+/// Test-only: create a shared BGRA `ID3D11Texture2D*` on its own device, so the
+/// cross-device VideoProcessor path can be exercised with a real foreign
+/// texture. Release with [mfencTestTextureRelease].
+@Native<Pointer<Void> Function(Int32, Int32, Int32)>(
+  symbol: 'miniav_shim_mfenc_test_shared_bgra',
+)
+external Pointer<Void> mfencTestSharedBgra(int width, int height, int pattern);
+
+/// As [mfencTestSharedBgra], but `nt` selects the sharing mode: 0 = legacy
+/// `D3D11_RESOURCE_MISC_SHARED`, 1 = NT-handle sharing via
+/// `IDXGIResource1::CreateSharedHandle` (which D3D11 only allows alongside a
+/// keyed mutex). Real GPU producers publish the NT shape; the importer must
+/// accept both, so both get tested.
+@Native<Pointer<Void> Function(Int32, Int32, Int32, Int32)>(
+  symbol: 'miniav_shim_mfenc_test_shared_bgra_ex',
+)
+external Pointer<Void> mfencTestSharedBgraEx(
+    int width, int height, int pattern, int nt);
+
+/// Test-only: an `ID3D11Device*` created WITHOUT video support.
+@Native<Pointer<Void> Function()>(
+  symbol: 'miniav_shim_mfenc_test_plain_device',
+)
+external Pointer<Void> mfencTestPlainDevice();
+
+@Native<Void Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_mfenc_test_device_release',
+)
+external void mfencTestDeviceRelease(Pointer<Void> dev);
+
+/// `fmt`: 0 = BGRA, 1 = RGBA. The recorder's GPU processor produces RGBA.
+@Native<Pointer<Void> Function(Int32, Int32, Int32, Int32, Int32)>(
+  symbol: 'miniav_shim_mfenc_test_shared_fmt',
+)
+external Pointer<Void> mfencTestSharedFmt(
+    int width, int height, int pattern, int nt, int fmt);
+
+@Native<Void Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_mfenc_test_texture_release',
+)
+external void mfencTestTextureRelease(Pointer<Void> tex);
+
+/// Diagnostic: run the real import + VideoProcessor blt, then read the NV12
+/// staging texture back and return the sum of its luma bytes. Varies with the
+/// source picture ⇔ the blt actually wrote. Test-only (stalls the GPU).
+@Native<Int64 Function(Pointer<Void>, Pointer<Void>)>(
+  symbol: 'miniav_shim_mfenc_test_blt_luma_sum',
+)
+external int mfencTestBltLumaSum(Pointer<Void> s, Pointer<Void> texturePtr);

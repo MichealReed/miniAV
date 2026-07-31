@@ -1,6 +1,34 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.2
+
+- **Internal pins are now caret ranges, not exact versions.** Exact pins made
+  every patch cascade: publishing `miniav_tools_platform_interface` 0.5.3 made
+  the already-published `miniav_tools` 0.5.3 and `miniav_tools_ffmpeg` 0.5.3
+  unsatisfiable next to it, because they pinned 0.5.2 exactly and nothing in the
+  set could move independently. `dart pub publish` warns about this. `release.py
+  sync` now normalises to caret so it cannot recur.
+- Requires `minigpu_view` ^1.5.10, whose published 1.5.9 still constrained
+  `miniav: ^0.5.2` and blocked any consumer of both.
+
+## 0.2.1
+
+- Repins `miniav_tools_codecs` to 0.6.2. 0.2.0 pinned 0.6.1 exactly, and 0.6.1
+  cannot build its native assets for a consumer — so 0.2.0 is unusable through
+  no fault of its own code. An exact pin propagates a dependency's breakage;
+  this is the argument for caret ranges on internal pins.
+- README rewritten: it described decode as FFmpeg-only, which stopped being true
+  once `registerPlayerBackends()` began registering the Media Foundation
+  hardware decoder and the OS AAC codec. Now documents which paths run without
+  FFmpeg, per platform, plus latency modes and `extraData` expectations.
+
+## 0.2.0
+
+- **Fixed: `miniav` constraint raised to `^0.7.0`.** It was `^0.6.0`, which
+  excludes 0.7.0 entirely — the release in which miniav took ownership of the
+  shared NT handle and closes it in `releaseBuffer`. A published player resolving
+  under the old constraint leaked one kernel handle per GPU frame (60/s at
+  60 fps).
 
 - **Web playback (video).** The player now compiles and runs on web:
   conditional backend registration (FFmpeg on native / WebCodecs on web —

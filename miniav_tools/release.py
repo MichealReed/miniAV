@@ -52,9 +52,14 @@ PACKAGES MANAGED:
 -----------------
 - miniav_tools_platform_interface (pure-Dart contracts)
 - miniav_tools                    (user-facing facade)
+- miniav_tools_codecs             (first-party codecs: MF, Opus, WGSL, framing)
 - miniav_tools_ffmpeg             (FFmpeg backend, FFI)
-- miniav_tools_minigpu            (pure-WGSL backend)
-- miniav_tools_web                (browser/WebCodecs backend)
+- miniav_recorder                 (recording pipeline)
+- miniav_player                   (playback pipeline)
+
+This list must match PACKAGES below, which verify_packages_list() enforces
+against what is actually on disk — see the note there for why drift is
+expensive.
 
 WHAT IT DOES:
 ------------
@@ -75,17 +80,48 @@ Follows markdownlint rules:
 """
 import os
 import re
+import sys
 import json
 import argparse
 import subprocess
 import urllib.request
+
+import release_checks
 from datetime import datetime
 
 def load_yaml_preserve_structure(file_path):
     with open(file_path, 'r', encoding='utf-8') as file:
         return file.read()
 
+def read_local_versions(root_dir):
+    """Map every managed package to the version currently in its own pubspec.
+
+    Internal pins must name the SIBLING's version, not the version being
+    released. Those used to be the same number because every package moved in
+    lockstep; they are not any more (miniav_tools_codecs is on 0.6.x and
+    miniav_player on 0.2.x while the rest are on 0.5.x). Stamping one version
+    across every internal pin wrote `miniav_tools_codecs: 0.5.2` into
+    miniav_player — a version of that package that has never existed — and left
+    every other pin naming a stale release whose own constraints had since
+    moved. Local builds hide this completely, because pubspec_overrides.yaml
+    redirects each pin to a path; it only surfaces off-repo, as a version solve
+    that blames whichever pair of packages it noticed first.
+    """
+    versions = {}
+    for pkg in PACKAGES:
+        path = os.path.join(root_dir, pkg, "pubspec.yaml")
+        if not os.path.exists(path):
+            continue
+        with open(path, 'r', encoding='utf-8') as f:
+            m = re.search(r'^version:\s*(\S+)', f.read(), re.MULTILINE)
+        if m:
+            versions[pkg] = m.group(1)
+    return versions
+
+
 def update_yaml_content(content, new_version, is_release, local_packages):
+    """`local_packages` maps package name -> its own version. Membership decides
+    what counts as an internal dependency; the value is what gets pinned."""
     # Update version, preserving the 'version: ' part
     # Use r'\g<1>' to avoid issues with new_version starting with a digit
     content = re.sub(r'^(version:\s*).*$', r'\g<1>' + new_version, content, flags=re.MULTILINE)
@@ -132,7 +168,10 @@ def update_yaml_content(content, new_version, is_release, local_packages):
                     if pkg_name_on_line in local_packages:
                         current_package_for_path = pkg_name_on_line # Set context for this new local package
                         if is_release:
-                            updated_dep_lines.append(f'{current_indent}{pkg_name_on_line}: {new_version}')
+                            # The SIBLING's version, not the one being released.
+                            pin = local_packages.get(pkg_name_on_line, new_version) \
+                                if isinstance(local_packages, dict) else new_version
+                            updated_dep_lines.append(f'{current_indent}{pkg_name_on_line}: {pin}')
                         else:
                             updated_dep_lines.append(f'{current_indent}{pkg_name_on_line}:')
                             path_exists_or_will_be_processed = False
@@ -370,11 +409,96 @@ def add_message_to_current_version(file_path, message):
 PACKAGES = [
     "miniav_tools_platform_interface",
     "miniav_tools",
+    "miniav_tools_codecs",
     "miniav_tools_ffmpeg",
-    "miniav_tools_minigpu",
-    "miniav_tools_web",
     "miniav_recorder",
+    "miniav_player",
 ]
+
+
+def verify_packages_list():
+    """Fail loudly when PACKAGES has drifted from what is on disk.
+
+    Every command here iterates PACKAGES, so a package missing from the list is
+    silently skipped — it keeps its old version and, worse, its external
+    dependency constraints are never bumped by `deps`. That is not theoretical:
+    miniav_player was absent from this list and sat on `miniav: ^0.6.0` long
+    after the rest of the repo moved to ^0.7.0, which excluded the release that
+    fixed a per-frame handle leak. Stale entries are just as bad — they make the
+    run print reassuring "Warning: ... not found" lines that scroll past.
+    """
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    on_disk = {
+        entry
+        for entry in os.listdir(root_dir)
+        if os.path.isfile(os.path.join(root_dir, entry, "pubspec.yaml"))
+    }
+    missing = sorted(on_disk - set(PACKAGES))
+    stale = sorted(set(PACKAGES) - on_disk)
+    if not missing and not stale:
+        return True
+
+    print("ERROR: release.py PACKAGES does not match the packages on disk.")
+    for pkg in missing:
+        print(f"  MISSING from PACKAGES (has a pubspec.yaml): {pkg}")
+    for pkg in stale:
+        print(f"  STALE in PACKAGES (no such package on disk): {pkg}")
+    print("Fix the PACKAGES list at the top of release.py, then re-run.")
+    return False
+
+def main_sync():
+    """Rewrite every internal pin to the sibling's current on-disk version.
+
+    `version <v>` stamps one version across the whole family, which is correct
+    when they move in lockstep and wrong the moment they do not. Bumping a
+    single package by hand leaves every pin naming its predecessor, and
+    pubspec_overrides.yaml makes that invisible in-repo — the first symptom is a
+    consumer's version solve failing on a constraint nobody touched.
+
+    Run this after any hand edit to a version, and before publishing.
+    """
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    versions = read_local_versions(root_dir)
+    print("On-disk versions:")
+    for pkg, ver in versions.items():
+        print(f"  {pkg}: {ver}")
+
+    changed = False
+    for dir_name in PACKAGES:
+        pubspec_path = os.path.join(root_dir, dir_name, "pubspec.yaml")
+        if not os.path.exists(pubspec_path):
+            continue
+        content = load_yaml_preserve_structure(pubspec_path)
+        original = content
+        for pkg, ver in versions.items():
+            if pkg == dir_name:
+                continue  # a package never pins itself
+            # Normalise to a CARET range, never an exact pin.
+            #
+            # Exact internal pins turn every patch into a cascade: publishing
+            # miniav_tools_platform_interface 0.5.3 instantly made the already
+            # published miniav_tools 0.5.3 and miniav_tools_ffmpeg 0.5.3
+            # unsatisfiable alongside it, because they pinned 0.5.2 exactly and
+            # nothing in that set can move independently. Every fix then needs a
+            # fresh release of everything above it, which is how a one-line
+            # change became six. `dart pub publish` warns about this ("should
+            # allow more than one version") and it is worth listening to.
+            #
+            # Only rewrite an existing exact or caret pin; leave `path:` and any
+            # other form alone rather than guessing at its intent.
+            content = re.sub(
+                rf'^(\s+{re.escape(pkg)}:\s*)\^?[\d]+\.[\d]+\.[\d]+\S*$',
+                lambda m, v=ver: f'{m.group(1)}^{v}',
+                content, flags=re.MULTILINE)
+        if content != original:
+            with open(pubspec_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            print(f"  Updated pins: {pubspec_path}")
+            changed = True
+    if not changed:
+        print("All internal pins already match on-disk versions.")
+    return changed
+
 
 def main_version_update(version, is_release, message):
     root_dir = os.path.dirname(os.path.abspath(__file__))
@@ -451,7 +575,18 @@ def main_deps(specific_deps=None):
     """Fetch latest versions from pub.dev and update all managed pubspecs."""
     root_dir = os.path.dirname(os.path.abspath(__file__))
 
-    deps_to_update = specific_deps if specific_deps else EXTERNAL_DEPS
+    if specific_deps:
+        deps_to_update = specific_deps
+    else:
+        # EXTERNAL_DEPS is a floor, not the source of truth: anything the
+        # pubspecs actually reference is included whether or not someone
+        # remembered to list it here.
+        discovered = release_checks.discover_family_deps(root_dir, PACKAGES)
+        deps_to_update = sorted(set(EXTERNAL_DEPS) | set(discovered))
+        missing = [d for d in discovered if d not in EXTERNAL_DEPS]
+        if missing:
+            print(f"  (not in EXTERNAL_DEPS, picked up from pubspecs: "
+                  f"{', '.join(missing)})")
 
     # Fetch latest versions once.
     print("Fetching latest versions from pub.dev...")
@@ -494,6 +629,9 @@ def main_deps(specific_deps=None):
 
 
 def main_publish():
+    if not release_checks.preflight(os.path.dirname(os.path.abspath(__file__)), PACKAGES):
+        print('Aborting publish. Override with `check` if you are certain.')
+        return
     root_dir = os.path.dirname(os.path.abspath(__file__))
     all_actions_successful = True
 
@@ -630,16 +768,29 @@ if __name__ == "__main__":
     deps_parser = subparsers.add_parser('deps', help='Fetch latest versions from pub.dev and update all managed pubspecs.')
     deps_parser.add_argument("packages", nargs="*", help="Specific external package names to update (default: all known external deps).")
 
+    subparsers.add_parser('sync', help="Rewrite internal pins to each sibling's on-disk version.")
+
+    subparsers.add_parser('check', help='Pre-publish checks: pin drift, stale published constraints, unbumped versions, publish validation.')
+
     publish_parser = subparsers.add_parser('publish', help='Prepares all packages for release and attempts to publish them.')
     
     args = parser.parse_args()
-    
+
+    # Every command below iterates PACKAGES; a drifted list silently skips a
+    # package instead of failing, so check before doing any work.
+    if not verify_packages_list():
+        sys.exit(1)
+
     if args.command == 'version':
         main_version_update(args.version, args.release, args.message)
     elif args.command == 'change':
         main_change(args.packages, args.message)
     elif args.command == 'deps':
         main_deps(args.packages if args.packages else None)
+    elif args.command == 'sync':
+        main_sync()
+    elif args.command == 'check':
+        sys.exit(0 if release_checks.preflight(os.path.dirname(os.path.abspath(__file__)), PACKAGES) else 1)
     elif args.command == 'publish':
         main_publish()
     else:

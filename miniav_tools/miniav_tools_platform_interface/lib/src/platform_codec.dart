@@ -48,6 +48,26 @@ abstract class PlatformEncoder {
   /// Encoders that need a different input layout (e.g. NV12 for a CPU-fed HW
   /// encoder) should leave this `false`.  Default: `false`.
   bool get acceptsYuv420pPlanes => false;
+
+  /// Whether this encoder consumes a captured GPU frame **by shared NT handle**
+  /// — a `FrameSource.miniavBuffer` whose `nativeHandles[0]` is a D3D11 shared
+  /// handle. The encoder opens it on its own device, so no readback and no
+  /// same-device requirement.  Windows only.  Default: `false`.
+  ///
+  /// This is the recorder's direct-passthrough path: with no scale or effects
+  /// configured, the capture handle goes straight to the encoder and no shader
+  /// core runs per frame.
+  bool get supportsD3d11SharedHandleInput => false;
+
+  /// Whether this encoder consumes a `D3D11TextureFrameSource` — a raw
+  /// `ID3D11Texture2D*` living on the *processor's* device (Dawn), typically
+  /// RGBA. Requires the encoder to work cross-device and to convert to its own
+  /// input format.  Windows only.  Default: `false`.
+  ///
+  /// This is the recorder's scale/effects path. It is a strictly stronger
+  /// requirement than [supportsD3d11SharedHandleInput]: an encoder may well
+  /// accept a shared handle but not a foreign-device texture pointer.
+  bool get supportsD3d11TextureInput => false;
 }
 
 /// Abstract audio encoder. Backends return a concrete subclass from

@@ -17,6 +17,7 @@ import 'dart:typed_data';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
 import '../av1/mp4/iso_box_writer.dart';
+import 'annexb.dart';
 
 class _Box {
   _Box(this.type, this.payloadStart, this.payloadEnd, this.end);
@@ -586,11 +587,41 @@ Uint8List _slice(ByteData d, int start, int end) =>
 // =============================================================================
 
 class _MuxT {
-  _MuxT(this.info, this.isVideo, this.config);
+  _MuxT(this.info, this.isVideo, this.config, {this.annexB = false});
   final TrackInfo info;
   final bool isVideo;
   final Uint8List config; // avcC/hvcC/av1C, or ASC/OpusHead for audio
+  /// H.264/HEVC only: the source emits Annex-B, so each packet needs rewriting
+  /// to length-prefixed NAL units on the way into `mdat`. Decided once from the
+  /// track's config record — never sniffed per packet (see [isAnnexB]).
+  final bool annexB;
   final List<EncodedPacket> packets = [];
+
+  List<Uint8List>? _samples;
+
+  /// Drop the cached sample list once the container has been assembled.
+  void releaseSamples() => _samples = null;
+
+  /// Packet payloads exactly as they will be written into `mdat` — Annex-B
+  /// rewritten to length-prefixed NALs where required. Sample sizes (`stsz`)
+  /// must be taken from here, not from `packets`, or the sample table will not
+  /// line up with the chunk.
+  ///
+  /// Payloads that need no rewrite are referenced, NOT copied. At clip sizes
+  /// this is the difference between one and two full copies of the media, and
+  /// the caller has already handed ownership over -- ClipBuffer passes an
+  /// immutable snapshot. Mutating a buffer after writePacket was never
+  /// supported.
+  List<Uint8List> get samples => _samples ??= [
+        for (final p in packets)
+          if (annexB)
+            annexBToLengthPrefixed(
+              Uint8List.fromList(p.data),
+              hevc: (info as VideoTrackInfo).codec == VideoCodec.hevc,
+            )
+          else
+            p.data,
+      ];
 }
 
 /// Writes H.264/HEVC/AV1 video + AAC/Opus audio into an ISO-BMFF (`.mp4`) byte
@@ -604,7 +635,8 @@ class Mp4Muxer implements PlatformMuxer {
   bool _headerWritten = false;
   bool _finished = false;
   bool _closed = false;
-  Uint8List? _out;
+  List<Uint8List>? _parts;
+  Uint8List? _flat;
 
   static const _video = {VideoCodec.h264, VideoCodec.hevc, VideoCodec.av1};
   static const _audio = {AudioCodec.aac, AudioCodec.opus};
@@ -624,7 +656,28 @@ class Mp4Muxer implements PlatformMuxer {
           throw CodecInitException(
               'mp4', '${t.codec} track needs its config record in extraData');
         }
-        tracks.add(_MuxT(t, true, Uint8List.fromList(cfg)));
+        // H.264/HEVC encoders hand us Annex-B parameter sets (the MF sequence
+        // header, FFmpeg's `extradata`); MP4 needs an avcC/hvcC record and
+        // length-prefixed samples. Convert here rather than in every encoder —
+        // the AVCC framing requirement belongs to the container, and this makes
+        // the muxer accept both conventions from any producer.
+        final bytes = Uint8List.fromList(cfg);
+        final annexB = isAnnexB(bytes) &&
+            (t.codec == VideoCodec.h264 || t.codec == VideoCodec.hevc);
+        if (annexB) {
+          final record = t.codec == VideoCodec.hevc
+              ? buildHvcC(bytes)
+              : buildAvcC(bytes);
+          if (record == null) {
+            throw CodecInitException(
+                'mp4',
+                '${t.codec} extraData is Annex-B but carries no usable '
+                    'SPS — cannot build the configuration record');
+          }
+          tracks.add(_MuxT(t, true, record, annexB: true));
+        } else {
+          tracks.add(_MuxT(t, true, bytes));
+        }
       } else if (t is AudioTrackInfo) {
         if (!_audio.contains(t.codec)) {
           throw CodecInitException('mp4', 'unsupported audio codec ${t.codec}');
@@ -665,11 +718,33 @@ class Mp4Muxer implements PlatformMuxer {
     _checkOpen();
     if (_finished) return;
     _finished = true;
-    _out = _build();
+    _parts = _buildParts();
+    // Drop the per-track sample lists now that they are referenced by _parts;
+    // for a long clip these are the single largest retained allocation.
+    for (final t in _tracks) {
+      t.releaseSamples();
+    }
   }
 
+  /// The finished container as ordered pieces, or null before [finish].
+  ///
+  /// Prefer this over [getBytes] when writing to a sink: concatenating is a
+  /// full extra copy of the whole file, which for a multi-minute clip is
+  /// hundreds of megabytes that exist only to be handed straight to a write.
+  List<Uint8List>? get outputParts => _parts;
+
   @override
-  List<int>? getBytes() => _out;
+  List<int>? getBytes() {
+    final p = _parts;
+    if (p == null) return null;
+    // Cached: callers may read this more than once, and it is the expensive
+    // path by construction.
+    final b = BytesBuilder(copy: false);
+    for (final part in p) {
+      b.add(part);
+    }
+    return _flat ??= b.toBytes();
+  }
 
   @override
   Future<void> close() async {
@@ -683,7 +758,7 @@ class Mp4Muxer implements PlatformMuxer {
     if (_closed) throw const CodecRuntimeException('mp4', 'muxer closed');
   }
 
-  Uint8List _build() {
+  List<Uint8List> _buildParts() {
     final ftyp = box('ftyp', [
       ...'isom'.codeUnits, 0, 0, 0, 0, //
       ...'isom'.codeUnits, ...'iso2'.codeUnits, ...'mp41'.codeUnits,
@@ -691,16 +766,23 @@ class Mp4Muxer implements PlatformMuxer {
     const mdatHeader = 8;
     final mdatStart = ftyp.length + mdatHeader;
 
-    // Lay out mdat one track at a time; record each track's chunk offset.
-    final mdat = BytesBuilder(copy: false);
+    // Lay out mdat one track at a time, recording each track's chunk offset.
+    //
+    // The samples are NOT concatenated into one buffer. Doing so was a full
+    // extra copy of the media purely to learn a length that can be summed, and
+    // at clip sizes that copy is the single biggest allocation in the process.
+    // They go into the output as-is; the offsets are computed from a running
+    // total, which is what they always were.
     final chunkOffsets = <int>[];
+    final body = <Uint8List>[];
+    var mdatLen = 0;
     for (final t in _tracks) {
-      chunkOffsets.add(mdatStart + mdat.length);
-      for (final p in t.packets) {
-        mdat.add(p.data);
+      chunkOffsets.add(mdatStart + mdatLen);
+      for (final s in t.samples) {
+        body.add(s);
+        mdatLen += s.length;
       }
     }
-    final mdatBody = mdat.toBytes();
 
     var maxDur = 0;
     final traks = <Uint8List>[];
@@ -714,15 +796,10 @@ class Mp4Muxer implements PlatformMuxer {
       for (final t in traks) ...t,
     ]);
 
-    final out = BytesBuilder(copy: false);
-    out.add(ftyp);
     final mh = BytesBuilder(copy: false);
-    _u32(mh, mdatHeader + mdatBody.length);
+    _u32(mh, mdatHeader + mdatLen);
     mh.add('mdat'.codeUnits);
-    out.add(mh.toBytes());
-    out.add(mdatBody);
-    out.add(moov);
-    return out.toBytes();
+    return [ftyp, mh.toBytes(), ...body, moov];
   }
 
   int _trackDurationUs(_MuxT t) {
@@ -865,7 +942,7 @@ class Mp4Muxer implements PlatformMuxer {
   }
 
   Uint8List _stbl(_MuxT t, int chunkOffset) {
-    final sizes = [for (final p in t.packets) p.data.length];
+    final sizes = [for (final s in t.samples) s.length];
     final body = <int>[
       ..._stsd(t),
       ..._stts(_durations(t)),

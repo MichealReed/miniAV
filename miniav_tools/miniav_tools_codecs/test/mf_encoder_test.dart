@@ -11,7 +11,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 import 'package:miniav_tools/miniav_tools.dart';
 import 'package:miniav_tools_codecs/miniav_tools_codecs.dart'
-    show registerMfEncodeBackend;
+    show MfEncodeBackend, registerMfEncodeBackend;
 import 'package:miniav_tools_codecs/src/codecs_native.dart';
 import 'package:test/test.dart';
 
@@ -60,7 +60,8 @@ void main() {
       return;
     }
     const w = 320, h = 240;
-    final handle = mfencCreate(0, w, h, 2000000, 30, 1, 30);
+    // nullptr device: this test wants the encoder to build its own.
+    final handle = mfencCreate(0, w, h, 2000000, 30, 1, 30, nullptr);
     expect(handle, isNot(nullptr));
 
     final extBuf = calloc<Uint8>(256);
@@ -151,5 +152,32 @@ void main() {
     packets += (await enc.flush()).length;
     await enc.close();
     expect(packets, greaterThan(0), reason: 'facade-driven encode produced AUs');
+  });
+
+  test('mf_encode is the PRIMARY H.264 encoder (FFmpeg not excluded)',
+      () async {
+    if (!Platform.isWindows || mfencHasMft(0) == 0) {
+      markTestSkipped('no H.264 encoder MFT');
+      return;
+    }
+    if (!MfEncodeBackend.hasHardwareMft(VideoCodec.h264)) {
+      // Without a hardware MFT the backend deliberately declines to claim a
+      // hardware capability, so FFmpeg's HW path should — correctly — win.
+      markTestSkipped('no HARDWARE H.264 MFT on this machine');
+      return;
+    }
+    registerMfEncodeBackend();
+    final enc = await MiniAVTools.createEncoder(const EncoderConfig(
+      codec: VideoCodec.h264,
+      width: 320,
+      height: 240,
+      bitrateBps: 2000000,
+    ));
+    addTearDown(enc.close);
+    expect(enc.backendName, 'mf_encode',
+        reason: 'default negotiation should land on the FFmpeg-free MF '
+            'hardware encoder, not ${enc.backendName}');
+    expect(enc.capability?.isHardware, isTrue,
+        reason: 'the selected capability must be the hardware one');
   });
 }

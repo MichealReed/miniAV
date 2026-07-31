@@ -11,6 +11,8 @@ import 'dart:typed_data';
 
 import 'package:miniav/miniav.dart';
 import 'package:miniav_tools/miniav_tools.dart';
+import 'package:miniav_tools_codecs/miniav_tools_codecs.dart'
+    show MfVideoEncoder, registerFirstPartyBackends;
 import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
 import 'package:minigpu/minigpu.dart';
 
@@ -154,6 +156,14 @@ class Recorder {
       // library reads it; here we trigger it explicitly so callers don't
       // have to add a stray import-side-effect line.
       registerFfmpegBackend();
+      // Same story for the first-party backends, and they go in FIRST so the
+      // negotiation below is a real contest rather than "whatever was loaded".
+      // This is what makes the FFmpeg-free path — Media Foundation hardware
+      // H.264/HEVC, OS AAC, first-party MP4 framing — the default for recording
+      // apps without a line of per-app setup. It does not force the outcome:
+      // each backend reports capability honestly and FFmpeg still wins where it
+      // is genuinely the better path (see registerFirstPartyBackends).
+      registerFirstPartyBackends();
       await ensureFFmpegLoaded();
 
       // Lazily try to bring up the shared GPU device for zero-copy. Only
@@ -329,10 +339,55 @@ class Recorder {
   /// unsupported / not yet initialised. Call [ensureSharedGpu] first.
   static Minigpu? get sharedGpu => _sharedGpu;
 
+  /// Whether the loaded minigpu native binary contains the event-drain fix,
+  /// or `null` when it cannot be asked (non-native, or minigpu < 1.5.8).
+  ///
+  /// Exposed so an app can surface this in a diagnostics screen; the recorder
+  /// checks it itself at GPU init and warns once.
+  static bool? get gpuDrainFixPresent {
+    final budget = Minigpu.drainSpinBudgetMs;
+    return budget == null ? null : budget > 0;
+  }
+
+  static bool _drainFixChecked = false;
+
+  /// Warns once if the loaded minigpu binary predates the event-drain fix.
+  ///
+  /// Without it every GPU wait rounds up to the Windows timer quantum
+  /// (~15.6 ms). The per-frame GPU stage takes several such waits, so at 60 fps
+  /// (16.67 ms budget) the stage overruns on its own, [AdaptiveGpuThrottle]
+  /// reads that as a saturated GPU and steps the live capture rate down — i.e.
+  /// a stale native artifact presents as recording stutter with no error
+  /// anywhere. This is a mistake that is otherwise silent: the DLL is bundled
+  /// as a build artifact and a stale one loads perfectly happily.
+  static void _assertDrainFixPresent() {
+    if (_drainFixChecked) return;
+    _drainFixChecked = true;
+    final budget = Minigpu.drainSpinBudgetMs;
+    if (budget == null) {
+      _log(
+        'minigpu drain-fix check unavailable (Minigpu.drainSpinBudgetMs is '
+        'null) — the loaded native binary predates minigpu 1.5.8, or the '
+        'symbol is missing. If recordings stutter, rebuild the native asset: '
+        'rm -rf .dart_tool/hooks_runner && dart pub get.',
+        RecorderLogLevel.warning,
+      );
+    } else if (budget <= 0) {
+      _log(
+        'minigpu event drain is running in PRE-FIX mode (spin budget '
+        '${budget}ms) — every GPU wait costs a ~15.6 ms timer quantum and '
+        'recordings WILL stutter. Unset MGPU_DRAIN_SPIN_MS (it is an A/B '
+        'measurement mode, not a setting).',
+        RecorderLogLevel.error,
+      );
+    }
+  }
+
   static Future<void> _initSharedGpuOnce() async {
     try {
       final gpu = Minigpu();
       await gpu.init();
+      _assertDrainFixPresent();
       if (!gpu.isExternalContentTypeSupported(
         ExternalContentType.d3d11SharedHandle,
       )) {
@@ -818,7 +873,24 @@ class Recorder {
               b.supportsEncode(effectiveCodecForGpuCheck) &&
               b.acceptedFrameSources.contains(FrameSourceKind.gpuTexture),
         );
-    final useGpuOutput = hasD3d11Encoder || hasMinigpuGpuEncoder;
+    // A backend that takes a capture buffer's shared NT handle (the MF encoder)
+    // also justifies GPU capture output, even when the FFmpeg D3D11 probe above
+    // failed — its direct-passthrough path needs the handle and never touches
+    // the Dawn device, so the adapter mismatch that fails that probe does not
+    // apply. Without this the capture is configured for CPU output and the
+    // handle never exists to pass through.
+    final hasSharedHandleEncoder =
+        _backendContext != null &&
+        Platform.isWindows &&
+        MiniAVToolsPlatform.instance.backends.any(
+          (b) =>
+              b.supportsEncode(effectiveCodecForGpuCheck) &&
+              b.acceptedFrameSources.contains(
+                FrameSourceKind.miniavBufferD3D11,
+              ),
+        );
+    final useGpuOutput =
+        hasD3d11Encoder || hasMinigpuGpuEncoder || hasSharedHandleEncoder;
     // The GPU processor (bilinear scale + effects chain) imports the capture's
     // D3D11 texture handle. So the capture must produce GPU output whenever a
     // processor will run — INCLUDING the CPU-readback path (useGpuOutput=false
@@ -845,6 +917,7 @@ class Recorder {
       'screen capture output: $captureLabel '
       '— backendContext=${_backendContext != null}, '
       'd3d11Encoder=$hasD3d11Encoder, '
+      'sharedHandleEncoder=$hasSharedHandleEncoder, '
       'minigpuEncoder=$hasMinigpuGpuEncoder, '
       'gpuWork=$hasGpuWork, '
       'd3d11Device=0x${(_backendContext?.d3d11DeviceHandle ?? 0).toRadixString(16)}',
@@ -1043,10 +1116,18 @@ class Recorder {
       // FfmpegBackend.createEncoder sees context.preferZeroCopy=true and tries
       // FfmpegD3d11HwEncoder.open again — which succeeds on session 2+ (warm
       // HW context from session 1), returns a D3D11 encoder, and the safety
-      // net below (processor != null && is! FfmpegD3d11HwEncoder) does NOT
+      // net below (processor != null && no GPU-input capability) does NOT
       // fire because the encoder IS D3D11.  CPU-only frames then hit the
       // encoder and every frame fails with CodecRuntimeException[ffmpeg-d3d11].
       noContext: !useGpuOutput,
+      // When GPU output is on AND there is scale/effects work, the processor
+      // will hand the encoder a D3D11 texture. Only negotiate among backends
+      // that take one — otherwise a higher-priority handle-only encoder wins
+      // and immediately falls back to CPU readback, which is worse than the
+      // backend it displaced.
+      requiredFrameSource: (useGpuOutput && hasGpuWork)
+          ? FrameSourceKind.d3d11Texture
+          : null,
     );
 
     // Safety net: if a GPU zero-copy processor was created (GPU output configured)
@@ -1059,13 +1140,19 @@ class Recorder {
     // device probe) so this branch should no longer fire in normal operation.
     var effectiveProcessor = processor;
     var effectiveCpuReadback = processorCpuReadback;
-    // Detect which GPU mode the selected encoder supports:
-    //  - FfmpegD3d11HwEncoder → D3D11 shared texture (Case A)
-    //  - supportsGpuBufferInput → packed RGBA8 GPU buffer (Case C, minigpu)
-    //  - neither → safety net fires, fall back to CPU
-    final isD3d11Encoder = encResult.encoder.platform is FfmpegD3d11HwEncoder;
-    final isGpuBufferEncoder =
-        encResult.encoder.platform.supportsGpuBufferInput;
+    // Detect which GPU mode the selected encoder supports. These are asked as
+    // CAPABILITIES, not as `platform is FfmpegD3d11HwEncoder` — that concrete
+    // type check silently forced every other GPU-capable encoder (e.g. the
+    // first-party MF one) onto the CPU-readback path, adding a full frame
+    // readback per frame even though the encoder could take the handle.
+    //  - supportsD3d11TextureInput      → processor texture (Case A)
+    //  - supportsD3d11SharedHandleInput → capture NT handle (Case A0)
+    //  - supportsGpuBufferInput         → packed RGBA8 GPU buffer (Case C)
+    //  - none → safety net fires, fall back to CPU readback
+    final platform = encResult.encoder.platform;
+    final isD3d11TextureEncoder = platform.supportsD3d11TextureInput;
+    final isD3d11HandleEncoder = platform.supportsD3d11SharedHandleInput;
+    final isGpuBufferEncoder = platform.supportsGpuBufferInput;
     final effectiveGpuBuffer =
         processor != null && !processorCpuReadback && isGpuBufferEncoder;
     // Zero-copy D3D11 sub-modes (see _VideoTrackRuntime):
@@ -1074,27 +1161,38 @@ class Recorder {
     //  - GPU work present                → pipelined two-stage encode: GPU
     //    stage of frame N+1 overlaps the encode of frame N (ring depth 2).
     // (`hasGpuWork` computed above with the capture-output decision.)
-    final zeroCopyD3d11 =
+    //
+    // The two sub-modes need DIFFERENT encoder capabilities, so they are gated
+    // separately: passthrough hands over a shared NT handle, the pipelined mode
+    // a foreign-device texture pointer. An encoder that does the first but not
+    // the second (the MF one) gets passthrough and falls back to CPU readback
+    // only when there is actual GPU work to do.
+    final gpuZeroCopyEligible =
         effectiveProcessor != null &&
         !effectiveCpuReadback &&
-        !effectiveGpuBuffer &&
-        isD3d11Encoder;
+        !effectiveGpuBuffer;
+    final canDirectPassthrough =
+        gpuZeroCopyEligible && !hasGpuWork && isD3d11HandleEncoder;
+    final canPipelinedZeroCopy =
+        gpuZeroCopyEligible && hasGpuWork && isD3d11TextureEncoder;
     // Log the actual per-frame encode path now that the encoder is known.
     if (processor != null && !processorCpuReadback) {
+      final backend = encResult.encoder.backendName;
       final pathLabel = effectiveGpuBuffer
-          ? 'GPU buffer → ${encResult.encoder.backendName} encodeFromGpuBuffer (zero CPU round-trip)'
-          : zeroCopyD3d11
-          ? (hasGpuWork
-                ? 'D3D11 shared texture → ffmpeg D3D11 encoder '
-                      '(zero-copy, pipelined GPU/encode stages)'
-                : 'capture NT handle → ffmpeg D3D11 encoder '
-                      '(direct BGRA passthrough, no GPU processing)')
+          ? 'GPU buffer → $backend encodeFromGpuBuffer (zero CPU round-trip)'
+          : canPipelinedZeroCopy
+          ? 'D3D11 shared texture → $backend '
+                '(zero-copy, pipelined GPU/encode stages)'
+          : canDirectPassthrough
+          ? 'capture NT handle → $backend '
+                '(direct BGRA passthrough, no GPU processing)'
           : 'GPU processor → CPU → encoder (unexpected; safety net may fire)';
       Recorder._log('screen encode path: $pathLabel');
     }
     if (processor != null &&
         !processorCpuReadback &&
-        !isD3d11Encoder &&
+        !canDirectPassthrough &&
+        !canPipelinedZeroCopy &&
         !isGpuBufferEncoder) {
       // The pre-check expected a GPU-capable encoder (D3D11 zero-copy or a
       // minigpu GPU-buffer encoder), so capture was configured for GPU output
@@ -1136,8 +1234,8 @@ class Recorder {
       idleFramePolicy: cfg.idleFramePolicy,
       adaptiveGpuThrottle: cfg.adaptiveGpuThrottle,
       cfrOutput: cfg.cfrOutput,
-      directD3d11Passthrough: zeroCopyD3d11 && !hasGpuWork,
-      pipelinedZeroCopy: zeroCopyD3d11 && hasGpuWork,
+      directD3d11Passthrough: canDirectPassthrough,
+      pipelinedZeroCopy: canPipelinedZeroCopy,
       startFn: (cb) => ctx.startCapture(cb),
       stopFn: () => ctx.stopCapture(),
       destroyFn: () => ctx.destroy(),
@@ -1216,6 +1314,32 @@ class Recorder {
     );
   }
 
+  /// [backendPreference], narrowed to backends that can actually consume
+  /// [kind]. Returns the preference unchanged when [kind] is null, when the
+  /// caller already pinned a backend, or when no backend would be left — a
+  /// filter that excluded everything would turn a working (if slower) encode
+  /// into no encode at all.
+  BackendPreference _preferenceFor(FrameSourceKind? kind) {
+    if (kind == null) return backendPreference;
+    if (backendPreference is PinnedBackendPreference) return backendPreference;
+    final all = MiniAVToolsPlatform.instance.backends;
+    final unable = <String>{
+      for (final b in all)
+        if (!b.acceptedFrameSources.contains(kind)) b.name,
+    };
+    if (unable.isEmpty || unable.length == all.length) return backendPreference;
+    if (backendPreference is ExcludedBackendPreference) {
+      unable.addAll(
+        (backendPreference as ExcludedBackendPreference).backendNames,
+      );
+    }
+    Recorder._log(
+      'encoder negotiation restricted to backends accepting ${kind.name} '
+      '(excluding: ${unable.join(", ")})',
+    );
+    return BackendPreference.excluded(unable);
+  }
+
   Future<({Encoder encoder, VideoCodec codec})> _openVideoEncoder(
     MiniAVVideoInfo format,
     VideoCodec codec,
@@ -1226,6 +1350,16 @@ class Recorder {
     // When true the BackendContext (D3D11 zero-copy device) is NOT passed to
     // the encoder.  Used when retrying with CPU frames after a D3D11 fallback.
     bool noContext = false,
+    // Frame-source kind the caller has already committed to producing. Backends
+    // that cannot consume it are excluded from negotiation.
+    //
+    // Without this, a higher-priority encoder that accepts only *some* GPU
+    // shapes wins the negotiation and then trips the safety net, silently
+    // adding back the CPU readback the GPU path existed to avoid — a straight
+    // downgrade from a lower-priority backend that could have taken the frame.
+    // Ranking cannot see this: it compares hardware/zero-copy/priority, not
+    // what the caller is actually about to hand over.
+    FrameSourceKind? requiredFrameSource,
   }) async {
     // HW H.264 encoders cap at 4096px on every shipping vendor (NVENC/QSV/
     // AMF/VT). Auto-promote to HEVC for ultrawide / 4K+ when HW is desired
@@ -1294,7 +1428,7 @@ class Recorder {
         crfQuality: effectiveCrf,
         backendOptions: mergedOptions,
       ),
-      preference: backendPreference,
+      preference: _preferenceFor(requiredFrameSource),
       context: noContext ? null : _backendContext,
     );
     final platform = enc.platform;
@@ -1501,13 +1635,28 @@ class Recorder {
           if (bridge != null) encoderForTrack[t.index] = bridge;
         }
 
-        final muxer = FfmpegMuxer.open(
-          MuxerConfig(
-            container: container,
-            output: FileMuxerOutput(sink.path),
-            tracks: tracks,
-          ),
-          encoderForTrack: encoderForTrack,
+        final muxerConfig = MuxerConfig(
+          container: container,
+          output: FileMuxerOutput(sink.path),
+          tracks: tracks,
+        );
+
+        // FFmpeg, deliberately, even for containers the first-party writer
+        // handles. The ISO-BMFF writer assembles the WHOLE file in memory and
+        // emits it at finish(), which is fine for a bounded clip and completely
+        // wrong for an open-ended recording — an hour of 4K would sit in RAM.
+        // FfmpegMuxer streams to disk as it goes.
+        //
+        // This keeps a known hazard: FfmpegMuxer needs a live AVCodecContext per
+        // audio track to fill codecpar, so it can only mux audio that FFmpeg
+        // itself encoded. If an audio track ever negotiates to a non-FFmpeg
+        // encoder here, `encoderForTrack` comes back short and the muxer throws
+        // at writeHeader. The real fix is either codecpar synthesis without a
+        // live context, or a streaming first-party writer -- not buffering the
+        // recording in memory to dodge it.
+        final muxer = Muxer(
+          FfmpegMuxer.open(muxerConfig, encoderForTrack: encoderForTrack),
+          'ffmpeg',
         );
         await muxer.writeHeader();
         return _FileSinkRuntime(muxer: muxer, path: sink.path);
@@ -2546,13 +2695,26 @@ class _VideoTrackRuntime extends _TrackRuntime {
       var ptsUs = nowUs;
       if (ptsUs <= _lastVideoPtsUs) ptsUs = _lastVideoPtsUs + 1;
       _lastVideoPtsUs = ptsUs;
-      final src = D3D11TextureFrameSource(
-        texturePtr: tex.d3d11TexturePtr,
-        width: tex.width,
-        height: tex.height,
-        pixelFormat: MiniAVPixelFormat.rgba32,
-      );
-      final pkt = await encoder.encode(src);
+      // Prefer asking the encoder to repeat its last frame. A duplicate is the
+      // same picture with a new timestamp, and expressing that by re-importing
+      // the producer's texture makes it depend on a surface lifetime we do not
+      // own -- this timer fires precisely when the pipeline is idle, which is
+      // when that surface is most likely to have been recycled. It also fails
+      // outright when there is no GPU processor writing the texture at all
+      // (direct passthrough, gpuWork=false), which is a configuration where the
+      // duplicate has no business importing anything.
+      final platform = encoder.platform;
+      EncodedPacket? pkt;
+      if (platform is MfVideoEncoder) {
+        pkt = await platform.repeatLastFrame(ptsUs);
+      } else {
+        pkt = await encoder.encode(D3D11TextureFrameSource(
+          texturePtr: tex.d3d11TexturePtr,
+          width: tex.width,
+          height: tex.height,
+          pixelFormat: MiniAVPixelFormat.rgba32,
+        ));
+      }
       if (pkt != null) {
         _statsPacketsOut++;
         _statsDupFrames++;
@@ -3720,7 +3882,11 @@ class _FileSinkRuntime implements _SinkRuntime {
           RecorderLogLevel.error,
         ),
       );
-  final FfmpegMuxer muxer;
+  /// The negotiated muxer facade, not a concrete FfmpegMuxer. The sink does
+  /// not care which backend writes the container -- it only needs
+  /// writePacket/finish/close -- and typing it concretely was what forced the
+  /// FFmpeg muxer on paths the first-party writer handles better.
+  final Muxer muxer;
   final String path;
 
   // Decoupled mux-write queue: [enqueuePacket] chains each encoded packet onto

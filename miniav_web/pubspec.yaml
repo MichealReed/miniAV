@@ -8,7 +8,7 @@ environment:
   flutter: ">=3.3.0"
 
 dependencies:
-  miniav_platform_interface: 0.7.0
+  miniav_platform_interface: ^0.7.0
   web: ^1.1.1
   flutter:
     sdk: flutter

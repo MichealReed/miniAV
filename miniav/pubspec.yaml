@@ -7,7 +7,7 @@ environment:
   sdk: ^3.11.4
 
 dependencies:
-  miniav_platform_interface: 0.7.0
+  miniav_platform_interface: ^0.7.0
 
 dev_dependencies:
   lints: ^5.0.0

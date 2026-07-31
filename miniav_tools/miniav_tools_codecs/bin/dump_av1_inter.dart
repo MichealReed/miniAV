@@ -19,7 +19,6 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:miniav_platform_interface/miniav_platform_interface.dart';
 import 'package:miniav_tools_codecs/miniav_tools_codecs.dart';
 // ignore_for_file: implementation_imports
 import 'package:miniav_tools_codecs/src/av1/av1_constants.dart';

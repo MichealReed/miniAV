@@ -1769,6 +1769,16 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   @override
   bool get acceptsYuv420pPlanes => false;
 
+  // Both GPU input shapes: a capture buffer's shared NT handle (direct
+  // passthrough) and a processor-produced texture pointer (scale/effects).
+  // These replace the recorder's former `platform is FfmpegD3d11HwEncoder`
+  // check, so any encoder that can do the same is now eligible for the path.
+  @override
+  bool get supportsD3d11SharedHandleInput => true;
+
+  @override
+  bool get supportsD3d11TextureInput => true;
+
   @override
   Future<void> close() async {
     if (_closed) return;

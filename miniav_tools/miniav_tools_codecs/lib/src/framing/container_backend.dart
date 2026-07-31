@@ -10,6 +10,9 @@ library;
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
 import 'adts_container.dart';
+// dart:io on the VM, a no-op on web -- ContainerFramingBackend is registered in
+// both places and this file must stay web-safe.
+import 'file_sink_stub.dart' if (dart.library.io) 'file_sink_io.dart';
 import 'mp4_container.dart';
 import 'ogg_container.dart';
 import 'wav_container.dart';
@@ -90,19 +93,21 @@ class ContainerFramingBackend extends MiniAVToolsBackend {
   @override
   Future<PlatformMuxer?> createMuxer(MuxerConfig config) async {
     try {
-      switch (config.container) {
-        case Container.wav:
-          return WavMuxer.open(config);
-        case Container.ogg:
-          return OggMuxer.open(config);
-        case Container.adts:
-          return AdtsMuxer.open(config);
-        case Container.mp4:
-        case Container.m4a:
-          return Mp4Muxer.open(config);
-        default:
-          return null;
-      }
+      final PlatformMuxer? inner = switch (config.container) {
+        Container.wav => WavMuxer.open(config),
+        Container.ogg => OggMuxer.open(config),
+        Container.adts => AdtsMuxer.open(config),
+        Container.mp4 || Container.m4a => Mp4Muxer.open(config),
+        _ => null,
+      };
+      if (inner == null) return null;
+      // Every first-party muxer assembles bytes and exposes them through
+      // getBytes(); none of them touch the filesystem. Handed a
+      // FileMuxerOutput they therefore reported complete success and wrote
+      // nothing at all -- the worst possible failure, because the caller has no
+      // way to tell. Rather than teach each muxer about files, wrap them once.
+      final out = config.output;
+      return out is FileMuxerOutput ? _FileWritingMuxer(inner, out.path) : inner;
     } on CodecInitException {
       return null; // fall through to FFmpeg
     }
@@ -151,4 +156,56 @@ class ContainerFramingBackend extends MiniAVToolsBackend {
     }
     return null;
   }
+}
+
+
+/// Writes an in-memory container to disk when it is finished.
+///
+/// The wrapped muxers are whole-file builders: they buffer packets and emit the
+/// finished container from [PlatformMuxer.finish]. That makes them a good fit
+/// for bounded output (a clip, a short asset) and a bad fit for an open-ended
+/// recording, which should stream instead -- nothing here changes that, it only
+/// makes the bounded case actually produce a file.
+class _FileWritingMuxer implements PlatformMuxer {
+  _FileWritingMuxer(this._inner, this._path);
+
+  final PlatformMuxer _inner;
+  final String _path;
+
+  @override
+  Future<void> writeHeader() => _inner.writeHeader();
+
+  @override
+  Future<void> writePacket(EncodedPacket packet) => _inner.writePacket(packet);
+
+  @override
+  Future<void> finish() async {
+    await _inner.finish();
+    // Ordered pieces where the muxer can provide them -- concatenating first
+    // would double the peak memory of a large clip for no benefit, since the
+    // bytes are going straight out to a sink either way.
+    final inner = _inner;
+    final List<List<int>>? parts = inner is Mp4Muxer
+        ? inner.outputParts
+        : (inner.getBytes() == null ? null : [inner.getBytes()!]);
+    if (parts == null) {
+      throw CodecRuntimeException(
+        ContainerFramingBackend.backendName,
+        'muxer finished without producing bytes; nothing to write to $_path',
+      );
+    }
+    if (!await writeMuxerFileParts(_path, parts)) {
+      throw CodecRuntimeException(
+        ContainerFramingBackend.backendName,
+        'this platform has no filesystem — use BytesMuxerOutput and write the '
+        'result yourself (requested $_path)',
+      );
+    }
+  }
+
+  @override
+  List<int>? getBytes() => _inner.getBytes();
+
+  @override
+  Future<void> close() => _inner.close();
 }

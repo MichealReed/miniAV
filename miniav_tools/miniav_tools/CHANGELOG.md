@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.5.3 (unreleased)
+## 0.5.4
+
+- **Internal pins are now caret ranges, not exact versions.** Exact pins made
+  every patch cascade: publishing `miniav_tools_platform_interface` 0.5.3 made
+  the already-published `miniav_tools` 0.5.3 and `miniav_tools_ffmpeg` 0.5.3
+  unsatisfiable next to it, because they pinned 0.5.2 exactly and nothing in the
+  set could move independently. `dart pub publish` warns about this. `release.py
+  sync` now normalises to caret so it cannot recur.
+- Republished: 0.5.3 shipped pinning `miniav_tools_platform_interface: 0.5.2`,
+  which cannot resolve alongside any package needing 0.5.3.
+
+## 0.5.3
 
 - `MiniAVTools.createAudioDecoder` + `AudioDecoder` facade wrapper
   (routes by `supportsAudioDecode`, mirrors `createAudioEncoder`).

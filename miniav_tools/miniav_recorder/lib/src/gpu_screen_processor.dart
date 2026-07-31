@@ -323,6 +323,14 @@ class _GpuEffectRuntime extends _EffectRuntime {
     _shader ??= _gpu.createComputeShader()
       ..loadKernelString(_descriptor.wgslSource);
 
+    // Destroying the old params buffer here is safe only because dispatches are
+    // FIRED, not awaited: it relies on the invariant that every frame ends at a
+    // synchronization point (the awaited `read` in processToBytes, or the
+    // awaited encoder consumption of the GPU buffer), so no dispatch fired in a
+    // previous frame is still queued against this buffer when we free it. This
+    // branch only runs on a resolution change, so it is rare — but if a future
+    // change lets a frame return without any sync, this becomes a
+    // use-after-free that will present as corrupt output on resize.
     if (_paramsBuf == null || _lastW != width || _lastH != height) {
       _paramsBuf?.destroy();
       final extras = _descriptor.extraParams;
@@ -352,7 +360,7 @@ class _GpuEffectRuntime extends _EffectRuntime {
     _shader!.setBufferAtSlot(1, _paramsBuf!);
 
     const kGroup = 8;
-    await _shader!.dispatch(
+    _shader!.dispatchFire(
       (width + kGroup - 1) ~/ kGroup,
       (height + kGroup - 1) ~/ kGroup,
       1,
@@ -436,7 +444,7 @@ class _CropEffectRuntime extends _EffectRuntime {
       ..setBufferAtSlot(1, _outBuf!)
       ..setBufferAtSlot(2, _paramsBuf!);
     const kGroup = 8;
-    await _shader!.dispatch(
+    _shader!.dispatchFire(
       (_desc.cropWidth + kGroup - 1) ~/ kGroup,
       (_desc.cropHeight + kGroup - 1) ~/ kGroup,
       1,
@@ -511,7 +519,7 @@ class _FlipEffectRuntime extends _EffectRuntime {
       ..setBufferAtSlot(1, _outBuf!)
       ..setBufferAtSlot(2, _paramsBuf!);
     const kGroup = 8;
-    await _shader!.dispatch(
+    _shader!.dispatchFire(
       (_inW + kGroup - 1) ~/ kGroup,
       (_inH + kGroup - 1) ~/ kGroup,
       1,
@@ -606,7 +614,7 @@ class _RotateEffectRuntime extends _EffectRuntime {
       ..setBufferAtSlot(1, _outBuf!)
       ..setBufferAtSlot(2, _paramsBuf!);
     const kGroup = 8;
-    await _shader!.dispatch(
+    _shader!.dispatchFire(
       (_outWidth + kGroup - 1) ~/ kGroup,
       (_outHeight + kGroup - 1) ~/ kGroup,
       1,
@@ -686,7 +694,7 @@ class _ScaleEffectRuntime extends _EffectRuntime {
       ..setBufferAtSlot(1, _outBuf!)
       ..setBufferAtSlot(2, _paramsBuf!);
     const kGroup = 8;
-    await _shader!.dispatch(
+    _shader!.dispatchFire(
       (_desc.width + kGroup - 1) ~/ kGroup,
       (_desc.height + kGroup - 1) ~/ kGroup,
       1,
@@ -762,7 +770,7 @@ class _CensorEffectRuntime extends _EffectRuntime {
       ..setBufferAtSlot(0, inBuf)
       ..setBufferAtSlot(1, _paramsBuf!);
     const kGroup = 8;
-    await _shader!.dispatch(
+    _shader!.dispatchFire(
       (_inW + kGroup - 1) ~/ kGroup,
       (_inH + kGroup - 1) ~/ kGroup,
       1,
@@ -1283,6 +1291,18 @@ class GpuScreenProcessor {
   /// Reads the VideoTexture directly via textureLoad — no intermediate
   /// toRGBA() buffer allocation. Handles both the downscale case and the
   /// no-downscale passthrough case (srcW == dstW).
+  /// NOTE: this dispatch stays AWAITED on purpose — do not convert it to
+  /// `dispatchFire` to match the effect chain. Two reasons, both fatal:
+  ///   1. [tex] is imported per frame and its binding is set with
+  ///      `setOnShader`, for which there is no ordered (FIFO-joining) variant.
+  ///      An inline texture rebind would race ahead of a fired dispatch exactly
+  ///      the way `setBufferAtSlot` does — every fired dispatch would sample the
+  ///      LAST frame's texture.
+  ///   2. The caller destroys [tex] in its `finally` as soon as this returns. A
+  ///      fired dispatch could still be queued, i.e. sampling a destroyed
+  ///      texture.
+  /// The effect chain below it has neither problem: persistent buffers, ordered
+  /// binds (ordered as of minigpu 1.5.9), and nothing destroyed mid-frame.
   Future<void> _runTexDownscale(VideoTexture tex) async {
     tex.setOnShader(_texDownscaleShader!, 0);
     _texDownscaleShader!

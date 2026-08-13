@@ -11,6 +11,14 @@ void main(List<String> args) async {
     if (!input.config.buildCodeAssets) return;
 
     Logger logger = Logger('build');
+
+    // hooks_runner re-runs this hook only when the hook script itself or a
+    // REGISTERED dependency is newer than the cached output. CMakeBuilder
+    // registers none of its sources, so without this an edited .c/.h keeps
+    // serving the previously built DLL — new exports resolve to nothing and
+    // the failure looks like a Dart bug, not a stale build.
+    output.dependencies.addAll(_sourceFiles(sourceDir));
+
     await runBuild(input, output, sourceDir.absolute.uri);
     final miniavLib = await output.findAndAddCodeAssets(
       input,
@@ -27,6 +35,38 @@ void main(List<String> args) async {
 }
 
 const name = 'miniav_ffi.dart';
+
+/// Every native source under [dir] that the CMake build actually compiles,
+/// as absolute URIs for `output.dependencies`. Build trees (`build*/`) and
+/// VCS metadata are skipped — registering generated output would make the
+/// hook re-run forever.
+Iterable<Uri> _sourceFiles(Directory dir) sync* {
+  const extensions = {
+    '.c',
+    '.cc',
+    '.cpp',
+    '.h',
+    '.hpp',
+    '.m',
+    '.mm',
+    '.txt',
+    '.cmake',
+  };
+  for (final entity in dir.listSync(recursive: true, followLinks: false)) {
+    if (entity is! File) continue;
+    final path = entity.path.replaceAll(r'\', '/');
+    if (path.contains('/build/') ||
+        path.contains('/build_win/') ||
+        path.contains('/build_linux/') ||
+        path.contains('/build_web/') ||
+        path.contains('/.git/')) {
+      continue;
+    }
+    final dot = path.lastIndexOf('.');
+    if (dot < 0 || !extensions.contains(path.substring(dot))) continue;
+    yield entity.absolute.uri;
+  }
+}
 
 Future<void> runBuild(
   BuildInput input,

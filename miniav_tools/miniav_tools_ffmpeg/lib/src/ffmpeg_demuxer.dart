@@ -199,6 +199,10 @@ class FfmpegDemuxer implements PlatformDemuxer {
             frameRateNumerator: par.frNum > 0 ? par.frNum : 0,
             frameRateDenominator: par.frDen > 0 ? par.frDen : 1,
             extraData: _extra(par, video: codec),
+            // Container display matrix (MP4 tkhd / MKV projection), clockwise.
+            // Frames stay in CODED orientation, so width/height above are the
+            // coded dims and the consumer applies the turn at present time.
+            rotationDegrees: shim.streamRotationDegrees(stPtr),
           );
         case _kMediaTypeAudio:
           final codec = _audioCodecFromId(par.codecId);

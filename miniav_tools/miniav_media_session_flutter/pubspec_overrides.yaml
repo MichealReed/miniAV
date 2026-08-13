@@ -1,0 +1,3 @@
+dependency_overrides:
+  miniav_media_session:
+    path: ../miniav_media_session

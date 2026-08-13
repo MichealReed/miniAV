@@ -24,7 +24,7 @@ import 'dart:typed_data';
 
 import 'package:miniav_tools/miniav_tools.dart';
 import 'package:miniav_tools_codecs/miniav_tools_codecs.dart'
-    show ContainerFramingBackend;
+    show ContainerFramingBackend, registerFirstPartyBackends;
 import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
@@ -311,6 +311,14 @@ class ClipBuffer {
   }) async {
     if (_buf.isEmpty) throw StateError('ClipBuffer.saveClip: buffer is empty');
 
+    // A ClipBuffer wired into a Recorder inherits the registration done by
+    // Recorder.start(); one fed manually through [onChunk] never runs it, and
+    // the muxer negotiation below would then fail with an opaque
+    // NoBackendForCodecException for a backend that simply was not registered.
+    // Both calls are idempotent.
+    registerFirstPartyBackends();
+    registerFfmpegBackend();
+
     // 1. Determine the time window for this clip.
     //    Use _maxPtsUs (the true maximum PTS seen) rather than _buf.last.ptsUs.
     //    _buf.last may be an audio packet whose encoder buffered samples for
@@ -374,6 +382,10 @@ class ClipBuffer {
           hasAudio: presentIndices.any(
             (i) => _meta[i]!.kind == TrackKind.audio,
           ),
+          videoCodecs: presentIndices
+              .where((i) => _meta[i]!.kind == TrackKind.video)
+              .map((i) => _meta[i]!.videoCodec!)
+              .toSet(),
           audioCodecs: presentIndices
               .where((i) => _meta[i]!.kind == TrackKind.audio)
               .map((i) => _meta[i]!.audioCodec!)
@@ -412,6 +424,14 @@ class ClipBuffer {
       audioCodecs: audioMetas.map((m) => m.audioCodec!),
     );
 
+    // Registering the FFmpeg backend does not LOAD it. On the FFmpeg route the
+    // load used to happen only as a side effect of opening a temporary audio
+    // encoder below, so a VIDEO-ONLY clip on a standalone ClipBuffer (nothing
+    // else in the process having called ensureFFmpegLoaded) reached
+    // FfmpegMuxer.open and threw "FFmpeg not loaded". Kept conditional: the
+    // first-party route must never pull libav in.
+    if (!useDartMuxer) await ensureFFmpegLoaded();
+
     // 8. Build track-info list. For the FFmpeg path we open a temporary audio
     //    encoder per audio track purely so FfmpegMuxer can call
     //    avcodec_parameters_from_context (ch_layout needs a live context).
@@ -447,6 +467,15 @@ class ClipBuffer {
           );
         } else {
           // Audio: create a temporary encoder purely for codecpar filling.
+          //
+          // PINNED to FFmpeg, because only an FfmpegEncoderBridge can serve
+          // that purpose: FfmpegMuxer reads codecpar out of a live
+          // AVCodecContext. Left to negotiate, the first-party OS AAC encoder
+          // (priority 55 > 50) wins, exposes no bridge, and the muxer throws
+          // "Audio tracks must be bound to a FfmpegAudioEncoder" further down.
+          // This branch only runs for containers the first-party writer cannot
+          // write, so the coupling is unavoidable here — the way out of it is
+          // to save the clip as MP4/M4A.
           final enc = await MiniAVTools.createAudioEncoder(
             AudioEncoderConfig(
               codec: meta.audioCodec!,
@@ -455,6 +484,7 @@ class ClipBuffer {
               bitrateBps: 128000,
               backendOptions: const {'global_header': '1'},
             ),
+            preference: BackendPreference.pinned(FfmpegBackend.backendName),
           );
           tempAudioEncoders[remapIdx] = enc;
           final bridge = enc.platform;
@@ -481,20 +511,41 @@ class ClipBuffer {
       );
       final Muxer muxer;
       if (useDartMuxer) {
-        muxer = muxerFactory != null
-            // An explicit factory is a deliberate override; honour it.
-            ? Muxer(muxerFactory!(muxerConfig), 'caller')
-            // PIN rather than negotiate. The track infos built above carry no
-            // encoder, which FfmpegMuxer rejects outright — so if it won the
-            // negotiation the failure would surface as a confusing throw inside
-            // writeHeader instead of as a decision made here. Pinning keeps the
-            // choice and its consequences in one place.
-            : await MiniAVTools.createMuxer(
-                muxerConfig,
-                preference: BackendPreference.pinned(
-                  ContainerFramingBackend.backendName,
-                ),
-              );
+        if (muxerFactory != null) {
+          // An explicit factory is a deliberate override; honour it.
+          muxer = Muxer(muxerFactory!(muxerConfig), 'caller');
+        } else {
+          // PIN rather than negotiate. The track infos built above carry no
+          // encoder, which FfmpegMuxer rejects outright — so if it won the
+          // negotiation the failure would surface as a confusing throw inside
+          // writeHeader instead of as a decision made here. Pinning keeps the
+          // choice and its consequences in one place.
+          try {
+            muxer = await MiniAVTools.createMuxer(
+              muxerConfig,
+              preference: BackendPreference.pinned(
+                ContainerFramingBackend.backendName,
+              ),
+            );
+          } catch (e) {
+            // A declining muxer reaches the negotiator as "no backend", which
+            // says nothing about WHY. The backend records the real reason —
+            // surface it instead of the generic one.
+            final cause = ContainerFramingBackend.lastMuxerInitFailure;
+            if (cause == null) rethrow;
+            recorderLog(
+              RecorderLogSource.recorder,
+              RecorderLogLevel.error,
+              '[clip_buffer] first-party ${effectiveContainer.name} muxer '
+              'refused $path: $cause',
+            );
+            throw CodecInitException(
+              ContainerFramingBackend.backendName,
+              'cannot write $path as ${effectiveContainer.name}',
+              cause: cause,
+            );
+          }
+        }
       } else {
         muxer = Muxer(
           FfmpegMuxer.open(

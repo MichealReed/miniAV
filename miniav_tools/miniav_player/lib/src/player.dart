@@ -24,7 +24,8 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter/foundation.dart' show kIsWeb, ValueListenable;
+import 'package:flutter/foundation.dart'
+    show kIsWeb, ValueListenable, visibleForTesting;
 import 'package:miniav_tools/miniav_tools.dart';
 import 'package:minigpu/minigpu.dart';
 import 'package:minigpu_view/minigpu_view.dart';
@@ -288,6 +289,12 @@ class MiniavPlayer {
                 config: DecoderConfig(
                   codec: videoInfo.codec,
                   extraData: videoInfo.extraData?.bytes,
+                  // The container's coded dims are not a hint for every
+                  // decoder: the MF HEVC decoder MFT rejects input until its
+                  // input media type carries a frame size, so dropping these
+                  // opens a session that can never produce a frame.
+                  width: videoInfo.width > 0 ? videoInfo.width : null,
+                  height: videoInfo.height > 0 ? videoInfo.height : null,
                 ),
               )
             : null,
@@ -610,6 +617,17 @@ class MiniavPlayer {
   bool _closed = false;
   bool _paused = false;
 
+  /// Test observable for decoded audio, invoked for every chunk the audio
+  /// decoder yields BEFORE it reaches the output sink. Static because
+  /// [openSource] starts pumping before it returns a player to assign to.
+  ///
+  /// The sink's counters ([PlayerStats.audioFramesWritten]) cannot stand in
+  /// for this: they stay 0 on a machine with no audio output device, and they
+  /// cannot distinguish real PCM from silence — which is exactly what a
+  /// backend that wins negotiation for a codec it cannot decode produces.
+  @visibleForTesting
+  static void Function(DecodedAudio chunk)? debugOnDecodedAudio;
+
   // --- stats -----------------------------------------------------------------
   int videoPacketsSubmitted = 0;
   int videoPacketsDropped = 0;
@@ -646,11 +664,26 @@ class MiniavPlayer {
   /// libopus/AAC), or null when there is no audio track.
   String? get audioDecoderBackend => _audioDecoder?.backendName;
 
+  /// The config the video decoder was negotiated and opened with — for
+  /// [openSource] this is what the container's track description compiled to
+  /// (codec, extradata, coded dims). Null when there is no video track.
+  ///
+  /// Exposed because a decoder can accept a config that is missing a field it
+  /// needs and then never produce a frame: the coded dims here are the only
+  /// observable difference between a working and a stalled MF HEVC session.
+  DecoderConfig? get videoDecoderConfig => _videoSpec?.config;
+
   /// Completes after the first video frame reaches the screen.
   Future<void> get onFirstFrame => _firstFrame.future;
 
   bool get isClosed => _closed;
   bool get isPaused => _paused;
+
+  /// True when this machine has no usable audio output device and the player
+  /// degraded to a silent sink: playback runs (and stays paced) but nothing is
+  /// audible. Poll-able because it is a property of the machine, not an error
+  /// in the stream — it is logged once, never raised to [onError] per chunk.
+  bool get audioOutputUnavailable => _audioOut?.usingNullSink ?? false;
 
   /// Playback volume (audio track only).
   double get volume => _audioOut?.volume ?? 1.0;
@@ -811,6 +844,29 @@ class MiniavPlayer {
     );
   }
 
+  /// Paced (VOD) write of one decoded chunk, where a pause HOLDS the samples
+  /// instead of discarding them.
+  ///
+  /// The chunk in hand is the only copy: it has already been removed from the
+  /// packet queue and decoded (a whole-file decoder hands over the entire
+  /// stream in ONE chunk), so aborting the write on `_paused` — as the live
+  /// path does, where the source keeps producing and dropping is the point —
+  /// silently threw away everything after the pause and still completed
+  /// `onEnded`. Only close and seek abort; both discard by definition.
+  ///
+  /// Returns false when the caller's loop should stop (closed / seeking).
+  Future<bool> _writePacedHoldingPause(DecodedAudio chunk) async {
+    while (_paused && !_closed && !_seeking) {
+      await Future<void>.delayed(const Duration(milliseconds: 8));
+    }
+    if (_closed || _seeking) return false;
+    await _audioOut!.writePaced(
+      chunk,
+      shouldAbort: () => _closed || _seeking,
+    );
+    return !_closed && !_seeking;
+  }
+
   Future<void> _pumpAudio() async {
     if (_audioPumping) return;
     _audioPumping = true;
@@ -826,6 +882,7 @@ class MiniavPlayer {
           continue;
         }
         for (final chunk in chunks) {
+          debugOnDecodedAudio?.call(chunk);
           // Seek preroll: skip chunks that end before the target.
           final dropBefore = _dropAudioBeforeUs;
           if (dropBefore != null) {
@@ -840,10 +897,7 @@ class MiniavPlayer {
           if (latencyMode == PlayerLatencyMode.paced) {
             // VOD: never drop — the ring-full wait is the decode-ahead
             // throttle that transitively pauses the demux pump.
-            await _audioOut!.writePaced(
-              chunk,
-              shouldAbort: () => _closed || _paused || _seeking,
-            );
+            if (!await _writePacedHoldingPause(chunk)) return;
           } else {
             await _audioOut!.write(chunk);
           }
@@ -886,8 +940,7 @@ class MiniavPlayer {
         }
         if (pkt == null) {
           _sourceEof = true;
-          await drain();
-          if (!_ended.isCompleted) _ended.complete();
+          await _finishEndOfStream();
           break;
         }
         if (pkt.trackIndex == _srcVideoTrack && _videoDecoder != null) {
@@ -950,6 +1003,65 @@ class MiniavPlayer {
     _pumpSource();
   }
 
+  /// End-of-stream tail: finish decoding what is queued, flush the decoders,
+  /// let the scheduler pace the result to the screen, then complete [onEnded].
+  ///
+  /// Every wait here is pause-aware, because a paused player can satisfy none
+  /// of them: [_pumpVideo] exits on `_paused` (so the packet queue stops
+  /// draining) and [pause] freezes the media clock (so the scheduler stops
+  /// presenting). Holding for the resume — instead of timing the waits out and
+  /// proceeding — is what keeps [drain] from flushing a decoder that still has
+  /// queued packets, and what keeps [onEnded] from completing on a tail that is
+  /// still queued. Seek/close abandon the tail instead: seek re-reaches EOF and
+  /// runs this again, close completes [onEnded] itself.
+  Future<void> _finishEndOfStream() async {
+    // Packets can still be queued behind the decode-ahead gate at EOF; let
+    // them decode before flushing (a flush racing an in-flight decode is also
+    // how a frame goes missing).
+    while (true) {
+      if (!await _awaitResumed()) return;
+      await _awaitVideoDecodeIdle();
+      if (!_paused) break;
+    }
+    // A seek that landed while the queue was draining owns the decoders now
+    // (it recreates them) — flushing them from here would race that.
+    if (_closed || _seeking) return;
+    await drain();
+    // The tail is decoded, not shown: the scheduler is still pacing it to the
+    // screen. onEnded promises presented, not decoded.
+    while (true) {
+      if (!await _awaitResumed()) return;
+      await _scheduler?.waitUntilPresented(
+        shouldAbort: () => _closed || _seeking || _paused,
+      );
+      if (!_paused) break;
+    }
+    if (_closed || _seeking) return;
+    if (!_ended.isCompleted) _ended.complete();
+  }
+
+  /// Block while the player is paused. False when close/seek ended the wait
+  /// (the caller must abandon what it was doing), true when playback is live.
+  Future<bool> _awaitResumed() async {
+    while (_paused && !_closed && !_seeking) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    return !_closed && !_seeking;
+  }
+
+  /// Poll until the video decode pump has consumed everything queued.
+  /// Bounded so a wedged decoder cannot hang end-of-stream.
+  Future<void> _awaitVideoDecodeIdle() async {
+    for (var i = 0; i < 400; i++) {
+      if (!_videoPumping && _videoQueue.isEmpty) return;
+      // A paused/seeking/closed pump has stopped consuming the queue, so the
+      // condition above is unsatisfiable until it restarts — returning lets
+      // the caller wait on THAT instead of burning the bound here.
+      if (_paused || _seeking || _closed) return;
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+  }
+
   /// Poll until the decode + source pumps have exited their loops (they honor
   /// [_seeking]). Bounded so a wedged pump can't hang seek forever.
   Future<void> _quiesceDecodePumps() async {
@@ -1007,7 +1119,27 @@ class MiniavPlayer {
   bool get isSeekable => usingMse || (_demuxer?.isSeekable ?? false);
 
   /// Completes when a source-driven player reaches end-of-stream AND the
-  /// buffered tail has been drained to the screen/speakers.
+  /// buffered tail has been drained. Specifically, at completion:
+  ///
+  ///  - every packet the container held has been decoded (including whatever
+  ///    the decoders were still holding, released by [drain]);
+  ///  - every decoded video frame has been PRESENTED — or dropped by the
+  ///    scheduler — so nothing is still being paced to the screen. Video is
+  ///    pts-clocked, so this is strictly later than "the last frame decoded";
+  ///  - every decoded audio chunk [drain] produced has been written to the
+  ///    output sink.
+  ///
+  /// It does NOT wait for the audio device to play out what is already in its
+  /// ring (~`AudioStreamSpec.bufferMs`), nor for paced writes still in flight
+  /// from the packet pump when the drain began. Both waits above are bounded:
+  /// a wedged presenter delays end-of-stream, it never blocks it forever.
+  ///
+  /// While [pause]d the tail waits are HELD, not timed out — a paused player
+  /// presents nothing, so completing would break the promise above. Resuming
+  /// finishes the tail; [close] also completes this (an app awaiting it to
+  /// advance a playlist would otherwise hang when the user stops playback
+  /// before the end), so a completion means "nothing more will be presented",
+  /// which end-of-stream and close both are.
   Future<void> get onEnded => _ended.future;
 
   // ---------------------------------------------------------------------------
@@ -1049,12 +1181,27 @@ class MiniavPlayer {
   }
 
   /// End-of-stream: drain decoder-buffered frames/samples and present them.
+  ///
+  /// This path applies the same seek preroll as [_pumpVideo] / [_pumpAudio]:
+  /// a decoder that only emits at `flush()` (a short single-GOP file, a
+  /// whole-file audio decoder) delivers EVERY frame here, so skipping the
+  /// preroll made a seek restart from the landing keyframe instead of the
+  /// requested position.
   Future<void> drain() async {
     if (_closed) return;
     final videoDecoder = _videoDecoder;
     if (videoDecoder != null) {
       try {
         for (final frame in await videoDecoder.flush()) {
+          videoFramesDecoded++;
+          final dropBefore = _dropVideoBeforeUs;
+          if (dropBefore != null) {
+            if (frame.ptsUs < dropBefore) {
+              frame.close();
+              continue;
+            }
+            _dropVideoBeforeUs = null;
+          }
           await _submitDecodedFrame(frame);
         }
       } catch (e, s) {
@@ -1067,8 +1214,23 @@ class MiniavPlayer {
       try {
         final chunks = await audioDecoder.flush();
         for (final chunk in chunks) {
+          debugOnDecodedAudio?.call(chunk);
+          final dropBefore = _dropAudioBeforeUs;
+          if (dropBefore != null) {
+            if (chunk.ptsUs + chunk.durationUs <= dropBefore) continue;
+            _dropAudioBeforeUs = null;
+          }
           if (!_clock.isAnchored) _clock.anchor(chunk.ptsUs);
-          await _audioOut!.write(chunk);
+          // Same mode split as _pumpAudio. The flushed tail is often the
+          // BIGGEST write of the stream (a whole-file decoder emits
+          // everything here), and the live write() drops whatever the ring
+          // cannot take right now — so draining it in live mode threw the
+          // end of every paced/VOD stream away.
+          if (latencyMode == PlayerLatencyMode.paced) {
+            if (!await _writePacedHoldingPause(chunk)) return;
+          } else {
+            await _audioOut!.write(chunk);
+          }
         }
       } catch (e, s) {
         audioDecodeErrorCount++;
@@ -1092,13 +1254,16 @@ class MiniavPlayer {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    // A closed player will never present again, which is what onEnded means —
+    // complete it on every path (the native one used to leave an awaiting
+    // playlist advance hanging forever when the user stopped before EOF).
+    if (!_ended.isCompleted) _ended.complete();
     // MSE fallback owns only its <video>/MediaSource — no decode/GPU pipeline.
     if (_mse != null) {
       _mseOnClose?.call();
       _mseOnClose = null;
       _mse!.dispose();
       _mse = null;
-      if (!_ended.isCompleted) _ended.complete();
       return;
     }
     // Demuxer first: unblocks a starved live read so the pump exits.

@@ -1,5 +1,15 @@
 # miniav_platform_interface CHANGELOG
 
+## 0.7.2
+
+- released 08/13/26 - MR
+## 0.7.1
+
+- Version bump so the family can depend on miniav_ffi 0.7.1, which fixes a
+  Windows use-after-free of the Media Foundation source-reader callback and
+  makes COM/MF initialisation process-lifetime instead of per-FFI-call. No API
+  change in this package.
+
 ## 0.7.0
 
 - Documented the GPU buffer handoff contract on the types that carry it:

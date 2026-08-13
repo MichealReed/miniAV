@@ -10,10 +10,12 @@
 /// provides a [MediaRecorderCapture] fallback for browsers lacking WebCodecs.
 ///
 /// Also registers the pure-Dart [ContainerFramingBackend] (WAV/Ogg/ADTS/MP4/M4A
-/// demux+mux) — it has NO `dart:ffi`/`dart:io`, so it is web-safe. This is what
-/// lets `openSource(MediaSource.bytes(mp4))` demux a container in the browser
-/// and feed the WebCodecs decoders; without it, container playback on web had
-/// no demuxer to fall through to (there is no FFmpeg on web).
+/// demux+mux, MP3 demux) — it has NO `dart:ffi`/`dart:io`, so it is web-safe.
+/// This is what lets `openSource(MediaSource.bytes(mp4))` demux a container in
+/// the browser and feed the WebCodecs decoders; without it, container playback
+/// on web had no demuxer to fall through to (there is no FFmpeg on web). MP3 is
+/// the clearest case: the browser can decode it (WebCodecs `'mp3'`) but nothing
+/// could frame it, so `.mp3` bytes had no path to playback on web at all.
 library;
 
 export 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
@@ -31,6 +33,7 @@ export 'convert.dart'
 export 'src/framing/container_backend.dart' show ContainerFramingBackend;
 export 'src/web/media_recorder_fallback.dart' show MediaRecorderCapture;
 export 'src/web/wasm_opus_backend.dart' show WasmOpusBackend;
+export 'src/web/web_audio_fallback_backend.dart' show WebAudioFallbackBackend;
 export 'src/web/web_backend.dart' show WebCodecsBackend;
 export 'src/web/web_capability.dart' show WebCapability;
 
@@ -38,6 +41,7 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 
 import 'src/framing/container_backend.dart';
 import 'src/web/wasm_opus_backend.dart';
+import 'src/web/web_audio_fallback_backend.dart';
 import 'src/web/web_backend.dart';
 
 // ignore: unused_element
@@ -62,6 +66,14 @@ bool _register() {
   // bytes into EncodedPackets for the WebCodecs decoders.
   if (!have.contains(ContainerFramingBackend.backendName)) {
     reg.register(ContainerFramingBackend());
+    registered = true;
+  }
+  // decodeAudioData floor (priority 40). Browsers without WebCodecs audio —
+  // older Safari/Firefox, many webviews — had NO MP3 decoder at all: the wasm
+  // module is Opus-only and dr_mp3 is behind dart:ffi. This is only ever
+  // reached when WebCodecs is absent or declines the codec.
+  if (!have.contains(WebAudioFallbackBackend.backendName)) {
+    reg.register(WebAudioFallbackBackend());
     registered = true;
   }
   return registered;

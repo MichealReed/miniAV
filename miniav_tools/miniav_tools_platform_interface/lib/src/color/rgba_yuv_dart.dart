@@ -4,8 +4,8 @@
 /// `test/rgba_yuv_convert_test.dart`).
 ///
 /// Lives in the platform interface (pure Dart, zero deps, no build hooks) so
-/// ANY consumer — web builds, pure-Dart codecs (livetensor's gsplats reference
-/// path), backend packages — can share the one canonical colour contract
+/// ANY consumer — web builds, pure-Dart codecs, backend packages, external
+/// projects — can share the one canonical colour contract
 /// without dragging in FFI or minigpu. The accelerated twins (C via
 /// [CpuFrameConverter], GPU WGSL) live in `miniav_tools_codecs`; on native hot
 /// paths prefer those (the C loop is ~10-20x faster per 1080p frame).

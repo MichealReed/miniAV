@@ -12,18 +12,25 @@ import 'dart:typed_data';
 
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
+import '../opus/opus_bitstream.dart';
 import 'codecs_wasm.dart';
 
 class WasmOpusAudioEncoder implements PlatformAudioEncoder {
-  WasmOpusAudioEncoder._(this._handle, this._sampleRate, this._channels)
+  WasmOpusAudioEncoder._(
+      this._handle, this._sampleRate, this._channels, this.preSkip48k)
       : _frameSamplesPerCh = _sampleRate ~/ 50, // 20 ms frames
         _leftover = Float32List((_sampleRate ~/ 50) * _channels) {
     _frameSamplesTotal = _frameSamplesPerCh * _channels;
     _extraData = CodecExtraData.audio(
       AudioCodec.opus,
-      _buildOpusHead(_channels, _sampleRate),
+      buildOpusHead(_channels, _sampleRate, preSkip48k),
     );
   }
+
+  /// libopus's real lookahead for this encoder, at 48 kHz — see
+  /// `OpusAudioEncoder.preSkip48k`. Same libopus build as native, so the same
+  /// value, but it is asked for rather than assumed.
+  final int preSkip48k;
 
   final int _handle;
   final int _sampleRate;
@@ -59,7 +66,12 @@ class WasmOpusAudioEncoder implements PlatformAudioEncoder {
       kOpusApplicationAudio,
     );
     if (handle == 0) return null;
-    return WasmOpusAudioEncoder._(handle, sampleRate, channels);
+    // Pre-skip is defined at 48 kHz whatever the encoder runs at.
+    final lookahead = CodecsWasm.instance.encoderLookahead(handle);
+    final preSkip48k = lookahead <= 0
+        ? 0
+        : (lookahead * 48000 + sampleRate ~/ 2) ~/ sampleRate;
+    return WasmOpusAudioEncoder._(handle, sampleRate, channels, preSkip48k);
   }
 
   @override
@@ -168,17 +180,4 @@ class WasmOpusAudioEncoder implements PlatformAudioEncoder {
     return out;
   }
 
-  static Uint8List _buildOpusHead(int channels, int inputSampleRate) {
-    final b = Uint8List(19);
-    final bd = ByteData.sublistView(b);
-    const magic = [0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64]; // 'OpusHead'
-    b.setRange(0, 8, magic);
-    b[8] = 1; // version
-    b[9] = channels;
-    bd.setUint16(10, 0, Endian.little); // pre-skip
-    bd.setUint32(12, inputSampleRate, Endian.little);
-    bd.setUint16(16, 0, Endian.little); // output gain
-    b[18] = 0; // channel mapping family 0
-    return b;
-  }
 }

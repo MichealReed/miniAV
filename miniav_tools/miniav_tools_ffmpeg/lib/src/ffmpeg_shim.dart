@@ -14,6 +14,7 @@ library;
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -481,6 +482,16 @@ external int _parSampleRate(Pointer<Void> par);
 @Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_shim_par_nb_channels')
 external int _parNbChannels(Pointer<Void> par);
 
+@Native<Int32 Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_stream_rotation_degrees',
+)
+external int _streamRotationDegrees(Pointer<Void> stream);
+
+@Native<Int32 Function(Pointer<Void>, Int32)>(
+  symbol: 'miniav_shim_stream_set_rotation_degrees',
+)
+external int _streamSetRotationDegrees(Pointer<Void> stream, int degrees);
+
 @Native<Uint32 Function()>(symbol: 'miniav_shim_avcodec_version')
 external int _avcodecVersion();
 
@@ -491,27 +502,36 @@ external int _abiVersion();
 // standalone, FFmpeg-free miniav_tools_codecs_native asset — see
 // miniav_tools_codecs/lib/src/codecs_native.dart.
 
-// ---- FFmpeg log forwarding (v8+) ----------------------------------------
+// ---- FFmpeg log forwarding (v8+, port-based since v21) -------------------
 //
 // Dart cannot bind av_log_set_callback directly (va_list is not expressible
-// in dart:ffi). The shim wraps it: we pass a simple (int level, char* msg)
-// callback and the shim formats + forwards each av_log call.
+// in dart:ffi). The shim wraps it: it formats each av_log line with
+// vsnprintf and hands the finished bytes to Dart.
+//
+// Delivery is a NATIVE PORT, not a function pointer. av_log_set_callback is
+// a PROCESS-GLOBAL registry; a NativeCallable installed there is owned by one
+// isolate, and when that isolate exits the VM deletes the trampoline while
+// FFmpeg keeps the pointer. The next log line from a codec thread (typically
+// inside avcodec_open2) then aborts the whole process. Posting to a Dart port
+// is defined, silent and thread-safe even after the port closes.
+//
+// The v8/v9 function-pointer exports (miniav_shim_set_ffmpeg_log_callback,
+// miniav_shim_free_log_message) are still exported by the shim for ABI
+// compatibility with non-Dart embedders; Dart deliberately does not bind
+// them any more.
 
-/// Native function type for the Dart-side FFmpeg log callback.
-typedef _FfmpegLogCbNative = Void Function(Int32 level, Pointer<Char> message);
+/// Initialises the shim's vendored Dart dynamic-linking API. Returns 0 on
+/// success. Idempotent; must be called before [_setLogPort].
+@Native<IntPtr Function(Pointer<Void>)>(symbol: 'miniav_shim_init_dart_api')
+external int _initDartApi(Pointer<Void> initializeApiDLData);
 
-@Native<Void Function(Pointer<NativeFunction<_FfmpegLogCbNative>>)>(
-  symbol: 'miniav_shim_set_ffmpeg_log_callback',
-)
-external void _setFfmpegLogCallback(
-  Pointer<NativeFunction<_FfmpegLogCbNative>> cb,
-);
+/// Routes formatted `av_log` output to a Dart native port (and sets the
+/// av_log level in the same call). Port 0 stops delivery.
+@Native<Void Function(Int64, Int32)>(symbol: 'miniav_shim_set_log_port')
+external void _setLogPort(int port, int level);
 
 @Native<Void Function(Int32)>(symbol: 'miniav_shim_set_ffmpeg_log_level')
 external void _setFfmpegLogLevel(int level);
-
-@Native<Void Function(Pointer<Char>)>(symbol: 'miniav_shim_free_log_message')
-external void _freeLogMessage(Pointer<Char> msg);
 
 // =============================================================================
 // Public façade
@@ -523,7 +543,7 @@ class FfmpegShim {
   FfmpegShim._();
 
   /// Currently expected shim ABI. Bump in lock-step with `shim.c`.
-  static const int kExpectedAbiVersion = 18;
+  static const int kExpectedAbiVersion = 21;
 
   static FfmpegShim? _instance;
   static bool _attemptedLoad = false;
@@ -1098,27 +1118,42 @@ class FfmpegShim {
   int parSampleRate(Pointer<Void> par) => _parSampleRate(par);
   int parNbChannels(Pointer<Void> par) => _parNbChannels(par);
 
+  /// Container display rotation for an `AVStream*`, degrees CLOCKWISE in
+  /// {0, 90, 180, 270} — the sign convention of
+  /// `VideoTrackInfo.rotationDegrees`. 0 when the stream carries no display
+  /// matrix, and also when it carries one that is not a plain turn (flip,
+  /// scale, arbitrary transform), matching the first-party MP4 reader.
+  int streamRotationDegrees(Pointer<Void> stream) =>
+      _streamRotationDegrees(stream);
+
+  /// Declare CLOCKWISE [degrees] on an OUTPUT `AVStream*` so the muxer writes
+  /// the display matrix into the container. Call after codecpar is populated
+  /// and before `avformat_write_header`. Returns 0 on success, <0 on a bad
+  /// argument (not a multiple of 90) or OOM.
+  int streamSetRotationDegrees(Pointer<Void> stream, int degrees) =>
+      _streamSetRotationDegrees(stream, degrees);
+
   // ---- FFmpeg log forwarding (v8+) ----------------------------------------
 
-  /// Active log NativeCallable — kept alive while a callback is registered.
-  NativeCallable<_FfmpegLogCbNative>? _ffmpegLogCallable;
+  /// Receive port for native `av_log` lines in THIS isolate. Non-null while
+  /// a Dart callback is registered.
+  ReceivePort? _logPort;
+
+  /// Last level handed to [setFfmpegLogLevel] / [setFfmpegLogCallback], so a
+  /// re-registration keeps the caller's verbosity.
+  int _logLevel = 32; // AV_LOG_INFO
+
+  /// Whether `Dart_InitializeApiDL` has run in THIS isolate. The shim guards
+  /// its own side too, but skipping the FFI call keeps re-registration cheap.
+  bool _dartApiInitialised = false;
 
   /// Set the FFmpeg log level using av_log_set_level.
   ///
   /// Standard AV_LOG_* constants: `quiet=-8`, `error=16`, `warning=24`,
   /// `info=32`, `verbose=40`, `debug=48`.
-  void setFfmpegLogLevel(int avLevel) => _setFfmpegLogLevel(avLevel);
-
-  /// Decode a null-terminated C string from native memory using
-  /// [Utf8Decoder.allowMalformed] so that FFmpeg log messages that contain
-  /// non-UTF-8 bytes (e.g. Latin-1 filenames on Windows) never throw.
-  static String _decodeCString(Pointer<Char> ptr) {
-    if (ptr.address == 0) return '';
-    final bytes = ptr.cast<Uint8>();
-    var len = 0;
-    while (bytes[len] != 0) len++;
-    final data = Uint8List.view(bytes.asTypedList(len).buffer, 0, len);
-    return const Utf8Decoder(allowMalformed: true).convert(data);
+  void setFfmpegLogLevel(int avLevel) {
+    _logLevel = avLevel;
+    _setFfmpegLogLevel(avLevel);
   }
 
   /// Install (or replace) a callback that receives formatted FFmpeg log
@@ -1126,34 +1161,67 @@ class FfmpegShim {
   /// formatted message string. Pass `null` to restore FFmpeg's default logger
   /// (which writes to native stderr — not visible in most Flutter apps).
   ///
-  /// The callback is dispatched on the Dart event loop via a `listener`
-  /// NativeCallable, so it is safe to run arbitrary Dart code (e.g. forward
-  /// to a logging framework — avoid `dart:io` `stderr`, which throws an
-  /// uncatchable async error in console-less Windows GUI apps).
+  /// Delivery is a **Dart native port**, not a `NativeCallable`.
+  /// `av_log_set_callback` is a PROCESS-GLOBAL registry: a function pointer
+  /// installed there is owned by the isolate that created it, and when that
+  /// isolate exits the VM deletes the trampoline while FFmpeg still holds the
+  /// pointer — the next log line from a codec thread (e.g. inside
+  /// `avcodec_open2`) then aborts the entire process. Posting to a Dart port
+  /// is defined and silent even after the port closes.
+  ///
+  /// PROCESS-GLOBAL, LAST WRITER WINS: if several isolates call this, only
+  /// the most recent registration receives log lines. That is exactly how the
+  /// function pointer behaved — minus the crash.
+  ///
+  /// The callback runs on this isolate's event loop, so it is safe to run
+  /// arbitrary Dart code (e.g. forward to a logging framework — avoid
+  /// `dart:io` `stderr`, which throws an uncatchable async error in
+  /// console-less Windows GUI apps).
   void setFfmpegLogCallback(
-    void Function(int level, String message)? callback,
-  ) {
-    final old = _ffmpegLogCallable;
-    _ffmpegLogCallable = null;
+    void Function(int level, String message)? callback, {
+    int? level,
+  }) {
+    if (level != null) _logLevel = level;
+
+    final old = _logPort;
+    _logPort = null;
 
     if (callback == null) {
-      _setFfmpegLogCallback(Pointer.fromAddress(0));
+      _setLogPort(0 /* ILLEGAL_PORT */, _logLevel);
       old?.close();
       return;
     }
 
-    final nc = NativeCallable<_FfmpegLogCbNative>.listener((
-      int level,
-      Pointer<Char> msg,
-    ) {
-      final str = _decodeCString(msg).trimRight();
-      // C++ heap-allocated this copy so the pointer stays valid across the
-      // async NativeCallable.listener dispatch.  Free it after consuming.
-      _freeLogMessage(msg);
-      callback(level, str);
+    if (!_dartApiInitialised) {
+      final rc = _initDartApi(NativeApi.initializeApiDLData);
+      if (rc != 0) {
+        // Dart API version mismatch: the shim was built against a different
+        // SDK. Leave FFmpeg on its default logger rather than crash.
+        ffmpegToolsLog(
+          MiniAVLogLevel.error,
+          'miniav_tools_ffmpeg: Dart_InitializeApiDL failed ($rc); native '
+          'FFmpeg log forwarding disabled.',
+        );
+        old?.close();
+        return;
+      }
+      _dartApiInitialised = true;
+    }
+
+    final port = ReceivePort('miniav_tools_ffmpeg.av_log');
+    port.listen((dynamic message) {
+      // Wire format: [int32 level, Uint8List utf8Bytes]. Bytes rather than a
+      // string because FFmpeg log lines are not guaranteed valid UTF-8.
+      if (message is! List || message.length != 2) return;
+      final lvl = message[0] as int;
+      final bytes = message[1] as Uint8List;
+      callback(
+        lvl,
+        const Utf8Decoder(allowMalformed: true).convert(bytes).trimRight(),
+      );
     });
-    _setFfmpegLogCallback(nc.nativeFunction);
-    _ffmpegLogCallable = nc;
+    _logPort = port;
+    _setLogPort(port.sendPort.nativePort, _logLevel);
     old?.close();
   }
 }

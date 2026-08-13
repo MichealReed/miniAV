@@ -30,8 +30,14 @@ typedef struct LoopbackPlatformContextWinWasapi {
   HANDLE stop_event_handle;
   HANDLE buffer_event_handle;
   BOOL event_driven_capture;
+  // The caller REQUESTED process scope (a "pid:"/"hwnd:" target).
   BOOL attempt_process_specific_capture;
-  DWORD target_process_id; // For logging/debugging if process-specific
+  // Real per-process loopback is running (ActivateAudioInterfaceAsync against
+  // VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK succeeded). Distinct from the field
+  // above: "asked for" and "got" are not the same thing, and conflating them
+  // is what let whole-system audio pass as one process's for so long.
+  BOOL process_loopback_active;
+  DWORD target_process_id; // Requested PID (0 if none)
   LARGE_INTEGER qpc_frequency;
 } LoopbackPlatformContextWinWasapi;
 

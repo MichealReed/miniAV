@@ -16,8 +16,18 @@ muxer.
 
 FFmpeg stays registered as the cross-platform floor and still wins wherever it
 is genuinely the better path — selection is by reported capability, ranking
-`isHardware` above `zeroCopy` above `priority`, not by registration order. On
-Linux/macOS the same code falls back to FFmpeg automatically.
+`isHardware` above `zeroCopy` above `priority`, not by registration order.
+
+**Platform reality — read this before targeting anything but Windows.** On
+Linux x86-64 the same code falls back to FFmpeg, which is auto-downloaded on
+first build (~92 MB, LGPL). It does **not** fall back on macOS, Android or iOS:
+the FFmpeg shim this package needs is only built when that download succeeds,
+and no artifact exists for those platforms — so `brew install ffmpeg` on macOS
+changes the error, not the outcome. Since `addMic()` defaults to AAC and OS AAC
+is Windows-only, the default recording configuration has no working audio
+encoder on macOS/Android/iOS today. ARM64 Linux downloads the x86-64 archive
+and fails to load it. Full matrix, caveats and the plan to close these gaps:
+[`docs/PLATFORM_SUPPORT.md`](../../docs/PLATFORM_SUPPORT.md).
 
 The `video stats` log line reports which encoder was chosen, along with encoded
 vs incoming fps — the first place to look if output is not what you expect. To

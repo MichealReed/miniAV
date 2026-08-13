@@ -120,8 +120,8 @@ def read_local_versions(root_dir):
 
 
 def update_yaml_content(content, new_version, is_release, local_packages):
-    """`local_packages` maps package name -> its own version. Membership decides
-    what counts as an internal dependency; the value is what gets pinned."""
+    """`local_packages` maps package name -> its own on-disk version. Membership
+    decides what counts as an internal dependency; the value is what gets pinned."""
     # Update version, preserving the 'version: ' part
     # Use r'\g<1>' to avoid issues with new_version starting with a digit
     content = re.sub(r'^(version:\s*).*$', r'\g<1>' + new_version, content, flags=re.MULTILINE)
@@ -168,10 +168,16 @@ def update_yaml_content(content, new_version, is_release, local_packages):
                     if pkg_name_on_line in local_packages:
                         current_package_for_path = pkg_name_on_line # Set context for this new local package
                         if is_release:
-                            # The SIBLING's version, not the one being released.
-                            pin = local_packages.get(pkg_name_on_line, new_version) \
-                                if isinstance(local_packages, dict) else new_version
-                            updated_dep_lines.append(f'{current_indent}{pkg_name_on_line}: {pin}')
+                            # The SIBLING's own version, as a CARET range.
+                            # Never the version being released -- siblings do
+                            # not all move together, and stamping it wrote pins
+                            # naming versions that had never existed. Never an
+                            # exact pin either: see main_sync for why those
+                            # cascade. The isinstance() dance this replaces was
+                            # dead -- the only caller passed a list, so the
+                            # branch it guarded never ran.
+                            pin = local_packages[pkg_name_on_line]
+                            updated_dep_lines.append(f'{current_indent}{pkg_name_on_line}: ^{pin}')
                         else:
                             updated_dep_lines.append(f'{current_indent}{pkg_name_on_line}:')
                             path_exists_or_will_be_processed = False
@@ -413,6 +419,12 @@ PACKAGES = [
     "miniav_tools_ffmpeg",
     "miniav_recorder",
     "miniav_player",
+    # miniav_media_session depends on nothing else in this family. Its Android
+    # companion depends on it, and the player binding depends on all three, so
+    # they publish in this order.
+    "miniav_media_session",
+    "miniav_media_session_flutter",
+    "miniav_media_session_player",
 ]
 
 
@@ -502,17 +514,30 @@ def main_sync():
 
 def main_version_update(version, is_release, message):
     root_dir = os.path.dirname(os.path.abspath(__file__))
+    # Snapshot each sibling's own version before the loop starts overwriting
+    # them: an internal pin names the SIBLING, not the version being released.
+    # A package with no pubspec on disk falls back to that version, and a -WIP
+    # suffix never belongs in a published constraint.
+    on_disk = read_local_versions(root_dir)
+    local_versions = {pkg: on_disk.get(pkg, version).replace("-WIP", "")
+                      for pkg in PACKAGES}
     for dir_name in PACKAGES:
         pubspec_path = os.path.join(root_dir, dir_name, "pubspec.yaml")
         if os.path.exists(pubspec_path):
-            process_pubspec(pubspec_path, version, is_release, PACKAGES)
+            process_pubspec(pubspec_path, version, is_release, local_versions)
             print(f"Updated {pubspec_path}")
         else:
             print(f"Warning: {pubspec_path} not found")
-        
+
         changelog_path = os.path.join(root_dir, dir_name, "CHANGELOG.md")
         process_changelog(changelog_path, version, is_release, message)
         print(f"Updated {changelog_path}")
+
+    if is_release:
+        # Every package above just moved to `version`, so a pin written from the
+        # snapshot can lag by one release. `sync` owns the rule for what a pin
+        # should say; run it rather than reimplementing it here.
+        main_sync()
 
 def main_change(packages_args, message):
     root_dir = os.path.dirname(os.path.abspath(__file__))
@@ -630,7 +655,9 @@ def main_deps(specific_deps=None):
 
 def main_publish():
     if not release_checks.preflight(os.path.dirname(os.path.abspath(__file__)), PACKAGES):
-        print('Aborting publish. Override with `check` if you are certain.')
+        print('Aborting publish: preflight failed. There is no override -- fix')
+        print('the errors above. `python release.py check` re-runs the same')
+        print('checks on their own.')
         return
     root_dir = os.path.dirname(os.path.abspath(__file__))
     all_actions_successful = True

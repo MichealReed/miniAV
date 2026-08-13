@@ -82,6 +82,9 @@ external int _opusEncEncode(
   int outCap,
 );
 
+@Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_opus_enc_lookahead')
+external int _opusEncLookahead(Pointer<Void> handle);
+
 @Native<Void Function(Pointer<Void>)>(symbol: 'miniav_opus_enc_destroy')
 external void _opusEncDestroy(Pointer<Void> handle);
 
@@ -111,7 +114,37 @@ int opusEncEncode(
   int outCap,
 ) => _opusEncEncode(handle, pcm, framesPerChannel, out, outCap);
 
+/// Encoder lookahead (algorithmic delay) in samples at the ENCODER'S sample
+/// rate — the number of priming samples a decoder must discard, i.e. what
+/// OpusHead's `pre-skip` has to carry once scaled to 48 kHz. 0 on failure.
+int opusEncLookahead(Pointer<Void> handle) => _opusEncLookahead(handle);
+
 void opusEncDestroy(Pointer<Void> handle) => _opusEncDestroy(handle);
+
+@Native<Pointer<Uint8> Function()>(symbol: 'miniav_opus_scratch_mode')
+external Pointer<Uint8> _opusScratchMode();
+
+/// Which temporary-allocation mode the bundled libopus was compiled with:
+/// `VAR_ARRAYS` or `USE_ALLOCA` (per-call, on the calling thread's stack —
+/// thread-safe), `NONTHREADSAFE_PSEUDOSTACK` (ONE process-global 120 kB scratch
+/// buffer behind an unsynchronised bump pointer — corrupts the heap as soon as
+/// two threads touch libopus at once), or `system` when a system libopus was
+/// linked and the mode was not ours to choose.
+///
+/// Asserted by `test/opus_encode_test.dart`: the pseudostack mode is invisible
+/// until it faults somewhere unrelated, so it is checked at the build config
+/// rather than waited for.
+String opusScratchMode() {
+  final p = _opusScratchMode();
+  if (p == nullptr) return 'unknown';
+  final codes = <int>[];
+  for (var i = 0; i < 64; i++) {
+    final b = p[i];
+    if (b == 0) break;
+    codes.add(b);
+  }
+  return String.fromCharCodes(codes);
+}
 
 // -----------------------------------------------------------------------------
 // SW audio decode (dr_mp3 / dr_flac / stb_vorbis) — all platforms
@@ -380,6 +413,44 @@ external int mfencReceive(Pointer<Void> s, Pointer<MfEncFrame> out);
 @Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_shim_mfenc_drain')
 external int mfencDrain(Pointer<Void> s);
 
+/// Poll an outstanding drain: 1 = finished and every output taken, 0 = keep
+/// calling [mfencReceive]. An async MFT answers `receive` with "nothing right
+/// now" long before the drain completes, so this is what stops `flush()` from
+/// silently dropping the frames a hardware encoder still holds in flight.
+@Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_shim_mfenc_drain_state')
+external int mfencDrainState(Pointer<Void> s);
+
+/// TEST-ONLY fault injection: make ONE encoder session misbehave the way a
+/// broken MFT does. Returns 0, or -1 for an unknown mode.
+///
+///  * 0 — none (every session starts here; nothing below is otherwise live).
+///  * 1 — the drain never completes: [mfencDrainState] keeps answering 0, so a
+///    caller's bounded poll loop has to exit through its own timeout.
+///  * 2 — input is accepted but [mfencReceive] yields nothing, while the drain
+///    reports COMPLETE. That combination is what tells "the MFT is wedged"
+///    apart from "the MFT finished and produced no video at all".
+///
+/// The mode lives on the session struct ON PURPOSE. `dart test` runs each test
+/// file in its own isolate inside a SINGLE process, so a process-global flag (or
+/// an environment variable read at runtime) would be visible to every suite
+/// encoding concurrently and would fail them non-deterministically. Pass the
+/// handle of a session the test created and nothing else can see it.
+@Native<Int32 Function(Pointer<Void>, Int32)>(
+  symbol: 'miniav_shim_mfenc_set_fault',
+)
+external int mfencSetFault(Pointer<Void> s, int mode);
+
+/// Drop every cached producer texture (and the retained repeat source), and
+/// return how many entries were released. The import cache keys on the
+/// producer's texture pointer and holds a reference to it, so a recycled
+/// address can never resolve to the previous picture — but the caller must say
+/// when its textures are gone (a resolution change, a rebuilt texture ring) or
+/// they stay resident.
+@Native<Int32 Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_mfenc_invalidate_imports',
+)
+external int mfencInvalidateImports(Pointer<Void> s);
+
 /// 1 when the session activated a hardware MFT rather than the software one.
 @Native<Int32 Function(Pointer<Void>)>(symbol: 'miniav_shim_mfenc_is_hardware')
 external int mfencIsHardware(Pointer<Void> s);
@@ -404,8 +475,11 @@ external void mfencFree(Pointer<Void> p);
 // (see native/mf_decoder.c). On non-Windows these symbols are absent — callers
 // gate on Platform.isWindows.
 
-/// Mirror of the C `MiniAVMfDecFrame` (40 bytes on 64-bit). The trailing [pad]
+/// Mirror of the C `MiniAVMfDecFrame` (48 bytes on 64-bit). The trailing [pad]
 /// keeps [ptsUs] 8-byte aligned, matching the C struct exactly.
+///
+/// [width]/[height] are the DISPLAY size (the bitstream's crop window);
+/// the texture is the coded size with the valid region at ([cropX], [cropY]).
 final class MiniAVMfDecFrame extends Struct {
   @IntPtr()
   external int outSharedHandle;
@@ -417,6 +491,10 @@ final class MiniAVMfDecFrame extends Struct {
   external int height;
   @Int32()
   external int pixelFormat;
+  @Int32()
+  external int cropX;
+  @Int32()
+  external int cropY;
   @Int32()
   external int pad;
   @Int64()
@@ -462,6 +540,23 @@ external int _mfdecReceive(Pointer<Void> session, Pointer<MiniAVMfDecFrame> out)
 external int _mfdecMapNv12(
   Pointer<Void> session,
   int texturePtr,
+  Pointer<Uint8> dst,
+  int dstCap,
+);
+
+@Native<
+    Int32 Function(
+        Pointer<Void>, IntPtr, Int32, Int32, Int32, Int32, Pointer<Uint8>,
+        Int32)>(
+  symbol: 'miniav_shim_mfdec_map_nv12_region',
+)
+external int _mfdecMapNv12Region(
+  Pointer<Void> session,
+  int texturePtr,
+  int cropX,
+  int cropY,
+  int cropW,
+  int cropH,
   Pointer<Uint8> dst,
   int dstCap,
 );
@@ -512,13 +607,38 @@ int mfdecSend(
 int mfdecReceive(Pointer<Void> session, Pointer<MiniAVMfDecFrame> out) =>
     _mfdecReceive(session, out);
 
-/// Map a shareable NV12 texture to CPU (tightly packed). Bytes written, or <0.
+/// Map a whole shareable NV12 texture to CPU (tightly packed, CODED size —
+/// block padding included). Bytes written, or <0. Frames should use
+/// [mfdecMapNv12Region] with their crop rect instead.
 int mfdecMapNv12(
   Pointer<Void> session,
   int texturePtr,
   Pointer<Uint8> dst,
   int dstCap,
 ) => _mfdecMapNv12(session, texturePtr, dst, dstCap);
+
+/// Map only a decoded frame's display aperture — [cropX]/[cropY] from
+/// [MiniAVMfDecFrame], [cropW]/[cropH] its width/height. Bytes written
+/// (`w * h * 3 / 2`), or <0.
+int mfdecMapNv12Region(
+  Pointer<Void> session,
+  int texturePtr,
+  int cropX,
+  int cropY,
+  int cropW,
+  int cropH,
+  Pointer<Uint8> dst,
+  int dstCap,
+) => _mfdecMapNv12Region(
+  session,
+  texturePtr,
+  cropX,
+  cropY,
+  cropW,
+  cropH,
+  dst,
+  dstCap,
+);
 
 /// Signal end-of-stream + collect trailing frames (poll [mfdecReceive]).
 int mfdecDrain(Pointer<Void> session) => _mfdecDrain(session);

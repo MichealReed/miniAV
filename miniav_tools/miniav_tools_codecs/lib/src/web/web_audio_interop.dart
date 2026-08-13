@@ -22,6 +22,20 @@ extension type AudioDecoder._(JSObject _) implements JSObject {
   external void close();
   external int get decodeQueueSize;
   external String get state;
+
+  /// Asks the browser whether this exact config can be decoded. The
+  /// `AudioDecoder` constructor existing does NOT mean a given codec is
+  /// implemented — Firefox shipped the API before MP3, for one — so this is
+  /// what lets the negotiator decline and fall through to a fallback backend
+  /// instead of configuring and throwing.
+  external static JSPromise<AudioDecoderSupport> isConfigSupported(
+    AudioDecoderConfig config,
+  );
+}
+
+/// Result of [AudioDecoder.isConfigSupported].
+extension type AudioDecoderSupport._(JSObject _) implements JSObject {
+  external bool get supported;
 }
 
 extension type AudioDecoderInit._(JSObject _) implements JSObject {

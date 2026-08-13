@@ -23,8 +23,9 @@ import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart'
 ///     it (→ D3D11 texture) over software decode.
 ///   - libopus audio decode + encode (all platforms) → picked over FFmpeg for Opus.
 ///   - raw PCM (pcmS16le/pcmF32le) decode + encode (all platforms).
-///   - WAV / Ogg / ADTS container framing (all platforms) → `.wav`/`.opus`
-///     files demux/mux with no libavformat.
+///   - dr_mp3 MP3 decode (all platforms).
+///   - WAV / Ogg / ADTS / MP4 container framing + MP3 demux (all platforms) →
+///     `.wav`/`.opus` files demux/mux with no libavformat.
 ///
 /// FFmpeg remains the cross-platform software floor + the fallback for other
 /// codecs/containers — so a packet-streaming H.264/HEVC-video + Opus-audio
@@ -34,8 +35,11 @@ void registerPlayerBackends() {
   registerMfDecodeBackend(); // FFmpeg-free HW video (Windows)
   registerOpusBackend(); // FFmpeg-free Opus audio (decode + encode)
   registerPcmBackend(); // FFmpeg-free raw PCM
-  registerSwAudioBackend(); // FFmpeg-free MP3 / FLAC / Vorbis decode
+  registerSwAudioBackend(); // FFmpeg-free MP3 decode (FLAC/Vorbis: see below)
   registerAacBackend(); // FFmpeg-free OS AAC decode+encode (Windows; MTA)
-  registerContainerFramingBackend(); // FFmpeg-free WAV/Ogg/ADTS/MP4 demux+mux
-  registerFfmpegBackend(); // software floor + fallback (MKV, SW video, STA AAC)
+  registerContainerFramingBackend(); // FFmpeg-free WAV/Ogg/ADTS/MP4/MP3 demux
+  // Software floor + fallback (MKV, SW video, STA AAC) — and the ONLY decoder
+  // for FLAC/Vorbis: sw_audio's are whole-container-only, so they cannot take a
+  // demuxed track and the backend does not claim those codecs.
+  registerFfmpegBackend();
 }

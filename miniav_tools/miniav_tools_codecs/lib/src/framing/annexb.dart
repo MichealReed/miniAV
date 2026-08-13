@@ -237,6 +237,46 @@ Uint8List? buildHvcC(Uint8List annexB) {
   return b.toBytes();
 }
 
+/// Largest luma dimension any HEVC level permits: `sqrt(8 * MaxLumaPs)` at
+/// level 6.2 (H.265 §A.4.1, MaxLumaPs = 35651584).
+const int _maxHevcDimension = 16888;
+
+/// Coded luma size of the first HEVC SPS in an Annex-B parameter-set blob.
+///
+/// `pic_width_in_luma_samples` / `pic_height_in_luma_samples` — the CODED size,
+/// before the conformance window is applied. That is deliberately the *coded*
+/// size: it is what a decoder's input type wants (the MFT derives the display
+/// aperture from the crop offsets itself), and cropping here would hand it a
+/// frame size that no CTU grid can hold.
+///
+/// Returns `null` when [annexB] has no SPS, the SPS does not parse, or the
+/// dimensions it carries are not plausible ([_maxHevcDimension]).
+({int width, int height})? hevcCodedSizeFromAnnexB(Uint8List annexB) {
+  for (final nal in splitAnnexB(annexB)) {
+    if (nal.length < 3 || _hevcType(nal) != _hevcSps) continue;
+    final info = _parseHevcSps(nal);
+    if (info == null) continue;
+    // The bound is load-bearing, not cosmetic: `ue()` parses values far beyond
+    // 32 bits without complaint, and this size is handed to an `Int32` FFI
+    // parameter, where dart:ffi truncates silently. A truncated-negative width
+    // makes the native side skip MF_MT_FRAME_SIZE altogether and hand back the
+    // decoder that accepts every packet and emits nothing — the exact failure
+    // this harvest exists to prevent, minus the fall-through. Rejecting here
+    // returns `null` instead, which declines to software.
+    if (info.picWidthInLumaSamples <= 0 ||
+        info.picHeightInLumaSamples <= 0 ||
+        info.picWidthInLumaSamples > _maxHevcDimension ||
+        info.picHeightInLumaSamples > _maxHevcDimension) {
+      continue;
+    }
+    return (
+      width: info.picWidthInLumaSamples,
+      height: info.picHeightInLumaSamples,
+    );
+  }
+  return null;
+}
+
 class _HevcSpsInfo {
   _HevcSpsInfo({
     required this.profileSpace,
@@ -250,6 +290,8 @@ class _HevcSpsInfo {
     required this.bitDepthChromaMinus8,
     required this.numTemporalLayers,
     required this.temporalIdNested,
+    required this.picWidthInLumaSamples,
+    required this.picHeightInLumaSamples,
   });
 
   final int profileSpace;
@@ -263,6 +305,10 @@ class _HevcSpsInfo {
   final int bitDepthChromaMinus8;
   final int numTemporalLayers;
   final int temporalIdNested;
+
+  /// Coded luma size — the conformance window is NOT applied.
+  final int picWidthInLumaSamples;
+  final int picHeightInLumaSamples;
 }
 
 /// Parse just enough of an HEVC SPS (ITU-T H.265 §7.3.2.2) to fill `hvcC`:
@@ -313,8 +359,8 @@ _HevcSpsInfo? _parseHevcSps(Uint8List nal) {
     r.ue(); // sps_seq_parameter_set_id
     final chromaFormatIdc = r.ue();
     if (chromaFormatIdc == 3) r.u(1); // separate_colour_plane_flag
-    r.ue(); // pic_width_in_luma_samples
-    r.ue(); // pic_height_in_luma_samples
+    final picWidth = r.ue(); // pic_width_in_luma_samples
+    final picHeight = r.ue(); // pic_height_in_luma_samples
     if (r.u(1) == 1) {
       r.ue(); // conf_win_left_offset
       r.ue(); // conf_win_right_offset
@@ -336,6 +382,8 @@ _HevcSpsInfo? _parseHevcSps(Uint8List nal) {
       bitDepthChromaMinus8: bitDepthChroma,
       numTemporalLayers: maxSubLayersMinus1 + 1,
       temporalIdNested: temporalIdNested,
+      picWidthInLumaSamples: picWidth,
+      picHeightInLumaSamples: picHeight,
     );
   } on _BitReaderOverrun {
     return null;

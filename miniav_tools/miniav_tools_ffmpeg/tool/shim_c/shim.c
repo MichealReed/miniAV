@@ -27,6 +27,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Vendored Dart SDK dynamic-linking API (dart_dl/). Gives us
+ * Dart_PostCObject_DL so the process-global av_log bridge can deliver to a
+ * Dart NATIVE PORT instead of a NativeCallable function pointer. */
+#include "dart_api_dl.h"
+
 #ifndef _WIN32
   #include <pthread.h>
 #endif
@@ -1573,6 +1578,93 @@ MIO_API int32_t miniav_shim_par_nb_channels(const AVCodecParameters* p) {
     return p ? p->ch_layout.nb_channels : 0;
 }
 
+/* 1.0 in the 16.16 fixed point the display matrix uses for a,b,c,d (entry [8]
+ * is 2.30, so it needs its own constant). */
+#define MIO_DISPLAY_ONE (1 << 16)
+#define MIO_DISPLAY_W   (1 << 30)
+
+/* Container display rotation for a video stream, degrees CLOCKWISE in
+ * {0,90,180,270}; 0 when the stream carries no display matrix.
+ *
+ * Two things are load-bearing and cannot be seen from the call site.
+ * (1) Storage: FFmpeg 7 removed AVStream.side_data / av_stream_get_side_data,
+ *     so stream-level side data now lives in codecpar->coded_side_data and is
+ *     read with av_packet_side_data_get.
+ * (2) The 2x2 is matched EXACTLY instead of going through
+ *     av_display_rotation_get, which derives an angle from atan2 and therefore
+ *     cannot separate a flip from a turn: a pure horizontal flip
+ *     (a=-1,b=0,c=0,d=1) yields 180 there, indistinguishable from a real
+ *     180 matrix, and any arbitrary transform snaps to whichever quadrant is
+ *     nearest. This table is the exact inverse of the first-party MP4 reader's
+ *     (miniav_tools_codecs Mp4Demuxer), so both demuxers agree on every
+ *     matrix; anything else — flips, scales, arbitrary transforms — is
+ *     unsupported and reads as 0 rather than a plausible-looking wrong turn. */
+MIO_API int32_t miniav_shim_stream_rotation_degrees(const AVStream* st) {
+    if (!st || !st->codecpar) return 0;
+    const AVPacketSideData* sd =
+        av_packet_side_data_get(st->codecpar->coded_side_data,
+                                st->codecpar->nb_coded_side_data,
+                                AV_PKT_DATA_DISPLAYMATRIX);
+    if (!sd || !sd->data || sd->size < 9 * sizeof(int32_t)) return 0;
+    /* Layout [a b u; c d v; x y w]; translation (x,y) is irrelevant here. */
+    const int32_t* m = (const int32_t*)sd->data;
+    const int32_t  a = m[0], b = m[1], c = m[3], d = m[4];
+    const int32_t  one = MIO_DISPLAY_ONE;
+    if (a == one && b == 0 && c == 0 && d == one) return 0;
+    if (a == 0 && b == one && c == -one && d == 0) return 90;
+    if (a == -one && b == 0 && c == 0 && d == -one) return 180;
+    if (a == 0 && b == -one && c == one && d == 0) return 270;
+    return 0;
+}
+
+/* Declare CLOCKWISE `degrees` of display rotation on an OUTPUT stream, so the
+ * muxer writes it into the container (mov tkhd matrix, matroska projection).
+ * Must be called after codecpar is populated and BEFORE
+ * avformat_write_header. Returns 0 on success, <0 on a bad argument or OOM.
+ *
+ * The matrix written is the exact inverse of the reader above, so a rotation
+ * survives demux -> mux. Stream side data lives in codecpar->coded_side_data
+ * since FFmpeg 7 (see above); av_packet_side_data_new REPLACES an existing
+ * entry of the same type, so this is safe after
+ * avcodec_parameters_from_context. */
+MIO_API int32_t miniav_shim_stream_set_rotation_degrees(AVStream* st,
+                                                        int32_t   degrees) {
+    if (!st || !st->codecpar) return -1;
+    int32_t deg = degrees % 360;
+    if (deg < 0) deg += 360;
+    if (deg % 90 != 0) return -1;
+    if (deg == 0) return 0; /* identity is the container default */
+
+    AVPacketSideData* sd = av_packet_side_data_new(
+        &st->codecpar->coded_side_data, &st->codecpar->nb_coded_side_data,
+        AV_PKT_DATA_DISPLAYMATRIX, 9 * sizeof(int32_t), 0);
+    if (!sd || !sd->data) return -2;
+
+    int32_t* m = (int32_t*)sd->data;
+    memset(m, 0, 9 * sizeof(int32_t));
+    const int32_t one = MIO_DISPLAY_ONE;
+    m[8]                = MIO_DISPLAY_W;
+    switch (deg) {
+        case 90:
+            m[1] = one;
+            m[3] = -one;
+            break;
+        case 180:
+            m[0] = -one;
+            m[4] = -one;
+            break;
+        case 270:
+            m[1] = -one;
+            m[3] = one;
+            break;
+        default: /* unreachable: deg is a multiple of 90 in [0,360) */
+            m[0] = one;
+            m[4] = one;
+            break;
+    }
+    return 0;
+}
+
 /* --- Sanity / version ------------------------------------------------- */
 
 MIO_API unsigned miniav_shim_avcodec_version(void) {
@@ -1978,53 +2070,146 @@ MIO_API unsigned miniav_shim_abi_version(void) {
      * miniav_tools_codecs_native asset — this shim no longer exports it. */
     /* v18: miniav_shim_frame_colorspace / _color_range (AVFrame colour
      * metadata readers for the BT.601/709 + limited/full matrix selection). */
-    return 18u;
+    /* v19: miniav_shim_stream_rotation_degrees (container display matrix →
+     * clockwise degrees, so the demuxer can fill
+     * VideoTrackInfo.rotationDegrees). */
+    /* v20: miniav_shim_stream_set_rotation_degrees — the write side, so the
+     * muxer stamps VideoTrackInfo.rotationDegrees into the container instead
+     * of dropping it on remux. */
+    /* v21: miniav_shim_init_dart_api + miniav_shim_set_log_port — av_log
+     * delivery moved from a process-global NativeCallable function pointer
+     * (which outlives the isolate that installed it and aborts the VM) to a
+     * Dart native port. The v8/v9 function-pointer entry points remain
+     * exported for ABI compatibility. */
+    return 21u;
 }
 
 /* --- FFmpeg log forwarding ------------------------------------------------
  *
  * FFmpeg's av_log_set_callback takes a va_list which is not bindable
- * directly from Dart FFI. This shim bridges the gap: Dart installs a
- * simple  (int level, const char* message)  callback here, and we set up
- * our own av_log callback that formats the message with vsnprintf and
- * forwards it.
+ * directly from Dart FFI, so this shim formats the message with vsnprintf
+ * and hands the finished string to Dart.
  *
- * Thread safety: the global function pointer is written under the lock
- * that av_log_set_callback provides on its own end. We do not provide
- * additional synchronisation — reads happen only inside the av_log
- * callback which is serialised by FFmpeg's internal mutex.
+ * DELIVERY IS A DART NATIVE PORT, NOT A FUNCTION POINTER.
+ * av_log_set_callback installs a PROCESS-GLOBAL hook. A Dart
+ * `NativeCallable` registered there belongs to ONE isolate; when that
+ * isolate exits the VM deletes the trampoline while FFmpeg still holds the
+ * pointer, and the next av_log from a codec thread aborts the whole
+ * process ("Callback invoked after it has been deleted" / "Cannot invoke
+ * native callback from a leaf call"). Posting to a Dart port is instead
+ * defined, silent and thread-safe even when the port is closed, and it is
+ * legal from any thread including one inside a leaf FFI call.
+ *
+ * Thread safety: the globals are plain writes read from inside the av_log
+ * callback, which FFmpeg serialises with its own mutex. Registering while
+ * codec threads log is a benign race (a message may go to the previous
+ * port) — never a crash, because a stale port id is inert.
  */
 
+/* Legacy function-pointer API. Retained for ABI compatibility with
+ * non-Dart / older embedders; the Dart side no longer uses it. */
 typedef void (*MiniavDartFfmpegLogCb)(int level, const char* message);
 static MiniavDartFfmpegLogCb _dart_ffmpeg_log_cb = NULL;
 
-static void _ffmpeg_dart_log_bridge(void* avcl, int level, const char* fmt, va_list vl) {
-    (void)avcl;
-    MiniavDartFfmpegLogCb cb = _dart_ffmpeg_log_cb;
-    if (!cb) return;
-    if (level > av_log_get_level()) return; /* respect the current level */
-    char buf[2048];
-    vsnprintf(buf, sizeof(buf), fmt, vl);
-    /* NativeCallable.listener dispatches asynchronously on the Dart event
-     * loop.  By the time Dart runs, this stack frame has returned and buf[]
-     * is gone.  Heap-copy so the pointer stays valid; Dart must call
-     * miniav_shim_free_log_message() after reading. */
-    size_t len = strlen(buf);
-    char* heap = (char*)malloc(len + 1);
-    if (!heap) return;
-    memcpy(heap, buf, len + 1);
-    cb(level, heap);
+/* Native-port delivery (preferred). ILLEGAL_PORT (0) disables. */
+static Dart_Port _dart_ffmpeg_log_port = ILLEGAL_PORT;
+static int _dart_api_ready = 0;
+
+/* Initialise the vendored Dart dynamic-linking API. Call once per process
+ * with NativeApi.initializeApiDLData before miniav_shim_set_log_port().
+ * Returns 0 on success (Dart_InitializeApiDL's convention). Idempotent. */
+MIO_API intptr_t miniav_shim_init_dart_api(void* initialize_api_dl_data) {
+    intptr_t rc = Dart_InitializeApiDL(initialize_api_dl_data);
+    if (rc == 0) _dart_api_ready = 1;
+    return rc;
 }
 
-/* Set (or clear) the Dart log callback. Pass NULL to restore FFmpeg's
- * default logger. */
-MIO_API void miniav_shim_set_ffmpeg_log_callback(MiniavDartFfmpegLogCb cb) {
-    _dart_ffmpeg_log_cb = cb;
+/* Post {int32 level, Uint8List utf8Message} to the registered port.
+ * Bytes rather than a C string: FFmpeg log lines may carry non-UTF-8
+ * (Latin-1 filenames on Windows), and Dart_CObject_kString demands valid
+ * UTF-8. The typed-data payload is COPIED into the message by
+ * Dart_PostCObject_DL, so no ownership crosses the boundary and there is
+ * nothing for Dart to free. */
+static void _ffmpeg_post_to_port(Dart_Port port, int level,
+                                 const char* msg, size_t len) {
+    Dart_CObject c_level;
+    c_level.type = Dart_CObject_kInt32;
+    c_level.value.as_int32 = level;
+
+    Dart_CObject c_msg;
+    c_msg.type = Dart_CObject_kTypedData;
+    c_msg.value.as_typed_data.type = Dart_TypedData_kUint8;
+    c_msg.value.as_typed_data.length = (intptr_t)len;
+    c_msg.value.as_typed_data.values = (uint8_t*)msg;
+
+    Dart_CObject* parts[2];
+    parts[0] = &c_level;
+    parts[1] = &c_msg;
+
+    Dart_CObject payload;
+    payload.type = Dart_CObject_kArray;
+    payload.value.as_array.length = 2;
+    payload.value.as_array.values = parts;
+
+    /* Return value ignored on purpose: false just means the port is gone
+     * (the isolate that owned it exited). That is the whole point. */
+    (void)Dart_PostCObject_DL(port, &payload);
+}
+
+static void _ffmpeg_dart_log_bridge(void* avcl, int level, const char* fmt, va_list vl) {
+    (void)avcl;
+    Dart_Port port = _dart_ffmpeg_log_port;
+    MiniavDartFfmpegLogCb cb = _dart_ffmpeg_log_cb;
+    if (port == ILLEGAL_PORT && !cb) return;
+    if (level > av_log_get_level()) return; /* respect the current level */
+    char buf[2048];
+    int n = vsnprintf(buf, sizeof(buf), fmt, vl);
+    size_t len = (n < 0) ? 0 : ((size_t)n >= sizeof(buf) ? sizeof(buf) - 1 : (size_t)n);
+
+    if (port != ILLEGAL_PORT && _dart_api_ready) {
+        _ffmpeg_post_to_port(port, level, buf, len);
+        return;
+    }
+
     if (cb) {
+        /* Legacy path: the callback may dispatch asynchronously, so the
+         * stack buffer would be dangling. Heap-copy; the receiver calls
+         * miniav_shim_free_log_message(). */
+        char* heap = (char*)malloc(len + 1);
+        if (!heap) return;
+        memcpy(heap, buf, len);
+        heap[len] = '\0';
+        cb(level, heap);
+    }
+}
+
+static void _ffmpeg_refresh_av_log_hook(void) {
+    if (_dart_ffmpeg_log_port != ILLEGAL_PORT || _dart_ffmpeg_log_cb) {
         av_log_set_callback(_ffmpeg_dart_log_bridge);
     } else {
         av_log_set_callback(av_log_default_callback);
     }
+}
+
+/* Route formatted av_log output to [port] and set the av_log level in the
+ * same call (so a caller cannot register a port at a verbosity that drops
+ * everything). Pass ILLEGAL_PORT (0) to stop delivery.
+ *
+ * PROCESS-GLOBAL: the LAST registration wins, exactly as the function
+ * pointer behaved. When several isolates register, only the most recent
+ * one receives log lines; the others' ports simply stop being written to. */
+MIO_API void miniav_shim_set_log_port(Dart_Port port, int32_t level) {
+    _dart_ffmpeg_log_port = port;
+    if (port != ILLEGAL_PORT) av_log_set_level((int)level);
+    _ffmpeg_refresh_av_log_hook();
+}
+
+/* Set (or clear) the legacy Dart log callback. Pass NULL to detach.
+ * DEPRECATED — a function pointer here is process-global and outlives the
+ * registering isolate; use miniav_shim_set_log_port(). */
+MIO_API void miniav_shim_set_ffmpeg_log_callback(MiniavDartFfmpegLogCb cb) {
+    _dart_ffmpeg_log_cb = cb;
+    _ffmpeg_refresh_av_log_hook();
 }
 
 /* Free a heap-allocated log message returned via the log callback.

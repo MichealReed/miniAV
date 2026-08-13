@@ -10,6 +10,7 @@ import 'package:miniav_platform_interface/miniav_platform_interface.dart';
 
 import 'miniav_ffi_bindings.dart' as bindings;
 import 'miniav_ffi_types.dart';
+import 'package:miniav_ffi/miniav_ffi_callback_trace.dart';
 
 /// A Dart-side fan-out for module-level device-change events. One instance
 /// per module (camera, audio, loopback, screen-displays, screen-windows,
@@ -53,6 +54,7 @@ class FFIDeviceChangeRegistry {
       );
       if (res != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
         // Roll back.
+        traceCallbackClose('subscriptions.registry');
         _native!.close();
         _native = null;
         _byId.remove(_id);
@@ -69,13 +71,20 @@ class FFIDeviceChangeRegistry {
     _listeners.remove(listener);
     if (_listeners.isEmpty && _native != null) {
       // Unregister native side.
-      setCallback(
+      final res = setCallback(
         ffi.Pointer<
           ffi.NativeFunction<bindings.MiniAVDeviceChangeCallbackFunction>
         >.fromAddress(0),
         ffi.Pointer<ffi.Void>.fromAddress(0),
       );
-      _native!.close();
+      // The unregister tears down a native watcher THREAD. If that did not
+      // succeed the thread is still alive holding this function pointer (the
+      // C side leaks the watcher on that path), so closing the callable would
+      // be a use-after-free that aborts the VM. Leak it to match.
+      if (res == bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+        traceCallbackClose('subscriptions.registry');
+        _native!.close();
+      }
       _native = null;
       _byId.remove(_id);
     }
@@ -153,6 +162,7 @@ class FFIContextLostRegistry<H extends ffi.Pointer> {
         ffi.Pointer<ffi.Void>.fromAddress(_id),
       );
       if (res != bindings.MiniAVResultCode.MINIAV_SUCCESS) {
+        traceCallbackClose('subscriptions.registry');
         _native!.close();
         _native = null;
         _byId.remove(_id);
@@ -175,6 +185,7 @@ class FFIContextLostRegistry<H extends ffi.Pointer> {
         >.fromAddress(0),
         ffi.Pointer<ffi.Void>.fromAddress(0),
       );
+      traceCallbackClose('subscriptions.registry');
       _native!.close();
       _native = null;
       _byId.remove(_id);
@@ -191,6 +202,7 @@ class FFIContextLostRegistry<H extends ffi.Pointer> {
         >.fromAddress(0),
         ffi.Pointer<ffi.Void>.fromAddress(0),
       );
+      traceCallbackClose('subscriptions.registry');
       _native!.close();
       _native = null;
       _byId.remove(_id);

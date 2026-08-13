@@ -1,0 +1,35 @@
+name: miniav_media_session_player
+description: One-line binding between MiniavPlayer and the OS media session. Publishes the player's track, state and playhead to the system shell and routes hardware media keys, lock-screen and headset controls back into the player.
+version: 0.1.0
+repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_tools/miniav_media_session_player
+
+environment:
+  sdk: ^3.11.4
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  miniav_media_session: ^0.1.0
+  # Android's JVM half. Pulled in here so `attach` works on Android without the
+  # app registering anything; a no-op plugin on every other platform.
+  miniav_media_session_flutter: ^0.1.0
+  miniav_player: ^0.2.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^5.0.0
+
+# WHY THIS IS A SEPARATE PACKAGE
+#
+# miniav_player pulls minigpu, minigpu_view, miniav_tools_ffmpeg and
+# miniav_tools_codecs — an entire decode and GPU-present stack, including an
+# FFmpeg native build. An app that only wants to tell the shell what is playing
+# (a soundboard, a mixer, a game) must not have to build FFmpeg to get a
+# now-playing card, so miniav_media_session depends on none of that.
+#
+# The dependency runs one way only: this package knows about both, and neither
+# of them knows about it. Putting the binding inside miniav_player would invert
+# that and hand every player consumer a media session it may not want — and on
+# Android, a foreground-service permission it definitely does not.

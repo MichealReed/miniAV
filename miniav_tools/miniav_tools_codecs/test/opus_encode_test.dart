@@ -11,10 +11,28 @@ import 'dart:typed_data';
 import 'package:miniav_tools/miniav_tools.dart';
 import 'package:miniav_tools_codecs/miniav_tools_codecs.dart'
     show registerOpusBackend, OpusAudioDecoder;
+import 'package:miniav_tools_codecs/src/codecs_native.dart' show opusScratchMode;
 import 'package:test/test.dart';
 
 void main() {
   setUpAll(registerOpusBackend);
+
+  // Build-config guard, not a behaviour test. libopus's
+  // NONTHREADSAFE_PSEUDOSTACK mode gives the WHOLE PROCESS one 120 kB scratch
+  // buffer behind an unsynchronised bump pointer; two threads inside libopus
+  // then overrun it and scribble on the heap. Nothing fails at the scene — the
+  // process later dies wherever it next touches the damaged region (observed:
+  // 0xC0000005 / 0xC0000374 / 0xC0000094 / 0xC0000409). So assert the mode.
+  test('libopus is built with a THREAD-SAFE scratch mode', () {
+    expect(
+      opusScratchMode(),
+      isNot('NONTHREADSAFE_PSEUDOSTACK'),
+      reason: 'libopus must use VAR_ARRAYS or USE_ALLOCA — see '
+          'native/cmake/opus.cmake. The pseudostack is process-global and '
+          'corrupts the heap under concurrent encode/decode.',
+    );
+    expect(opusScratchMode(), isIn(const ['VAR_ARRAYS', 'USE_ALLOCA', 'system']));
+  });
 
   test('Opus encode→decode round-trip is FFmpeg-free and audible', () async {
     const sr = 48000;

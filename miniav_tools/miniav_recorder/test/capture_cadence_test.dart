@@ -11,31 +11,86 @@ import 'package:test/test.dart';
 /// Spawns a small always-on-top window repainting at ~60 Hz so screen capture
 /// always has fresh frames (capture only delivers when the desktop changes).
 /// Returns null when unavailable (headless CI) — callers skip on inactivity.
+///
+/// The repaint must be a PIXEL change every tick, never a FLASH: an earlier
+/// version filled the window with a random full-range colour per tick, which
+/// strobed large luminance jumps at ~66 Hz — squarely in the photosensitive-
+/// seizure band for anyone at the machine while the suite runs. Capture's
+/// dirty detection only needs a 1-level delta, so this paints a small,
+/// corner-anchored dark panel whose colour breathes over ~4 s (±12 levels)
+/// with a ±1 blue alternation per tick to guarantee the delta even at the
+/// sine peaks where the rounded green value repeats.
+///
+/// The window MUST be able to close itself. `animator?.kill()` in a `finally`
+/// only runs when Dart unwinds normally — it does NOT run when the test
+/// process is killed by a timeout or dies on a native crash, and this suite
+/// shares a process with GPU suites that have historically aborted it. Each
+/// such death used to strand a borderless, taskbar-less, TITLE-LESS always-on-
+/// top window in the corner of the developer's desktop with no way to identify
+/// what had spawned it; 13 of them once accumulated in a single session.
+/// So the script now (a) carries a findable title, (b) polls for the parent
+/// test process and exits when it is gone, and (c) has a hard lifetime cap as
+/// a last resort. Sweep any strays with:
+///   Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+///     Where-Object { $_.CommandLine -like '*miniav-test-animator*' } |
+///     ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 Future<Process?> spawnAnimator() async {
   try {
-    return await Process.start('powershell', [
-      '-NoProfile',
-      '-WindowStyle',
-      'Hidden',
-      '-Command',
-      r'''
+    return await Process.start(
+      'powershell',
+      [
+        '-NoProfile',
+        '-WindowStyle',
+        'Hidden',
+        '-Command',
+        r'''
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $f = New-Object Windows.Forms.Form
-$f.Width = 500; $f.Height = 400
+$f.Text = 'miniav-test-animator'
+$f.Width = 280; $f.Height = 140
 $f.TopMost = $true
-$f.StartPosition = 'CenterScreen'
-$rnd = New-Object Random
+$f.FormBorderStyle = 'None'
+$f.ShowInTaskbar = $false
+$f.StartPosition = 'Manual'
+$wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+$f.Location = New-Object System.Drawing.Point(
+  ($wa.Right - $f.Width - 24), ($wa.Bottom - $f.Height - 24))
+$script:i = 0
 $t = New-Object Windows.Forms.Timer
 $t.Interval = 15
 $t.add_Tick({
-  $f.BackColor = [System.Drawing.Color]::FromArgb(
-    $rnd.Next(256), $rnd.Next(256), $rnd.Next(256))
+  $script:i++
+  $g = 40 + [int](12 * [math]::Sin($script:i / 40.0))
+  $f.BackColor = [System.Drawing.Color]::FromArgb($g, $g, (46 + ($script:i % 2)))
 })
 $t.Start()
+# Self-termination watchdog: outlive neither the test process nor the cap.
+$script:parent = 0
+if ($env:MINIAV_ANIMATOR_PARENT_PID) {
+  $script:parent = [int]$env:MINIAV_ANIMATOR_PARENT_PID
+}
+$script:deadline = (Get-Date).AddSeconds(180)
+$w = New-Object Windows.Forms.Timer
+$w.Interval = 1000
+$w.add_Tick({
+  $orphaned = $false
+  if ($script:parent -gt 0) {
+    try { $null = Get-Process -Id $script:parent -ErrorAction Stop }
+    catch { $orphaned = $true }
+  }
+  if ($orphaned -or (Get-Date) -gt $script:deadline) {
+    $w.Stop(); $t.Stop(); $f.Close()
+  }
+})
+$w.Start()
 [Windows.Forms.Application]::Run($f)
 ''',
-    ]);
+      ],
+      // Read by the watchdog above. Passed via the environment rather than
+      // interpolated into the script so no quoting/escaping can break it.
+      environment: {'MINIAV_ANIMATOR_PARENT_PID': '$pid'},
+    );
   } catch (_) {
     return null;
   }
@@ -223,7 +278,7 @@ void main() {
     // ignore: avoid_print
     print(
       'cfr grid: n=${deltas.length} exact=${(exactShare * 100).toStringAsFixed(1)}% '
-      'max=${maxDelta}µs',
+      'max=$maxDeltaµs',
     );
     expect(exactShare, greaterThan(0.85),
         reason: 'CFR output must sit on the exact fps grid');

@@ -349,6 +349,83 @@ void main() {
             'would go unfilled');
   });
 
+  test('invalidateImports drops the cached sources and re-imports correctly',
+      () async {
+    // The import cache keys on the producer's TEXTURE POINTER. A pointer is not
+    // an identity — free a texture and the next allocation can land on the same
+    // address, which a resize or a rebuilt output ring makes routine — so a
+    // stale hit would encode the previous picture forever while reporting
+    // success at every step. The cache now holds a reference to each source,
+    // which makes that impossible, and this is the entry point that lets the
+    // producer say "those surfaces are gone" instead of pinning VRAM forever.
+    final enc = await MfVideoEncoder.open(const EncoderConfig(
+      codec: VideoCodec.h264,
+      width: _w,
+      height: _h,
+      bitrateBps: 2000000,
+      frameRateNumerator: 30,
+      frameRateDenominator: 1,
+      gopLength: 30,
+    ));
+    expect(enc, isNotNull);
+    addTearDown(() => enc!.close());
+    if (!enc!.supportsD3d11Input) {
+      markTestSkipped('no D3D11 device bound');
+      return;
+    }
+
+    final a = mfencTestSharedFmt(_w, _h, 1, 1, 1); // gradient, NT-shared RGBA
+    final b = mfencTestSharedFmt(_w, _h, 0, 1, 1); // flat grey, same shape
+    expect(a, isNot(nullptr));
+    expect(b, isNot(nullptr));
+    addTearDown(() => mfencTestTextureRelease(a));
+    addTearDown(() => mfencTestTextureRelease(b));
+
+    // Import + blt each source and read the NV12 staging luma back. This is the
+    // only measurement that can tell "the cache returned the right texture"
+    // from "packets came out either way".
+    final sumA = mfencTestBltLumaSum(enc.nativeHandleForTest, a);
+    final sumB = mfencTestBltLumaSum(enc.nativeHandleForTest, b);
+    expect(sumA, greaterThan(0), reason: 'blt of A failed: ${enc.lastImportError}');
+    expect(sumB, greaterThan(0), reason: 'blt of B failed: ${enc.lastImportError}');
+    expect((sumA - sumB).abs(), greaterThan(_w * _h),
+        reason: 'the two sources must be distinguishable through the blt, or '
+            'this test cannot detect a stale cache hit at all');
+
+    // Both are cached now, and each pins its source; invalidation releases
+    // exactly those and leaves nothing behind.
+    expect(enc.invalidateImports(), 2,
+        reason: 'two producer textures were imported and pinned');
+    expect(enc.invalidateImports(), 0,
+        reason: 'a second invalidation has nothing left to release');
+
+    // Re-import after the invalidation: each source must still yield ITS OWN
+    // picture. A cache that handed back the previously imported texture would
+    // return the other sum here.
+    expect(mfencTestBltLumaSum(enc.nativeHandleForTest, b), sumB,
+        reason: 're-imported B but got a different picture');
+    expect(mfencTestBltLumaSum(enc.nativeHandleForTest, a), sumA,
+        reason: 're-imported A but got a different picture');
+
+    // And the encoder still encodes the new content end to end.
+    enc.invalidateImports();
+    final packets = <EncodedPacket>[];
+    for (var i = 0; i < 10; i++) {
+      final p = await enc.encode(D3D11TextureFrameSource(
+        texturePtr: b.address,
+        width: _w,
+        height: _h,
+        pixelFormat: MiniAVPixelFormat.rgba32,
+        timestampUs: i * 33333,
+      ));
+      if (p != null) packets.add(p);
+    }
+    packets.addAll(await enc.flush());
+    expect(packets, isNotEmpty,
+        reason: 'encoding stopped working after an invalidation. NATIVE '
+            'REASON: ${enc.lastImportError}');
+  });
+
   test('the same session accepts NV12 after a texture frame', () async {
     // The VideoProcessor and its NV12 staging texture are built lazily and
     // reused; feeding a CPU frame afterwards must still work (the MFT input

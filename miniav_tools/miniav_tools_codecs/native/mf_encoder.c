@@ -55,6 +55,18 @@
  * OpenSharedResource into a pointer compare. */
 #define MFENC_IMPORT_CACHE 4
 
+/* TEST-ONLY fault injection — see miniav_shim_mfenc_set_fault.
+ *
+ * PER SESSION, deliberately: there is no global, no static and no environment
+ * variable here. `dart test` runs every test FILE in its own isolate inside ONE
+ * process, and these sessions all share that process (and its single MTA
+ * worker), so a process-wide test flag is visible to every suite running
+ * concurrently and would make unrelated encoders fail non-deterministically.
+ * A field on the session the test itself created cannot leak that way. */
+#define MFENC_FAULT_NONE 0        /* normal MFT behaviour */
+#define MFENC_FAULT_NEVER_DRAIN 1 /* drain_state never reports complete */
+#define MFENC_FAULT_NO_OUTPUT 2   /* input accepted, receive() yields nothing */
+
 typedef struct {
   uint8_t *data; /* malloc'd elementary bitstream; caller frees */
   int size;
@@ -81,7 +93,26 @@ typedef struct {
   int is_hardware;
   int need_input;  /* unconsumed METransformNeedInput count */
   int have_output; /* unconsumed METransformHaveOutput count */
+  /* Drain state machine. THREE states, and conflating any two of them wedges
+   * the encoder:
+   *   draining      — MFT_MESSAGE_COMMAND_DRAIN issued, tail still coming out.
+   *   drain_done    — METransformDrainComplete seen for THAT drain.
+   *   stream_ended  — the MFT has been drained and, per the MFT contract, will
+   *                   not accept input again until it is told the stream
+   *                   restarted. Without that message an async MFT never raises
+   *                   another METransformNeedInput, so every submit path spins
+   *                   to its timeout forever — flush() then encode() used to
+   *                   wedge the shared MTA worker for every session. */
+  int draining;
   int drain_done;
+  int stream_ended;
+  /* Bounded output-type renegotiations after MF_E_TRANSFORM_STREAM_CHANGE. An
+   * MFT that keeps signalling a change must not turn receive() into a loop. */
+  int stream_change_retries;
+  /* MFENC_FAULT_* — a misbehaving MFT, simulated for THIS session only. Zero
+   * for every session that does not deliberately set it, so the production
+   * paths below are unchanged. See miniav_shim_mfenc_set_fault. */
+  int fault;
   char mft_name[128]; /* MFT_FRIENDLY_NAME_Attribute, for diagnostics/tests */
 
   /* D3D11 zero-copy input. Present only on the hardware path: the MFT is bound
@@ -143,15 +174,30 @@ typedef struct {
    * self-contained. */
   ID3D11Texture2D *last_sub;
 
-  /* Why the most recent import failed. Diagnostics, but load-bearing ones:
+  /* Why the most recent submission failed. Diagnostics, but load-bearing ones:
    * "could not import" is the same message for a QueryInterface miss, a
    * refused CreateSharedHandle and a cross-adapter OpenSharedResource, and
    * those have completely different fixes. Guessing between them from the
-   * outside is what turned this into several wrong fixes in a row. */
+   * outside is what turned this into several wrong fixes in a row. Every
+   * failure return in this file writes one. */
   char imp_err[224];
   struct {
-    void *key;     /* caller's ID3D11Texture2D* — identity only, not a ref */
-    HANDLE handle; /* its shared handle, so pointer reuse after a free misses */
+    /* The producer's texture, REFERENCED — not a bare pointer.
+     *
+     * A pointer is not an identity: free a texture and the next allocation can
+     * land on the same address, which on a resize or a ring rebuild is routine.
+     * A pointer-keyed hit would then hand the encoder the OLD imported texture
+     * and every frame would encode a stale picture forever, with success
+     * reported at every step. Holding a reference makes the address
+     * unreusable for as long as the entry lives.
+     *
+     * The tradeoff is VRAM: up to MFENC_IMPORT_CACHE producer surfaces stay
+     * resident (4 x W x H x 4 B — ~135 MB at 4K, ~5 MB at 720p) until they are
+     * evicted by a newer import, the session is destroyed, or the caller calls
+     * miniav_shim_mfenc_invalidate_imports. That is why the invalidation entry
+     * point exists: on a resolution change the producer's old surfaces are
+     * dead weight AND a stale-hit hazard. */
+    ID3D11Texture2D *key;
     ID3D11Texture2D *tex;
     ID3D11VideoProcessorInputView *iv;
     IDXGIKeyedMutex *km; /* NULL for MISC_SHARED sources, which have none */
@@ -177,6 +223,9 @@ static void mfenc_pump(MfVidEnc *s) {
       s->have_output++;
     } else if (met == METransformDrainComplete) {
       s->drain_done = 1;
+      /* The MFT is now at end-of-stream and will refuse input until it is told
+       * the stream restarted. Recorded here so the next submit can do it. */
+      s->stream_ended = 1;
     }
     IMFMediaEvent_Release(ev);
   }
@@ -199,7 +248,11 @@ static int mfenc_wait_event(MfVidEnc *s) {
    * already has. Waiting for NeedInput while output is pending therefore stalls
    * until the timeout — report "not accepting" so the caller drains first. */
   mfenc_pump(s);
-  if (s->need_input || s->drain_done) return 0;
+  /* drain_done is a wake condition ONLY while a drain is outstanding. Treating
+   * it as one unconditionally made this return 0 instantly forever after the
+   * first flush, and both submit paths spin `while (need_input == 0)` on that
+   * answer — a livelock that never reached the timeout escape below. */
+  if (s->need_input || (s->draining && s->drain_done)) return 0;
   if (s->have_output) return 1;
 
   /* Budget the spin in TIME, not iterations: SwitchToThread returns in ~ns when
@@ -211,7 +264,7 @@ static int mfenc_wait_event(MfVidEnc *s) {
   const double budget_s = 0.008; /* 8 ms — well inside a 30 fps frame */
   for (;;) {
     mfenc_pump(s);
-    if (s->need_input || s->drain_done) return 0;
+    if (s->need_input || (s->draining && s->drain_done)) return 0;
     if (s->have_output) return 1;
     QueryPerformanceCounter(&now);
     if ((double)(now.QuadPart - t0.QuadPart) / (double)freq.QuadPart > budget_s)
@@ -219,6 +272,84 @@ static int mfenc_wait_event(MfVidEnc *s) {
     SwitchToThread();
   }
   return -1;
+}
+
+/* Bounded wait for DRAIN progress, specifically.
+ *
+ * mfenc_wait_event treats METransformNeedInput as a wake condition. That is
+ * right on the submit path and wrong here: nothing consumes input credit during
+ * a drain, and leftover credit is the NORMAL state at flush time — an async MFT
+ * raises one METransformNeedInput per free input slot and the caller stops
+ * submitting when it runs out of frames, not when the MFT is full. So
+ * wait_event returned 0 with zero elapsed time on every drain poll, and the
+ * "bounded ~8 ms" wait the flush loop is built on never happened: the Dart poll
+ * loop became a hot spin issuing two marshalled round-trips per iteration,
+ * holding the single shared MTA worker's gate against every other session.
+ * Wake only on what a drain can actually make progress on.
+ * Returns 0 if drain_done or output landed, -1 on timeout/closed generator. */
+static int mfenc_wait_drain(MfVidEnc *s) {
+  if (!s->event_gen) return -1;
+  mfenc_pump(s);
+  if (s->drain_done || s->have_output) return 0;
+
+  LARGE_INTEGER freq, t0, now;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&t0);
+  const double budget_s = 0.008; /* same budget as the submit-side wait */
+  for (;;) {
+    mfenc_pump(s);
+    if (s->drain_done || s->have_output) return 0;
+    QueryPerformanceCounter(&now);
+    if ((double)(now.QuadPart - t0.QuadPart) / (double)freq.QuadPart > budget_s)
+      break;
+    SwitchToThread();
+  }
+  return -1;
+}
+
+/* Yield-spin ~1 ms. Used ONLY by the injected drain fault: the real poll costs
+ * a bounded ~8 ms inside mfenc_wait_drain, and returning instantly instead
+ * would turn the caller's timeout loop into thousands of marshalled round-trips
+ * a second, all of them holding the one shared MTA worker's gate against every
+ * other session in the process. Yield rather than Sleep(1) for the same reason
+ * mfenc_wait_event does: a Sleep costs a ~15.6 ms timer quantum. */
+static void mfenc_fault_pause(void) {
+  LARGE_INTEGER freq, t0, now;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&t0);
+  const double budget_s = 0.001;
+  for (;;) {
+    QueryPerformanceCounter(&now);
+    if ((double)(now.QuadPart - t0.QuadPart) / (double)freq.QuadPart > budget_s)
+      return;
+    SwitchToThread();
+  }
+}
+
+/* Put the MFT back into "accepting input" before a new frame is submitted.
+ *
+ * MFT_MESSAGE_COMMAND_DRAIN ends the stream: the MFT must not be given more
+ * input until MFT_MESSAGE_NOTIFY_START_OF_STREAM arrives. That message used to
+ * be sent exactly once, at create — so flush() followed by encode() left an
+ * async MFT that would never raise METransformNeedInput again. A drain that
+ * timed out is treated the same way: restarting is the only recovery, and it
+ * is cheaper than a wedged session.
+ *
+ * Called from every path that hands the MFT a new sample. */
+static void mfenc_restart_stream(MfVidEnc *s) {
+  if (!s->stream_ended && !s->draining) return;
+  s->stream_ended = 0;
+  s->draining = 0;
+  s->drain_done = 0;
+  /* Take everything already queued first, then FORGET the input credit: an MFT
+   * re-issues METransformNeedInput from scratch in response to
+   * MFT_MESSAGE_NOTIFY_START_OF_STREAM, so a credit counted before the drain is
+   * not spendable now and calling ProcessInput on it is an error. Output
+   * credit is left alone — it may still be the tail of the last segment. */
+  mfenc_pump(s);
+  s->need_input = 0;
+  IMFTransform_ProcessMessage(s->mft, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+  mfenc_pump(s);
 }
 
 static int mfenc_started;
@@ -616,7 +747,26 @@ static void *mfenc_create_impl(int codec, int width, int height,
     IMFMediaType_SetUINT64(it, &MF_MT_FRAME_SIZE, PACK64(width, height));
     IMFMediaType_SetUINT64(it, &MF_MT_FRAME_RATE, PACK64(fps_num, fps_den));
     IMFMediaType_SetUINT64(it, &MF_MT_PIXEL_ASPECT_RATIO, PACK64(1, 1));
-    HRESULT hr = IMFTransform_SetInputType(s->mft, 0, it, 0);
+    /* ODD WIDTH: 4:2:0 chroma comes in PAIRS, so one NV12 row is an even number
+     * of bytes and a system-memory frame at width 641 is laid out on a 642-byte
+     * stride (see mfenc_send_nv12_impl, and the staging ring, which pads the
+     * same way). Without this the MFT would assume stride == width and read
+     * every row shifted. Set only when it differs, and fall back if the MFT
+     * refuses the attribute — an encoder that will not take a stride hint is
+     * still better off with the frame size alone than with no session at all,
+     * and the texture path does not depend on it. */
+    HRESULT hr;
+    if (((width + 1) & ~1) != width) {
+      IMFMediaType_SetUINT32(it, &MF_MT_DEFAULT_STRIDE,
+                             (UINT32)((width + 1) & ~1));
+      hr = IMFTransform_SetInputType(s->mft, 0, it, 0);
+      if (FAILED(hr)) {
+        IMFMediaType_DeleteItem(it, &MF_MT_DEFAULT_STRIDE);
+        hr = IMFTransform_SetInputType(s->mft, 0, it, 0);
+      }
+    } else {
+      hr = IMFTransform_SetInputType(s->mft, 0, it, 0);
+    }
     IMFMediaType_Release(it);
     if (FAILED(hr)) goto fail;
   }
@@ -723,19 +873,50 @@ static int mfenc_get_extradata_impl(void *session, uint8_t *out, int cap) {
   return s->extradata_len;
 }
 
-/* Feed one system-memory NV12 frame (size must be width*height*3/2). */
+/* Bytes one system-memory NV12 frame occupies for this session.
+ *
+ * NOT width*height*3/2. 4:2:0 chroma is subsampled 2x2, so:
+ *   - a row is an even number of bytes (chroma arrives in U,V PAIRS), hence the
+ *     padded stride — the same (w+1)&~1 convention the staging ring uses;
+ *   - there are CEIL(h/2) chroma rows, not floor. At 2576x1119 the floored
+ *     count is 559 instead of 560 and the frame is 2576 B short, which is
+ *     exactly how every CPU frame at an odd height came back as an error.
+ * Both sides must compute this the same way; the Dart side mirrors it. */
+static int mfenc_nv12_size(int width, int height) {
+  int stride = (width + 1) & ~1;
+  return stride * height + stride * ((height + 1) / 2);
+}
+
+/* Feed one system-memory NV12 frame (size must be at least
+ * mfenc_nv12_size(width, height)). */
 static int mfenc_send_nv12_impl(void *session, const uint8_t *nv12,
                                 int nv12_size, int64_t pts_us,
                                 int force_keyframe) {
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s || !nv12) return -1;
-  int need = s->width * s->height * 3 / 2;
-  if (nv12_size < need) return -1;
+  s->imp_err[0] = 0;
+  int need = mfenc_nv12_size(s->width, s->height);
+  if (nv12_size < need) {
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "NV12 frame is %d B, need %d for %dx%d (stride %d, %d chroma rows)",
+             nv12_size, need, s->width, s->height, (s->width + 1) & ~1,
+             (s->height + 1) / 2);
+    return -1;
+  }
+  mfenc_restart_stream(s);
 
   IMFMediaBuffer *buf = NULL;
-  if (FAILED(MFCreateMemoryBuffer((DWORD)need, &buf))) return -1;
+  HRESULT hb = MFCreateMemoryBuffer((DWORD)need, &buf);
+  if (FAILED(hb)) {
+    snprintf(s->imp_err, sizeof(s->imp_err), "MFCreateMemoryBuffer=0x%08lX",
+             (unsigned long)hb);
+    return -1;
+  }
   BYTE *dst = NULL;
-  if (FAILED(IMFMediaBuffer_Lock(buf, &dst, NULL, NULL))) {
+  HRESULT hl = IMFMediaBuffer_Lock(buf, &dst, NULL, NULL);
+  if (FAILED(hl)) {
+    snprintf(s->imp_err, sizeof(s->imp_err), "IMFMediaBuffer::Lock=0x%08lX",
+             (unsigned long)hl);
     IMFMediaBuffer_Release(buf);
     return -1;
   }
@@ -744,7 +925,10 @@ static int mfenc_send_nv12_impl(void *session, const uint8_t *nv12,
   IMFMediaBuffer_SetCurrentLength(buf, (DWORD)need);
 
   IMFSample *smp = NULL;
-  if (FAILED(MFCreateSample(&smp))) {
+  HRESULT hs = MFCreateSample(&smp);
+  if (FAILED(hs)) {
+    snprintf(s->imp_err, sizeof(s->imp_err), "MFCreateSample=0x%08lX",
+             (unsigned long)hs);
     IMFMediaBuffer_Release(buf);
     return -1;
   }
@@ -763,6 +947,8 @@ static int mfenc_send_nv12_impl(void *session, const uint8_t *nv12,
       if (mfenc_wait_event(s) != 0) break; /* output pending, or timed out */
     }
     if (s->need_input == 0) {
+      snprintf(s->imp_err, sizeof(s->imp_err),
+               "no METransformNeedInput within the wait budget (back-pressure)");
       IMFSample_Release(smp);
       return 1; /* caller drains via receive(), then retries this frame */
     }
@@ -771,8 +957,25 @@ static int mfenc_send_nv12_impl(void *session, const uint8_t *nv12,
 
   HRESULT hr = IMFTransform_ProcessInput(s->mft, 0, smp, 0);
   IMFSample_Release(smp);
-  if (FAILED(hr) && hr != MF_E_NOTACCEPTING) return -1;
-  return (hr == MF_E_NOTACCEPTING) ? 1 : 0;
+  if (FAILED(hr) && hr != MF_E_NOTACCEPTING) {
+    snprintf(s->imp_err, sizeof(s->imp_err), "ProcessInput(NV12)=0x%08lX",
+             (unsigned long)hr);
+    return -1;
+  }
+  if (hr == MF_E_NOTACCEPTING) {
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "ProcessInput(NV12)=MF_E_NOTACCEPTING (back-pressure)");
+    return 1;
+  }
+  /* The last thing the MFT saw is now a SYSTEM-MEMORY frame, and this session
+   * does not retain those. Drop the retained GPU surface so repeatLastFrame
+   * declines rather than resurrecting a picture from before the fallback — the
+   * Dart contract already says null means "re-encode it yourself". */
+  if (s->last_sub) {
+    ID3D11Texture2D_Release(s->last_sub);
+    s->last_sub = NULL;
+  }
+  return 0;
 }
 
 /* Feed one frame as a D3D11 texture opened from a shared NT handle — the
@@ -787,15 +990,15 @@ static int mfenc_send_nv12_impl(void *session, const uint8_t *nv12,
  * 0 = accepted, 1 = drain and retry, -1 = error. */
 static int mfenc_submit_texture(MfVidEnc *s, ID3D11Texture2D *tex,
                                 int64_t pts_us, int force_keyframe) {
-  if (tex != s->last_sub) {
-    if (s->last_sub) ID3D11Texture2D_Release(s->last_sub);
-    s->last_sub = tex;
-    ID3D11Texture2D_AddRef(s->last_sub);
-  }
+  mfenc_restart_stream(s);
   IMFMediaBuffer *buf = NULL;
   HRESULT hr = MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)tex,
                                          0, FALSE, &buf);
-  if (FAILED(hr) || !buf) return -1;
+  if (FAILED(hr) || !buf) {
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "MFCreateDXGISurfaceBuffer=0x%08lX", (unsigned long)hr);
+    return -1;
+  }
 
   /* A DXGI surface buffer starts with CURRENT LENGTH 0. An MFT reading it then
    * sees an empty buffer and encodes a blank frame — no error anywhere, real
@@ -813,7 +1016,10 @@ static int mfenc_submit_texture(MfVidEnc *s, ID3D11Texture2D *tex,
   }
 
   IMFSample *smp = NULL;
-  if (FAILED(MFCreateSample(&smp))) {
+  HRESULT hs = MFCreateSample(&smp);
+  if (FAILED(hs)) {
+    snprintf(s->imp_err, sizeof(s->imp_err), "MFCreateSample=0x%08lX",
+             (unsigned long)hs);
     IMFMediaBuffer_Release(buf);
     return -1;
   }
@@ -828,6 +1034,8 @@ static int mfenc_submit_texture(MfVidEnc *s, ID3D11Texture2D *tex,
       if (mfenc_wait_event(s) != 0) break;
     }
     if (s->need_input == 0) {
+      snprintf(s->imp_err, sizeof(s->imp_err),
+               "no METransformNeedInput within the wait budget (back-pressure)");
       IMFSample_Release(smp);
       return 1;
     }
@@ -835,8 +1043,25 @@ static int mfenc_submit_texture(MfVidEnc *s, ID3D11Texture2D *tex,
   }
   hr = IMFTransform_ProcessInput(s->mft, 0, smp, 0);
   IMFSample_Release(smp);
-  if (FAILED(hr) && hr != MF_E_NOTACCEPTING) return -1;
-  return (hr == MF_E_NOTACCEPTING) ? 1 : 0;
+  if (FAILED(hr) && hr != MF_E_NOTACCEPTING) {
+    snprintf(s->imp_err, sizeof(s->imp_err), "ProcessInput(texture)=0x%08lX",
+             (unsigned long)hr);
+    return -1;
+  }
+  if (hr == MF_E_NOTACCEPTING) {
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "ProcessInput(texture)=MF_E_NOTACCEPTING (back-pressure)");
+    return 1;
+  }
+  /* Retain the surface ONLY once the MFT has actually taken it. Recording it
+   * up front meant a refused sample still became the repeat source, so an
+   * idle-CFR duplicate reproduced a picture the encoder never encoded. */
+  if (tex != s->last_sub) {
+    if (s->last_sub) ID3D11Texture2D_Release(s->last_sub);
+    s->last_sub = tex;
+    ID3D11Texture2D_AddRef(s->last_sub);
+  }
+  return 0;
 }
 
 /* Lazily build the VideoProcessor, its staging ring and everything else the
@@ -844,10 +1069,11 @@ static int mfenc_submit_texture(MfVidEnc *s, ID3D11Texture2D *tex,
  *
  * Every step is guarded on its own output, so a partial build can be resumed by
  * the next call instead of leaking the pieces that did succeed. Readiness is
- * "the processor AND at least one staging slot" — `s->vp` alone would memoise a
- * half-built session as ready and quietly drop every frame thereafter. */
+ * "the processor AND at least two staging slots" — `s->vp` alone would memoise
+ * a half-built session as ready and quietly drop every frame thereafter, and
+ * one slot is not enough for the reason spelled out at the ring loop below. */
 static int mfenc_ensure_vp(MfVidEnc *s) {
-  if (s->vp && s->nv12_tex[0]) return 0;
+  if (s->vp && s->nv12_tex[0] && s->nv12_tex[1]) return 0;
   if (!s->device) return -1;
 
   if (!s->ctx) ID3D11Device_GetImmediateContext(s->device, &s->ctx);
@@ -913,7 +1139,12 @@ static int mfenc_ensure_vp(MfVidEnc *s) {
 
   /* A short ring still works — it just leaves less slack for frames in flight —
    * so a failure part-way through stops allocating rather than failing the
-   * session. Zero slots is the only fatal case. */
+   * session. Fewer than TWO slots is fatal, though: the most recently submitted
+   * surface is retained for repeatLastFrame, so with a single slot that slot
+   * permanently carries the extra reference, [mfenc_pick_nv12] never sees it
+   * idle, and every frame goes down the 3-strike force-take path — dropping
+   * roughly every other frame with no diagnostic anywhere. Failing here is
+   * honest: the texture path is unavailable and the caller falls back. */
   int built = 0;
   for (int i = 0; i < MFENC_NV12_RING; i++) {
     if (s->nv12_tex[i]) {
@@ -949,7 +1180,14 @@ static int mfenc_ensure_vp(MfVidEnc *s) {
     s->nv12_base_rc[i] = ID3D11Texture2D_Release(s->nv12_tex[i]);
     built++;
   }
-  if (built == 0) return -1;
+  if (built < 2) {
+    if (s->imp_err[0] == 0)
+      snprintf(s->imp_err, sizeof(s->imp_err),
+               "only %d NV12 staging slot(s) could be allocated; the texture "
+               "path needs at least 2",
+               built);
+    return -1;
+  }
 
   /* One reusable fence. Only one blt is ever outstanding — the send path waits
    * for it before returning — so a single query covers the whole ring. */
@@ -1007,20 +1245,31 @@ static void mfenc_read_env(void) {
   }
 }
 
+/* Release one import-cache entry, including the reference that pins the
+ * producer's texture at its address. */
+static void mfenc_drop_import(MfVidEnc *s, int i) {
+  if (s->imp[i].km) IDXGIKeyedMutex_Release(s->imp[i].km);
+  if (s->imp[i].iv) ID3D11VideoProcessorInputView_Release(s->imp[i].iv);
+  if (s->imp[i].tex) ID3D11Texture2D_Release(s->imp[i].tex);
+  if (s->imp[i].key) ID3D11Texture2D_Release(s->imp[i].key);
+  memset(&s->imp[i], 0, sizeof(s->imp[i]));
+}
+
 /* Open the caller's texture on our device and build its VP input view, or
  * return a cached one. Result is an index into `s->imp`, or -1.
  *
- * The cache is keyed on BOTH the pointer and the shared handle. The pointer
- * alone is not an identity: a freed texture's address can be handed back for a
- * different texture, and a stale hit would silently encode the wrong picture.
- * GetSharedHandle is a cheap accessor on an already-shared resource; the
- * expensive half is OpenSharedResource, and that is what the cache removes. */
+ * The cache is keyed on the producer's texture pointer, and the entry holds a
+ * REFERENCE to it — see the field comment. A pointer alone is not an identity:
+ * a freed texture's address can be handed back for a different texture, and a
+ * stale hit silently encodes the previous picture forever. The reference makes
+ * that impossible rather than unlikely; the expensive half of an import,
+ * OpenSharedResource, is what the cache removes. */
 static int mfenc_import_slot(MfVidEnc *s, ID3D11Texture2D *foreign) {
   mfenc_read_env();
   s->imp_err[0] = 0;
   if (!mfenc_no_cache)
     for (int i = 0; i < MFENC_IMPORT_CACHE; i++)
-      if (s->imp[i].iv && s->imp[i].key == (void *)foreign) return i;
+      if (s->imp[i].iv && s->imp[i].key == foreign) return i;
 
   /* Resolve the caller's texture onto OUR device. Three shapes, in order of
    * cost -- and the order matters for correctness as much as speed, because
@@ -1147,15 +1396,39 @@ static int mfenc_import_slot(MfVidEnc *s, ID3D11Texture2D *foreign) {
 
   int i = s->imp_next;
   s->imp_next = (s->imp_next + 1) % MFENC_IMPORT_CACHE;
-  if (s->imp[i].km) IDXGIKeyedMutex_Release(s->imp[i].km);
-  if (s->imp[i].iv) ID3D11VideoProcessorInputView_Release(s->imp[i].iv);
-  if (s->imp[i].tex) ID3D11Texture2D_Release(s->imp[i].tex);
-  s->imp[i].key = (void *)foreign;
-  s->imp[i].handle = NULL;
+  mfenc_drop_import(s, i); /* LRU eviction, releasing the pinned source */
+  s->imp[i].key = foreign;
+  ID3D11Texture2D_AddRef(foreign); /* pin the address for as long as we key on it */
   s->imp[i].tex = src;
   s->imp[i].iv = iv;
   s->imp[i].km = km;
   return i;
+}
+
+/* Forget every imported source texture.
+ *
+ * The cache pins the producer's textures so their addresses cannot be reused,
+ * which is what makes a pointer key safe — but it also holds VRAM the producer
+ * has finished with. On a resolution change or a texture-ring rebuild the
+ * caller knows the old surfaces are dead, and this is how it says so. Returns
+ * the number of entries released. */
+static int mfenc_invalidate_imports_impl(void *session) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  if (!s) return -1;
+  int n = 0;
+  for (int i = 0; i < MFENC_IMPORT_CACHE; i++) {
+    if (s->imp[i].key || s->imp[i].tex) n++;
+    mfenc_drop_import(s, i);
+  }
+  s->imp_next = 0;
+  /* The retained repeat source is from before the change too, so a duplicate
+   * would reproduce a stale picture. Drop it; repeatLastFrame then returns null
+   * and the caller re-encodes, which is the documented contract. */
+  if (s->last_sub) {
+    ID3D11Texture2D_Release(s->last_sub);
+    s->last_sub = NULL;
+  }
+  return n;
 }
 
 /* Choose a staging slot the encoder is no longer reading from.
@@ -1183,9 +1456,15 @@ static int mfenc_pick_nv12(MfVidEnc *s) {
   }
   if (++s->nv12_busy_streak < 3) return -1;
   s->nv12_busy_streak = 0;
-  for (int n = 0; n < MFENC_NV12_RING; n++) {
-    int i = (s->nv12_next + n) % MFENC_NV12_RING;
-    if (s->nv12_tex[i]) {
+  /* Force-take, but never the slot holding the repeat source: overwriting it
+   * mid-hold makes repeatLastFrame emit a picture that is neither the last
+   * frame nor the current one. Two passes so the repeat source is only taken
+   * when it is genuinely the last option. */
+  for (int pass = 0; pass < 2; pass++) {
+    for (int n = 0; n < MFENC_NV12_RING; n++) {
+      int i = (s->nv12_next + n) % MFENC_NV12_RING;
+      if (!s->nv12_tex[i]) continue;
+      if (pass == 0 && s->nv12_tex[i] == s->last_sub) continue;
       s->nv12_next = (i + 1) % MFENC_NV12_RING;
       return i;
     }
@@ -1210,7 +1489,13 @@ static int mfenc_blt_texture_to_nv12(MfVidEnc *s, ID3D11Texture2D *foreign) {
   int im = mfenc_import_slot(s, foreign);
   if (im < 0) return -1;
   int slot = mfenc_pick_nv12(s);
-  if (slot < 0) return -2; /* every staging surface still in flight */
+  if (slot < 0) {
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "all %d NV12 staging surfaces are still held by the MFT "
+             "(back-pressure, drain and retry)",
+             MFENC_NV12_RING);
+    return -2; /* every staging surface still in flight */
+  }
 
   IDXGIKeyedMutex *km = s->imp[im].km;
   if (km) {
@@ -1265,7 +1550,11 @@ static int mfenc_blt_texture_to_nv12(MfVidEnc *s, ID3D11Texture2D *foreign) {
   }
 
   if (km) IDXGIKeyedMutex_ReleaseSync(km, 0);
-  if (FAILED(hr)) return -1;
+  if (FAILED(hr)) {
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "imported OK, but VideoProcessorBlt=0x%08lX", (unsigned long)hr);
+    return -1;
+  }
   s->nv12_last = slot;
   return slot;
 }
@@ -1280,11 +1569,15 @@ static int mfenc_send_d3d11_texture_impl(void *session, void *texture_ptr,
   if (mfenc_ensure_vp(s) != 0) {
     /* Distinguish "the VideoProcessor could not be built" from "the texture
      * could not be imported" -- otherwise an empty reason is ambiguous and the
-     * reader assumes the import, which is the wrong half to investigate. */
+     * reader assumes the import, which is the wrong half to investigate.
+     * Whatever ensure_vp itself recorded is the more specific half, so it goes
+     * first rather than being overwritten. */
+    char why[128];
+    snprintf(why, sizeof(why), "%s", s->imp_err);
     snprintf(s->imp_err, sizeof(s->imp_err),
-             "mfenc_ensure_vp failed (device=%p vdev=%p vctx=%p vp=%p nv12[0]=%p)",
-             (void *)s->device, (void *)s->vdev, (void *)s->vctx, (void *)s->vp,
-             (void *)s->nv12_tex[0]);
+             "mfenc_ensure_vp failed: %s (device=%p vdev=%p vp=%p nv12[0]=%p)",
+             why[0] ? why : "no reason recorded", (void *)s->device,
+             (void *)s->vdev, (void *)s->vp, (void *)s->nv12_tex[0]);
     return -1;
   }
   int slot = mfenc_blt_texture_to_nv12(s, (ID3D11Texture2D *)texture_ptr);
@@ -1309,17 +1602,28 @@ static int mfenc_send_d3d11_impl(void *session, void *shared_handle,
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s || !shared_handle || !s->device) return -1;
 
+  s->imp_err[0] = 0;
   ID3D11Texture2D *tex = NULL;
   ID3D11Device1 *dev1 = NULL;
-  if (FAILED(ID3D11Device_QueryInterface(s->device, &IID_ID3D11Device1,
-                                         (void **)&dev1)) ||
-      !dev1)
+  HRESULT hq = ID3D11Device_QueryInterface(s->device, &IID_ID3D11Device1,
+                                           (void **)&dev1);
+  if (FAILED(hq) || !dev1) {
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "encoder device QueryInterface(ID3D11Device1)=0x%08lX",
+             (unsigned long)hq);
     return -1;
+  }
   HRESULT hr = ID3D11Device1_OpenSharedResource1(dev1, (HANDLE)shared_handle,
                                                  &IID_ID3D11Texture2D,
                                                  (void **)&tex);
   ID3D11Device1_Release(dev1);
-  if (FAILED(hr) || !tex) return -1;
+  if (FAILED(hr) || !tex) {
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "OpenSharedResource1(capture handle)=0x%08lX -- most likely the "
+             "handle is on a different adapter than the encoder device",
+             (unsigned long)hr);
+    return -1;
+  }
 
   int r = mfenc_submit_texture(s, tex, pts_us, force_keyframe);
   ID3D11Texture2D_Release(tex);
@@ -1337,6 +1641,11 @@ static int mfenc_receive_impl(void *session, MiniAVMfEncFrame *out) {
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s || !out) return -1;
   memset(out, 0, sizeof(*out));
+
+  /* Injected fault: an MFT that swallows everything it is given. "Need more
+   * input" is exactly what a real one answers while it holds frames, so the
+   * caller cannot tell this apart from a slow encoder — which is the point. */
+  if (s->fault == MFENC_FAULT_NO_OUTPUT) return 0;
 
   /* Async: ProcessOutput is only legal after METransformHaveOutput. Without
    * this gate the call returns E_UNEXPECTED on every hardware MFT. */
@@ -1380,6 +1689,42 @@ static int mfenc_receive_impl(void *session, MiniAVMfEncFrame *out) {
     if (preBuf) IMFMediaBuffer_Release(preBuf);
     if (pre) IMFSample_Release(pre);
     if (odb.pEvents) IMFCollection_Release(odb.pEvents);
+    /* The MFT wants a new output type and will keep answering STREAM_CHANGE
+     * until it gets one. Returning 2 without renegotiating just handed the
+     * caller a loop that never terminates and an MFT that never produces
+     * another frame. Take the first available output type it will accept. */
+    if (s->stream_change_retries >= 4) {
+      snprintf(s->imp_err, sizeof(s->imp_err),
+               "MFT keeps signalling MF_E_TRANSFORM_STREAM_CHANGE after %d "
+               "output-type renegotiations",
+               s->stream_change_retries);
+      return 0; /* give up rather than spin; the caller stops asking */
+    }
+    s->stream_change_retries++;
+    int ok = 0;
+    for (DWORD ti = 0;; ti++) {
+      IMFMediaType *cand = NULL;
+      if (FAILED(IMFTransform_GetOutputAvailableType(s->mft, 0, ti, &cand)) ||
+          !cand)
+        break;
+      if (SUCCEEDED(IMFTransform_SetOutputType(s->mft, 0, cand, 0))) {
+        /* The parameter sets travel with the output type, so refresh them —
+         * a muxer handed the pre-change SPS/PPS writes an undecodable track. */
+        UINT32 n = 0;
+        IMFMediaType_GetBlobSize(cand, &MF_MT_MPEG_SEQUENCE_HEADER, &n);
+        if (n > 0 && n <= sizeof(s->extradata) &&
+            SUCCEEDED(IMFMediaType_GetBlob(cand, &MF_MT_MPEG_SEQUENCE_HEADER,
+                                           s->extradata, n, NULL)))
+          s->extradata_len = (int)n;
+        ok = 1;
+      }
+      IMFMediaType_Release(cand);
+      if (ok) break;
+    }
+    if (!ok)
+      snprintf(s->imp_err, sizeof(s->imp_err),
+               "MF_E_TRANSFORM_STREAM_CHANGE and the MFT accepted none of its "
+               "own available output types");
     return 2;
   }
   if (FAILED(hr) || !odb.pSample) {
@@ -1398,6 +1743,8 @@ static int mfenc_receive_impl(void *session, MiniAVMfEncFrame *out) {
       if (out->data) {
         memcpy(out->data, p, len);
         out->size = (int)len;
+        /* Output is flowing again: the renegotiation budget is per stall. */
+        s->stream_change_retries = 0;
         UINT32 clean = 0;
         IMFSample_GetUINT32(odb.pSample, &MFSampleExtension_CleanPoint, &clean);
         out->is_keyframe = clean ? 1 : 0;
@@ -1418,27 +1765,86 @@ static int mfenc_receive_impl(void *session, MiniAVMfEncFrame *out) {
 static int mfenc_drain_impl(void *session) {
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s) return -1;
+  /* Already drained, or a drain is still outstanding: COMMAND_DRAIN is not
+   * re-issuable, and a caller calling flush() twice is normal. The state
+   * machine below carries on from wherever it is. */
+  if (s->stream_ended || s->draining) return 0;
+  s->draining = 1;
+  s->drain_done = 0;
   IMFTransform_ProcessMessage(s->mft, MFT_MESSAGE_COMMAND_DRAIN, 0);
   /* Async MFTs keep raising METransformHaveOutput after the drain command and
    * finish with METransformDrainComplete; pump so those land in have_output and
    * the caller's receive() loop can flush them. Bounded so a wedged MFT cannot
-   * hang the caller. */
+   * hang the caller — and it is only a HEAD START: the caller must keep polling
+   * mfenc_drain_state_impl until the drain actually completes, or it loses
+   * whatever the MFT still had in flight. */
   if (s->is_async) {
-    s->drain_done = 0;
-    mfenc_pump(s);
-    /* Deadline-bounded: mfenc_wait_event returns 0 for METransformNeedInput
-     * too, and the MFT keeps raising it, so a loop keyed only on
-     * drain_done/have_output spins forever. That was the hang. */
-    LARGE_INTEGER dfreq, d0, dnow;
-    QueryPerformanceFrequency(&dfreq);
-    QueryPerformanceCounter(&d0);
-    while (!s->drain_done && !s->have_output) {
-      mfenc_wait_event(s);
-      QueryPerformanceCounter(&dnow);
-      if ((double)(dnow.QuadPart - d0.QuadPart) / (double)dfreq.QuadPart > 1.0)
-        break; /* 1 s cap */
-    }
+    /* ONE bounded wait, not a loop. mfenc_wait_drain really does wait (up to
+     * ~8 ms) instead of returning instantly on leftover input credit, so the
+     * head start no longer needs a deadline loop around it — and must not have
+     * one: this runs on the single shared MTA worker with mfenc_w_gate held,
+     * where a 1 s cap is 1 s of every other session (and destroy) blocked. The
+     * caller polls mfenc_drain_state_impl for the rest. */
+    mfenc_wait_drain(s);
+  } else {
+    /* A sync MFT finishes its drain inside ProcessOutput — the caller's
+     * receive() loop running dry IS the completion signal. Mark the stream
+     * ended so the next submit restarts it. */
+    s->draining = 0;
+    s->drain_done = 1;
+    s->stream_ended = 1;
   }
+  return 0;
+}
+
+/* Poll an outstanding drain.
+ *  1 = the drain is finished AND every output it raised has been taken
+ *  0 = more output is still coming — keep calling receive()
+ *
+ * flush() cannot stop when receive() returns 0: for an ASYNC MFT that only
+ * means "nothing ready at this instant", while a hardware encoder routinely
+ * holds two to four frames in flight. Stopping there drops the end of the
+ * recording with success reported everywhere, which is the worst shape a bug
+ * can take. Each call waits a bounded ~8 ms (spin/yield, never Sleep, never a
+ * blocking GetEvent) so a wedged MFT costs latency rather than a hang. */
+static int mfenc_drain_state_impl(void *session) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  if (!s) return -1;
+  /* Injected faults. NEVER_DRAIN reports "still coming" forever so the caller's
+   * bounded poll loop has to exit through its timeout; NO_OUTPUT reports the
+   * drain COMPLETE, which is what separates "the MFT is wedged" from "the MFT
+   * finished and produced nothing" — two different bugs with two different
+   * messages, and a fault that got this wrong would test the wrong one. */
+  if (s->fault == MFENC_FAULT_NEVER_DRAIN) {
+    mfenc_fault_pause(); /* the real call costs ~8 ms; do not spin hot */
+    return 0;
+  }
+  if (s->fault == MFENC_FAULT_NO_OUTPUT) return 1;
+  if (!s->is_async) return 1;
+  if (!s->draining) return 1; /* nothing outstanding */
+  if (s->drain_done)
+    mfenc_pump(s);
+  else
+    mfenc_wait_drain(s); /* NOT wait_event — see mfenc_wait_drain */
+  return (s->drain_done && s->have_output == 0) ? 1 : 0;
+}
+
+/* Make THIS session misbehave, so the caller's "the encoder lied" error paths
+ * can be reached without one. Returns 0, or -1 for an unknown mode.
+ *
+ * The two faults exist because the two failures they simulate used to be
+ * silent: a drain that never completes returned a TRUNCATED tail as a complete
+ * stream, and an MFT that accepted every frame and emitted none returned an
+ * empty list that is indistinguishable from an ordinary empty flush. Both are
+ * unreachable on working hardware, so the alternative to injecting them is not
+ * testing them. */
+static int mfenc_set_fault_impl(void *session, int mode) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  if (!s) return -1;
+  if (mode != MFENC_FAULT_NONE && mode != MFENC_FAULT_NEVER_DRAIN &&
+      mode != MFENC_FAULT_NO_OUTPUT)
+    return -1;
+  s->fault = mode;
   return 0;
 }
 
@@ -1468,11 +1874,7 @@ static void mfenc_destroy_impl(void *session) {
   if (s->event_gen) IMFMediaEventGenerator_Release(s->event_gen);
   /* VideoProcessor chain before the device that produced it. Views first: they
    * hold references to the resources they were built on. */
-  for (int i = 0; i < MFENC_IMPORT_CACHE; i++) {
-    if (s->imp[i].km) IDXGIKeyedMutex_Release(s->imp[i].km);
-    if (s->imp[i].iv) ID3D11VideoProcessorInputView_Release(s->imp[i].iv);
-    if (s->imp[i].tex) ID3D11Texture2D_Release(s->imp[i].tex);
-  }
+  for (int i = 0; i < MFENC_IMPORT_CACHE; i++) mfenc_drop_import(s, i);
   if (s->last_sub) ID3D11Texture2D_Release(s->last_sub);
   if (s->blt_fence) ID3D11Query_Release(s->blt_fence);
   for (int i = 0; i < MFENC_NV12_RING; i++) {
@@ -1646,6 +2048,44 @@ MFENC_API int miniav_shim_mfenc_drain(void *session) {
   return mfenc_on_worker(job_drain, &a, -1);
 }
 
+static int job_drain_state(void *vp) {
+  return mfenc_drain_state_impl(((ArgSession *)vp)->s);
+}
+/* 1 = drain finished and every output taken, 0 = keep calling receive(). */
+MFENC_API int miniav_shim_mfenc_drain_state(void *session) {
+  ArgSession a = {session};
+  return mfenc_on_worker(job_drain_state, &a, -1);
+}
+
+typedef struct { void *s; int mode; } ArgFault;
+static int job_set_fault(void *vp) {
+  ArgFault *a = (ArgFault *)vp;
+  return mfenc_set_fault_impl(a->s, a->mode);
+}
+/* TEST-ONLY. 0 = none, 1 = never complete the drain, 2 = accept input and
+ * produce nothing (with the drain reporting complete). Scoped to ONE session:
+ * every test file shares this process, so a global switch would be a fault
+ * injected into whatever else happened to be encoding at the time. Marshalled
+ * like every other session entry point so the flag is ordered against the jobs
+ * already queued on the worker rather than raced against them. */
+MFENC_API int miniav_shim_mfenc_set_fault(void *session, int mode) {
+  ArgFault a = {session, mode};
+  return mfenc_on_worker(job_set_fault, &a, -1);
+}
+
+static int job_invalidate_imports(void *vp) {
+  return mfenc_invalidate_imports_impl(((ArgSession *)vp)->s);
+}
+/* Drop every cached producer texture (and the retained repeat source). Call on
+ * a resolution change or when the producer rebuilds its texture ring: the cache
+ * pins those surfaces, so this is both the VRAM release and the guarantee that
+ * a recycled address can never resolve to the previous picture. Returns the
+ * number of entries released. */
+MFENC_API int miniav_shim_mfenc_invalidate_imports(void *session) {
+  ArgSession a = {session};
+  return mfenc_on_worker(job_invalidate_imports, &a, -1);
+}
+
 static int job_is_hardware(void *vp) {
   return mfenc_is_hardware_impl(((ArgSession *)vp)->s);
 }
@@ -1802,8 +2242,7 @@ MFENC_API void miniav_shim_mfenc_test_texture_release(void *tex) {
  *
  * Test-only — it stalls the GPU on a Map, which is exactly what the real path
  * exists to avoid. Returns -1 on failure. */
-MFENC_API int64_t miniav_shim_mfenc_test_blt_luma_sum(void *session,
-                                                      void *texture_ptr) {
+static int64_t mfenc_test_blt_luma_sum_impl(void *session, void *texture_ptr) {
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s || !texture_ptr || !s->device) return -1;
   if (mfenc_ensure_vp(s) != 0) return -1;
@@ -1842,5 +2281,23 @@ MFENC_API int64_t miniav_shim_mfenc_test_blt_luma_sum(void *session,
   return sum;
 }
 
+/* Marshalled like every other session entry point: it touches the MFT session's
+ * D3D11 objects, and thread affinity is not optional for those. */
+typedef struct {
+  void *s;
+  void *tex;
+  int64_t result;
+} ArgLumaSum;
+static int job_blt_luma_sum(void *vp) {
+  ArgLumaSum *a = (ArgLumaSum *)vp;
+  a->result = mfenc_test_blt_luma_sum_impl(a->s, a->tex);
+  return 0;
+}
+MFENC_API int64_t miniav_shim_mfenc_test_blt_luma_sum(void *session,
+                                                      void *texture_ptr) {
+  ArgLumaSum a = {session, texture_ptr, -1};
+  if (mfenc_on_worker(job_blt_luma_sum, &a, -1) != 0) return -1;
+  return a.result;
+}
 
 #endif /* _WIN32 */

@@ -8,6 +8,7 @@ import 'package:miniav_platform_interface/miniav_platform_types.dart';
 import '../miniav_ffi_bindings.dart' as bindings;
 import '../miniav_ffi_subscriptions.dart';
 import '../miniav_ffi_types.dart';
+import 'package:miniav_ffi/miniav_ffi_callback_trace.dart';
 
 /// FFI implementation of [MiniAudioInputPlatformInterface].
 class MiniAVFFIAudioInputPlatform extends MiniAudioInputPlatformInterface {
@@ -264,6 +265,7 @@ class MiniAVFFIAudioInputContextPlatform
       }
     }
 
+    traceCallbackOpen('audioInput.frameCallback');
     _callbackHandle =
         ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>.listener(
           ffiCallback,
@@ -282,6 +284,7 @@ class MiniAVFFIAudioInputContextPlatform
   }
 
   Future<void> _cleanupCallback() async {
+    traceCallbackClose('audioInput.frameCallback');
     _callbackHandle?.close();
     _callbackHandle = null;
   }

@@ -1,0 +1,41 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+  package="com.practicalxr.miniav_media_session_flutter">
+
+  <!--
+    These permissions merge into every app that depends on this package, which
+    is precisely why the Android half lives in its own package: an app that only
+    wants a now-playing card on desktop, or that uses miniav_player without a
+    media session, never takes them on.
+
+    FOREGROUND_SERVICE                 (API 28+) start the service that owns the
+                                       notification.
+    FOREGROUND_SERVICE_MEDIA_PLAYBACK  (API 34+) required IN ADDITION from
+                                       Android 14, matching the mediaPlayback
+                                       type below. Without it startForeground
+                                       throws on 14+.
+    POST_NOTIFICATIONS                 (API 33+) declared so an app CAN request
+                                       it. Declaring grants nothing — it is a
+                                       runtime permission and asking needs an
+                                       Activity, so it stays the host app's
+                                       call. Media-session notifications are
+                                       generally exempt anyway; this is here so
+                                       apps that do prompt are not blocked by a
+                                       missing declaration.
+  -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission
+    android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+  <application>
+    <!--
+      Not exported: nothing outside the app has any business starting it. The
+      notification's own buttons reach it through PendingIntents, which do not
+      require export.
+    -->
+    <service
+      android:name=".MiniavMediaSessionService"
+      android:exported="false"
+      android:foregroundServiceType="mediaPlayback" />
+  </application>
+</manifest>

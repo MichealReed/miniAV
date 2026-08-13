@@ -1,5 +1,270 @@
 # miniav_ffi CHANGELOG
 
+## 0.7.2
+
+- released 08/13/26 - MR
+## 0.7.1
+
+- **`<miniav.h>` now includes `miniav_playback.h`.** The umbrella header pulled
+  in types/buffer/capture but not playback, stranding all 21 public
+  `MiniAV_AudioOutput_*` declarations. A C consumer that included only
+  `<miniav.h>`, as the docs say to, got an implicit declaration for
+  `MiniAV_AudioOutput_CreateContext` — which C assumes returns `int`, silently
+  truncating the returned 64-bit handle and segfaulting inside miniaudio on
+  first use. Dart/FFI callers were never affected (they bind symbols directly).
+  Trap: the symbols were exported all along, so this never failed to LINK — it
+  failed at the language level, and the crash surfaces far from the include.
+  Any new public header must be added to `miniav.h`.
+
+- **Windows per-process loopback had never worked: every `pid:` target
+  received the WHOLE SYSTEM's audio.** The backend called
+  `IAudioClient3::InitializeSharedAudioStream(flags, <PID>, fmt, NULL)`,
+  putting the target PID in the `PeriodInFrames` argument. A PID is never a
+  legal period, so the call always failed with
+  `AUDCLNT_E_INVALID_DEVICE_PERIOD` (0x88890021) and the backend fell through
+  to whole-system loopback — right format, wrong content, no error above DEBUG,
+  and indistinguishable from correct output by inspecting the PCM. Real
+  per-process capture is now implemented with `ActivateAudioInterfaceAsync`
+  against `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK` and
+  `AUDIOCLIENT_ACTIVATION_PARAMS`, mode
+  `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` (apps routinely render
+  audio from child processes; excluding the tree would make browsers, Electron
+  shells and launchers silent). Requires **Windows 10 build 20348 / Windows
+  11**. Verified with a two-tone oracle: two child processes render 997 Hz and
+  3001 Hz, and a `pid:` capture of either contains only its own tone at ~40000x
+  separation, while a whole-system capture contains both
+  (`src/loopback/test/test_loopback_process_isolation.c`; positive control
+  `MINIAV_LOOPBACK_STRESS_NO_PROCESS_LOOPBACK=1` +
+  `MINIAV_LOOPBACK_ALLOW_SYSTEM_FALLBACK=1` reproduces the old substitution).
+- **Behaviour change: per-process loopback that cannot be delivered now FAILS
+  `Loopback.configure` instead of silently substituting whole-system audio.**
+  Applies to an unsupported Windows build, an activation failure, or a PID that
+  is not running. `MINIAV_LOOPBACK_ALLOW_SYSTEM_FALLBACK=1` opts back into the
+  substitution, which is then logged at ERROR. Whole-system loopback (a `NULL`
+  or MMDevice-ID target) is untouched.
+- **New: `MiniAV_Loopback_GetActiveTargetInfo`** (C API; not in the Dart
+  bindings) reports the scope the backend ACTUALLY achieved —
+  `MINIAV_LOOPBACK_TARGET_PROCESS` with the PID, or
+  `MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO` — as opposed to the one requested.
+  `MINIAV_LOOPBACK_TARGET_NONE` means the backend does not report scope
+  (macOS/Linux). Windows always reports one of the first two.
+- Per-process loopback genuinely negotiates, unlike endpoint loopback: the
+  requested rate/channels/format is honoured and converted into (48 k, 44.1 k
+  and 16 kHz verified), and it taps the target BEFORE the endpoint master
+  volume, so it is typically louder than the same audio via system loopback.
+  The format read-back contract from earlier in 0.7.1 is unchanged — whatever
+  the stream is actually initialized with is what
+  `getConfiguredFormat()` and every buffer's `info` report.
+- Traps, all three of which fail silently or misleadingly:
+  (1) `ActivateAudioInterfaceAsync` returns `E_ILLEGAL_METHOD_CALL`
+  (0x8000000E) — before looking at the activation params at all — unless the
+  completion handler is **agile**: it must answer `QueryInterface` for
+  `IAgileObject` and delegate `IMarshal` to a free-threaded marshaler. C++
+  samples inherit this from WRL's `FtmBase`, so it is invisible in the docs.
+  (2) `IAudioClient::GetMixFormat` returns `E_NOTIMPL` on a process-loopback
+  client — there is no endpoint format to inherit, the caller must supply one.
+  (3) Activating for a **nonexistent PID succeeds** and then delivers zeroed
+  frames forever; the PID is therefore validated with `OpenProcess` first
+  (`ERROR_ACCESS_DENIED` counts as alive — elevated targets do work).
+
+- **`MiniAVInputConfig` bindings were 16 bytes short of the C struct, so every
+  `Input_Configure` read past the end of its own allocation.** The C struct
+  grew three appended motion fields (`motion_rate_hz`, `motion_mode`,
+  `motion_callback`) — 48 → 64 bytes — while `miniav_ffi_bindings.dart` still
+  described the 7-field, 48-byte shape. `calloc<MiniAVInputConfig>()` sized the
+  allocation from the short definition and `input_api.c`'s
+  `ctx->config = *config;` copied 64 bytes out of it, so 16 bytes of unrelated
+  heap landed in `ctx->config.motion_*`; `miniav_input_deliver_motion` calls
+  `motion_callback` as a function pointer (iOS/Android backends read the same
+  two fields straight from the caller's buffer during `configure`). The
+  bindings now mirror the C struct (`MiniAVVec3`, `MiniAVQuat`,
+  `MiniAVMotionEvent`, `MiniAVMotionMode`, `MiniAVAttitudeRef`,
+  `MiniAVDisplayRotation`, `MiniAVMotionCallback` added), and
+  `copyInputConfigToNative` writes the motion trio explicitly zero/null. Motion
+  is still not delivered over FFI — the fields are present and inert, and
+  `MINIAV_INPUT_TYPE_MOTION` is never requested, so no backend starts a sensor.
+  Trap: appending a field keeps OFFSETS stable but changes `sizeof()`, and
+  `sizeof()` is what callers allocate with and what struct assignment copies —
+  "ABI-additive" never meant a stale binding was safe.
+- **New: `MiniAV_ABI_StructSize` / `MiniAV_ABI_StructCount` /
+  `MiniAV_ABI_StructNameAt`** (`src/common/miniav_abi.c`) export `sizeof()` for
+  every struct that crosses the FFI boundary.
+  `test/abi_struct_size_test.dart` asserts `sizeOf<T>()` against C for all of
+  them and fails if C adds a struct Dart does not check. Audited with it and
+  clean: `MiniAVDeviceInfo` 513, `MiniAVVideoInfo` 24, `MiniAVAudioInfo` 16,
+  `MiniAVLoopbackTargetInfo` 16, `MiniAVKeyboardEvent` 24, `MiniAVMouseEvent`
+  48, `MiniAVGamepadEvent` 32, `MiniAVVec3` 24, `MiniAVQuat` 32,
+  `MiniAVMotionEvent` 232, `MiniAVVideoPlane` 40, `MiniAVBuffer` 264,
+  `MiniAVNativeBufferInternalPayload` 72, plus the anonymous
+  `MiniAVLoopbackTargetInfo.TARGETHANDLE` / `MiniAVBuffer.data{,.video,.audio}`
+  members. `MiniAVInputConfig` was the only mismatch.
+
+- **Windows loopback reported the REQUESTED audio format, not the endpoint's,
+  and stamped every delivered PCM buffer with it.**
+  `MiniAV_Loopback_Configure` cached the caller's request into
+  `configured_video_format` right after the backend had stored the real WASAPI
+  mix format there. WASAPI shared-mode loopback has no format negotiation — it
+  always runs at the endpoint mix format — so on a 44.1 kHz or 5.1 endpoint the
+  bytes were right and the label was wrong, with no error and no log; muxing
+  that audio wrote the wrong sample rate into the file header. Both Windows
+  screen backends hardcode a 48 kHz / 2 ch request, so this hit every screen
+  recording with audio. Configure now reads the format back from the backend
+  (`get_configured_video_format`) and caches THAT. Contract, matching the
+  PipeWire and CoreAudio backends: **the negotiated format wins and is reported
+  back** — `MiniAV_Loopback_GetConfiguredFormat` and `MiniAVAudioBuffer.info`
+  describe what is actually delivered; a request the endpoint cannot provide is
+  logged at WARN, not faked and not failed. `num_frames` is still carried
+  through from the request (a caller-side chunk hint WASAPI does not
+  negotiate). Trap: a backend that writes its result into the shared context
+  field can have it clobbered by the generic layer immediately afterwards —
+  PipeWire/CoreAudio were unaffected only because they keep theirs in the
+  platform context.
+
+- **Windows window capture with `captureAudio: true` delivered video only, and
+  returned success.** The WGC backend formatted its per-process audio target as
+  `"PID:%lu"` while `MiniAV_Loopback_Configure` matched a case-sensitive
+  `"pid:"`, so the ID fell through to the "assume an MMDevice ID" branch,
+  `IMMDeviceEnumerator::GetDevice(L"PID:1234")` failed, and audio was disabled
+  with a WARN. Producers now emit lowercase `pid:` (canonical, same shape as
+  `hwnd:`) and the consumer matches case-insensitively so IDs from older builds
+  still resolve. **Behaviour change:** `MiniAV_Screen_ConfigureWindow` /
+  `ConfigureDisplay` / `ConfigureRegion` and `MiniAV_Screen_StartCapture` now
+  return an error when `capture_audio` was requested and no audio path could be
+  established, instead of returning `MINIAV_SUCCESS` with a video-only capture.
+  Both Windows screen backends (WGC and DXGI) answer the same way. Callers that
+  want video regardless should configure with `captureAudio: false`. Note:
+  per-process loopback still falls back to whole-system audio (see
+  `docs/PLATFORM_SUPPORT.md`).
+
+- **Windows WGC: a window resized mid-capture could be handed a
+  `dataSizeBytes` past the end of the mapped buffer.** The
+  `Direct3D11CaptureFramePool` was sized once from `capture_item.Size()` at
+  StartCapture and never revisited, while per-frame dimensions came from the
+  live `frame.ContentSize()`; the CPU path then computed
+  `RowPitch(pool-sized) * height(new, larger)` (measured: 1,180,160 bytes
+  advertised over a 903,680-byte mapping), and the GPU path had the same shape.
+  The pool is now recreated (`Direct3D11CaptureFramePool::Recreate`) when the
+  content size changes, and the reported extent is clamped to what was actually
+  mapped/allocated either way. Recreation runs under the context's critical
+  section — the same lock teardown holds while closing the pool — after the
+  frame is closed and outside the callback drain, so it cannot deadlock against
+  the existing `WGCCallbackRef` / `wgc_drain_callbacks` protocol. New exports
+  `miniav_wgc_debug_oversize_reports()` and
+  `miniav_wgc_debug_pool_recreates()` back the regression harness. Trap: a
+  frame pool's surfaces are always pool-sized; `ContentSize()` is the target's
+  live size and the two are only equal until something resizes.
+
+- **New Windows-only C regression harnesses**, both with positive controls that
+  restore the pre-fix behaviour and fail if the bug does *not* reproduce:
+  `src/loopback/test/test_loopback_format_honesty.c`
+  (`MINIAV_LOOPBACK_STRESS_REQUESTED_FORMAT=1`,
+  `MINIAV_LOOPBACK_STRESS_CASE_SENSITIVE_ID=1`) and
+  `src/screen/test/test_wgc_resize_stress.c`
+  (`MINIAV_WGC_STRESS_NO_POOL_RECREATE=1`, `MINIAV_WGC_STRESS_UPPERCASE_PID=1`,
+  `MINIAV_SCREEN_STRESS_AUDIO_OPTIONAL=1`).
+
+- **Windows camera: destroying a context no longer frees the Media Foundation
+  source-reader callback while MF still holds it.** `MFPlatformContext` *is*
+  the `IMFSourceReaderCallback` given to the source reader, so MF holds a
+  reference and drops it asynchronously on an RTWorkQ thread — after
+  `IMFSourceReader_Release` has returned. `mf_destroy_platform` freed the
+  object outright and `MFPlatform_Release` deliberately did nothing at
+  refcount 0, so MFReadWrite then called through a freed vtable and killed the
+  process with `0xC0000005` at a heap address. Release now frees on the last
+  reference (whichever thread holds it) and destroy drops only its own. No API
+  change. Traps: `parent_ctx` must be cleared *under the callback's critical
+  section* and re-read *inside* it (a callback that latched the pointer before
+  blocking on the lock would use the parent after the caller freed it); and the
+  critical section must be deleted in the final release, not in destroy.
+- **Windows COM/Media Foundation initialisation is now process-lifetime and
+  library-owned** (`src/common/miniav_com_win.{h,c}`; one `CoIncrementMTAUsage`
+  plus one `MFStartup`, never released). It used to be driven per FFI entry
+  point in the camera (MF), loopback (WASAPI) and screen (WGC) backends.
+  `CoInitializeEx`/`CoUninitialize` are PER-THREAD and a Dart isolate does not
+  own a fixed OS thread: measured on this suite, one isolate's consecutive FFI
+  calls ran on three different pool threads, and single pool threads served two
+  different isolates. A `CoUninitialize` therefore evicted a thread another
+  isolate believed it owned, and the last thread leaving the MTA destroyed
+  every COM object in it. No API change; single-consumer behaviour is
+  unchanged and an STA host keeps its STA. Traps: releasing on a refcount edge
+  would reintroduce the race (the count can reach zero while another isolate's
+  objects are live), so init is deliberately monotonic; the held MTA reference
+  is also what makes miniaudio's own unpaired `CoUninitialize` survivable, so
+  `MINIAV_COM_ENSURE_MTA()` must stay ahead of every `ma_context_init`.
+  `MINIAV_COM_TRACE=1` logs each call site with its OS thread id.
+
+- **The WASAPI loopback capture thread now joins the MTA explicitly.** It calls
+  `IAudioCaptureClient`/`IAudioClient` methods but had never entered an
+  apartment at all; it worked only because the process-lifetime MTA reference
+  above makes an uninitialised thread an implicit MTA member and because these
+  are direct in-process vtable calls with no marshalling — an accident of the
+  current design rather than a contract. It now pairs `CoInitializeEx`/
+  `CoUninitialize` around the thread body. Trap, and the distinction that
+  makes this correct where per-call COM was not: a DEDICATED thread we create
+  and join is the one place the pair is sound, because both calls run on the
+  SAME thread with balanced lifetime — unlike FFI entry points, where the Dart
+  VM hands an isolate's consecutive calls to different pool threads. The
+  process MTA reference additionally guarantees this `CoUninitialize` can never
+  be the last one out. `RPC_E_CHANGED_MODE` is handled by NOT uninitialising
+  (it would unbalance whoever put the thread in an STA).
+
+- **Windows screen capture (WGC): stopping or destroying a context now waits
+  for in-flight capture callbacks.** WinRT dispatches `FrameArrived` /
+  `GraphicsCaptureItem.Closed` on threadpool threads, and revoking an event
+  token does not wait for a handler that is already running — while the FPS
+  pacing loop deliberately blocks for up to a frame interval *after* releasing
+  the context lock. Teardown therefore closed the pacing timer and stop event
+  the callback was waiting on, deleted the critical section and freed the
+  context under it. Stop/destroy now clear `is_streaming`, signal the stop
+  event, revoke the tokens, release the lock, then drain an in-flight callback
+  count (2 s bound, logs on expiry) before freeing. Capture-lost notification
+  also takes the lock to read `lost_cb`, and invokes it unlocked so an app may
+  stop or destroy from inside it. No API change; teardown may now block for the
+  few ms a callback needs to unwind. Traps: the drain MUST run with the
+  critical section released (an in-flight handler acquires it — draining under
+  it deadlocks); and the pacing loop's no-waitable-timer fallback used a bare
+  `Sleep()` that ignored the stop event, parking teardown for a whole frame
+  interval — it now waits on the event, keeping the same absolute deadline.
+- **`setLogCallback` now delivers through a Dart native port instead of a
+  `NativeCallable`** (new C exports `MiniAV_InitDartApi` / `MiniAV_SetLogPort`;
+  `miniav_c/third_party/dart_dl/` vendors the BSD-licensed Dart SDK
+  dynamic-linking API). `MiniAV_SetLogCallback` is a PROCESS-GLOBAL registry:
+  the installed pointer is owned by ONE isolate, and when that isolate exits
+  the VM deletes the trampoline while the C library keeps the pointer — the
+  next `miniav_log()` from a capture thread, or from inside a leaf FFI call
+  such as `MiniAV_ReleaseBuffer`, aborted the whole process
+  (`runtime_entry.cc: Callback invoked after it has been deleted`). A
+  whole-suite `dart test` hit it every run, since every test FILE is a
+  separate isolate in ONE VM process. Semantics are unchanged and now
+  documented: PROCESS-GLOBAL, LAST WRITER WINS — with several isolates
+  registered only the most recent receives lines. Trap: the message crosses as
+  raw bytes, not a `Dart_CObject` string, because device names can carry
+  Latin-1 and `Dart_CObject_kString` requires valid UTF-8. `MiniAVLogCallback`
+  stays in the C API for non-Dart embedders, which own their function's
+  lifetime; on the web/wasm build `MiniAV_InitDartApi` returns
+  `MINIAV_ERROR_NOT_SUPPORTED` and the port path is inert.
+- **`stopCapture()` no longer closes a `NativeCallable` the native side is
+  still holding.** Loopback, input and the device-change registry closed
+  theirs unconditionally and only `print`ed the native result — but
+  `MINIAV_ERROR_TIMEOUT` is precisely the code the C layer returns to say "the
+  thread did not join and still has your pointer" (which is why it
+  deliberately leaks its own context there). Those paths now drop the callable
+  without closing it, matching the native leak; closing it was a
+  use-after-free that aborted the VM. Camera, screen and audio input were
+  already correct (their backends fence under a critical section or a device
+  join).
+- `hook/build.dart` registers `miniav_c/**` sources as build dependencies.
+  Without them an edited `.c`/`.h` kept serving the previously built DLL, so a
+  newly added export resolved to nothing and the failure looked like a Dart
+  bug.
+- `code_assets`, `hooks` and `logging` are now real dependencies. `hook/build.dart`
+  imports them and a consumer never receives `dev_dependencies`, so the native
+  asset could not build downstream. `dart pub publish` reports this as an error;
+  0.7.0 shipped past it because publishing runs with validation skipped.
+- `miniav_platform_interface` is now a caret range (`^0.7.0`) rather than an
+  exact pin, which had made every patch release of it unsatisfiable alongside
+  this package.
+
 ## 0.7.0
 
 ### GPU buffer handoff contract (Windows) — leak fixes
@@ -362,9 +627,11 @@ Audio/video *playback* is intentionally NOT here — it becomes a future
 ## 0.5.8
 
 - fix audio buffer allocations and leak issue
+
 ## 0.5.7
 
 - Fix logger noisiness
+
 ## 0.5.6
 
 - fix FormatException on non-UTF-8 bytes in MiniAV log callback: use Utf8Decoder(allowMalformed: true) instead of toDartString()

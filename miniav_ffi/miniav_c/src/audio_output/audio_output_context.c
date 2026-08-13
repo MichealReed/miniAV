@@ -6,6 +6,7 @@
 #include "../../include/miniav_playback.h"
 
 // Internal / common headers
+#include "../common/miniav_com_win.h"
 #include "../common/miniav_context_base.h"
 #include "../common/miniav_logging.h"
 #include "../common/miniav_utils.h"
@@ -105,6 +106,11 @@ MiniAV_AudioOutput_EnumerateDevices(MiniAVDeviceInfo **devices,
   *count = 0;
 
   ma_context ma_ctx;
+  // miniaudio's WASAPI backend runs CoInitializeEx on the thread that inits a
+  // ma_context and CoUninitialize on whichever thread uninits it — under Dart
+  // those are different pool threads. Holding a process-lifetime MTA reference
+  // makes that mismatch survivable instead of tearing the apartment down.
+  MINIAV_COM_ENSURE_MTA();
   if (ma_context_init(NULL, 0, NULL, &ma_ctx) != MA_SUCCESS) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "AudioOutput: failed to init miniaudio context for enumeration.");
@@ -152,6 +158,11 @@ MiniAV_AudioOutput_GetDefaultFormat(const char *device_id,
 
   // Query the default playback device's native format when possible.
   ma_context ma_ctx;
+  // miniaudio's WASAPI backend runs CoInitializeEx on the thread that inits a
+  // ma_context and CoUninitialize on whichever thread uninits it — under Dart
+  // those are different pool threads. Holding a process-lifetime MTA reference
+  // makes that mismatch survivable instead of tearing the apartment down.
+  MINIAV_COM_ENSURE_MTA();
   if (ma_context_init(NULL, 0, NULL, &ma_ctx) == MA_SUCCESS) {
     ma_device_info info;
     if (ma_context_get_device_info(&ma_ctx, ma_device_type_playback, NULL,
@@ -232,6 +243,11 @@ MiniAVResultCode MiniAV_AudioOutput_Configure(
   ma_bool32 have_playback_id = MA_FALSE;
   if (device_id && device_id[0] != '\0') {
     ma_context tmp_ctx;
+    // miniaudio's WASAPI backend runs CoInitializeEx on the thread that inits a
+    // ma_context and CoUninitialize on whichever thread uninits it — under Dart
+    // those are different pool threads. Holding a process-lifetime MTA reference
+    // makes that mismatch survivable instead of tearing the apartment down.
+    MINIAV_COM_ENSURE_MTA();
     if (ma_context_init(NULL, 0, NULL, &tmp_ctx) == MA_SUCCESS) {
       ma_device_info *playback_infos = NULL;
       ma_uint32 playback_count = 0;

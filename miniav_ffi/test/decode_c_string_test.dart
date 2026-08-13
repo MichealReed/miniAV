@@ -1,10 +1,14 @@
-// Tests for the _decodeCString helper used in MiniAVFFIPlatform.setLogCallback.
-//
-// The helper reads a null-terminated C string via FFI and decodes it with
-// Utf8Decoder(allowMalformed: true) so that non-UTF-8 bytes from native log
-// messages (device names, driver strings with Latin-1 chars) never cause a
+// Tests for reading a native log message as bytes and decoding it with
+// Utf8Decoder(allowMalformed: true), so that non-UTF-8 content from native log
+// messages (device names, driver strings with Latin-1 chars) never causes a
 // FormatException.  These tests verify both the happy path and the
 // malformed-byte cases that motivated the fix.
+//
+// Production no longer reads a Pointer<Char>: MiniAVFFIPlatform.setLogCallback
+// receives the message as a Uint8List over a Dart native port (see
+// miniav_ffi_log_port.dart) and runs the same allowMalformed decode on it.
+// The C-string walk below is kept because it exercises the identical decoder
+// contract — and because non-Dart embedders still get a char*.
 
 import 'dart:convert';
 import 'dart:ffi';

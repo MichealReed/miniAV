@@ -6,6 +6,7 @@
 #include "../../include/miniav_capture.h" // Defines MiniAVBufferCallback and the capture functions
 
 // Internal headers for this module
+#include "../common/miniav_com_win.h"
 #include "../common/miniav_context_base.h"
 #include "../common/miniav_device_watcher.h"
 #include "../common/miniav_logging.h"
@@ -128,6 +129,11 @@ MiniAVResultCode MiniAV_Audio_EnumerateDevices(MiniAVDeviceInfo **devices,
   *count = 0;
 
   ma_context ma_ctx;
+  // miniaudio's WASAPI backend runs CoInitializeEx on the thread that inits a
+  // ma_context and CoUninitialize on whichever thread uninits it — under Dart
+  // those are different pool threads. Holding a process-lifetime MTA reference
+  // makes that mismatch survivable instead of tearing the apartment down.
+  MINIAV_COM_ENSURE_MTA();
   ma_result res = ma_context_init(NULL, 0, NULL, &ma_ctx);
   if (res != MA_SUCCESS) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
@@ -224,6 +230,11 @@ MiniAVResultCode MiniAV_Audio_GetSupportedFormats(const char *device_id_str,
   // Query the ACTUAL device (this used to return a hardcoded 4-combo table
   // regardless of device_id_str).
   ma_context ma_ctx;
+  // miniaudio's WASAPI backend runs CoInitializeEx on the thread that inits a
+  // ma_context and CoUninitialize on whichever thread uninits it — under Dart
+  // those are different pool threads. Holding a process-lifetime MTA reference
+  // makes that mismatch survivable instead of tearing the apartment down.
+  MINIAV_COM_ENSURE_MTA();
   if (ma_context_init(NULL, 0, NULL, &ma_ctx) == MA_SUCCESS) {
     ma_device_info basic;
     if (audio_find_capture_device(&ma_ctx, device_id_str, &basic)) {
@@ -307,6 +318,11 @@ MiniAVResultCode MiniAV_Audio_CreateContext(MiniAVAudioContextHandle *context) {
     return MINIAV_ERROR_OUT_OF_MEMORY;
   }
 
+  // miniaudio's WASAPI backend runs CoInitializeEx on the thread that inits a
+  // ma_context and CoUninitialize on whichever thread uninits it — under Dart
+  // those are different pool threads. Holding a process-lifetime MTA reference
+  // makes that mismatch survivable instead of tearing the apartment down.
+  MINIAV_COM_ENSURE_MTA();
   ma_result res = ma_context_init(NULL, 0, NULL, &ctx->ma_ctx);
   if (res != MA_SUCCESS) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
@@ -483,6 +499,11 @@ MiniAVResultCode MiniAV_Audio_GetDefaultFormat(const char *device_id_str,
   // hardcoded F32/48k/2ch while running a dead enumeration loop purely to
   // populate a log line).
   ma_context ma_ctx_temp;
+  // miniaudio's WASAPI backend runs CoInitializeEx on the thread that inits a
+  // ma_context and CoUninitialize on whichever thread uninits it — under Dart
+  // those are different pool threads. Holding a process-lifetime MTA reference
+  // makes that mismatch survivable instead of tearing the apartment down.
+  MINIAV_COM_ENSURE_MTA();
   if (ma_context_init(NULL, 0, NULL, &ma_ctx_temp) == MA_SUCCESS) {
     ma_device_info basic;
     if (audio_find_capture_device(&ma_ctx_temp, device_id_str, &basic)) {

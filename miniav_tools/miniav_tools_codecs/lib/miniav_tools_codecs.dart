@@ -40,6 +40,9 @@ export 'src/framing/wav_container.dart' show WavDemuxer, WavMuxer;
 export 'src/framing/ogg_container.dart' show OggDemuxer, OggMuxer;
 export 'src/framing/adts_container.dart'
     show AdtsDemuxer, AdtsMuxer, ascToAdtsParams, adtsSampleRates;
+export 'src/framing/mp3_container.dart'
+    show Mp3Demuxer, Mp3VbrHeader, isMp3Sync, isAdtsSync, isId3Magic,
+        id3TagLength;
 export 'src/framing/mp4_container.dart' show Mp4Demuxer, Mp4Muxer;
 export 'src/framing/annexb.dart'
     show isAnnexB, splitAnnexB, buildAvcC, buildHvcC, annexBToLengthPrefixed;
@@ -100,8 +103,8 @@ import 'src/sw_audio/sw_audio_backend.dart';
 /// specific backend, name it at the call site (`EncoderConfig.backend`);
 /// there is no unregister.
 ///
-/// Covers: minigpu, MF encode + decode, OS AAC, Opus, PCM, software audio
-/// (MP3/FLAC/Vorbis) and container framing (WAV/Ogg/ADTS/MP4).
+/// Covers: minigpu, MF encode + decode, OS AAC, Opus, PCM, software audio (MP3)
+/// and container framing (WAV/Ogg/ADTS/MP4 demux+mux, MP3 demux).
 bool registerFirstPartyBackends() {
   var any = registerMinigpuBackend();
   any = registerMfEncodeBackend() || any;
@@ -195,9 +198,10 @@ bool registerPcmBackend() {
 }
 
 /// Register the pure-Dart container framing backend — WAV + Ogg + ADTS + MP4
-/// demux/mux (idempotent, all platforms). Priority 55 (above FFmpeg's 50) so
-/// these containers open/write FFmpeg-free by default; a parse failure returns
-/// `null`, so the negotiator still falls through to FFmpeg.
+/// demux/mux plus MP3 demux (idempotent, all platforms). Priority 55 (above
+/// FFmpeg's 50) so these containers open/write FFmpeg-free by default; a parse
+/// failure returns `null`, so the negotiator still falls through to FFmpeg.
+/// MP3 is demux-only — there is no first-party mp3 encoder to mux for.
 bool registerContainerFramingBackend() {
   final existing = MiniAVToolsPlatform.instance.backends.any(
     (b) => b.name == ContainerFramingBackend.backendName,
@@ -207,9 +211,14 @@ bool registerContainerFramingBackend() {
   return true;
 }
 
-/// Register the first-party software audio-decode backend — MP3 / FLAC / Vorbis
-/// via dr_mp3 / dr_flac / stb_vorbis (idempotent, all platforms). Priority 55
-/// (above FFmpeg) — an FFmpeg-free decode path for these three codecs.
+/// Register the first-party software audio-decode backend — MP3 via dr_mp3
+/// (idempotent, all platforms). Priority 55 (above FFmpeg) — an FFmpeg-free
+/// decode path for MP3.
+///
+/// FLAC and Vorbis are deliberately NOT claimed: the native entry points take a
+/// whole container and [SwAudioDecoder] ignores `extraData`, so a demuxed
+/// stream has no STREAMINFO/setup headers to open with. They route to FFmpeg
+/// (see [SwAudioBackend]).
 bool registerSwAudioBackend() {
   final existing = MiniAVToolsPlatform.instance.backends.any(
     (b) => b.name == SwAudioBackend.backendName,

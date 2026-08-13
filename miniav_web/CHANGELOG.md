@@ -1,5 +1,14 @@
 # miniav_web CHANGELOG
 
+## 0.7.2
+
+- released 08/13/26 - MR
+## 0.7.1
+
+- Version bump to keep the miniav 0.7.1 family aligned. No functional change in
+  this package; the 0.7.1 fixes are Windows-native and do not apply to the web
+  implementation.
+
 ## 0.7.0
 
 - Implements the new `setIOSAppGroup` interface member (throws

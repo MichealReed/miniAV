@@ -7,6 +7,24 @@
 /// player imports the shared handle straight into Dawn (no CPU readback).
 /// [DecodedFrame.readBytes] maps it to CPU (NV12→I420) as a software fallback.
 ///
+/// **Frame-size contract.** [DecodedFrame.width]/[DecodedFrame.height] are the
+/// DISPLAY size — the bitstream's crop window (H.264 frame cropping / HEVC
+/// conformance window). Video codes in macroblocks/CTUs, so the decoder's
+/// surface is the CODED size, padded up (240 → 256 in HEVC, 1080 → 1088, 200 →
+/// 208 in H.264) with decoder garbage in the padding.
+///
+///  * `readBytes()` returns the display region only, padding excluded:
+///    `width * height + 2 * ceil(width / 2) * ceil(height / 2)`, i.e. exactly
+///    `width * height * 3 / 2` for the even display sizes 4:2:0 crop windows
+///    can express.
+///  * The D3D11 texture behind [DecodedFrame.gpuHandle] stays CODED size, with
+///    the valid region at the top-left (the crop origin is 0,0 for every
+///    stream a codec can produce; a non-zero origin is honoured by the CPU map
+///    but would need a source offset in a GPU consumer). Import it with the
+///    frame's `width`/`height`, NOT the texture's own dimensions: NV12 plane
+///    views are addressed from the top-left, so the reported size selects the
+///    valid region. Copying the texture wholesale would show the padding.
+///
 /// Only ever constructed when a hardware decoder MFT exists — [open] returns
 /// `null` otherwise (and on a non-MTA/STA thread), so the facade negotiator
 /// falls back to the software decoder for free.
@@ -20,6 +38,7 @@ import 'package:ffi/ffi.dart';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
 import '../codecs_native.dart';
+import '../framing/annexb.dart' show hevcCodedSizeFromAnnexB, isAnnexB;
 
 int? _codecId(VideoCodec codec) => switch (codec) {
   VideoCodec.h264 => 0,
@@ -48,7 +67,11 @@ class MfD3d11Decoder implements PlatformDecoder {
 
   /// Open a hardware MF decode session for [config]. Returns `null` when the
   /// codec isn't H.264/HEVC, the native codecs asset isn't loadable, no
-  /// hardware MFT exists, or the calling thread is STA (MF needs MTA).
+  /// hardware MFT exists, the calling thread is STA (MF needs MTA), or the
+  /// codec is HEVC and no frame size can be established — neither from
+  /// [DecoderConfig.width]/[DecoderConfig.height] nor from the SPS in
+  /// [DecoderConfig.extraData] (see below). Each of those makes the facade
+  /// negotiator fall back.
   static Future<MfD3d11Decoder?> open(DecoderConfig config) async {
     if (!Platform.isWindows) return null;
     final codec = _codecId(config.codec);
@@ -77,12 +100,51 @@ class MfD3d11Decoder implements PlatformDecoder {
       }
     }
 
+    var width = config.width ?? 0;
+    var height = config.height ?? 0;
+
+    // The HEVC decoder MFT REQUIRES MF_MT_FRAME_SIZE on its input type
+    // (mf_decoder.c/mfdec_configure_input): without it, it cannot propose an
+    // output type and rejects EVERY ProcessInput with
+    // MF_E_TRANSFORM_TYPE_NOT_SET — but mfdecCreate still succeeds, so the
+    // negotiator would commit to a decoder that only ever returns null, and the
+    // caller gets a black screen with no error. (H.264 is untouched throughout:
+    // its MFT parses the SPS in-band and needs no hint.)
+    //
+    // When the caller has no dims but did carry parameter sets, the size is in
+    // them — harvest the CODED size from the SPS and hint with that. Coded, not
+    // display: the input type describes the CTU grid, and the MFT still derives
+    // the display aperture from the conformance window itself, so the frames
+    // this decoder reports stay cropped exactly as before.
+    //
+    // `headers` covers the hvcC case (a demuxer's out-of-band record); raw
+    // Annex-B extradata (what the MF encoder's sequence header is) carries the
+    // same SPS and is read directly — it is left out of `headers` only because
+    // that path feeds packets verbatim.
+    if (config.codec == VideoCodec.hevc && (width <= 0 || height <= 0)) {
+      final paramSets = headers ??
+          (extra != null && isAnnexB(extra) ? extra : null);
+      final coded =
+          paramSets == null ? null : hevcCodedSizeFromAnnexB(paramSets);
+      if (coded != null) {
+        width = coded.width;
+        height = coded.height;
+      }
+    }
+
+    // Still no size (no extradata, or an SPS that did not parse) → decline, so
+    // the facade falls through to the software decoder, which reads the dims
+    // out of the bitstream itself.
+    if (config.codec == VideoCodec.hevc && (width <= 0 || height <= 0)) {
+      return null;
+    }
+
     // Let the session create its own hardware D3D11 device (nullptr) on the
     // primary adapter — the player's Dawn is on the same adapter, so the shared
     // handle opens there. Coded-dims hint: required by the HEVC decoder MFT
     // (frame size on the input type), harmless for H.264.
     final session = mfdecCreate(nullptr, codec, nullptr, 0,
-        width: config.width ?? 0, height: config.height ?? 0);
+        width: width, height: height);
     if (session == nullptr) return null;
 
     final out = calloc<MiniAVMfDecFrame>();
@@ -139,6 +201,8 @@ class MfD3d11Decoder implements PlatformDecoder {
     texturePtr: _out.ref.outTexturePtr,
     width: _out.ref.width,
     height: _out.ref.height,
+    cropX: _out.ref.cropX,
+    cropY: _out.ref.cropY,
     ptsUs: _out.ref.ptsUs,
   );
 
@@ -184,6 +248,10 @@ class _MfD3d11Frame implements DecodedFrame {
   final Pointer<Void> _session;
   final int _sharedHandle;
   final int _texturePtr;
+
+  /// Display-region origin inside the coded texture (0,0 in practice).
+  final int _cropX;
+  final int _cropY;
   bool _closed = false;
 
   @override
@@ -199,10 +267,14 @@ class _MfD3d11Frame implements DecodedFrame {
     required int texturePtr,
     required this.width,
     required this.height,
+    required int cropX,
+    required int cropY,
     required this.ptsUs,
   }) : _session = session,
        _sharedHandle = sharedHandle,
-       _texturePtr = texturePtr;
+       _texturePtr = texturePtr,
+       _cropX = cropX,
+       _cropY = cropY;
 
   @override
   FrameSourceKind get outputKind => FrameSourceKind.d3d11Texture;
@@ -226,14 +298,26 @@ class _MfD3d11Frame implements DecodedFrame {
 
   /// Map the NV12 texture to CPU and convert to I420 for the player's existing
   /// YUV→RGBA path (Milestone 1). Milestone 2 skips this via a GPU import.
+  ///
+  /// Only the display region is copied out — the texture is coded-size, so a
+  /// whole-texture map would append the block-padding rows to the picture.
   @override
   Future<List<int>> readBytes() async {
-    final needed = width * height + (width * (height ~/ 2));
+    final needed = width * height + (width * ((height + 1) ~/ 2));
     final dst = calloc<Uint8>(needed);
     try {
-      final n = mfdecMapNv12(_session, _texturePtr, dst, needed);
+      final n = mfdecMapNv12Region(
+        _session,
+        _texturePtr,
+        _cropX,
+        _cropY,
+        width,
+        height,
+        dst,
+        needed,
+      );
       if (n < 0) {
-        throw StateError('mfdec_map_nv12 failed ($n)');
+        throw StateError('mfdec_map_nv12_region failed ($n)');
       }
       final nv12 = Uint8List.fromList(dst.asTypedList(n));
       return _nv12ToI420(nv12, width, height);
@@ -251,17 +335,25 @@ class _MfD3d11Frame implements DecodedFrame {
 }
 
 /// NV12 (Y plane, then interleaved UV) → I420 (Y, U, V planes).
+///
+/// Chroma row/column counts are the same CEILING the native map uses
+/// (`mfdec_map_region` writes `(h + 1) / 2` UV rows of `w` bytes); an odd
+/// extent would otherwise leave the last row/column of the source unread and
+/// the two halves of the round-trip disagreeing about the plane size.
 Uint8List _nv12ToI420(Uint8List nv12, int w, int h) {
   final ySize = w * h;
-  final cW = w ~/ 2, cH = h ~/ 2;
+  final cW = (w + 1) ~/ 2, cH = (h + 1) ~/ 2;
   final cSize = cW * cH;
   final out = Uint8List(ySize + 2 * cSize);
   out.setRange(0, ySize, nv12);
-  final uvOff = ySize;
   var ui = ySize, vi = ySize + cSize;
-  for (var i = 0; i < cSize; i++) {
-    out[ui++] = nv12[uvOff + 2 * i]; // U
-    out[vi++] = nv12[uvOff + 2 * i + 1]; // V
+  for (var row = 0; row < cH; row++) {
+    final src = ySize + row * w; // one interleaved UV row is w bytes
+    for (var c = 0; c < cW; c++) {
+      out[ui++] = nv12[src + 2 * c]; // U
+      final vIdx = src + 2 * c + 1;
+      out[vi++] = vIdx < nv12.length ? nv12[vIdx] : 128; // V (odd w: no pair)
+    }
   }
   return out;
 }

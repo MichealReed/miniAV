@@ -8,6 +8,8 @@ import 'dart:js_interop';
 
 import 'package:web/web.dart' as web;
 
+import 'web_audio_interop.dart' as wc;
+
 @JS('globalThis.VideoEncoder')
 external JSAny? get _videoEncoderCtor;
 
@@ -116,6 +118,69 @@ abstract final class WebCapability {
       return support.supported;
     } catch (_) {
       return false;
+    }
+  }
+
+  /// Returns `true` if a [VideoDecoder] can actually be configured for
+  /// [codecString].
+  ///
+  /// [hasVideoDecoder] only proves the CONSTRUCTOR exists. HEVC and AV1 in
+  /// particular depend on the browser AND the hardware, so a decoder that
+  /// exists can still refuse the codec — without this the backend would
+  /// configure and throw instead of declining. (Video ENCODE has always been
+  /// gated this way; decode was not, which was simply an oversight.)
+  ///
+  /// Returns `false` if [hasVideoDecoder] is false; `true` when the probe
+  /// itself is unavailable, leaving `configure()` as the judge.
+  static Future<bool> isVideoDecoderSupported(
+    String codecString, {
+    int width = 1280,
+    int height = 720,
+  }) async {
+    if (!hasVideoDecoder) return false;
+    try {
+      final support = await web.VideoDecoder.isConfigSupported(
+        web.VideoDecoderConfig(
+          codec: codecString,
+          codedWidth: width,
+          codedHeight: height,
+        ),
+      ).toDart;
+      return support.supported;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  /// Returns `true` if an [AudioDecoder] can actually be configured for
+  /// [codecString] at [sampleRate]/[channels].
+  ///
+  /// [hasAudioDecoder] only proves the CONSTRUCTOR exists; a browser can ship
+  /// the API without a given codec. Checking here lets the WebCodecs backend
+  /// decline cleanly so the negotiator falls through to a fallback, instead of
+  /// configuring and throwing at the user.
+  ///
+  /// Returns `false` if [hasAudioDecoder] is false or on any error.
+  static Future<bool> isAudioDecoderSupported(
+    String codecString, {
+    int sampleRate = 48000,
+    int channels = 2,
+  }) async {
+    if (!hasAudioDecoder) return false;
+    try {
+      final support = await wc.AudioDecoder.isConfigSupported(
+        wc.AudioDecoderConfig(
+          codec: codecString,
+          sampleRate: sampleRate,
+          numberOfChannels: channels,
+        ),
+      ).toDart;
+      return support.supported;
+    } catch (_) {
+      // Older implementations lack isConfigSupported entirely. Absence of the
+      // probe is not evidence of absence of the codec — assume supported and
+      // let configure() be the judge, exactly as before this check existed.
+      return true;
     }
   }
 }

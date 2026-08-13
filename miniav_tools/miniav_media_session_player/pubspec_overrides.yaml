@@ -1,0 +1,36 @@
+# Must cover the TRANSITIVE in-repo closure, not just the direct deps: pub
+# resolves overrides for the whole graph, so a sibling that miniav_player pulls
+# in would otherwise resolve from pub.dev and shadow local work.
+dependency_overrides:
+  miniav_media_session:
+    path: ../miniav_media_session
+  miniav_media_session_flutter:
+    path: ../miniav_media_session_flutter
+  miniav_player:
+    path: ../miniav_player
+  miniav:
+    path: ../../miniav
+  miniav_ffi:
+    path: ../../miniav_ffi
+  miniav_web:
+    path: ../../miniav_web
+  miniav_platform_interface:
+    path: ../../miniav_platform_interface
+  miniav_tools:
+    path: ../miniav_tools
+  miniav_tools_ffmpeg:
+    path: ../miniav_tools_ffmpeg
+  miniav_tools_codecs:
+    path: ../miniav_tools_codecs
+  miniav_tools_platform_interface:
+    path: ../miniav_tools_platform_interface
+  minigpu_platform_interface:
+    path: ../../../minigpu/minigpu_platform_interface
+  minigpu:
+    path: ../../../minigpu/minigpu
+  minigpu_ffi:
+    path: ../../../minigpu/minigpu_ffi
+  minigpu_web:
+    path: ../../../minigpu/minigpu_web
+  minigpu_view:
+    path: ../../../minigpu/minigpu_view

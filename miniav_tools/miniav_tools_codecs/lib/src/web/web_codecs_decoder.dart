@@ -28,7 +28,10 @@ import 'package:web/web.dart' as web;
 
 import 'web_backend.dart';
 
-String _toWebCodecsString(VideoCodec codec, Map<String, String> opts) {
+/// WebCodecs codec string for [codec]. Library-visible so the backend can ask
+/// `VideoDecoder.isConfigSupported` about the exact string it would configure
+/// with (HEVC/AV1 support varies by browser AND by hardware).
+String toWebCodecsString(VideoCodec codec, Map<String, String> opts) {
   if (opts.containsKey('codecString')) return opts['codecString']!;
   return switch (codec) {
     VideoCodec.h264 => 'avc1.42E01E',
@@ -122,7 +125,7 @@ class WebCodecsVideoDecoder implements PlatformDecoder {
   /// Create and configure a decoder from a [DecoderConfig].
   static Future<WebCodecsVideoDecoder> create(DecoderConfig config) async {
     final dec = WebCodecsVideoDecoder._();
-    final codecStr = _toWebCodecsString(config.codec, config.backendOptions);
+    final codecStr = toWebCodecsString(config.codec, config.backendOptions);
 
     dec._decoder = web.VideoDecoder(
       web.VideoDecoderInit(

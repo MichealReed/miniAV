@@ -22,7 +22,10 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 import 'web_audio_interop.dart' as wc;
 import 'web_backend.dart';
 
-String _audioCodecString(AudioCodec codec, Map<String, String> opts) {
+/// WebCodecs codec string for [codec]. Library-visible so the backend can ask
+/// `AudioDecoder.isConfigSupported` about the exact string it would configure
+/// with. (The encoder keeps its own copy — same table, opposite direction.)
+String audioCodecString(AudioCodec codec, Map<String, String> opts) {
   if (opts.containsKey('codecString')) return opts['codecString']!;
   return switch (codec) {
     AudioCodec.aac => 'mp4a.40.2', // AAC-LC
@@ -134,7 +137,7 @@ class WebCodecsAudioDecoder implements PlatformAudioDecoder {
       );
     }
     final dec = WebCodecsAudioDecoder._();
-    final codecStr = _audioCodecString(config.codec, config.backendOptions);
+    final codecStr = audioCodecString(config.codec, config.backendOptions);
     dec._decoder = wc.AudioDecoder(
       wc.AudioDecoderInit(
         output: (JSAny? d) {
@@ -145,17 +148,31 @@ class WebCodecsAudioDecoder implements PlatformAudioDecoder {
         }.toJS,
       ),
     );
+    // Codec-private data: AAC AudioSpecificConfig, FLAC STREAMINFO, Vorbis
+    // headers. MP3 has none.
+    //
+    // `description` must be OMITTED entirely when there is none — passing it as
+    // null sets the key to JS `null`, and WebCodecs then fails converting it to
+    // a BufferSource with "Failed to read the 'description' property from
+    // 'AudioDecoderConfig'". (A named argument explicitly passed as null is
+    // still emitted into the JS object literal; only an argument left off is
+    // absent.) This is why MP3 could not play on web at all.
     final extra = config.extraData;
-    dec._decoder!.configure(
-      wc.AudioDecoderConfig(
-        codec: codecStr,
-        sampleRate: sampleRate,
-        numberOfChannels: channels,
-        description: (extra != null && extra.isNotEmpty)
-            ? Uint8List.fromList(extra).toJS
-            : null,
-      ),
-    );
+    // Tight copy so `description` is exactly those bytes — `extra` may be a
+    // view into a larger buffer.
+    final cfg = (extra != null && extra.isNotEmpty)
+        ? wc.AudioDecoderConfig(
+            codec: codecStr,
+            sampleRate: sampleRate,
+            numberOfChannels: channels,
+            description: Uint8List.fromList(extra).toJS,
+          )
+        : wc.AudioDecoderConfig(
+            codec: codecStr,
+            sampleRate: sampleRate,
+            numberOfChannels: channels,
+          );
+    dec._decoder!.configure(cfg);
     dec._throwIfError();
     return dec;
   }

@@ -127,6 +127,69 @@ class VideoScheduler {
       ? (_livePending != null ? 1 : 0)
       : _queue.length;
 
+  /// Frames accepted but not yet accounted for, INCLUDING the one whose
+  /// present is in flight. [queueDepth] deliberately excludes that one (it is
+  /// the decode-ahead backpressure signal); end-of-stream needs it, or the
+  /// tail reads as shown while it is still on its way to the screen.
+  int get pendingCount => queueDepth + (_presenting ? 1 : 0);
+
+  /// Every frame this scheduler has finished with — presented or dropped.
+  /// Its increments are the definition of progress for [waitUntilPresented].
+  int get _settledCount =>
+      presentedCount + droppedSupersededCount + droppedLateCount;
+
+  /// Paced mode only: the head frame's presentation time has not arrived yet,
+  /// so no progress is EXPECTED — waiting is what pacing means. An unanchored
+  /// clock reads as not-waiting (nothing will ever be presented then, which is
+  /// a real stall), and so does a PAUSED one: a frozen media time never reaches
+  /// the head pts, so waiting on it is a stall, not pacing.
+  bool get _waitingOnClock {
+    if (mode != PlayerLatencyMode.paced ||
+        _presenting ||
+        _queue.isEmpty ||
+        _clock.isPaused) {
+      return false;
+    }
+    final now = _clock.mediaTimeUs();
+    return now != null && _queue.first.ptsUs > now;
+  }
+
+  /// Wait until every submitted frame has been presented (or dropped), so a
+  /// caller can say the queue really reached the screen.
+  ///
+  /// Bounded three ways, because the failure shapes need different bounds:
+  /// [stallTimeout] catches a wedged presenter quickly but does not run while
+  /// paced frames are legitimately waiting on the media clock (a low-framerate
+  /// tail would otherwise be cut short) — a paused clock is NOT such a wait, so
+  /// pausing mid-wait gives up on the stall bound rather than pacing out the
+  /// absolute one. [shouldAbort] drops the wait when the caller's own state
+  /// moved on (pause / seek / close), so a caller that can make the queue
+  /// drainable again is not held here meanwhile. [maxWait] is the absolute
+  /// backstop. Returns false when it gave up with frames still pending.
+  Future<bool> waitUntilPresented({
+    Duration stallTimeout = const Duration(seconds: 2),
+    Duration maxWait = const Duration(seconds: 30),
+    bool Function()? shouldAbort,
+  }) async {
+    var lastSettled = _settledCount;
+    final stall = Stopwatch()..start();
+    final total = Stopwatch()..start();
+    while (!_disposed && pendingCount > 0) {
+      if (shouldAbort != null && shouldAbort()) return false;
+      await Future<void>.delayed(const Duration(milliseconds: 4));
+      if (_settledCount != lastSettled) {
+        lastSettled = _settledCount;
+        stall.reset();
+      } else if (_waitingOnClock) {
+        stall.reset();
+      } else if (stall.elapsed > stallTimeout) {
+        return false;
+      }
+      if (total.elapsed > maxWait) return false;
+    }
+    return pendingCount == 0;
+  }
+
   /// Submit a decoded frame. Never blocks; drop policy per [mode].
   void submit(ScheduledVideoFrame frame) {
     if (_disposed) return;

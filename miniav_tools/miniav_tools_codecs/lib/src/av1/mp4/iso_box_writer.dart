@@ -1,8 +1,10 @@
-/// Minimal ISOBMFF box writer used by the AV1 MP4 muxer.
+/// Minimal ISOBMFF box writer, shared by the ISO-BMFF muxers.
 ///
-/// Only what we need for an AV1-in-MP4 file written in a single shot at
-/// `finish()` time. All sizes are 32-bit (no `largesize`); for >4GiB outputs
-/// we would switch the relevant boxes to 64-bit.
+/// [box] and [fullBox] compose whole payloads in memory, so their size always
+/// fits 32 bits — the one box that can exceed 4 GiB is `mdat`, whose payload is
+/// never held here. `Mp4Muxer` writes that header itself in the `largesize`
+/// form (size==1 + u64), and picks version-1 `mvhd`/`tkhd`/`mdhd` and `co64`
+/// where the 32-bit fields would wrap.
 library;
 
 import 'dart:typed_data';

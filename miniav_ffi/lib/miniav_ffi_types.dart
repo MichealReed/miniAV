@@ -595,6 +595,14 @@ MiniAVGamepadEvent gamepadEventFromNative(bindings.MiniAVGamepadEvent native) {
 }
 
 /// Copy MiniAVInputConfig to a native struct, setting callback pointers.
+///
+/// Writes EVERY field of the native struct, including the motion trio. The C
+/// struct is 64 bytes and `MiniAV_Input_Configure` copies all 64 into the
+/// context; leaving the tail to whatever the allocator happened to hold puts
+/// garbage in `motion_callback`, which the C side calls as a function pointer.
+/// Motion is not delivered over FFI (no desktop backend, and the MOTION bit is
+/// never requested), so the trio is written zero/null — the "no motion"
+/// encoding every backend and `miniav_input_deliver_motion` null-check honours.
 void copyInputConfigToNative(
   MiniAVInputConfig config,
   bindings.MiniAVInputConfig native, {
@@ -609,4 +617,7 @@ void copyInputConfigToNative(
   native.mouse_callback = mouseCb;
   native.gamepad_callback = gamepadCb;
   native.user_data = ffi.nullptr;
+  native.motion_rate_hz = 0;
+  native.motion_modeAsInt = 0; // MINIAV_MOTION_MODE_RAW_DEVICE_FRAME
+  native.motion_callback = ffi.nullptr;
 }

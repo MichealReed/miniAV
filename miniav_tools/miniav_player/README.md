@@ -49,15 +49,31 @@ therefore runs **without FFmpeg in the process**:
 | H.264 / HEVC decode → D3D11 texture | Media Foundation hardware MFT | Windows |
 | AAC decode | OS codec (Media Foundation) | Windows |
 | Opus decode | libopus | all |
-| MP3 / FLAC / Vorbis decode | dr_mp3 / dr_flac / stb_vorbis | all |
+| MP3 decode | dr_mp3 | all |
 | Raw PCM (`pcmS16le`, `pcmF32le`) | first-party | all |
-| WAV / Ogg / ADTS / MP4 framing | first-party | all |
+| WAV / Ogg / ADTS / MP4 framing, MP3 demux | first-party | all |
 
 FFmpeg is registered alongside as the cross-platform software floor and the
-fallback for everything else (MKV, VP8/VP9/AV1, software video, and AAC when the
-calling thread is STA). So an H.264 + Opus stream on Windows decodes with zero
-FFmpeg; the same stream on Linux/macOS falls back to FFmpeg software decode
-automatically, with no code change.
+fallback for everything else (MKV, VP8/VP9/AV1, software video, AAC when the
+calling thread is STA, **and FLAC/Vorbis**). So an H.264 + Opus stream on
+Windows decodes with zero FFmpeg; the same stream on Linux x86-64 falls back to
+FFmpeg software decode automatically, with no code change.
+
+**It does not fall back on macOS, Android or iOS.** The FFmpeg shim this
+package needs is only built when the FFmpeg auto-download succeeds, and no
+artifact exists for those platforms — so `brew install ffmpeg` on macOS changes
+the error, not the outcome. There is no video decoder at all on those three
+today. Note also that the FFmpeg-free demuxers accept in-memory **bytes only**,
+so `MediaSource.file(...)` routes to FFmpeg on every platform; the honest macOS
+feature set is audio-only playback of WAV/MP3/Opus/Ogg via `MediaSource.bytes`.
+Full matrix, caveats and the plan:
+[`docs/PLATFORM_SUPPORT.md`](../../docs/PLATFORM_SUPPORT.md).
+
+FLAC and Vorbis are on the FFmpeg side of that line: the first-party decoders
+behind them need a whole container, and a demuxed track arrives as packets
+whose headers the demuxer has already stripped. Playing a `.flac` or an
+Ogg/Vorbis file therefore requires `miniav_tools_ffmpeg` (registered here by
+default) — dropping it raises `NoBackendForCodecException` on open.
 
 Selection is by capability, not by registration order — the negotiator ranks
 `isHardware` above `zeroCopy` above `priority`. To force one:
@@ -109,11 +125,10 @@ the stream form buffers a bounded amount of undemuxed input and pauses the
 source behind it, so a slow consumer cannot run the process out of memory.
 
 Audio-only files work exactly the same way; there is simply no video track to
-present, so you do not need `MiniavPlayerView`. MP3, FLAC, Vorbis, Opus, AAC
-and raw PCM all decode first-party. Container support is the limit rather than
-the codec: WAV, Ogg, ADTS and MP4 demux without FFmpeg, and anything else
-(including a bare `.mp3` file, MKV, and MOV) demuxes through FFmpeg and then
-decodes first-party.
+present, so you do not need `MiniavPlayerView`. MP3, Opus, AAC and raw PCM
+decode first-party; FLAC and Vorbis decode through FFmpeg (see above). WAV,
+Ogg, ADTS, MP4 and bare MP3 demux without FFmpeg; anything else (MKV, MOV)
+demuxes through FFmpeg and then decodes first-party where it can.
 
 ### Sharing an app GPU context
 

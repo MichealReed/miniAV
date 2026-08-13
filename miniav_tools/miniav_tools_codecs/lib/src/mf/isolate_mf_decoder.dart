@@ -13,6 +13,10 @@
 ///     on present-or-drop — so no frame leaks.
 ///   - [DecodedFrame.readBytes] round-trips to the worker (NV12→I420 map) as a
 ///     CPU fallback for consumers that don't take the texture path.
+///
+/// The relayed w/h are the DISPLAY size and the texture stays coded-size —
+/// see the frame-size contract on [MfD3d11Decoder], which this host inherits
+/// unchanged.
 library;
 
 import 'dart:async';

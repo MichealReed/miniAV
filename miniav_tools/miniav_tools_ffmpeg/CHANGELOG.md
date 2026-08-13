@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.5.5
+
+- **Native `av_log` forwarding moved from a `NativeCallable` to a Dart native
+  port** (shim ABI 20 -> 21, new exports `miniav_shim_init_dart_api` /
+  `miniav_shim_set_log_port`; `tool/shim_c/dart_dl/` vendors the BSD-licensed
+  Dart SDK dynamic-linking API). `av_log_set_callback` is a PROCESS-GLOBAL
+  registry: a `NativeCallable` installed there is owned by ONE isolate, and
+  when that isolate exits the VM deletes the trampoline while FFmpeg keeps the
+  pointer — the next log line from a codec thread aborted the whole process
+  (`runtime_entry.cc: Callback invoked after it has been deleted`, typically
+  under `avcodec_open2`). A whole-suite `dart test` hit it every run, because
+  every test FILE is a separate isolate in ONE VM process; `dart test` now
+  completes. `setFfmpegLogCallback` gained an optional `level:` argument and
+  registers a `ReceivePort` per isolate. Semantics unchanged and still
+  documented: PROCESS-GLOBAL, LAST WRITER WINS — with several isolates
+  registered only the most recent receives lines. Trap: the message is carried
+  as raw bytes, not a `Dart_CObject` string, because FFmpeg emits Latin-1
+  filenames on Windows and `Dart_CObject_kString` requires valid UTF-8. The
+  v8/v9 function-pointer exports remain for non-Dart embedders; Dart no longer
+  binds them.
+- `FfmpegDemuxer` now fills `VideoTrackInfo.rotationDegrees` from the
+  container's display matrix (shim ABI 18 -> 20, new exports
+  `miniav_shim_stream_rotation_degrees` / `_set_rotation_degrees`). It
+  previously reported 0 for every container, so a 90-degree phone MP4/MKV/WebM
+  played back sideways. Value is degrees CLOCKWISE in {0, 90, 180, 270};
+  decoded frames stay in coded orientation, so `width`/`height` remain the
+  coded dimensions and the consumer applies the turn. Only a plain quadrant
+  turn is reported: flips, scales and arbitrary transforms read as 0, matching
+  `miniav_tools_codecs`' MP4 demuxer, so the two never disagree about the same
+  file. Trap: `av_display_rotation_get` cannot be used for this — it derives
+  the angle from `atan2`, so a mirrored (pure horizontal flip) clip comes back
+  as 180 and would render upside down. Second trap: FFmpeg 7 removed
+  `AVStream.side_data` / `av_stream_get_side_data`, so stream side data lives
+  in `codecpar->coded_side_data`.
+- `FfmpegMuxer` now WRITES `VideoTrackInfo.rotationDegrees` as a container
+  display matrix, so a rotation read by the demuxer survives a remux instead
+  of being silently dropped (it plays sideways otherwise). Set before
+  `avformat_write_header`, after codecpar is populated —
+  `avcodec_parameters_from_context` overwrites the side data. A rotation that
+  is not a multiple of 90, or a missing shim, throws rather than writing an
+  upright file.
+- `hook/build.dart` registers `tool/shim_c/**` as build dependencies. Without
+  them an edited `shim.c` kept serving the previously built DLL, and a stale
+  ABI makes `FfmpegShim.tryLoad()` return null — which takes the whole backend
+  down (every open throws "shim not loadable"), not just the new export.
+
 ## 0.5.4
 
 - **Internal pins are now caret ranges, not exact versions.** Exact pins made

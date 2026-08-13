@@ -222,6 +222,20 @@ file(GLOB COMMON_SOURCES "src/common/*.c" "src/common/*.h")
 list(APPEND ALL_SOURCES ${COMMON_SOURCES})
 list(APPEND ALL_PRIVATE_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src/common")
 
+# --- Dart dynamic-linking API (native builds only) --------------------------
+# third_party/dart_dl is a verbatim copy of the Dart SDK's include/ headers
+# plus dart_api_dl.c. It lets miniav_logging.c deliver log lines to a Dart
+# NATIVE PORT instead of a MiniAVLogCallback function pointer. The log
+# callback registry is PROCESS-GLOBAL: a Dart NativeCallable registered there
+# outlives the isolate that created it, and the VM aborts the whole process
+# the moment a capture thread logs afterwards. A stale port id is inert.
+# Not built for web — a wasm module has no Dart VM to post to.
+if(NOT MINIAV_PLATFORM_WEB)
+    list(APPEND ALL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dart_dl/dart_api_dl.c")
+    list(APPEND ALL_PRIVATE_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dart_dl")
+    list(APPEND ALL_DEFINITIONS "MINIAV_HAVE_DART_DL")
+endif()
+
 list(APPEND ALL_HEADERS
     "include/miniav_buffer.h"
     "include/miniav_capture.h"
@@ -238,7 +252,9 @@ if(MINIAV_PLATFORM_WINDOWS)
     list(APPEND ALL_DEFINITIONS "MINIAV_PLATFORM_WINDOWS")
     list(APPEND ALL_DEFINITIONS "MINIAV_BUILD_DLL")
     target_compile_definitions(miniav_c PUBLIC MINIAV_DLL)
-    list(APPEND ALL_LINK_LIBS ole32 uuid shlwapi)
+    # mmdevapi: ActivateAudioInterfaceAsync, used by the WASAPI loopback
+    # backend for real per-process capture (Windows 10 build 20348+).
+    list(APPEND ALL_LINK_LIBS ole32 uuid shlwapi mmdevapi)
     
 elseif(MINIAV_PLATFORM_MACOS)
     list(APPEND ALL_DEFINITIONS "MINIAV_PLATFORM_MACOS")
@@ -719,12 +735,47 @@ if(MINIAV_PLATFORM_WINDOWS OR MINIAV_PLATFORM_MACOS OR MINIAV_PLATFORM_LINUX)
         add_executable(test_screen_capture src/screen/test/test_screen_capture.c)
         target_link_libraries(test_screen_capture PRIVATE miniav_c)
         target_include_directories(test_screen_capture PRIVATE ${TEST_INCLUDE_DIRS})
+
+        if(MINIAV_PLATFORM_WINDOWS)
+            # Start/stop/destroy race harness for the WGC backend's threadpool
+            # callback drain. Positive control: MINIAV_WGC_STRESS_NO_DRAIN=1.
+            add_executable(test_wgc_teardown_stress src/screen/test/test_wgc_teardown_stress.c)
+            target_link_libraries(test_wgc_teardown_stress PRIVATE miniav_c)
+            target_include_directories(test_wgc_teardown_stress PRIVATE ${TEST_INCLUDE_DIRS})
+
+            # Frame-pool-vs-content-size harness (resize a captured window) plus
+            # window-capture-with-audio. Positive controls:
+            #   MINIAV_WGC_STRESS_NO_POOL_RECREATE=1
+            #   MINIAV_LOOPBACK_STRESS_CASE_SENSITIVE_ID=1
+            add_executable(test_wgc_resize_stress src/screen/test/test_wgc_resize_stress.c)
+            target_link_libraries(test_wgc_resize_stress PRIVATE miniav_c user32 gdi32)
+            target_include_directories(test_wgc_resize_stress PRIVATE ${TEST_INCLUDE_DIRS})
+        endif()
     endif()
 
     if(MINIAV_ENABLE_LOOPBACK)
         add_executable(test_loopback_capture src/loopback/test/test_loopback_capture.c)
         target_link_libraries(test_loopback_capture PRIVATE miniav_c)
         target_include_directories(test_loopback_capture PRIVATE ${TEST_INCLUDE_DIRS})
+
+        if(MINIAV_PLATFORM_WINDOWS)
+            # Reported-vs-negotiated audio format and "PID:"/"pid:" target-ID
+            # parsing. Positive controls:
+            #   MINIAV_LOOPBACK_STRESS_REQUESTED_FORMAT=1
+            #   MINIAV_LOOPBACK_STRESS_CASE_SENSITIVE_ID=1
+            add_executable(test_loopback_format_honesty src/loopback/test/test_loopback_format_honesty.c)
+            target_link_libraries(test_loopback_format_honesty PRIVATE miniav_c)
+            target_include_directories(test_loopback_format_honesty PRIVATE ${TEST_INCLUDE_DIRS})
+
+            # Does "pid:<x>" actually deliver ONLY process x's audio? Two child
+            # processes render different tones; the harness re-runs itself as
+            # the tone renderer. Positive control:
+            #   MINIAV_LOOPBACK_STRESS_NO_PROCESS_LOOPBACK=1
+            #   MINIAV_LOOPBACK_ALLOW_SYSTEM_FALLBACK=1
+            add_executable(test_loopback_process_isolation src/loopback/test/test_loopback_process_isolation.c)
+            target_link_libraries(test_loopback_process_isolation PRIVATE miniav_c)
+            target_include_directories(test_loopback_process_isolation PRIVATE ${TEST_INCLUDE_DIRS})
+        endif()
     endif()
 
     if(MINIAV_ENABLE_INPUT)

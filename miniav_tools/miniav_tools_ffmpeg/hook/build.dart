@@ -43,6 +43,17 @@ void main(List<String> args) async {
       return;
     }
 
+    // hooks_runner re-runs this hook only when the hook script itself or a
+    // REGISTERED dependency is newer than the cached output. CMakeBuilder
+    // registers none of its sources, so without this an edited shim.c keeps
+    // serving the previously built DLL — and a stale ABI makes
+    // FfmpegShim.tryLoad() return null, which takes the whole FFmpeg backend
+    // down (every open throws 'shim not loadable'), not just the new export.
+    output.dependencies.addAll([
+      for (final f in _sourceDir.listSync(recursive: true).whereType<File>())
+        f.absolute.uri,
+    ]);
+
     // Ensure FFmpeg dev distribution is on disk (downloads ~120MB once).
     FfmpegDownloadResult? ff;
     try {

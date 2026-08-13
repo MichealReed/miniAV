@@ -24,7 +24,8 @@ if(EMSCRIPTEN)
   set_target_properties(miniav_codecs PROPERTIES
     C_STANDARD 11
     OUTPUT_NAME "miniav_codecs")
-  target_compile_definitions(miniav_codecs PRIVATE HAVE_OPUS=1)
+  target_compile_definitions(miniav_codecs PRIVATE HAVE_OPUS=1
+    MINIAV_OPUS_SCRATCH_MODE="${MINIAV_OPUS_SCRATCH_MODE}")
   target_link_libraries(miniav_codecs PRIVATE opus::opus)
   target_link_options(miniav_codecs PRIVATE
     "-O3"
@@ -60,7 +61,8 @@ else()
   )
   set_target_properties(miniav_tools_codecs_native PROPERTIES C_STANDARD 11)
 
-  target_compile_definitions(miniav_tools_codecs_native PRIVATE HAVE_OPUS=1)
+  target_compile_definitions(miniav_tools_codecs_native PRIVATE HAVE_OPUS=1
+    MINIAV_OPUS_SCRATCH_MODE="${MINIAV_OPUS_SCRATCH_MODE}")
   target_link_libraries(miniav_tools_codecs_native PRIVATE opus::opus)
 
   # Hide internal symbols on POSIX (matches the dllexport visibility on Windows).

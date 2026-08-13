@@ -1,4 +1,4 @@
-# Dart/Flutter gates for the miniav_tools codec stack + player (P3.1).
+# Dart/Flutter gates for the miniav_tools codec stack + recorder + player.
 #
 # Layout note: the tracked pubspec_overrides.yaml files resolve minigpu by
 # RELATIVE PATH (../../../minigpu/...), i.e. a `minigpu` checkout SIBLING to
@@ -9,18 +9,25 @@
 # Toolchain: Flutter MASTER channel — the packages pin a bleeding-edge Dart SDK
 # (native-assets build hooks), matching the dev environment.
 #
-# Scope (v1, deliberately hermetic):
-#   - analyze: whole codec stack + player (errors fail; infos/warnings don't).
-#   - codecs tests (Windows): the FFmpeg-free suites. The native asset builds
-#     via the CMake build hook (MSVC on the runner). GPU byte-exact suites
-#     self-skip when Dawn can't init on the runner's adapter; container/codec
-#     fixtures are generated with the ffmpeg CLI when available (tests skip
-#     cleanly if not).
+# WHY THE TEST LISTS ARE CURATED, NOT `dart test`:
+# the runners have no GPU (Dawn init fails), no hardware Media Foundation MFTs
+# (no NVENC/QSV encoder, no HW decoder, no HEVC Video Extensions), no capture
+# devices, and no FFmpeg runtime unless something downloads ~92 MB from BtbN.
+# Suites that SKIP on those absences are listed; suites that FAIL on them are
+# excluded by name with the reason, so the gap is explicit instead of silent.
+# Every exclusion below was checked against the test's actual guard.
+#
+# Scope:
+#   - analyze: codec stack + recorder + player (errors fail; infos/warnings don't).
+#   - codecs tests (Windows), in three steps by dependency:
+#       hermetic          — always; needs only the CMake-built native asset.
+#       fixture-dependent — only if the ffmpeg-CLI fixture step succeeded.
+#       FFmpeg-runtime    — opt-in (see `ffmpeg_suites` below).
+#   - recorder tests (Windows), PER FILE.
 #   - platform_interface + tools tests (pure Dart / fake backends).
 #   - web build: examples/player through dart2js (the proven web gate).
-# NOT here (yet): FFmpeg-runtime suites (BtbN download flakiness), flutter test
-# of the player on Windows (native-assets-under-flutter-test is unstable on
-# master — run locally), real-browser tests.
+# NOT here: browser-platform suites (need `-p chrome`), real-device suites,
+# `flutter test` of the player (see the commented job at the bottom).
 name: dart-ci
 
 on:
@@ -39,6 +46,13 @@ on:
       - "miniav_web/**"
       - ".github/workflows/dart-ci.yml"
   workflow_dispatch:
+    inputs:
+      ffmpeg_suites:
+        description: >-
+          Also run the FFmpeg-RUNTIME suites. These auto-download ~92 MB of
+          shared libraries from BtbN, which is why they are not on by default.
+        type: boolean
+        default: false
 
 jobs:
   analyze:
@@ -55,18 +69,30 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: master
-      - name: Pub get + analyze (codec stack + player)
+      # --no-fatal-warnings is NOT decoration and NOT the tool default:
+      # `dart analyze` exits 2 on warning-level issues unless told otherwise, so
+      # without it the loop fails on pre-existing lint debt (unused
+      # imports/locals, redundant `!`) in packages it merely walks past — and
+      # because `set -e` aborts on the first one, the packages listed after it
+      # are never analyzed at all. Errors still exit non-zero, which is the gate
+      # this job is for and what the Scope note above promises.
+      - name: Pub get + analyze (codec stack + recorder + player)
         working-directory: miniAV/miniav_tools
         run: |
           set -e
-          for pkg in miniav_tools_platform_interface miniav_tools_codecs miniav_tools_ffmpeg miniav_tools miniav_player; do
+          for pkg in miniav_tools_platform_interface miniav_tools_codecs miniav_tools_ffmpeg miniav_tools miniav_recorder miniav_player; do
             echo "=== $pkg ==="
-            (cd "$pkg" && flutter pub get && dart analyze)
+            (cd "$pkg" && flutter pub get && dart analyze --no-fatal-warnings)
           done
 
   codecs-test-windows:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      # Hermetic by default: without this the first create*() that lands on the
+      # FFmpeg backend silently starts a ~92 MB BtbN download. The opt-in step
+      # below overrides it.
+      MINIAV_TOOLS_FFMPEG_NO_AUTODOWNLOAD: "1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,9 +105,14 @@ jobs:
         with:
           channel: master
       - name: Generate test fixtures (ffmpeg CLI)
+        id: fixtures
         working-directory: miniAV/miniav_tools/miniav_tools_codecs/test
         shell: bash
-        continue-on-error: true # fixture-dependent tests skip cleanly if absent
+        # continue-on-error keeps a choco/network hiccup from reddening the
+        # whole build; the suites that CANNOT skip without these files are
+        # gated on `steps.fixtures.outcome` instead (see below), so a failure
+        # here skips them rather than failing them.
+        continue-on-error: true
         run: |
           choco install ffmpeg -y --no-progress
           export PATH="$PATH:/c/ProgramData/chocolatey/bin"
@@ -93,24 +124,264 @@ jobs:
           ffmpeg -hide_banner -loglevel error -display_rotation -90 -i assets/plain_tmp.mp4 -c copy -y assets/rot90.mp4
           rm assets/plain_tmp.mp4
           ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=duration=1:size=64x48:rate=10 -c:v libx264 -pix_fmt yuv420p -bf 2 -g 10 -y assets/bframes.mp4
-      - name: dart test (FFmpeg-free suites; native asset via CMake hook)
+      - name: Pub get (builds the native asset via the CMake hook / MSVC)
+        working-directory: miniAV/miniav_tools/miniav_tools_codecs
+        shell: bash
+        run: dart pub get
+
+      # DEFAULT concurrency. -j 1 used to be mandatory here for two SEPARATE
+      # reasons; both are fixed, and the history is kept because the second one
+      # is a build-config change that anyone could undo without noticing.
+      #
+      # FIXED #1 (the original reason): parallel isolates each drove the
+      # PROCESS-GLOBAL Dawn context and concurrent init/teardown crashed the VM
+      # with an access violation even when every test passed. minigpu_ffi 1.5.10
+      # serializes the context lifecycle and reference-counts it at the C-API
+      # boundary. MGPU_UNSAFE_NO_CTX_LOCK=1 brings the old access violation
+      # straight back — that env var exists to re-confirm it.
+      #
+      # FIXED #2 (the one that was long "unattributed"): the intermittent aborts
+      # around test ~68-74 with VARYING fault codes (0xC0000005, 0xC0000374,
+      # 0xC0000094, 0xC0000409) were heap corruption coming from LIBOPUS.
+      # miniav_tools_codecs/native/cmake/opus.cmake built it with
+      # NONTHREADSAFE_PSEUDOSTACK on MSVC — libopus's last-resort mode, where
+      # every scratch array in the library comes out of ONE process-global
+      # 120 000-byte buffer behind an unsynchronised bump pointer. `dart test`
+      # runs each suite in its own isolate in ONE process, so several OS threads
+      # sit inside libopus at once, the pointer walks off the end and libopus
+      # memcpys over the heap. clang-cl ASan on an 8-thread harness: "WRITE of
+      # size 4096 ... 320 bytes after 120000-byte region allocated by
+      # opus_alloc_scratch" (run_prefilter, celt_encoder.c), 10/10 runs; 0/10
+      # with USE_ALLOCA. Windows now builds USE_ALLOCA, and
+      # test/opus_encode_test.dart asserts the mode via opusScratchMode() so a
+      # regression is a red test rather than a corrupted process.
+      #
+      # Measured on the dev box AFTER the fix: 10/10 full-suite runs at default
+      # concurrency, zero aborts; reverting that one cmake define alone brings
+      # the aborts straight back.
+      #
+      # One thing default concurrency DOES still expose locally, and it is not
+      # this bug: a bare `dart test` of the whole package intermittently fails
+      # mf_frame_sources_test.dart, which passes alone and passes at
+      # --concurrency=1. That is several MF-encoder suites contending for the one
+      # hardware MFT — a clean test failure, never an abort. It cannot affect
+      # this job: mf_frame_sources_test.dart is in the excluded list below (no
+      # runner has a hardware MFT at all), and every mf_* suite that IS listed
+      # skips itself on that hardware.
+      #
+      # If mixed-fault-code aborts ever reappear: do NOT attribute them from the
+      # stack. Two investigations did exactly that and named two unrelated
+      # subsystems (the Media Foundation path; the AV1 cluster) — with heap
+      # corruption the faulting site is wherever the poisoned memory is next
+      # touched, never the code that wrote it. Reproduce under a heap tool
+      # (ASan, or Application Verifier / PageHeap) instead.
+      - name: dart test — hermetic suites (no fixtures, no FFmpeg runtime)
         working-directory: miniAV/miniav_tools/miniav_tools_codecs
         shell: bash
         run: |
-          dart pub get
-          # --concurrency=1: parallel test isolates each spin up a Dawn device;
-          # concurrent teardown can crash the VM (access violation) even when
-          # every test passes. Serialized runs are stable (dev-box verified).
-          dart test --concurrency=1 \
+          dart test \
+            test/adts_id3_resync_test.dart \
+            test/annexb_test.dart \
+            test/auto_register_test.dart \
+            test/av1_bool_coder_test.dart \
+            test/av1_tile_group_test.dart \
+            test/container_timing_test.dart \
+            test/ffmpeg_free_path_test.dart \
             test/frame_convert_test.dart \
-            test/gpu_planar_yuv_test.dart \
             test/framing_test.dart \
+            test/gpu_planar_yuv_test.dart \
+            test/gpu_rgba_yuv420_test.dart \
+            test/honest_capabilities_test.dart \
+            test/mf_aac_test.dart \
+            test/mf_d3d11_decode_test.dart \
+            test/mf_encoder_lifecycle_test.dart \
+            test/mf_encoder_test.dart \
+            test/mf_hevc_decode_test.dart \
+            test/mf_hevc_no_dims_test.dart \
+            test/mf_nonaligned_decode_test.dart \
+            test/mp3_container_test.dart \
+            test/mp3_header_matrix_test.dart \
             test/mp4_demux_test.dart \
-            test/mp4_mux_test.dart \
             test/mp4_metadata_test.dart \
-            test/pcm_roundtrip_test.dart \
+            test/mp4_multitrack_test.dart \
+            test/mp4_mux_test.dart \
+            test/mp4_rotation_roundtrip_test.dart \
+            test/mp4_seek_test.dart \
+            test/mp4_streaming_file_test.dart \
+            test/mp4_timing_test.dart \
+            test/muxer_file_output_test.dart \
             test/opus_encode_test.dart \
+            test/opus_preskip_test.dart \
+            test/opus_producer_preskip_test.dart \
+            test/pcm_roundtrip_test.dart \
+            test/rgba_yuv_convert_test.dart \
+            test/wav_adts_streaming_file_test.dart \
+            test/wav_formats_test.dart
+
+      # These read test/assets/* with NO existsSync guard — a missing fixture
+      # is a FileSystemException, not a skip — so they are gated on the fixture
+      # step having actually succeeded. (`outcome` is the pre-continue-on-error
+      # result; `conclusion` would always be 'success' here.)
+      - name: dart test — fixture-dependent suites
+        if: steps.fixtures.outcome == 'success'
+        working-directory: miniAV/miniav_tools/miniav_tools_codecs
+        shell: bash
+        run: |
+          dart test \
+            test/mp3_decode_roundtrip_test.dart \
+            test/sw_audio_chunked_feed_test.dart \
             test/sw_audio_test.dart
+
+      # These need FFmpeg to actually LOAD (they assert backendName == 'ffmpeg'
+      # and decode, or use the FFmpeg encoder as their packet source), so they
+      # pull the BtbN archive. Opt in per run via the workflow_dispatch input,
+      # or permanently by setting repo variable MINIAV_CI_FFMPEG=1.
+      # MINIAV_TOOLS_FFMPEG_NETTEST is the flag the repo's own suites already
+      # use for "network downloads are allowed here".
+      # bframe_decode_test SKIPS itself without FFmpeg, so it is here rather
+      # than in the hermetic step: listing it there would only ever record a
+      # skip, which reads like coverage and is not.
+      - name: dart test — FFmpeg-runtime suites (opt-in; downloads ~92 MB)
+        if: >-
+          steps.fixtures.outcome == 'success' &&
+          (inputs.ffmpeg_suites == true || vars.MINIAV_CI_FFMPEG == '1')
+        working-directory: miniAV/miniav_tools/miniav_tools_codecs
+        shell: bash
+        env:
+          MINIAV_TOOLS_FFMPEG_NO_AUTODOWNLOAD: "0"
+          MINIAV_TOOLS_FFMPEG_NETTEST: "1"
+        run: |
+          dart test \
+            test/bframe_decode_test.dart \
+            test/flac_vorbis_stream_decode_test.dart \
+            test/full_stack_selection_test.dart \
+            test/opus_roundtrip_test.dart
+
+      # DELIBERATELY EXCLUDED from every step above — each FAILS rather than
+      # skips on this hardware, so listing them would be a permanent red:
+      #   av1_dav1d_multires_test.dart   ffmpeg-CLI guard only; choco puts
+      #   av1_dav1d_roundtrip_test.dart  ffmpeg on PATH, so the guard passes
+      #                                  and the run falls into an UNGUARDED
+      #                                  minigpu encode (no GPU on the runner).
+      #   av1_phase0_test.dart           `expect(encoder, isNotNull)` on a
+      #   av1_yuv420_test.dart           MinigpuBackend encoder with no
+      #   mjpeg_test.dart                Dawn-init try/catch.
+      #   mf_gpu_import_test.dart        setUpAll does a bare `await gpu.init()`
+      #                                  (no try/catch, unlike gpu_planar_yuv);
+      #                                  a Dawn failure errors the group AND
+      #                                  leaves `late gpu` unset for teardown.
+      #   mf_encode_hw_test.dart         open the MF encoder and assert
+      #   mf_frame_sources_test.dart     isNotNull with no mfencHasMft() guard;
+      #   mf_mp4_roundtrip_test.dart     two also require an HEVC MFT (HEVC
+      #   mf_texture_zero_copy_test.dart Video Extensions is a Store package).
+      #   mf_sta_thread_test.dart        asserts enc.isHardware — needs a real
+      #                                  hardware MFT, which no runner has.
+      #   _av1_header_dump_test.dart     a print-only diagnostic; it asserts
+      #                                  nothing, so gating on it is noise.
+      #   mp4_web_file_output_test.dart  @TestOn('browser') — the VM runner
+      #   smoke_web_test.dart            cannot load them; they need `-p chrome`.
+
+  recorder-test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      MINIAV_TOOLS_FFMPEG_NO_AUTODOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: miniAV
+      - uses: actions/checkout@v4
+        with:
+          repository: PracticalXR/minigpu
+          path: minigpu
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: master
+      - name: Pub get
+        working-directory: miniAV/miniav_tools/miniav_recorder
+        shell: bash
+        run: flutter pub get
+      # ONE process, default concurrency. Both reasons this used to be one
+      # process PER FILE are now fixed; the history is worth keeping because
+      # each failure mode was silent in the per-suite results — the run just
+      # stopped.
+      #
+      # (1) Log callbacks. miniav's and FFmpeg's process-global log callbacks
+      # deliver over a Dart NATIVE PORT instead of a NativeCallable
+      # (miniav_ffi 0.7.1 / miniav_tools_ffmpeg 0.5.5), and minigpu's does too
+      # (minigpu_ffi 1.5.10), so an exited isolate can no longer leave a
+      # deleted trampoline behind for a native thread to call ("Callback
+      # invoked after it has been deleted"). A closed port is inert.
+      #
+      # (2) Dawn/GPU state, which is what still blocked a whole-suite run after
+      # (1) landed: several suites init Dawn, the native context is
+      # process-global while the Dart wrapper is per-isolate, and sharing one
+      # process either died with an access violation (parallel) or made
+      # createSharedOutputTexture return null in shared_ring_test
+      # (--concurrency=1). minigpu_ffi 1.5.10 serializes the context lifecycle
+      # and reference-counts it at the C-API boundary: concurrent inits share
+      # one device instead of racing to free each other's, and teardown happens
+      # only when the LAST consumer detaches. Dev-box verified — 427/427 at
+      # default concurrency AND at --concurrency=1, with shared_ring_test
+      # running 402nd of 427 in the serialized run and still getting a live
+      # texture. Setting MGPU_UNSAFE_NO_CTX_LOCK=1 brings the abort straight
+      # back, which is how to re-confirm this if the job ever goes red again.
+      #
+      # NOTE the codecs job above still runs -j 1. That is NOT this problem
+      # left over: it is a separate heap-corruption abort in the Media
+      # Foundation path there, which reproduces with every GPU suite excluded.
+      # See the comment on that step.
+      - name: dart test
+        working-directory: miniAV/miniav_tools/miniav_recorder
+        shell: bash
+        run: |
+          dart test \
+            test/adaptive_gpu_throttle_test.dart \
+            test/audio_effect_test.dart \
+            test/audio_pts_test.dart \
+            test/audio_track_extradata_test.dart \
+            test/av_sync_test.dart \
+            test/bounded_write_queue_test.dart \
+            test/camera_timestamp_test.dart \
+            test/clip_slice_test.dart \
+            test/encoder_import_cache_test.dart \
+            test/fps_throttle_test.dart \
+            test/frame_duplicator_test.dart \
+            test/frame_pacer_test.dart \
+            test/gpu_yuv420_converter_test.dart \
+            test/log_level_test.dart \
+            test/muxer_routing_test.dart \
+            test/recorder_mp4_frame_data_test.dart \
+            test/recorder_smoke_test.dart \
+            test/recorder_stats_test.dart \
+            test/shared_output_async_test.dart \
+            test/shared_ring_test.dart \
+            test/sync_drift_simulation_test.dart \
+            test/zero_copy_capability_test.dart
+
+      # camera_timestamp_test IS listed above even though a runner has no
+      # camera: its guard is `enumerateDevices().isEmpty -> markTestSkipped`,
+      # so it always skips, and what it still gates is that
+      # MiniCamera.enumerateDevices() loads the native lib and returns rather
+      # than throwing.
+      #
+      # DELIBERATELY EXCLUDED:
+      #   capture_cadence_test.dart   its CADENCE assertions do self-skip on a
+      #                               static desktop, but getting there is not
+      #                               free: it spawns a WinForms animator via
+      #                               powershell, installs a MiniAV log
+      #                               NativeCallable, and does an UNGUARDED
+      #                               `await rec.start()` — with no encoder MFT
+      #                               and FFmpeg download disabled that throws
+      #                               CodecInitException, which fails. It is
+      #                               also a >6 s wall-clock timing measurement
+      #                               on a shared-tenancy VM.
+      #
+      # log_level_test.dart is now INCLUDED. It was excluded as the source of
+      # the "Callback invoked after it has been deleted" teardown crash; every
+      # log route it installs — miniav, FFmpeg and, since minigpu_ffi 1.5.10,
+      # minigpu — is a native port now, so an isolate exiting with one
+      # registered is inert rather than fatal.
 
   pure-dart-tests:
     runs-on: ubuntu-latest
@@ -156,3 +427,49 @@ jobs:
         run: |
           flutter pub get
           flutter build web --no-tree-shake-icons
+
+# ---------------------------------------------------------------------------
+# miniav_player `flutter test` — SKELETON, still blocked.
+#
+# The audio half of the blocker is GONE: PlayerAudioOutput now degrades a
+# failed device open to a null sink (still paced, still honours pause) instead
+# of throwing, exposes `MiniavPlayer.audioOutputUnavailable`, and deliberately
+# logs via dart:developer rather than routing to `onError` — so the five audio
+# tests that assert `expect(errors, isEmpty)` stay green with no audio device.
+# Fixtures are read through a helper that markTestSkipped's on absence.
+#
+# What still blocks it: `flutter test` has to build the native ASSETS for
+# miniav_tools_codecs + miniav + minigpu through their build hooks, and that
+# path is unstable on the master channel this workflow pins (the packages need
+# master for the native-assets SDK). Until a `flutter test` run is green on a
+# runner, enabling this trades a real gate for a flaky one. Enable by deleting
+# the comment markers once the toolchain is verified.
+#
+#  player-test-windows:
+#    runs-on: windows-latest
+#    timeout-minutes: 45
+#    env:
+#      MINIAV_TOOLS_FFMPEG_NO_AUTODOWNLOAD: "1"
+#    steps:
+#      - uses: actions/checkout@v4
+#        with:
+#          path: miniAV
+#      - uses: actions/checkout@v4
+#        with:
+#          repository: PracticalXR/minigpu
+#          path: minigpu
+#      - uses: subosito/flutter-action@v2
+#        with:
+#          channel: master
+#      # The fixtures live in the CODECS package's test/assets (the player's
+#      # helper resolves ../miniav_tools_codecs/test/assets/), so this job
+#      # needs the same ffmpeg-CLI step as codecs-test-windows.
+#      - name: Pub get
+#        working-directory: miniAV/miniav_tools/miniav_player
+#        shell: bash
+#        run: flutter pub get
+#      - name: flutter test (audio smoke — device-free via the null sink)
+#        working-directory: miniAV/miniav_tools/miniav_player
+#        shell: bash
+#        run: flutter test test/player_audio_source_test.dart
+# ---------------------------------------------------------------------------

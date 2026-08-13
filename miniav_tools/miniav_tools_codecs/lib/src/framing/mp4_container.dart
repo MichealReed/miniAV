@@ -1,15 +1,17 @@
-/// MP4 / ISO-BMFF demuxer — pure Dart, FFmpeg-free.
+/// MP4 / ISO-BMFF demuxer + muxer — pure Dart, FFmpeg-free.
 ///
-/// Parses ftyp/moov→trak→mdia→minf→stbl (stsd/stts/stsc/stsz/stco/co64/ctts/
-/// stss) into a per-track sample table, then emits [EncodedPacket]s across all
-/// tracks in file order (each tagged with `trackIndex`), carrying pts (stts +
-/// ctts composition offset), dts (stts decode order — so B-frame streams
-/// present correctly), keyframe flags (stss), and per-track codec extra-data
-/// (avcC / hvcC / av1C / esds→ASC / dOps). Bytes input only; malformed boxes
-/// throw [CodecInitException] (→ the negotiator falls through to FFmpeg).
+/// Parses ftyp/moov→trak→edts/elst + mdia→minf→stbl (stsd/stts/stsc/stsz/stco/
+/// co64/ctts/stss) into a per-track sample table, then emits [EncodedPacket]s
+/// across all tracks in file order (each tagged with `trackIndex`), carrying
+/// pts (stts + ctts composition offset + edit-list origin), dts (stts decode
+/// order — so B-frame streams present correctly), keyframe flags (stss), and
+/// per-track codec extra-data (avcC / hvcC / av1C / esds→ASC / dOps). Bytes
+/// input only; malformed boxes throw [CodecInitException] (→ the negotiator
+/// falls through to FFmpeg).
 ///
-/// The ISO-BMFF *writer* lives in `av1/mp4/av1_mp4_muxer.dart`; this is its
-/// inverse and round-trips that muxer's output.
+/// [Mp4Muxer] below is the inverse and round-trips through it. An older,
+/// AV1-only writer lives in `av1/mp4/av1_mp4_muxer.dart`; its output also
+/// round-trips here.
 library;
 
 import 'dart:typed_data';
@@ -18,6 +20,11 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 
 import '../av1/mp4/iso_box_writer.dart';
 import 'annexb.dart';
+// dart:io on the VM, a no-op on web — Mp4Muxer streams straight to disk when
+// there is a filesystem and falls back to assembling in memory when there is
+// not, so this file must stay web-safe.
+import 'file_sink_stub.dart' if (dart.library.io) 'file_sink_io.dart';
+import 'muxer_file_sink.dart';
 
 class _Box {
   _Box(this.type, this.payloadStart, this.payloadEnd, this.end);
@@ -30,12 +37,16 @@ class _Box {
 /// A single decoded sample position, in file order.
 class _Sample {
   _Sample(this.trackIndex, this.offset, this.size, this.dtsUs, this.ptsUs,
-      this.keyframe);
+      this.durUs, this.keyframe);
   final int trackIndex;
   final int offset;
   final int size;
   final int dtsUs;
   final int ptsUs;
+
+  /// The sample's own `stts` duration in µs. Carried because a track's length
+  /// is the last sample's END, not its start.
+  final int durUs;
   final bool keyframe;
 }
 
@@ -65,11 +76,25 @@ class Mp4Demuxer implements PlatformDemuxer {
       throw const CodecInitException('mp4', 'no moov box');
     }
 
+    // Movie timescale: edit-list segment durations are expressed in it, so a
+    // track's presentation offset can't be read without it.
+    var movieTimescale = 1000000;
+    final mvhd = _child(d, moov, 'mvhd');
+    if (mvhd != null && mvhd.payloadStart < mvhd.payloadEnd) {
+      // version(1)+flags(3); v0: [c4 m4 timescale4 dur4]; v1: [c8 m8 ts4 dur8]
+      final v = d.getUint8(mvhd.payloadStart);
+      final tsOff = mvhd.payloadStart + 4 + (v == 1 ? 16 : 8);
+      if (tsOff + 4 <= mvhd.payloadEnd) {
+        final ts = d.getUint32(tsOff, Endian.big);
+        if (ts > 0) movieTimescale = ts;
+      }
+    }
+
     final tracks = <TrackInfo>[];
     final samples = <_Sample>[];
     for (final b in _walk(d, moov.payloadStart, moov.payloadEnd)) {
       if (b.type != 'trak') continue;
-      _parseTrack(d, bytes, b, tracks, samples);
+      _parseTrack(d, bytes, b, tracks, samples, movieTimescale);
     }
     if (tracks.isEmpty) {
       throw const CodecInitException('mp4', 'no tracks in moov');
@@ -94,6 +119,7 @@ class Mp4Demuxer implements PlatformDemuxer {
     _Box trak,
     List<TrackInfo> tracks,
     List<_Sample> samples,
+    int movieTimescale,
   ) {
     // This track will occupy index `tracks.length` once added; tag its samples
     // with that so `trackIndex` stays in sync even if an earlier track was
@@ -140,16 +166,26 @@ class Mp4Demuxer implements PlatformDemuxer {
 
     // Build per-sample timing (ticks → µs) in decode order.
     int us(int ticks) => (ticks * 1000000) ~/ timescale;
+
+    // Edit list: leading empty edits delay this track on the movie timeline,
+    // and the first real edit's media_time says which media composition time
+    // the track starts presenting at. Together they carry the per-track start
+    // offset a muxer used to keep audio and video in lip-sync, so the shift has
+    // to be reapplied here or the offset is silently lost on read-back.
+    final edit = _parseElst(d, _child(d, trak, 'edts'), movieTimescale);
+    final shiftUs = edit.delayUs - us(edit.mediaStartTicks);
+
     var dtsTicks = 0;
     for (var i = 0; i < sizes.length; i++) {
-      final dts = us(dtsTicks);
-      final pts = us(dtsTicks + ctts[i]);
+      final dts = us(dtsTicks) + shiftUs;
+      final pts = us(dtsTicks + ctts[i]) + shiftUs;
       samples.add(_Sample(
         trackIndex,
         offsets[i],
         sizes[i],
         dts,
         pts,
+        us(dtsTicks + durations[i]) - us(dtsTicks),
         keyframes == null ? true : keyframes.contains(i),
       ));
       dtsTicks += durations[i];
@@ -218,22 +254,47 @@ class Mp4Demuxer implements PlatformDemuxer {
   @override
   Future<void> seek(int timestampUs) async {
     _checkOpen();
-    // Seek to the last keyframe at/before the target (in file order).
+    // Land on the last VIDEO keyframe at/before the target.
+    //
+    // Two things this must not do. (1) Consider audio samples: audio has no
+    // stss, so _parseTrack marks every audio sample keyframe:true — a scan over
+    // all tracks lands on whichever sample is nearest the target, which for an
+    // interleaved file is almost always an audio one, and the video decoder is
+    // then fed from the middle of a GOP (grey/blocky output until the next IDR).
+    // (2) Stop early on the first ptsUs > target: _samples is FILE-OFFSET order,
+    // and B-frame reordering makes pts non-monotonic in that order, so an early
+    // break terminates the scan before the real seek point. Scan everything and
+    // keep the best candidate instead — the tables are already in memory.
+    // Audio-only files have no video keyframes to aim at, so there the old
+    // any-track rule is the only one available (and is correct).
+    final hasVideo = tracks.any((t) => t is VideoTrackInfo);
     var target = 0;
+    var bestPts = -1;
     for (var i = 0; i < _samples.length; i++) {
-      if (_samples[i].ptsUs <= timestampUs && _samples[i].keyframe) target = i;
-      if (_samples[i].ptsUs > timestampUs) break;
+      final s = _samples[i];
+      if (!s.keyframe || s.ptsUs > timestampUs) continue;
+      if (hasVideo && tracks[s.trackIndex] is! VideoTrackInfo) continue;
+      if (s.ptsUs > bestPts) {
+        bestPts = s.ptsUs;
+        target = i;
+      }
     }
     _idx = target;
   }
 
+  /// Where the media ENDS — the largest `pts + duration`, not the largest
+  /// `pts`. Dropping the last sample's own duration made every file read back
+  /// one frame short (a whole packet at 25 fps, and the entire length of a
+  /// single-sample track), so a player's scrubber never reached the end.
   @override
   int? get durationUs {
+    if (_samples.isEmpty) return null;
     var max = 0;
     for (final s in _samples) {
-      if (s.ptsUs > max) max = s.ptsUs;
+      final end = s.ptsUs + s.durUs;
+      if (end > max) max = end;
     }
-    return _samples.isEmpty ? null : max;
+    return max;
   }
 
   @override
@@ -353,9 +414,12 @@ _CodecInfo? _parseStsd(ByteData d, _Box stsd, bool isVideo) {
         break;
       }
     }
+    // The 16.16 samplerate field in a version-0 AudioSampleEntry cannot hold a
+    // rate ≥ 65536, so writers (this one and libavformat both) store 0 there
+    // and leave the truth to the AudioSpecificConfig. Recover it.
     return _CodecInfo.audio(
       AudioCodec.aac,
-      sampleRate,
+      sampleRate != 0 ? sampleRate : (asc == null ? 0 : _ascSampleRate(asc)),
       channels,
       asc == null ? null : CodecExtraData.audio(AudioCodec.aac, asc),
     );
@@ -376,6 +440,43 @@ _CodecInfo? _parseStsd(ByteData d, _Box stsd, bool isVideo) {
     );
   }
   return null;
+}
+
+/// Sampling frequencies addressable by a 4-bit `samplingFrequencyIndex`
+/// (ISO/IEC 14496-3 Table 1.18); index 15 is the escape to an explicit rate.
+const List<int> _aacSampleRates = [
+  96000, 88200, 64000, 48000, 44100, 32000, //
+  24000, 22050, 16000, 12000, 11025, 8000, 7350,
+];
+
+/// Read the sampling rate out of an AudioSpecificConfig.
+///
+/// `audioObjectType(5)` (escaped to 6 more bits when 31) then
+/// `samplingFrequencyIndex(4)`, which when 15 is followed by the rate as 24
+/// explicit bits. Returns 0 when the config is too short to say.
+int _ascSampleRate(Uint8List asc) {
+  var bit = 0;
+  int u(int n) {
+    var v = 0;
+    for (var i = 0; i < n; i++) {
+      final byte = bit >> 3;
+      if (byte >= asc.length) return -1;
+      v = (v << 1) | ((asc[byte] >> (7 - (bit & 7))) & 1);
+      bit++;
+    }
+    return v;
+  }
+
+  var aot = u(5);
+  if (aot == 31) aot = u(6);
+  if (aot < 0) return 0;
+  final idx = u(4);
+  if (idx < 0) return 0;
+  if (idx == 15) {
+    final explicit = u(24);
+    return explicit < 0 ? 0 : explicit;
+  }
+  return idx < _aacSampleRates.length ? _aacSampleRates[idx] : 0;
 }
 
 /// Extract the AudioSpecificConfig from an esds box (ES_Descriptor →
@@ -507,6 +608,70 @@ List<int> _parseCtts(ByteData d, _Box? ctts, int sampleCount) {
   return out;
 }
 
+/// A track's presentation origin, recovered from `edts`/`elst`.
+class _EditOrigin {
+  const _EditOrigin(this.delayUs, this.mediaStartTicks);
+
+  /// Microseconds of leading empty edits — how much later than the movie
+  /// timeline's zero this track starts presenting.
+  final int delayUs;
+
+  /// Media time (in the TRACK's timescale) the first real edit starts at.
+  final int mediaStartTicks;
+}
+
+/// Parse `edts`/`elst` into a presentation origin.
+///
+/// Only the leading empty edits (media_time == -1, which are pure delay) and
+/// the first real edit's media_time are honoured. Arbitrary edit lists — rate
+/// changes, multiple segments splicing the media out of order — are a general
+/// editing feature no muxer here emits, and pretending to apply one would be
+/// worse than ignoring the extra segments.
+_EditOrigin _parseElst(ByteData d, _Box? edts, int movieTimescale) {
+  if (edts == null || movieTimescale <= 0) return const _EditOrigin(0, 0);
+  final elst = _child(d, edts, 'elst');
+  if (elst == null || elst.payloadStart + 8 > elst.payloadEnd) {
+    return const _EditOrigin(0, 0);
+  }
+  final version = d.getUint8(elst.payloadStart);
+  final entrySize = version == 1 ? 20 : 12;
+  var p = elst.payloadStart + 4;
+  final entries = d.getUint32(p, Endian.big);
+  p += 4;
+  var delayTicks = 0;
+  var mediaStart = 0;
+  var foundReal = false;
+  for (var e = 0; e < entries; e++) {
+    if (p + entrySize > elst.payloadEnd) break;
+    final int segDur, mediaTime;
+    if (version == 1) {
+      segDur = _readU64(d, p);
+      mediaTime = _readS64(d, p + 8);
+    } else {
+      segDur = d.getUint32(p, Endian.big);
+      mediaTime = d.getInt32(p + 4, Endian.big);
+    }
+    p += entrySize;
+    if (mediaTime < 0) {
+      if (!foundReal) delayTicks += segDur; // empty edit → pure delay
+      continue;
+    }
+    if (!foundReal) {
+      mediaStart = mediaTime;
+      foundReal = true;
+    }
+  }
+  return _EditOrigin((delayTicks * 1000000) ~/ movieTimescale, mediaStart);
+}
+
+int _readU64(ByteData d, int p) =>
+    (d.getUint32(p, Endian.big) << 32) | d.getUint32(p + 4, Endian.big);
+
+/// Signed 64-bit read built from two 32-bit halves — `getInt64` is unavailable
+/// on the web compilers this file also has to build for.
+int _readS64(ByteData d, int p) =>
+    d.getInt32(p, Endian.big) * 0x100000000 + d.getUint32(p + 4, Endian.big);
+
 Set<int>? _parseStss(ByteData d, _Box? stss, int sampleCount) {
   if (stss == null) return null; // no stss → every sample is a sync sample
   var p = stss.payloadStart + 4;
@@ -541,11 +706,18 @@ List<int> _sampleOffsets(ByteData d, _Box stbl, List<int> sizes) {
   }
 
   var sampleIdx = 0;
+  // first_chunk is ascending, so the entry that governs chunk c is found by
+  // advancing a cursor, never by rescanning the table. A streaming-muxed
+  // interleave writes roughly a chunk per packet and a new stsc entry every
+  // time the run length changes, so a rescan is quadratic in sample count:
+  // an hour of A/V is billions of iterations and open() appears to hang.
+  var e = 0;
+  var spc = 1;
   for (var c = 0; c < chunkOffsets.length && sampleIdx < sizes.length; c++) {
     // samples in chunk c (1-based chunk number = c+1).
-    var spc = 1;
-    for (var e = 0; e < firstChunk.length; e++) {
-      if (firstChunk[e] <= c + 1) spc = samplesPerChunk[e];
+    while (e < firstChunk.length && firstChunk[e] <= c + 1) {
+      spc = samplesPerChunk[e];
+      e++;
     }
     var off = chunkOffsets[c];
     for (var s = 0; s < spc && sampleIdx < sizes.length; s++) {
@@ -581,7 +753,6 @@ List<int> _parseChunkOffsets(ByteData d, _Box stbl) {
 
 Uint8List _slice(ByteData d, int start, int end) =>
     Uint8List.sublistView(d.buffer.asUint8List(d.offsetInBytes), start, end);
-
 // =============================================================================
 // Mp4Muxer — general ISO-BMFF writer (H.264/HEVC/AV1 video + AAC/Opus audio).
 // =============================================================================
@@ -591,47 +762,138 @@ class _MuxT {
   final TrackInfo info;
   final bool isVideo;
   final Uint8List config; // avcC/hvcC/av1C, or ASC/OpusHead for audio
+
   /// H.264/HEVC only: the source emits Annex-B, so each packet needs rewriting
   /// to length-prefixed NAL units on the way into `mdat`. Decided once from the
   /// track's config record — never sniffed per packet (see [isAnnexB]).
   final bool annexB;
+
+  /// In-memory mode only: packets held until `finish()` lays out `mdat`. Stays
+  /// empty when streaming, where each payload goes to disk on arrival.
   final List<EncodedPacket> packets = [];
+
+  // Per-sample metadata, recorded in BOTH modes. A few dozen bytes per sample
+  // against payloads measured in kilobytes — this is what lets the streaming
+  // mode be O(sample count) in memory instead of O(bytes).
+  final List<int> dtsUs = [];
+  final List<int> ptsUs = [];
+  final List<int> nominalDurUs = [];
+  final List<bool> keys = [];
+
+  /// Sample sizes as they land in `mdat` (Annex-B already reframed). Appended
+  /// per packet when streaming; filled once at `finish()` in memory mode.
+  final List<int> sizes = [];
+
+  /// Absolute file offsets of this track's chunks and how many samples each
+  /// holds. In-memory mode writes one chunk per track; streaming coalesces
+  /// consecutive same-track samples and opens a new chunk whenever another
+  /// track interleaves.
+  final List<int> chunkOffsets = [];
+  final List<int> chunkCounts = [];
 
   List<Uint8List>? _samples;
 
   /// Drop the cached sample list once the container has been assembled.
   void releaseSamples() => _samples = null;
 
-  /// Packet payloads exactly as they will be written into `mdat` — Annex-B
-  /// rewritten to length-prefixed NALs where required. Sample sizes (`stsz`)
-  /// must be taken from here, not from `packets`, or the sample table will not
-  /// line up with the chunk.
+  /// One packet payload exactly as it will be written into `mdat`.
   ///
   /// Payloads that need no rewrite are referenced, NOT copied. At clip sizes
   /// this is the difference between one and two full copies of the media, and
   /// the caller has already handed ownership over -- ClipBuffer passes an
   /// immutable snapshot. Mutating a buffer after writePacket was never
   /// supported.
-  List<Uint8List> get samples => _samples ??= [
-        for (final p in packets)
-          if (annexB)
-            annexBToLengthPrefixed(
-              Uint8List.fromList(p.data),
-              hevc: (info as VideoTrackInfo).codec == VideoCodec.hevc,
-            )
-          else
-            p.data,
-      ];
+  Uint8List reframe(EncodedPacket p) => annexB
+      ? annexBToLengthPrefixed(p.data,
+          hevc: (info as VideoTrackInfo).codec == VideoCodec.hevc)
+      : p.data;
+
+  /// Packet payloads exactly as they will be written into `mdat`. Sample sizes
+  /// (`stsz`) must be taken from here, not from `packets`, or the sample table
+  /// will not line up with the chunk.
+  List<Uint8List> get samples =>
+      _samples ??= [for (final p in packets) reframe(p)];
+}
+
+/// A track's sample timing, derived once and shared by every box that needs it.
+class _Timing {
+  const _Timing(
+    this.durations,
+    this.ctts,
+    this.mediaDurationUs,
+    this.compositionStartUs,
+    this.presentationDurationUs,
+  );
+
+  /// Per-sample decode durations — the `stts` deltas.
+  final List<int> durations;
+
+  /// Per-sample composition offsets (`ctts`), normalised to be non-negative so
+  /// a version-0 box can carry them. `null` when every offset is 0, i.e. the
+  /// track has no reordering and needs no `ctts` at all.
+  final List<int>? ctts;
+
+  /// Sum of [durations] — the `mdhd` duration.
+  final int mediaDurationUs;
+
+  /// Earliest composition time in the media (media timescale). Non-zero when
+  /// reordering pushes the first *presented* sample past media time 0; the
+  /// edit list carries it so the track still starts at its true instant.
+  final int compositionStartUs;
+
+  /// Media covered by the edit list: [compositionStartUs] .. end.
+  final int presentationDurationUs;
+
+  /// Move the presented range [us] later into the composition timeline, and
+  /// shorten it by the same amount. The media is untouched — [mediaDurationUs]
+  /// and the sample tables still describe every sample — only the edit list
+  /// stops covering the leading [us], which is how a decode preroll is carried
+  /// but not presented.
+  _Timing trimmedFront(int us) {
+    final t = us > presentationDurationUs ? presentationDurationUs : us;
+    return _Timing(durations, ctts, mediaDurationUs, compositionStartUs + t,
+        presentationDurationUs - t);
+  }
 }
 
 /// Writes H.264/HEVC/AV1 video + AAC/Opus audio into an ISO-BMFF (`.mp4`) byte
-/// stream, `moov` after `mdat` (single chunk per track). The inverse of
-/// [Mp4Demuxer]; a superset of the AV1-only muxer. Timescale is microseconds.
+/// stream or file. The inverse of [Mp4Demuxer]; a superset of the AV1-only
+/// muxer. Movie and media timescales are both microseconds.
+///
+/// Two output modes, same `moov`:
+///
+///  * **In-memory** (`BytesMuxerOutput`, or any platform without a filesystem).
+///    Packets are buffered, `mdat` is laid out one track at a time at
+///    `finish()`, and the result is exposed as [outputParts] / [getBytes].
+///  * **Streaming** (`FileMuxerOutput` where `dart:io` exists). The file is
+///    opened at [writeHeader], `ftyp` and a 64-bit-largesize `mdat` header are
+///    written up front, and every packet is appended as it arrives — only
+///    per-sample metadata is retained. `finish()` patches the reserved
+///    largesize and appends `moov`. An hour of 4K therefore costs sample-table
+///    memory, not the media.
+///
+/// `moov` comes **after** `mdat` in both modes: sample sizes and offsets are
+/// only known once the media has been written, and rewriting the file to put
+/// `moov` first (the "faststart" layout) is a second full pass. This matches
+/// FFmpeg's default; progressive HTTP playback of a file written here needs a
+/// `faststart` remux, local playback does not.
 class Mp4Muxer implements PlatformMuxer {
-  Mp4Muxer._(this._tracks);
+  Mp4Muxer._(this._tracks, this._filePath);
 
   static const int _timescale = 1000000;
+  static const int _u32Max = 0xFFFFFFFF;
+
   final List<_MuxT> _tracks;
+
+  /// Set when this muxer owns a `FileMuxerOutput` and the platform has a
+  /// filesystem — i.e. when it will stream rather than buffer.
+  final String? _filePath;
+
+  MuxerFileSink? _sink;
+  int _mdatHeaderOffset = 0;
+  int _mdatLen = 0;
+  int _lastStreamedTrack = -1;
+
   bool _headerWritten = false;
   bool _finished = false;
   bool _closed = false;
@@ -640,6 +902,11 @@ class Mp4Muxer implements PlatformMuxer {
 
   static const _video = {VideoCodec.h264, VideoCodec.hevc, VideoCodec.av1};
   static const _audio = {AudioCodec.aac, AudioCodec.opus};
+
+  /// `true` when this muxer writes the configured `FileMuxerOutput` itself, so
+  /// a caller must NOT also wrap it in a "collect the bytes and save them"
+  /// adapter.
+  bool get ownsFileOutput => _filePath != null;
 
   static Mp4Muxer open(MuxerConfig config) {
     if (config.tracks.isEmpty) {
@@ -691,18 +958,36 @@ class Mp4Muxer implements PlatformMuxer {
         throw CodecInitException('mp4', 'unsupported track ${t.runtimeType}');
       }
     }
-    return Mp4Muxer._(tracks);
+    final out = config.output;
+    final path =
+        (out is FileMuxerOutput && muxerFileSinkAvailable) ? out.path : null;
+    return Mp4Muxer._(tracks, path);
   }
 
   @override
   Future<void> writeHeader() async {
     _checkOpen();
+    _checkNotFinished('writeHeader');
+    if (_headerWritten) return;
+    final path = _filePath;
+    if (path != null) {
+      final sink = await openMuxerFileSink(path);
+      _sink = sink;
+      final ftyp = _ftyp();
+      await sink.add(ftyp);
+      _mdatHeaderOffset = ftyp.length;
+      // Always the 16-byte largesize form when streaming: how big `mdat` ends
+      // up is unknowable here, and widening the header afterwards would mean
+      // shifting the whole file by 8 bytes.
+      await sink.add(_mdatLargesizeHeader(0));
+    }
     _headerWritten = true;
   }
 
   @override
   Future<void> writePacket(EncodedPacket packet) async {
     _checkOpen();
+    _checkNotFinished('writePacket');
     if (!_headerWritten) {
       throw const CodecRuntimeException('mp4', 'writePacket before writeHeader');
     }
@@ -710,7 +995,30 @@ class Mp4Muxer implements PlatformMuxer {
     if (i < 0 || i >= _tracks.length) {
       throw CodecRuntimeException('mp4', 'trackIndex $i out of range');
     }
-    _tracks[i].packets.add(packet);
+    final t = _tracks[i];
+    t.dtsUs.add(packet.dtsUs);
+    t.ptsUs.add(packet.ptsUs);
+    t.nominalDurUs.add(packet.durationUs);
+    t.keys.add(packet.isKeyframe);
+
+    final sink = _sink;
+    if (sink == null) {
+      t.packets.add(packet);
+      return;
+    }
+    final bytes = t.reframe(packet);
+    if (_lastStreamedTrack != i) {
+      // Another track wrote in between (or this is the track's first sample):
+      // the run of bytes is no longer contiguous, so start a new chunk.
+      t.chunkOffsets.add(sink.length);
+      t.chunkCounts.add(1);
+      _lastStreamedTrack = i;
+    } else {
+      t.chunkCounts[t.chunkCounts.length - 1]++;
+    }
+    t.sizes.add(bytes.length);
+    await sink.add(bytes);
+    _mdatLen += bytes.length;
   }
 
   @override
@@ -718,15 +1026,25 @@ class Mp4Muxer implements PlatformMuxer {
     _checkOpen();
     if (_finished) return;
     _finished = true;
-    _parts = _buildParts();
-    // Drop the per-track sample lists now that they are referenced by _parts;
-    // for a long clip these are the single largest retained allocation.
-    for (final t in _tracks) {
-      t.releaseSamples();
+    final sink = _sink;
+    if (sink == null) {
+      _parts = _buildParts();
+      // Drop the per-track sample lists now that they are referenced by _parts;
+      // for a long clip these are the single largest retained allocation.
+      for (final t in _tracks) {
+        t.releaseSamples();
+      }
+      return;
     }
+    // The reserved largesize is only knowable now.
+    await sink.patchU64(_mdatHeaderOffset + 8, 16 + _mdatLen);
+    await sink.add(_buildMoov());
+    await sink.close();
+    _sink = null;
   }
 
-  /// The finished container as ordered pieces, or null before [finish].
+  /// The finished container as ordered pieces, or null before [finish] — and
+  /// always null in streaming mode, where the bytes went to the file instead.
   ///
   /// Prefer this over [getBytes] when writing to a sink: concatenating is a
   /// full extra copy of the whole file, which for a multi-minute clip is
@@ -749,6 +1067,11 @@ class Mp4Muxer implements PlatformMuxer {
   @override
   Future<void> close() async {
     _closed = true;
+    // A close() without finish() (an aborted recording) still has to let go of
+    // the file handle.
+    final sink = _sink;
+    _sink = null;
+    if (sink != null) await sink.close();
     for (final t in _tracks) {
       t.packets.clear();
     }
@@ -758,13 +1081,48 @@ class Mp4Muxer implements PlatformMuxer {
     if (_closed) throw const CodecRuntimeException('mp4', 'muxer closed');
   }
 
+  void _checkNotFinished(String what) {
+    if (_finished) {
+      throw CodecRuntimeException(
+        'mp4',
+        '$what after finish(): the container is already sealed and this data '
+            'would be dropped — create a new muxer',
+      );
+    }
+  }
+
+  static Uint8List _ftyp() => box('ftyp', [
+        ...'isom'.codeUnits, 0, 0, 0, 0, //
+        ...'isom'.codeUnits, ...'iso2'.codeUnits, ...'mp41'.codeUnits,
+      ]);
+
+  /// An `mdat` header in the 64-bit form: size==1 signals that a `largesize`
+  /// follows the type.
+  static Uint8List _mdatLargesizeHeader(int totalSize) {
+    final b = BytesBuilder(copy: false);
+    _u32(b, 1);
+    b.add('mdat'.codeUnits);
+    _u32(b, (totalSize >> 32) & 0xffffffff);
+    _u32(b, totalSize & 0xffffffff);
+    return b.toBytes();
+  }
+
   List<Uint8List> _buildParts() {
-    final ftyp = box('ftyp', [
-      ...'isom'.codeUnits, 0, 0, 0, 0, //
-      ...'isom'.codeUnits, ...'iso2'.codeUnits, ...'mp41'.codeUnits,
-    ]);
-    const mdatHeader = 8;
-    final mdatStart = ftyp.length + mdatHeader;
+    final ftyp = _ftyp();
+
+    // Sizes first: whether `mdat` needs a 64-bit header decides where the
+    // payload starts, and every chunk offset is measured from there.
+    var mdatLen = 0;
+    for (final t in _tracks) {
+      t.sizes
+        ..clear()
+        ..addAll([for (final s in t.samples) s.length]);
+      for (final s in t.sizes) {
+        mdatLen += s;
+      }
+    }
+    final large = 8 + mdatLen > _u32Max;
+    final headerLen = large ? 16 : 8;
 
     // Lay out mdat one track at a time, recording each track's chunk offset.
     //
@@ -773,73 +1131,188 @@ class Mp4Muxer implements PlatformMuxer {
     // at clip sizes that copy is the single biggest allocation in the process.
     // They go into the output as-is; the offsets are computed from a running
     // total, which is what they always were.
-    final chunkOffsets = <int>[];
     final body = <Uint8List>[];
-    var mdatLen = 0;
+    var off = ftyp.length + headerLen;
     for (final t in _tracks) {
-      chunkOffsets.add(mdatStart + mdatLen);
+      t.chunkOffsets.clear();
+      t.chunkCounts.clear();
+      if (t.sizes.isNotEmpty) {
+        t.chunkOffsets.add(off);
+        t.chunkCounts.add(t.sizes.length);
+      }
       for (final s in t.samples) {
         body.add(s);
-        mdatLen += s.length;
+        off += s.length;
       }
     }
 
-    var maxDur = 0;
-    final traks = <Uint8List>[];
-    for (var i = 0; i < _tracks.length; i++) {
-      final dur = _trackDurationUs(_tracks[i]);
-      if (dur > maxDur) maxDur = dur;
-      traks.add(_trak(_tracks[i], i + 1, chunkOffsets[i]));
-    }
-    final moov = box('moov', [
-      ..._mvhd(maxDur, _tracks.length + 1),
-      for (final t in traks) ...t,
-    ]);
+    final moov = _buildMoov();
 
     final mh = BytesBuilder(copy: false);
-    _u32(mh, mdatHeader + mdatLen);
-    mh.add('mdat'.codeUnits);
+    if (large) {
+      mh.add(_mdatLargesizeHeader(headerLen + mdatLen));
+    } else {
+      _u32(mh, headerLen + mdatLen);
+      mh.add('mdat'.codeUnits);
+    }
     return [ftyp, mh.toBytes(), ...body, moov];
   }
 
-  int _trackDurationUs(_MuxT t) {
-    var d = 0;
-    for (final p in t.packets) {
-      d += p.durationUs;
-    }
-    if (d > 0) return d;
-    // Fall back to pts span + one frame.
-    if (t.packets.length >= 2) {
-      final span = t.packets.last.ptsUs - t.packets.first.ptsUs;
-      final per = span ~/ (t.packets.length - 1);
-      return span + per;
-    }
-    return t.packets.length * 20000;
-  }
-
-  List<int> _durations(_MuxT t) {
-    final n = t.packets.length;
-    final out = List<int>.filled(n, 0);
-    for (var i = 0; i < n; i++) {
-      if (t.packets[i].durationUs > 0) {
-        out[i] = t.packets[i].durationUs;
-      } else if (i + 1 < n) {
-        out[i] = t.packets[i + 1].ptsUs - t.packets[i].ptsUs;
-      } else if (i > 0) {
-        out[i] = out[i - 1];
-      } else {
-        out[i] = 20000;
+  /// Build `moov` from the per-track metadata. Identical in both output modes —
+  /// the only thing streaming changes is where the sample bytes went and how
+  /// the chunks ended up grouped.
+  Uint8List _buildMoov() {
+    // Presentation origin: the earliest PTS across every track. A track that
+    // starts later gets an edit list expressing exactly that gap. Dropping each
+    // track's own first PTS independently (which is what deriving timing from
+    // deltas alone does) bakes the gap in as an A/V offset no player can undo.
+    //
+    // A NEGATIVE PTS is not "earlier content", it is the caller marking decode
+    // preroll: a clip cut mid-GOP anchors at the cut point, so the keyframe and
+    // frames before it that the clip still has to CARRY come in below zero.
+    // Presentation therefore stays anchored at zero whenever anything is
+    // negative, and each track trims its own sub-zero head via the edit list;
+    // rebasing onto the preroll instead would present it and open the file with
+    // a matching stretch of silence on every other track.
+    int? origin;
+    for (final t in _tracks) {
+      for (final p in t.ptsUs) {
+        if (origin == null || p < origin) origin = p;
       }
     }
-    return out;
+    final o = (origin == null || origin < 0) ? 0 : origin;
+
+    var movieDurationUs = 0;
+    final traks = <Uint8List>[];
+    for (var i = 0; i < _tracks.length; i++) {
+      final t = _tracks[i];
+      var tm = _timing(t);
+      var start = 0;
+      if (t.ptsUs.isNotEmpty) {
+        var first = t.ptsUs.first;
+        for (final p in t.ptsUs) {
+          if (p < first) first = p;
+        }
+        start = first - o;
+        if (start < 0) {
+          tm = tm.trimmedFront(-start);
+          start = 0;
+        }
+      }
+      final total = start + tm.presentationDurationUs;
+      if (total > movieDurationUs) movieDurationUs = total;
+      traks.add(_trak(t, tm, i + 1, start));
+    }
+    return box('moov', [
+      ..._mvhd(movieDurationUs, _tracks.length + 1),
+      for (final t in traks) ...t,
+    ]);
+  }
+
+  /// Nominal per-sample duration, used only where real timing is missing.
+  static int _defaultDurationUs(_MuxT t) {
+    if (t.isVideo) {
+      final v = t.info as VideoTrackInfo;
+      if (v.frameRateNumerator > 0 && v.frameRateDenominator > 0) {
+        return (_timescale * v.frameRateDenominator) ~/ v.frameRateNumerator;
+      }
+      return 20000;
+    }
+    final a = t.info as AudioTrackInfo;
+    return a.sampleRate > 0 ? (1024 * _timescale) ~/ a.sampleRate : 20000;
+  }
+
+  /// Derive `stts` deltas and `ctts` composition offsets for one track.
+  ///
+  /// `stts` is a table of DECODE durations, so the deltas come from DTS — not
+  /// PTS. With B-frames PTS is not monotonic, and a negative PTS delta written
+  /// into an unsigned field becomes a ~4000-second sample duration, i.e. a
+  /// garbage file. The PTS/DTS difference is what `ctts` is for.
+  _Timing _timing(_MuxT t) {
+    final n = t.ptsUs.length;
+    if (n == 0) return const _Timing([], null, 0, 0, 0);
+
+    // `dtsUs` is a required field, but producers with no reordering to express
+    // commonly leave it at 0 for every packet. When a track never sets it,
+    // decode order IS presentation order and PTS is the decode clock.
+    final dts = t.dtsUs.any((v) => v != 0) ? t.dtsUs : t.ptsUs;
+    for (var i = 1; i < n; i++) {
+      if (dts[i] < dts[i - 1]) {
+        throw CodecRuntimeException(
+          'mp4',
+          'DTS goes backwards at sample $i (${dts[i - 1]}us → ${dts[i]}us): '
+              'MP4 stores decode durations, which cannot be negative. Feed '
+              'packets in DTS order — reordering is expressed by PTS, not by '
+              'the order packets arrive in.',
+        );
+      }
+    }
+
+    final durations = List<int>.filled(n, 0);
+    for (var i = 0; i < n; i++) {
+      var d = i + 1 < n ? dts[i + 1] - dts[i] : 0;
+      if (d <= 0) {
+        // Last sample, or two samples sharing a DTS: fall back to what the
+        // producer declared, then to the neighbour, then to the nominal rate.
+        d = t.nominalDurUs[i] > 0
+            ? t.nominalDurUs[i]
+            : (i > 0 ? durations[i - 1] : _defaultDurationUs(t));
+      }
+      durations[i] = d;
+    }
+
+    // Decode times as the FILE will reproduce them — the accumulated durations,
+    // which differ from the raw DTS wherever a delta had to be filled in above.
+    // Deriving ctts from these keeps composition times exact regardless.
+    final dt = List<int>.filled(n, 0);
+    for (var i = 1; i < n; i++) {
+      dt[i] = dt[i - 1] + durations[i - 1];
+    }
+
+    final base = dts[0];
+    final raw = List<int>.filled(n, 0);
+    var minOffset = 0;
+    for (var i = 0; i < n; i++) {
+      raw[i] = (t.ptsUs[i] - base) - dt[i];
+      if (raw[i] < minOffset) minOffset = raw[i];
+    }
+    // A version-0 ctts is unsigned, so shift the whole composition timeline up
+    // until no offset is negative; the edit list's media_time takes the shift
+    // back out, leaving presentation times unchanged.
+    final ctts = List<int>.filled(n, 0);
+    var any = false;
+    var minCt = 0;
+    for (var i = 0; i < n; i++) {
+      ctts[i] = raw[i] - minOffset;
+      if (ctts[i] != 0) any = true;
+      final ct = dt[i] + ctts[i];
+      if (i == 0 || ct < minCt) minCt = ct;
+    }
+    if (minCt < 0) minCt = 0;
+
+    final mediaDuration = dt[n - 1] + durations[n - 1];
+    final presentation = mediaDuration - minCt;
+    return _Timing(durations, any ? ctts : null, mediaDuration, minCt,
+        presentation < 0 ? 0 : presentation);
   }
 
   Uint8List _mvhd(int durationUs, int nextTrackId) {
+    // version 1 only when the duration needs 64 bits: at a microsecond
+    // timescale a u32 wraps after 71.6 minutes, and version 0 is what every
+    // reader handles best, so widen exactly when required.
+    final v1 = durationUs > _u32Max;
     final b = BoxBuilder();
-    b.u32(0); // creation
-    b.u32(0); // modification
-    b.u32(_timescale);
-    b.u32(durationUs);
+    if (v1) {
+      b.u64(0); // creation
+      b.u64(0); // modification
+      b.u32(_timescale);
+      b.u64(durationUs);
+    } else {
+      b.u32(0); // creation
+      b.u32(0); // modification
+      b.u32(_timescale);
+      b.u32(durationUs);
+    }
     b.u32(0x00010000); // rate 1.0
     b.u16(0x0100); // volume 1.0
     b.u16(0); // reserved
@@ -852,33 +1325,43 @@ class Mp4Muxer implements PlatformMuxer {
     }
     b.zero(24); // pre_defined[6]
     b.u32(nextTrackId);
-    return fullBox('mvhd', 0, 0, b.toBytes());
+    return fullBox('mvhd', v1 ? 1 : 0, 0, b.toBytes());
   }
 
-  Uint8List _trak(_MuxT t, int trackId, int chunkOffset) {
+  Uint8List _trak(_MuxT t, _Timing tm, int trackId, int startOffsetUs) {
     final body = <int>[
-      ..._tkhd(t, trackId),
-      ..._mdia(t, chunkOffset),
+      ..._tkhd(t, trackId, startOffsetUs + tm.presentationDurationUs),
+      if (startOffsetUs > 0 || tm.compositionStartUs > 0)
+        ..._edts(startOffsetUs, tm),
+      ..._mdia(t, tm),
     ];
     return box('trak', body);
   }
 
-  Uint8List _tkhd(_MuxT t, int trackId) {
+  Uint8List _tkhd(_MuxT t, int trackId, int durationUs) {
+    final v1 = durationUs > _u32Max;
     final b = BoxBuilder();
-    b.u32(0); // creation
-    b.u32(0); // modification
-    b.u32(trackId);
-    b.u32(0); // reserved
-    b.u32(_trackDurationUs(t));
+    if (v1) {
+      b.u64(0); // creation
+      b.u64(0); // modification
+      b.u32(trackId);
+      b.u32(0); // reserved
+      b.u64(durationUs);
+    } else {
+      b.u32(0); // creation
+      b.u32(0); // modification
+      b.u32(trackId);
+      b.u32(0); // reserved
+      b.u32(durationUs);
+    }
     b.u32(0);
     b.u32(0); // reserved[2]
     b.u16(0); // layer
     b.u16(0); // alternate_group
     b.u16(t.isVideo ? 0 : 0x0100); // volume
     b.u16(0); // reserved
-    for (final m in const [
-      0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000 //
-    ]) {
+    for (final m in _displayMatrix(
+        t.isVideo ? (t.info as VideoTrackInfo).rotationDegrees : 0)) {
       b.u32(m);
     }
     if (t.isVideo) {
@@ -889,24 +1372,86 @@ class Mp4Muxer implements PlatformMuxer {
       b.u32(0);
       b.u32(0);
     }
-    return fullBox('tkhd', 0, 0x000007, b.toBytes()); // enabled|in-movie|preview
+    // enabled|in-movie|preview
+    return fullBox('tkhd', v1 ? 1 : 0, 0x000007, b.toBytes());
   }
 
-  Uint8List _mdia(_MuxT t, int chunkOffset) => box('mdia', [
-        ..._mdhd(_trackDurationUs(t)),
+  /// The 9-entry tkhd transformation matrix for a clockwise display rotation.
+  ///
+  /// The (a,b,c,d) 2×2 is the exact inverse mapping of [Mp4Demuxer]'s reader,
+  /// so a rotation survives a mux→demux round trip. `u,v,w` stay (0,0,1.0):
+  /// 0x40000000 is 1.0 in 2.30 fixed point — that last entry is NOT 16.16 like
+  /// the other eight. Anything but 0/90/180/270 falls back to unity rather than
+  /// writing a transform the reader would report as 0.
+  ///
+  /// tkhd width/height are left at the CODED size (see the caller): the matrix
+  /// is what declares the display orientation, and swapping them too would
+  /// rotate the picture twice.
+  static List<int> _displayMatrix(int rotationDegrees) {
+    const one = 0x00010000; // 1.0 in 16.16
+    const negOne = -0x00010000;
+    const w = 0x40000000; // 1.0 in 2.30
+    return switch (rotationDegrees % 360) {
+      90 => const [0, one, 0, negOne, 0, 0, 0, 0, w],
+      180 => const [negOne, 0, 0, 0, negOne, 0, 0, 0, w],
+      270 => const [0, negOne, 0, one, 0, 0, 0, 0, w],
+      _ => const [one, 0, 0, 0, one, 0, 0, 0, w],
+    };
+  }
+
+  /// Edit list: where this track sits on the movie timeline.
+  ///
+  /// A leading empty edit (media_time = -1) delays the track by
+  /// [startOffsetUs]; the following real edit maps media composition time
+  /// [_Timing.compositionStartUs] onward onto it. Without this every track
+  /// silently starts at zero, so a video track whose first keyframe lands
+  /// 300 ms after the first audio packet plays 300 ms early, forever.
+  Uint8List _edts(int startOffsetUs, _Timing tm) {
+    final v1 = startOffsetUs > _u32Max ||
+        tm.presentationDurationUs > _u32Max ||
+        tm.compositionStartUs > _u32Max;
+    final b = BytesBuilder(copy: false);
+    final empty = startOffsetUs > 0;
+    _u32(b, empty ? 2 : 1); // entry_count
+    void entry(int segmentDurationUs, int mediaTimeUs) {
+      if (v1) {
+        _u64(b, segmentDurationUs);
+        _u64(b, mediaTimeUs);
+      } else {
+        _u32(b, segmentDurationUs);
+        _u32(b, mediaTimeUs); // media_time is signed; -1 == the empty edit
+      }
+      _u32(b, 0x00010000); // media_rate 1.0
+    }
+
+    if (empty) entry(startOffsetUs, -1);
+    entry(tm.presentationDurationUs, tm.compositionStartUs);
+    return box('edts', fullBox('elst', v1 ? 1 : 0, 0, b.toBytes()));
+  }
+
+  Uint8List _mdia(_MuxT t, _Timing tm) => box('mdia', [
+        ..._mdhd(tm.mediaDurationUs),
         ..._hdlr(t.isVideo),
-        ..._minf(t, chunkOffset),
+        ..._minf(t, tm),
       ]);
 
   Uint8List _mdhd(int durationUs) {
+    final v1 = durationUs > _u32Max;
     final b = BoxBuilder();
-    b.u32(0);
-    b.u32(0);
-    b.u32(_timescale);
-    b.u32(durationUs);
+    if (v1) {
+      b.u64(0);
+      b.u64(0);
+      b.u32(_timescale);
+      b.u64(durationUs);
+    } else {
+      b.u32(0);
+      b.u32(0);
+      b.u32(_timescale);
+      b.u32(durationUs);
+    }
     b.u16(0x55c4); // language 'und'
     b.u16(0); // pre_defined
-    return fullBox('mdhd', 0, 0, b.toBytes());
+    return fullBox('mdhd', v1 ? 1 : 0, 0, b.toBytes());
   }
 
   Uint8List _hdlr(bool isVideo) {
@@ -919,10 +1464,10 @@ class Mp4Muxer implements PlatformMuxer {
     return fullBox('hdlr', 0, 0, b.toBytes());
   }
 
-  Uint8List _minf(_MuxT t, int chunkOffset) => box('minf', [
+  Uint8List _minf(_MuxT t, _Timing tm) => box('minf', [
         ...(t.isVideo ? _vmhd() : _smhd()),
         ..._dinf(),
-        ..._stbl(t, chunkOffset),
+        ..._stbl(t, tm),
       ]);
 
   Uint8List _vmhd() {
@@ -941,15 +1486,23 @@ class Mp4Muxer implements PlatformMuxer {
     return box('dinf', dref);
   }
 
-  Uint8List _stbl(_MuxT t, int chunkOffset) {
-    final sizes = [for (final s in t.samples) s.length];
+  Uint8List _stbl(_MuxT t, _Timing tm) {
+    // co64 only when an offset genuinely needs 64 bits — a second track past
+    // the 4 GiB mark used to wrap its chunk offset into the middle of the
+    // first, which parses fine and reads the wrong bytes.
+    var needCo64 = false;
+    for (final o in t.chunkOffsets) {
+      if (o > _u32Max) needCo64 = true;
+    }
+    final stss = t.isVideo ? _stss(t) : null;
     final body = <int>[
       ..._stsd(t),
-      ..._stts(_durations(t)),
-      ..._stsc(sizes.length),
-      ..._stsz(sizes),
-      ..._stco(sizes.isEmpty ? const [] : [chunkOffset]),
-      if (t.isVideo) ..._stss(t.packets),
+      ..._stts(tm.durations),
+      if (tm.ctts != null) ..._ctts(tm.ctts!),
+      ..._stsc(t.chunkCounts),
+      ..._stsz(t.sizes),
+      ...(needCo64 ? _co64(t.chunkOffsets) : _stco(t.chunkOffsets)),
+      if (stss != null) ...stss,
     ];
     return box('stbl', body);
   }
@@ -1003,7 +1556,11 @@ class Mp4Muxer implements PlatformMuxer {
     b.u16(16); // samplesize
     b.u16(0); // pre_defined
     b.u16(0); // reserved
-    b.u32(a.sampleRate << 16); // samplerate 16.16
+    // samplerate is 16.16 fixed point, so it tops out at 65535 Hz — 96 kHz AAC
+    // does not fit. Writing the truncated value is what silently mislabels the
+    // track; 0 is the established "look at the codec config instead" encoding
+    // (libavformat does the same), and the ASC/dOps carries the real rate.
+    b.u32(a.sampleRate > 0xFFFF ? 0 : a.sampleRate << 16);
     if (a.codec == AudioCodec.opus) {
       b.bytes(_dOps(t.config, a.channels, a.sampleRate));
       return box('Opus', b.toBytes());
@@ -1064,23 +1621,49 @@ class Mp4Muxer implements PlatformMuxer {
       }
     }
     final b = BytesBuilder(copy: false);
-    _u32(b, runs.length);
+    _u32c(b, runs.length, 'stts entry count');
     for (final r in runs) {
-      _u32(b, r[0]);
-      _u32(b, r[1]);
+      _u32c(b, r[0], 'stts run length');
+      _u32c(b, r[1], 'sample duration');
     }
     return fullBox('stts', 0, 0, b.toBytes());
   }
 
-  Uint8List _stsc(int count) {
+  /// Composition offsets (PTS − DTS) for reordered streams. Version 0, so the
+  /// offsets are unsigned — [_timing] has already normalised them.
+  Uint8List _ctts(List<int> offsets) {
+    final runs = <List<int>>[];
+    for (final o in offsets) {
+      if (runs.isNotEmpty && runs.last[1] == o) {
+        runs.last[0]++;
+      } else {
+        runs.add([1, o]);
+      }
+    }
     final b = BytesBuilder(copy: false);
-    if (count == 0) {
-      _u32(b, 0);
-    } else {
-      _u32(b, 1);
-      _u32(b, 1); // first_chunk
-      _u32(b, count); // samples_per_chunk
-      _u32(b, 1); // sample_desc_index
+    _u32c(b, runs.length, 'ctts entry count');
+    for (final r in runs) {
+      _u32c(b, r[0], 'ctts run length');
+      _u32c(b, r[1], 'composition offset');
+    }
+    return fullBox('ctts', 0, 0, b.toBytes());
+  }
+
+  /// sample-to-chunk, run-length encoded over [chunkCounts] (one entry per
+  /// chunk, in order).
+  Uint8List _stsc(List<int> chunkCounts) {
+    final entries = <List<int>>[]; // [first_chunk, samples_per_chunk]
+    for (var c = 0; c < chunkCounts.length; c++) {
+      if (entries.isEmpty || entries.last[1] != chunkCounts[c]) {
+        entries.add([c + 1, chunkCounts[c]]);
+      }
+    }
+    final b = BytesBuilder(copy: false);
+    _u32c(b, entries.length, 'stsc entry count');
+    for (final e in entries) {
+      _u32c(b, e[0], 'first_chunk'); // 1-based
+      _u32c(b, e[1], 'samples_per_chunk');
+      _u32(b, 1); // sample_description_index
     }
     return fullBox('stsc', 0, 0, b.toBytes());
   }
@@ -1088,48 +1671,89 @@ class Mp4Muxer implements PlatformMuxer {
   Uint8List _stsz(List<int> sizes) {
     final b = BytesBuilder(copy: false);
     _u32(b, 0);
-    _u32(b, sizes.length);
+    _u32c(b, sizes.length, 'sample count');
     for (final s in sizes) {
-      _u32(b, s);
+      _u32c(b, s, 'sample size');
     }
     return fullBox('stsz', 0, 0, b.toBytes());
   }
 
   Uint8List _stco(List<int> offsets) {
     final b = BytesBuilder(copy: false);
-    _u32(b, offsets.length);
+    _u32c(b, offsets.length, 'chunk count');
     for (final o in offsets) {
-      _u32(b, o);
+      _u32c(b, o, 'chunk offset');
     }
     return fullBox('stco', 0, 0, b.toBytes());
   }
 
-  Uint8List _stss(List<EncodedPacket> packets) {
-    final keys = <int>[];
-    for (var i = 0; i < packets.length; i++) {
-      if (packets[i].isKeyframe) keys.add(i + 1);
-    }
+  Uint8List _co64(List<int> offsets) {
     final b = BytesBuilder(copy: false);
-    _u32(b, keys.length);
+    _u32c(b, offsets.length, 'chunk count');
+    for (final o in offsets) {
+      _u64(b, o);
+    }
+    return fullBox('co64', 0, 0, b.toBytes());
+  }
+
+  /// Sync-sample table, or `null` when it should be left out.
+  ///
+  /// An `stss` with entry_count 0 does NOT mean "unknown" — it means NO sample
+  /// is a sync sample, so a player has nowhere to start and nothing to seek to.
+  /// Omitting the box means "every sample is a sync sample", which is both the
+  /// safe default and exactly right for an all-key track. `isKeyframe` defaults
+  /// to false on EncodedPacket, so a producer that never sets it lands in the
+  /// empty case and must not be taken literally.
+  Uint8List? _stss(_MuxT t) {
+    final n = t.keys.length;
+    final keys = <int>[];
+    for (var i = 0; i < n; i++) {
+      if (t.keys[i]) keys.add(i + 1);
+    }
+    if (keys.isEmpty || keys.length == n) return null;
+    final b = BytesBuilder(copy: false);
+    _u32c(b, keys.length, 'sync sample count');
     for (final k in keys) {
-      _u32(b, k);
+      _u32c(b, k, 'sync sample index');
     }
     return fullBox('stss', 0, 0, b.toBytes());
   }
 
+  /// Synthesise an AAC AudioSpecificConfig for a track that supplied none.
   static Uint8List _buildAsc(int sampleRate, int channels) {
-    const freq = [
-      96000, 88200, 64000, 48000, 44100, 32000, //
-      24000, 22050, 16000, 12000, 11025, 8000, 7350,
-    ];
-    var idx = freq.indexOf(sampleRate);
-    if (idx < 0) idx = 4;
-    final ch = channels.clamp(1, 7);
-    return Uint8List.fromList([
-      (2 << 3) | ((idx >> 1) & 0x07),
-      ((idx & 1) << 7) | ((ch & 0x0f) << 3),
-    ]);
+    final idx = _aacSampleRates.indexOf(sampleRate);
+    final cfg = _aacChannelConfig(channels);
+    final bits = _BitWriter();
+    bits.write(2, 5); // audioObjectType: AAC-LC
+    if (idx >= 0) {
+      bits.write(idx, 4);
+    } else {
+      // Escape to an explicit rate rather than quietly labelling the stream
+      // 44.1 kHz — a wrong rate here plays the whole track at the wrong speed.
+      bits.write(15, 4);
+      bits.write(sampleRate, 24);
+    }
+    bits.write(cfg, 4); // channelConfiguration
+    bits.write(0, 3); // GASpecificConfig: 960/1024 frame, no core, no extension
+    return bits.toBytes();
   }
+
+  /// AAC `channelConfiguration` (ISO/IEC 14496-3 Table 1.19) for a channel
+  /// count. 7 means 7.1 (EIGHT channels), so clamping a count into 0..7 quietly
+  /// relabels 7-channel audio as 7.1 and 9-channel as 7.1 too.
+  static int _aacChannelConfig(int channels) => switch (channels) {
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 5,
+        6 => 6, // 5.1
+        8 => 7, // 7.1
+        _ => throw CodecInitException(
+            'mp4',
+            'AAC has no channelConfiguration for $channels channels — supply '
+                'the AudioSpecificConfig in the track extraData'),
+      };
 
   static Uint8List _buildOpusHead(int channels, int rate) {
     final b = Uint8List(19);
@@ -1142,11 +1766,60 @@ class Mp4Muxer implements PlatformMuxer {
   }
 }
 
+/// Big-endian bit writer for the handful of packed codec configs written here.
+class _BitWriter {
+  final BytesBuilder _b = BytesBuilder(copy: false);
+  int _acc = 0;
+  int _bits = 0;
+
+  void write(int value, int count) {
+    for (var i = count - 1; i >= 0; i--) {
+      _acc = (_acc << 1) | ((value >> i) & 1);
+      _bits++;
+      if (_bits == 8) {
+        _b.addByte(_acc & 0xff);
+        _acc = 0;
+        _bits = 0;
+      }
+    }
+  }
+
+  Uint8List toBytes() {
+    if (_bits > 0) _b.addByte((_acc << (8 - _bits)) & 0xff);
+    _bits = 0;
+    _acc = 0;
+    return _b.toBytes();
+  }
+}
+
 void _u32(BytesBuilder b, int v) {
   b.addByte((v >> 24) & 0xff);
   b.addByte((v >> 16) & 0xff);
   b.addByte((v >> 8) & 0xff);
   b.addByte(v & 0xff);
+}
+
+void _u64(BytesBuilder b, int v) {
+  _u32(b, (v >> 32) & 0xffffffff);
+  _u32(b, v & 0xffffffff);
+}
+
+/// Write a value that a 32-bit field must be able to hold, or say so.
+///
+/// Every one of these used to be masked, which turns "too long to represent"
+/// into a file that parses and is wrong — a 90-minute recording declaring 18
+/// minutes, a chunk offset pointing into the middle of another track's samples.
+/// Where the container has a 64-bit form the writer uses it; where it does not,
+/// this is the backstop.
+void _u32c(BytesBuilder b, int v, String what) {
+  if (v < 0 || v > 0xFFFFFFFF) {
+    throw CodecRuntimeException(
+      'mp4',
+      '$what $v does not fit the 32-bit field ISO-BMFF provides for it; this '
+          'stream cannot be represented in MP4 as written',
+    );
+  }
+  _u32(b, v);
 }
 
 extension _FirstOrNull<E> on Iterable<E> {

@@ -29,9 +29,13 @@ import 'ffmpeg_shim.dart';
 
 /// Rolling capture of the most recent FFmpeg log lines, used purely for
 /// diagnostics when avformat_write_header rejects a stream. Populated by a
-/// shim log callback that is installed ONCE per process and NEVER closed —
-/// closing the global FFmpeg av_log callback while encoder threads are still
-/// invoking it crashes with "Callback invoked after it has been deleted".
+/// shim log registration that is installed once per ISOLATE and never closed.
+///
+/// `av_log_set_callback` is process-global, so delivery goes through a Dart
+/// NATIVE PORT (see [FfmpegShim.setFfmpegLogCallback]). A function pointer
+/// here used to abort the VM as soon as the registering isolate exited and a
+/// codec thread logged again — which is precisely what happens when a
+/// multi-file `dart test` run puts several isolates in one process.
 final List<String> _ffmpegDiagLog = <String>[];
 bool _ffmpegDiagInstalled = false;
 
@@ -366,6 +370,15 @@ class FfmpegMuxer implements PlatformMuxer {
         } else {
           _fillCodecparFromTrack(ff, codecpar, track, extradataAllocs);
         }
+
+        // Orientation. Must come AFTER codecpar is populated:
+        // avcodec_parameters_from_context overwrites coded_side_data, which is
+        // where the display matrix lives. Without this the rotation the
+        // demuxer reads is silently dropped on remux and the clip plays
+        // sideways.
+        if (track is VideoTrackInfo && track.rotationDegrees % 360 != 0) {
+          _setStreamRotation(stream, track.rotationDegrees);
+        }
       }
 
       return FfmpegMuxer._(ff, cfg, fmtCtx, streams, extradataAllocs);
@@ -381,6 +394,30 @@ class FfmpegMuxer implements PlatformMuxer {
       calloc.free(pFmtCtx);
       calloc.free(fmtName);
       if (filename != nullptr) calloc.free(filename);
+    }
+  }
+
+  /// Stamp CLOCKWISE [degrees] onto an output stream as a container display
+  /// matrix (mov tkhd). Only the shim can reach `codecpar->coded_side_data`,
+  /// so a missing shim is reported rather than silently writing an upright
+  /// file for a track that declared a turn.
+  static void _setStreamRotation(Pointer<AVStream> stream, int degrees) {
+    final shim = FfmpegShim.tryLoad();
+    if (shim == null) {
+      throw CodecInitException(
+        'ffmpeg',
+        'VideoTrackInfo.rotationDegrees=$degrees requires the '
+            'miniav_tools_ffmpeg shim (display-matrix writer) — run '
+            '`dart pub get` to rebuild',
+      );
+    }
+    final r = shim.streamSetRotationDegrees(stream.cast(), degrees);
+    if (r < 0) {
+      throw CodecInitException(
+        'ffmpeg',
+        'muxer: cannot write rotationDegrees=$degrees '
+            '(expected a multiple of 90): shim returned $r',
+      );
     }
   }
 

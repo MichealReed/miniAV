@@ -1,14 +1,14 @@
 name: miniav_tools_ffmpeg
 description: FFmpeg-backed codecs/muxers for miniav_tools (libavcodec/libavformat).
-version: 0.5.4
-repository: https://github.com/PracticalXR/miniav_tools/tree/master/miniav_tools_ffmpeg
+version: 0.5.5
+repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_tools/miniav_tools_ffmpeg
 environment:
   sdk: ^3.11.4
 
 dependencies:
-  miniav_tools_platform_interface: ^0.5.3
-  miniav_platform_interface: ^0.7.0
-  minigpu_platform_interface: ^1.5.9
+  miniav_tools_platform_interface: ^0.5.4
+  miniav_platform_interface: ^0.7.1
+  minigpu_platform_interface: ^1.6.0
   ffi: ^2.1.4
   meta: ^1.16.0
   http: ^1.2.0

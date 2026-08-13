@@ -46,16 +46,28 @@ void main() {
     );
 
     expect(encoder, isNotNull, reason: 'createEncoder returned null');
+    // hwAccel=required must yield a real hardware open, but the backend may
+    // host it either directly (FfmpegHwEncoder) or CPU-fed inside the worker
+    // isolate (IsolateSoftwareEncoder wrapping FfmpegHwEncoder.openWith) —
+    // both are NVENC. Asserting the concrete type is what broke when the
+    // isolate host became the default; assert what was OPENED instead.
+    final hwDescription = switch (encoder!) {
+      FfmpegHwEncoder e => '${e.encoderName} (hw)',
+      IsolateSoftwareEncoder e => e.activeEncoderDescription,
+      _ => fail(
+          'hwAccel=required selected ${encoder.runtimeType}, '
+          'which is not a hardware-capable host',
+        ),
+    };
     expect(
-      encoder,
-      isA<FfmpegHwEncoder>(),
-      reason:
-          'hwAccel=required should select an HW encoder, got ${encoder.runtimeType}',
+      hwDescription,
+      contains('(hw)'),
+      reason: 'hwAccel=required opened a non-hardware encoder: $hwDescription',
     );
     expect(
-      (encoder as FfmpegHwEncoder).vendor,
-      HwEncoderVendor.nvenc,
-      reason: 'expected NVENC to win the probe order',
+      hwDescription,
+      contains('nvenc'),
+      reason: 'expected NVENC to win the probe order, got $hwDescription',
     );
 
     try {

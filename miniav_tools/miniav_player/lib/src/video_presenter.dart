@@ -77,7 +77,7 @@ class _ExternalSharedTextureSource extends PreviewSource {
 /// [sharedHandle] + `ID3D11Texture2D*` [texPtr]. Present it straight through a
 /// [MinigpuPreviewController.present] (no minigpu compute / no presenter
 /// needed). Centralises the nativeSharedTexture wiring consumers used to
-/// hand-roll (livetensor gsplats, gui_bench).
+/// hand-roll (third-party GPU codecs, benchmark harnesses).
 PreviewSource makeSharedTexturePreviewSource(
         int sharedHandle, int texPtr, int width, int height) =>
     _ExternalSharedTextureSource(sharedHandle, texPtr, width, height);
@@ -299,8 +299,8 @@ class VideoFramePresenter {
   }
 
   /// Present an EXTERNAL, already-RGBA D3D11 shared texture — a codec that
-  /// composes RGBA directly into its own shared texture (e.g. livetensor's
-  /// gsplats GPU decoder) and hands out the (legacy DXGI) [sharedHandle] +
+  /// composes RGBA directly into its own shared texture (e.g. a third-party GPU
+  /// decoder) and hands out the (legacy DXGI) [sharedHandle] +
   /// `ID3D11Texture2D*` [texPtr]. No import/convert/copy: the handle is handed
   /// straight to the preview controller. Centralises the nativeSharedTexture
   /// PreviewSource so consumers don't hand-roll it.

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.4
+
+- Documentation only: the colour-contract doc comment no longer names a
+  private downstream project. No API or behaviour change.
+
 ## 0.5.3
 
 - `PlatformEncoder` gains two GPU-input capability getters, both defaulting to

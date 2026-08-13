@@ -4,6 +4,7 @@ import '../miniav_ffi_types.dart';
 import '../miniav_ffi_bindings.dart' as bindings;
 import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart';
+import 'package:miniav_ffi/miniav_ffi_callback_trace.dart';
 
 class MiniFFIScreenPlatform implements MiniScreenPlatformInterface {
   static final FFIDeviceChangeRegistry _displayChangeRegistry =
@@ -332,6 +333,7 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
       }
     }
 
+    traceCallbackOpen('screen.frameCallback');
     _callbackHandle =
         ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>.listener(
           ffiCallback,
@@ -366,6 +368,7 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
   }
 
   Future<void> _cleanupCallback() async {
+    traceCallbackClose('screen.frameCallback');
     _callbackHandle?.close();
     _callbackHandle = null;
     _stopping = false;

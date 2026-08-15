@@ -3,6 +3,27 @@
 Status: **Windows and web backends working; macOS/iOS, Linux and Android not
 implemented.**
 
+> **Relationship to the threading work** (gpu `docs/WORK_CONTEXT_PLAN.md`,
+> 2026-08): background services and WorkContext compose but stay separate —
+> this layer owns process LIFETIME (foreground service / `UIBackgroundModes` /
+> audio-exempt tabs), WorkContext owns in-process placement. Once the player
+> pipeline is a WorkContext server, `miniav_media_session_player` becomes just
+> another client of the player's command/event channel (lock-screen pause =
+> `PauseCmd`; notification position = the same `ProgressEvent` stream the UI
+> reads). Requirements that plan takes on for us: multi-client channels, and
+> no rAF-driven pacing anywhere in the pipeline.
+>
+> **DECIDED 2026-08-17: `miniav_media_session_player` is slated for
+> elimination** before anything publishes (all three packages are still
+> unpublished — no pub.dev name is claimed yet, so this is free now and
+> permanent later). The transport vocabulary moves to
+> `miniav_tools_platform_interface`; this package's `attach(channel)` replaces
+> the binding; the one-liner moves into app code. The two-package table below
+> then reads: `miniav_media_session` (+ its `_flutter` Android companion,
+> which stays — it is the JVM/manifest carrier and will also host the
+> foreground service). `WorkEntry.service(...)` in the WorkContext plan is the
+> declaration this layer honors.
+
 ## The problem
 
 An app that plays audio should appear in the system shell — the Windows volume

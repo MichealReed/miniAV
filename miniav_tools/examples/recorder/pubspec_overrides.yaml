@@ -26,3 +26,7 @@ dependency_overrides:
     path: ../../../../minigpu/minigpu_web
   miniav_web:
     path: ../../../miniav_web
+  # spawn is not on pub.dev yet; publishing it is a prerequisite for
+  # publishing anything that reaches miniav_tools_platform_interface.
+  spawn:
+    path: ../../../../spawn/spawn

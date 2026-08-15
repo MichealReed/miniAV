@@ -6,6 +6,9 @@
 //      formula across a full-range pseudo-random buffer — this locks the C
 //      implementation to its documented spec across every input value,
 //   4. odd dimensions don't crash and produce the right output size.
+@TestOn('vm') // exercises the native FFI converter — cannot compile to js
+library;
+
 import 'dart:typed_data';
 
 import 'package:miniav_tools_codecs/miniav_tools_codecs.dart';

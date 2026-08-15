@@ -38,6 +38,8 @@ import 'backend_register_native.dart'
 // Platform-selected web VideoFrame → PreviewSource helper (web-only body).
 import 'web_present_stub.dart'
     if (dart.library.js_interop) 'web_present.dart';
+import 'worker_audio_stub.dart'
+    if (dart.library.js_interop) 'worker_audio_web.dart';
 
 import 'audio_output.dart';
 import 'media_source.dart';
@@ -324,6 +326,7 @@ class MiniavPlayer {
     player._srcVideoTrack = videoTrack;
     player._srcAudioTrack = audioTrack;
     player._rotationDegrees = videoInfo?.rotationDegrees ?? 0;
+    await player._tryWorkerAudio(source, audioInfo);
     player._pumpSource();
     return player;
   }
@@ -595,6 +598,21 @@ class MiniavPlayer {
   final List<EncodedPacket> _audioQueue = [];
   bool _audioPumping = false;
 
+  /// Set when audio is running entirely off the main thread: a worker demuxes
+  /// and decodes into shared memory and an AudioWorklet plays it on the audio
+  /// thread (web + shared memory only; see [WorkerAudioTrack]).
+  ///
+  /// When this is set the player runs NO audio pump: `_audioQueue`,
+  /// `_audioDecoder` and `_audioOut` are all unused, source packets for the
+  /// audio track are not routed, and the media clock is re-anchored from what
+  /// the audio device has actually played rather than from what was written.
+  WorkerAudioTrack? _workerAudio;
+  Timer? _workerAudioClock;
+
+  /// True when audio plays without the main thread being involved at all.
+  /// [PlayerStats.audioUnderruns] is then the number that matters.
+  bool get usingWorkerAudio => _workerAudio != null;
+
   // --- source-driven playback (openSource) -----------------------------------
   Demuxer? _demuxer;
   int _srcVideoTrack = -1;
@@ -686,8 +704,19 @@ class MiniavPlayer {
   bool get audioOutputUnavailable => _audioOut?.usingNullSink ?? false;
 
   /// Playback volume (audio track only).
-  double get volume => _audioOut?.volume ?? 1.0;
-  set volume(double v) => _audioOut?.volume = v;
+  ///
+  /// On the worker path this is a `GainNode` on the audio graph rather than a
+  /// scale applied to samples, so changing it costs the producer nothing and
+  /// does not disturb audio already queued in the ring.
+  double get volume => _workerAudio?.volume ?? _audioOut?.volume ?? 1.0;
+  set volume(double v) {
+    final worker = _workerAudio;
+    if (worker != null) {
+      worker.volume = v;
+      return;
+    }
+    _audioOut?.volume = v;
+  }
 
   PlayerStats get stats => PlayerStats(
     videoPacketsSubmitted: videoPacketsSubmitted,
@@ -700,6 +729,7 @@ class MiniavPlayer {
     audioPacketsSubmitted: audioPacketsSubmitted,
     audioFramesWritten: _audioOut?.writtenFrames ?? 0,
     audioFramesDropped: _audioOut?.droppedFrames ?? 0,
+    audioUnderruns: _workerAudio?.underruns ?? 0,
     decodeMs: _lastDecodeMs,
     convertMs: _presenter?.timings.convertMs ?? 0,
     copyMs: _presenter?.timings.copyMs ?? 0,
@@ -867,6 +897,29 @@ class MiniavPlayer {
     return !_closed && !_seeking;
   }
 
+  /// Re-anchors the media clock from the audio device's own consumed count.
+  ///
+  /// The ring knows exactly how many frames have been PLAYED, which is the true
+  /// playback position; the ordinary path can only know what has been written,
+  /// which runs ahead by whatever is still sitting in the device buffer. Video
+  /// is paced against this clock, so sourcing it from the device is what keeps
+  /// the two together.
+  ///
+  /// Periodic rather than continuous because `PlayerClock` is a wall clock and
+  /// only needs correcting for drift between it and the audio device — a few
+  /// parts per million, so a step every 250 ms is far below anything visible.
+  void _startWorkerAudioClock() {
+    _workerAudioClock?.cancel();
+    _workerAudioClock = Timer.periodic(
+      const Duration(milliseconds: 250),
+      (_) {
+        if (_closed || _paused || _seeking) return;
+        final us = _workerAudio?.positionUs;
+        if (us != null) _clock.anchor(us);
+      },
+    );
+  }
+
   Future<void> _pumpAudio() async {
     if (_audioPumping) return;
     _audioPumping = true;
@@ -949,7 +1002,12 @@ class MiniavPlayer {
           // decode-ahead gate above is the backpressure here.
           _videoQueue.add(pkt);
           _pumpVideo();
-        } else if (pkt.trackIndex == _srcAudioTrack && _audioDecoder != null) {
+        } else if (pkt.trackIndex == _srcAudioTrack &&
+            _audioDecoder != null &&
+            _workerAudio == null) {
+          // Skipped entirely when the worker owns audio: it has its own
+          // demuxer over the same bytes and reads this track itself, so
+          // routing here would decode every packet twice.
           audioPacketsSubmitted++;
           _audioQueue.add(pkt);
           _pumpAudio();
@@ -997,10 +1055,60 @@ class MiniavPlayer {
       _dropAudioBeforeUs = targetUs;
       _sourceEof = false;
       await _recreateDecoders();
+      // The worker owns its own demuxer and decoder, so it seeks itself. It
+      // suspends the audio thread across the operation, which is what makes
+      // clearing the ring safe.
+      await _workerAudio?.seek(targetUs);
     } finally {
       _seeking = false;
     }
     _pumpSource();
+  }
+
+  /// Moves the audio track onto a worker, if this page can host one.
+  ///
+  /// Everything about it is best effort. `WorkerAudioTrack.start` returns null
+  /// on any page without shared memory, without an `AudioWorklet`, or without
+  /// the compiled payload, and this leaves the ordinary audio pump running in
+  /// every one of those cases — the same pump that has always been there. It is
+  /// an upgrade, never a requirement.
+  ///
+  /// The worker opens its OWN demuxer over the same bytes and reads the audio
+  /// track itself. That is a second parse of the container, which is cheap
+  /// (a table walk, measured at ~8 ms for a 20 000-sample file) and buys the
+  /// thing worth having: audio packets never cross a thread boundary, so the
+  /// main thread is not in the audio path at any point.
+  Future<void> _tryWorkerAudio(
+    MediaSource source,
+    AudioTrackInfo? audioInfo,
+  ) async {
+    if (audioInfo == null || _audioSpec == null) return;
+    final input = source.toDemuxerInput();
+    // Bytes-only: the worker is handed a container, not a stream to pull.
+    if (input is! BytesDemuxerInput) return;
+    final rate = audioInfo.sampleRate;
+    final channels = audioInfo.channels;
+    if (rate <= 0 || channels <= 0) return;
+
+    final track = await WorkerAudioTrack.start(
+      bytes: input.bytes,
+      sampleRate: rate,
+      channels: channels,
+      depth: Duration(milliseconds: _audioSpec.bufferMs * 3),
+      volume: _audioOut?.volume ?? 1.0,
+    );
+    if (track == null) return;
+
+    _workerAudio = track;
+    // The main-thread audio path is now dead weight, and leaving the decoder
+    // in place would be worse than that: `_pumpSource` routes audio packets on
+    // its presence, so every packet would be decoded twice and written to two
+    // different sinks.
+    try {
+      await _audioDecoder?.close();
+    } catch (_) {}
+    _audioDecoder = null;
+    _startWorkerAudioClock();
   }
 
   /// End-of-stream tail: finish decoding what is queued, flush the decoders,
@@ -1037,7 +1145,26 @@ class MiniavPlayer {
       if (!_paused) break;
     }
     if (_closed || _seeking) return;
+    // Video is done. Audio may not be: the worker runs its own demuxer at its
+    // own pace and the ring still holds whatever the device has not played.
+    // `onEnded` promises the stream is over, and a file whose audio outlasts
+    // its video — or an audio-only file, where the video side finishes
+    // instantly — would otherwise report ended while still audibly playing.
+    if (!await _awaitWorkerAudioEnded()) return;
     if (!_ended.isCompleted) _ended.complete();
+  }
+
+  /// Waits for worker-hosted audio to finish playing. True when it has (or
+  /// when there is none); false when close/seek ended the wait.
+  Future<bool> _awaitWorkerAudioEnded() async {
+    final worker = _workerAudio;
+    if (worker == null) return true;
+    while (!_closed && !_seeking) {
+      if (!await _awaitResumed()) return false;
+      if (await worker.isEnded()) return true;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    return false;
   }
 
   /// Block while the player is paused. False when close/seek ended the wait
@@ -1158,6 +1285,9 @@ class MiniavPlayer {
     _paused = true;
     _clock.pause();
     _audioOut?.pause();
+    // Suspending the audio thread is the whole of pause for the worker path:
+    // with nothing draining the ring, the worker blocks on backpressure.
+    unawaited(_workerAudio?.pause() ?? Future<void>.value());
   }
 
   /// Resume playback. On the MSE path this ALWAYS retries `play()` (even when
@@ -1175,6 +1305,7 @@ class MiniavPlayer {
     _paused = false;
     _clock.resume();
     _audioOut?.resume();
+    unawaited(_workerAudio?.resume() ?? Future<void>.value());
     _pumpVideo();
     _pumpAudio();
     _pumpSource();
@@ -1282,6 +1413,12 @@ class MiniavPlayer {
       await _audioDecoder?.close();
     } catch (_) {}
     _audioOut?.dispose();
+    _workerAudioClock?.cancel();
+    _workerAudioClock = null;
+    try {
+      await _workerAudio?.close();
+    } catch (_) {}
+    _workerAudio = null;
     // Unregister the texture from Flutter (owned controller) BEFORE destroying
     // the GPU textures, and await the presenter so its in-flight async copy /
     // present has finished — otherwise `destroy()` frees a texture still in

@@ -21,7 +21,7 @@ Built on [`miniav_tools_codecs`](../miniav_tools_codecs) (hardware decode),
 
 ```yaml
 dependencies:
-  miniav_player: ^0.2.1
+  miniav_player: ^0.2.4
 ```
 
 Native code (Media Foundation shims, libopus, dr_mp3/dr_flac/stb_vorbis, FFmpeg)
@@ -67,7 +67,7 @@ today. Note also that the FFmpeg-free demuxers accept in-memory **bytes only**,
 so `MediaSource.file(...)` routes to FFmpeg on every platform; the honest macOS
 feature set is audio-only playback of WAV/MP3/Opus/Ogg via `MediaSource.bytes`.
 Full matrix, caveats and the plan:
-[`docs/PLATFORM_SUPPORT.md`](../../docs/PLATFORM_SUPPORT.md).
+[`docs/PLATFORM_SUPPORT.md`](https://github.com/PracticalXR/miniAV/blob/master/docs/PLATFORM_SUPPORT.md).
 
 FLAC and Vorbis are on the FFmpeg side of that line: the first-party decoders
 behind them need a whole container, and a demuxed track arrives as packets

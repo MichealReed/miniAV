@@ -32,3 +32,6 @@ export 'package:miniav_platform_interface/miniav_platform_types.dart'
         MiniAVVideoBuffer,
         MiniAVAudioBuffer,
         MiniAVNativeFence;
+export 'src/audio_ring/shared_audio_ring.dart'
+    show SharedAudioRing, kControlSlots, kDataOffsetBytes;
+export 'src/demux_protocol.dart';

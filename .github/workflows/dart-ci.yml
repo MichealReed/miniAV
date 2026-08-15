@@ -66,6 +66,14 @@ jobs:
         with:
           repository: PracticalXR/minigpu
           path: minigpu
+      # spawn is not on pub.dev yet, and the tracked pubspec_overrides.yaml
+      # files resolve it by relative path (../../../spawn/spawn) exactly as
+      # they do minigpu. Without this checkout every `pub get` below fails
+      # with "could not find package spawn".
+      - uses: actions/checkout@v4
+        with:
+          repository: PracticalXR/spawn
+          path: spawn
       - uses: subosito/flutter-action@v2
         with:
           channel: master
@@ -101,6 +109,14 @@ jobs:
         with:
           repository: PracticalXR/minigpu
           path: minigpu
+      # spawn is not on pub.dev yet, and the tracked pubspec_overrides.yaml
+      # files resolve it by relative path (../../../spawn/spawn) exactly as
+      # they do minigpu. Without this checkout every `pub get` below fails
+      # with "could not find package spawn".
+      - uses: actions/checkout@v4
+        with:
+          repository: PracticalXR/spawn
+          path: spawn
       - uses: subosito/flutter-action@v2
         with:
           channel: master
@@ -294,6 +310,14 @@ jobs:
         with:
           repository: PracticalXR/minigpu
           path: minigpu
+      # spawn is not on pub.dev yet, and the tracked pubspec_overrides.yaml
+      # files resolve it by relative path (../../../spawn/spawn) exactly as
+      # they do minigpu. Without this checkout every `pub get` below fails
+      # with "could not find package spawn".
+      - uses: actions/checkout@v4
+        with:
+          repository: PracticalXR/spawn
+          path: spawn
       - uses: subosito/flutter-action@v2
         with:
           channel: master
@@ -394,6 +418,14 @@ jobs:
         with:
           repository: PracticalXR/minigpu
           path: minigpu
+      # spawn is not on pub.dev yet, and the tracked pubspec_overrides.yaml
+      # files resolve it by relative path (../../../spawn/spawn) exactly as
+      # they do minigpu. Without this checkout every `pub get` below fails
+      # with "could not find package spawn".
+      - uses: actions/checkout@v4
+        with:
+          repository: PracticalXR/spawn
+          path: spawn
       - uses: subosito/flutter-action@v2
         with:
           channel: master
@@ -408,6 +440,71 @@ jobs:
           flutter pub get
           dart test
 
+  # The browser-platform suites. These are the ONLY place the web worker paths
+  # exist at all: on the VM both fall back to in-process work, so a green VM run
+  # says nothing about them. Curated by file for the same reason the Windows
+  # suites are — a bare `dart test -p chrome` would also try to compile the
+  # dart:ffi suites to JS.
+  browser-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: miniAV
+      - uses: actions/checkout@v4
+        with:
+          repository: PracticalXR/minigpu
+          path: minigpu
+      - uses: actions/checkout@v4
+        with:
+          repository: PracticalXR/spawn
+          path: spawn
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: master
+      - name: platform_interface (the demux protocol, on both platforms)
+        working-directory: miniAV/miniav_tools/miniav_tools_platform_interface
+        run: |
+          dart pub get
+          dart test -p chrome
+      - name: Build the worker payloads
+        working-directory: miniAV/miniav_tools/miniav_tools_codecs
+        shell: bash
+        # The payloads are committed, but building them here is what catches a
+        # worker whose sources no longer compile — a stale committed payload
+        # would otherwise let the suite pass against code that is gone.
+        # They are copied under test/ because the test runner serves the
+        # package at a random per-run prefix and exposes only the test tree,
+        # so lib/ is not reachable from a browser test.
+        run: |
+          dart pub get
+          dart run spawn:build
+          mkdir -p test/workers/build
+          cp lib/workers/build/*.dart.js test/workers/build/
+      - name: Stage the AudioWorklet module next to the tests
+        working-directory: miniAV/miniav_tools/miniav_tools_codecs
+        shell: bash
+        # Plain JS, so spawn:build does not produce it. The runner serves only
+        # the test tree, so the worklet has to live there to be loadable.
+        run: cp lib/web/miniav_audio_ring_worklet.js test/
+      - name: codecs browser suites (WebCodecs, workers, and the audio ring)
+        working-directory: miniAV/miniav_tools/miniav_tools_codecs
+        # The audio-ring suites need SharedArrayBuffer; dart_test.yaml passes
+        # Chrome the flag that grants it without cross-origin isolation, and
+        # both suites ASSERT shared memory is real before testing anything, so
+        # a runner where the flag stops working fails loudly instead of
+        # silently proving nothing.
+        run: |
+          dart test -p chrome \
+            test/audio_ring_sink_test.dart \
+            test/audio_playback_worker_test.dart \
+            test/worker_decoder_test.dart \
+            test/worker_demuxer_test.dart \
+            test/smoke_web_test.dart \
+            test/web_audio_fallback_adts_test.dart \
+            test/mp4_web_file_output_test.dart
+
   web-build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -419,6 +516,14 @@ jobs:
         with:
           repository: PracticalXR/minigpu
           path: minigpu
+      # spawn is not on pub.dev yet, and the tracked pubspec_overrides.yaml
+      # files resolve it by relative path (../../../spawn/spawn) exactly as
+      # they do minigpu. Without this checkout every `pub get` below fails
+      # with "could not find package spawn".
+      - uses: actions/checkout@v4
+        with:
+          repository: PracticalXR/spawn
+          path: spawn
       - uses: subosito/flutter-action@v2
         with:
           channel: master

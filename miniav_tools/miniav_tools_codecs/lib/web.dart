@@ -31,6 +31,11 @@ export 'convert.dart'
         dartRgbaToI420,
         dartRgbaToI420Async;
 export 'src/framing/container_backend.dart' show ContainerFramingBackend;
+// The off-main-thread audio path: an AudioWorklet playing from shared memory,
+// fed by a worker. See src/web/audio_ring_sink.dart.
+export 'src/web/audio_ring_sink.dart'
+    show AudioRingSink, kDefaultRingDepth, kWorkletAssetUrl;
+export 'src/web/worker_audio_track.dart' show WorkerAudioTrack;
 export 'src/web/media_recorder_fallback.dart' show MediaRecorderCapture;
 export 'src/web/wasm_opus_backend.dart' show WasmOpusBackend;
 export 'src/web/web_audio_fallback_backend.dart' show WebAudioFallbackBackend;

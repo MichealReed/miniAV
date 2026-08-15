@@ -1,6 +1,11 @@
 dependency_overrides:
   miniav_tools_platform_interface:
     path: ../miniav_tools_platform_interface
+  # spawn is not on pub.dev yet; this path override is what lets the port be
+  # written and tested before the first publish. Removing it (or publishing
+  # spawn) is a prerequisite for releasing this package.
+  spawn:
+    path: ../../../spawn/spawn
   miniav_platform_interface:
     path: ../../miniav_platform_interface
   minigpu_platform_interface:

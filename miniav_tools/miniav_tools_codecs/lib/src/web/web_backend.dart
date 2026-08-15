@@ -19,6 +19,7 @@ import 'web_codecs_audio_decoder.dart';
 import 'web_codecs_audio_encoder.dart';
 import 'web_codecs_decoder.dart';
 import 'web_codecs_encoder.dart';
+import 'worker_decoder.dart';
 
 class WebCodecsBackend extends MiniAVToolsBackend {
   static const String backendName = 'webcodecs';
@@ -124,7 +125,12 @@ class WebCodecsBackend extends MiniAVToolsBackend {
     )) {
       return null;
     }
-    return WebCodecsVideoDecoder.create(config);
+    // Prefer the worker: the browser decodes off-thread either way, but the
+    // bridge to it (chunk in, poll the event loop, frame out) was running on
+    // the UI thread. Null means no worker was available — decode in process,
+    // exactly as this did before workers existed.
+    return await WorkerVideoDecoder.tryCreate(config) ??
+        await WebCodecsVideoDecoder.create(config);
   }
 
   @override
@@ -155,7 +161,8 @@ class WebCodecsBackend extends MiniAVToolsBackend {
     )) {
       return null;
     }
-    return WebCodecsAudioDecoder.create(config);
+    return await WorkerAudioDecoder.tryCreate(config) ??
+        await WebCodecsAudioDecoder.create(config);
   }
 
   @override

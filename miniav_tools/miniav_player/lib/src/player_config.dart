@@ -41,6 +41,7 @@ class PlayerStats {
     required this.audioPacketsSubmitted,
     required this.audioFramesWritten,
     required this.audioFramesDropped,
+    this.audioUnderruns = 0,
     required this.decodeMs,
     required this.convertMs,
     required this.copyMs,
@@ -60,6 +61,14 @@ class PlayerStats {
   final int audioPacketsSubmitted;
   final int audioFramesWritten;
   final int audioFramesDropped;
+
+  /// Frames the audio device wanted and could not have, on the worker-hosted
+  /// audio path ([MiniavPlayer.usingWorkerAudio]). Zero elsewhere.
+  ///
+  /// The one audio number worth alerting on there: audio no longer depends on
+  /// the main thread, so a glitch means the WORKER fell behind — a slow decode
+  /// or a ring too shallow for the machine — and nothing else can cause one.
+  final int audioUnderruns;
 
   /// Last-frame timings, milliseconds. `convertMs` includes the YUV upload
   /// (the player's single CPU→GPU pixel copy).

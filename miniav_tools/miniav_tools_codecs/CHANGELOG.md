@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.2
+
+- Web audio can now play entirely off the main thread: an AudioWorklet reads decoded PCM from shared memory that a worker fills, so a busy main thread no longer starves playback. Fixes two WebCodecs decoder faults: a packet handed to decode() was dropped whenever a frame was already buffered, which broke the reference chain for every frame after it, and both decoders passed the whole backing buffer instead of the packet's view of it. Decoders now wait on the output callback instead of polling a timer the browser clamps to 4ms, taking audio decode from 5.0ms to 0.1ms per packet. Worker-hosted demux and decode are available behind backendOptions['worker'] = 'true'. Also exposes the Media Foundation encoder's bound D3D11 device, and decodes AAC in the decodeAudioData fallback by synthesizing ADTS headers so browsers without WebCodecs audio can play it.
+
 ## 0.7.1
 
 - released 08/13/26 - MR

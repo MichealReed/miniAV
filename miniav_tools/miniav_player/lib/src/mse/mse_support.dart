@@ -12,8 +12,12 @@ import 'package:miniav_tools/miniav_tools.dart';
 /// player should take the MSE `<video>` fallback for video.
 bool webCodecsVideoAvailable() => globalContext.has('VideoDecoder');
 
-/// True when the browser exposes Media Source Extensions.
-bool mseAvailable() => globalContext.has('MediaSource');
+/// True when the browser exposes Media Source Extensions — classic
+/// `MediaSource`, or WebKit's `ManagedMediaSource` (iPhone has ONLY the
+/// latter: classic MSE never shipped on iPhone Safari; MMS arrived in
+/// iOS 17.1). Checking classic alone reported "no MSE" on every iPhone.
+bool mseAvailable() =>
+    globalContext.has('MediaSource') || globalContext.has('ManagedMediaSource');
 
 /// True when the WebCodecs video path is unavailable but MSE is — i.e. the
 /// player should take the browser-native `<video>` fallback for video.

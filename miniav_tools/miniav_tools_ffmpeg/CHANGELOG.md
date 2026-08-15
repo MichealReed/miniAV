@@ -1,6 +1,29 @@
 # Changelog
 
+## 0.5.6
+
+- Host the container demuxer on spawn, so it runs on an isolate natively and a Web Worker on web through one API.
+
 ## 0.5.5
+
+- **`IsolateDemuxer` is now hosted by `package:spawn`.** The handshake, the
+  pending-request map, id correlation, the `[op, id, ...]` reply protocol and
+  the bounded-close-then-kill teardown were all hand-rolled here and are now
+  the worker library's job. Behaviour is unchanged - the full demuxer
+  roundtrip suite passes untouched, including the starved-live-worker shutdown
+  and the stalled-mid-probe open timeout.
+
+  One thing deliberately did NOT move: closing the byte pipe BEFORE closing the
+  worker. Killing an isolate does not preempt a blocking native call, so only
+  the code that owns the pipe can free a starved `av_read_frame`. No worker
+  library can do that for us.
+
+  New `src/demux_protocol.dart` gives `TrackInfo` and `EncodedPacket` a byte
+  encoding, because `spawn` carries portable values or `WireMessage`s rather
+  than deep-copying arbitrary objects. That is more work than an isolate send,
+  and it is what makes the protocol legible to a non-Dart host later.
+
+  Adds a dependency on `spawn`.
 
 - **Native `av_log` forwarding moved from a `NativeCallable` to a Dart native
   port** (shim ABI 20 -> 21, new exports `miniav_shim_init_dart_api` /

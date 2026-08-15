@@ -1,13 +1,13 @@
 name: miniav_recorder
 description: High-level multi-source A/V recorder built on miniav + miniav_tools. Sync screen/camera/mic/loopback into MP4/MKV files or chunked streams.
-version: 0.5.10
+version: 0.5.11
 repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_tools/miniav_recorder
 environment:
   sdk: ^3.11.4
 
 dependencies:
-  miniav: ^0.7.1
-  miniav_platform_interface: ^0.7.1
+  miniav: ^0.7.2
+  miniav_platform_interface: ^0.7.2
   miniav_tools: ^0.5.6
   miniav_tools_ffmpeg: ^0.5.5
   miniav_tools_platform_interface: ^0.5.4
@@ -18,9 +18,9 @@ dependencies:
   # ^1.5.8: the drain-fix gate needs Minigpu.drainSpinBudgetMs.
   # ^1.5.9: the effect chain needs ComputeShader.setBufferAtSlotFire — without
   # it, mixing setBufferAtSlot with dispatchFire silently binds wrong.
-  minigpu: ^1.6.0
+  minigpu: ^1.6.1
   # Canonical GPU/CPU colour converters (RGBA->YUV420) live here now.
-  miniav_tools_codecs: ^0.7.0
+  miniav_tools_codecs: ^0.7.2
 
 dev_dependencies:
   lints: ^5.0.0

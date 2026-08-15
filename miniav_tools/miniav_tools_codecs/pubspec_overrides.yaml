@@ -23,3 +23,5 @@ dependency_overrides:
     path: ../../miniav_ffi
   miniav_web:
     path: ../../miniav_web
+  spawn:
+    path: ../../../spawn/spawn

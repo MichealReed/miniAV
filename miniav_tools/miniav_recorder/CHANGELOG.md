@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.11
+
+- Report the encoder's D3D11 device alongside the capture context's, so a device mismatch - which otherwise shows up as every GPU frame being refused with no explanation - is visible in the log.
+
 ## 0.5.10
 
 - released 08/13/26 - MR

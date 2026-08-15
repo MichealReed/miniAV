@@ -22,31 +22,123 @@
 /// WebCodecs exists the negotiator prefers it (priority 80 vs this backend's
 /// 40) and streams packet-by-packet as before.
 ///
-/// ## Why MP3 only
+/// ## Why MP3 and AAC, and nothing else
 ///
 /// Packets arriving here are DEMUXED — container framing already stripped.
 /// Concatenated MP3 frames are themselves a valid MP3 bitstream, so they feed
-/// `decodeAudioData` directly. Demuxed AAC (no ADTS wrapper), FLAC (no
-/// STREAMINFO) and Vorbis (no setup headers) are not self-contained and would
-/// need re-wrapping first — exactly the reasoning that made [SwAudioBackend]
-/// claim MP3 alone. AAC could be supported later by synthesising ADTS headers
-/// from the AudioSpecificConfig in `extraData`.
+/// `decodeAudioData` directly. AAC is one synthesized header away from the
+/// same property: wrapping each raw frame in a 7-byte ADTS header (built from
+/// the AudioSpecificConfig in `extraData`) yields a valid `.aac` stream, and
+/// packets that are ALREADY ADTS (an `.aac` file demuxed by container framing)
+/// pass through untouched. That matters on WebKit specifically: iOS shipped
+/// WebCodecs `VideoDecoder` years before `AudioDecoder`, so an MP4's H.264
+/// track could decode while its AAC track had no decoder at all — and a player
+/// that requires both then fails the WHOLE file over the audio track.
+///
+/// FLAC (no STREAMINFO) and Vorbis (no setup headers) stay out: their demuxed
+/// packets cannot be made self-contained without rebuilding a real container,
+/// which is [ContainerFramingBackend]'s job, not a decode-time patch.
 library;
 
 import 'dart:async';
 import 'dart:js_interop';
 import 'dart:typed_data';
 
+import 'package:meta/meta.dart';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 import 'package:web/web.dart' as web;
 
+/// ADTS parameters recovered from an AudioSpecificConfig, enough to wrap raw
+/// AAC frames into a decodable `.aac` stream. Null fields mean "could not be
+/// expressed in ADTS" and the packet must already carry its own header.
+@visibleForTesting
+class AdtsParams {
+  const AdtsParams(this.profile, this.freqIndex, this.channelConfig);
+
+  /// ADTS 2-bit profile: audioObjectType - 1. HE-AAC (AOT 5/29) is carried as
+  /// its LC core with implicit SBR signalling — which is exactly how every
+  /// ADTS HE-AAC stream in the wild is written.
+  final int profile;
+  final int freqIndex;
+  final int channelConfig;
+
+  static const _rates = [
+    96000, 88200, 64000, 48000, 44100, 32000,
+    24000, 22050, 16000, 12000, 11025, 8000, 7350,
+  ];
+
+  /// Parse the leading fields of an AudioSpecificConfig (ISO 14496-3 §1.6.2.1).
+  static AdtsParams? fromAudioSpecificConfig(Uint8List asc) {
+    if (asc.length < 2) return null;
+    var bitPos = 0;
+    int read(int n) {
+      var v = 0;
+      for (var i = 0; i < n; i++) {
+        final byte = bitPos >> 3;
+        if (byte >= asc.length) return -1;
+        v = (v << 1) | ((asc[byte] >> (7 - (bitPos & 7))) & 1);
+        bitPos++;
+      }
+      return v;
+    }
+
+    var aot = read(5);
+    if (aot == 31) aot = 32 + read(6);
+    var freqIndex = read(4);
+    if (freqIndex == 15) {
+      // Explicit 24-bit rate: only expressible in ADTS if it maps back onto a
+      // table entry exactly.
+      final rate = read(24);
+      freqIndex = _rates.indexOf(rate);
+      if (freqIndex < 0) return null;
+    }
+    final channelConfig = read(4);
+    if (aot < 0 || freqIndex < 0 || channelConfig < 0) return null;
+
+    // ADTS's 2-bit profile can express AOT 1..4. HE-AAC (5=SBR, 29=PS) rides
+    // on its LC core; anything else (ER codecs, xHE) cannot be ADTS-wrapped.
+    final int profile;
+    if (aot >= 1 && aot <= 4) {
+      profile = aot - 1;
+    } else if (aot == 5 || aot == 29) {
+      profile = 1; // AAC-LC core; the first freqIndex in an HE-AAC ASC IS the core rate
+    } else {
+      return null;
+    }
+    return AdtsParams(profile, freqIndex, channelConfig);
+  }
+
+  /// 7-byte ADTS header (protection absent) for a raw frame of [payloadLen].
+  Uint8List headerFor(int payloadLen) {
+    final frameLen = payloadLen + 7;
+    final h = Uint8List(7);
+    h[0] = 0xFF;
+    h[1] = 0xF1; // sync low nibble: MPEG-4, layer 00, protection_absent
+    h[2] = ((profile & 0x3) << 6) |
+        ((freqIndex & 0xF) << 2) |
+        ((channelConfig >> 2) & 0x1);
+    h[3] = ((channelConfig & 0x3) << 6) | ((frameLen >> 11) & 0x3);
+    h[4] = (frameLen >> 3) & 0xFF;
+    h[5] = ((frameLen & 0x7) << 5) | 0x1F; // buffer fullness high (0x7FF = VBR)
+    h[6] = 0xFC; // buffer fullness low | 1 raw data block
+    return h;
+  }
+}
+
 class WebAudioFallbackDecoder implements PlatformAudioDecoder {
-  WebAudioFallbackDecoder._(this._sampleRateHint);
+  WebAudioFallbackDecoder._(this._sampleRateHint, this._codec, this._adts);
 
   /// Sample rate to decode AT. `decodeAudioData` resamples to the context's
   /// rate, so seeding the context with the container's rate keeps MP3 at its
   /// native 44.1 kHz instead of silently resampling everything to 48 kHz.
   final int _sampleRateHint;
+
+  final AudioCodec _codec;
+
+  /// Non-null when raw AAC frames can be ADTS-wrapped. Null for MP3 (never
+  /// needed) and for AAC configs whose ASC was absent or inexpressible — those
+  /// still play IF the packets already carry ADTS headers.
+  final AdtsParams? _adts;
 
   final BytesBuilder _buf = BytesBuilder();
   int _firstPtsUs = 0;
@@ -62,13 +154,29 @@ class WebAudioFallbackDecoder implements PlatformAudioDecoder {
   static const int _maxRate = 96000;
 
   static WebAudioFallbackDecoder? create(AudioDecoderConfig config) {
-    if (config.codec != AudioCodec.mp3) return null;
+    if (config.codec != AudioCodec.mp3 && config.codec != AudioCodec.aac) {
+      return null;
+    }
+    AdtsParams? adts;
+    if (config.codec == AudioCodec.aac) {
+      final asc = config.extraData;
+      if (asc != null && asc.isNotEmpty) {
+        adts = AdtsParams.fromAudioSpecificConfig(asc);
+      }
+      // adts == null is still viable: an .aac file demuxed by container
+      // framing arrives with ADTS headers already on every packet.
+    }
     final hint = config.sampleRate;
     final rate = (hint != null && hint >= _minRate && hint <= _maxRate)
         ? hint
         : 48000;
-    return WebAudioFallbackDecoder._(rate);
+    return WebAudioFallbackDecoder._(rate, config.codec, adts);
   }
+
+  /// True when [data] already starts with an ADTS header (12-bit syncword +
+  /// layer 00) — pass through rather than double-wrapping.
+  static bool _isAdts(Uint8List data) =>
+      data.length >= 2 && data[0] == 0xFF && (data[1] & 0xF6) == 0xF0;
 
   @override
   Future<List<DecodedAudio>> decode(EncodedPacket packet) async {
@@ -77,7 +185,26 @@ class WebAudioFallbackDecoder implements PlatformAudioDecoder {
       _firstPtsUs = packet.ptsUs;
       _havePts = true;
     }
-    _buf.add(packet.data);
+    final data = packet.data;
+    if (_codec == AudioCodec.aac && !_isAdts(data)) {
+      final adts = _adts;
+      if (adts == null) {
+        throw StateError(
+          'AAC packet without an ADTS header, and no usable '
+          'AudioSpecificConfig in extraData to synthesise one — this raw AAC '
+          'stream cannot be fed to decodeAudioData.',
+        );
+      }
+      if (data.length + 7 > 0x1FFF) {
+        // ADTS frame_length is 13 bits; a real AAC frame is ~1/4 of this.
+        throw StateError(
+          'AAC packet of ${data.length} bytes exceeds the ADTS frame-length '
+          'field — this is not a single raw AAC frame.',
+        );
+      }
+      _buf.add(adts.headerFor(data.length));
+    }
+    _buf.add(data);
     return const []; // whole-buffer decoder — everything lands at flush()
   }
 
@@ -98,9 +225,10 @@ class WebAudioFallbackDecoder implements PlatformAudioDecoder {
       decoded = await ctx.decodeAudioData(ab).toDart;
     } catch (e) {
       throw StateError(
-        'decodeAudioData could not decode the MP3 bitstream ($e). '
-        'This fallback needs a self-contained stream; if these packets came '
-        'from a container, the demuxer must emit raw MP3 frames.',
+        'decodeAudioData could not decode the ${_codec.name} bitstream ($e). '
+        'This fallback needs a self-contained stream: raw MP3 frames, or AAC '
+        'as ADTS (native ADTS packets, or raw frames wrapped here from the '
+        "container's AudioSpecificConfig).",
       );
     }
 

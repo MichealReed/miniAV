@@ -1,19 +1,20 @@
 name: miniav_tools_codecs
 description: First-party codecs for miniav_tools — GPU-compute (WGSL via minigpu), hardware (Media Foundation / vendor SDKs), and audio. FFmpeg is the software/container fallback.
-version: 0.7.1
+version: 0.7.2
 repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_tools/miniav_tools_codecs
 environment:
   sdk: ^3.11.4
 
 dependencies:
-  miniav_tools_platform_interface: ^0.5.4
-  miniav_platform_interface: ^0.7.1
-  minigpu_platform_interface: ^1.6.0
-  minigpu: ^1.6.0
+  spawn: ^0.1.0
+  miniav_tools_platform_interface: ^0.5.5
+  miniav_platform_interface: ^0.7.2
+  minigpu_platform_interface: ^1.6.1
+  minigpu: ^1.6.1
   # Web (WebCodecs + MSE) codec backend — see lib/web.dart. Only used on web.
   web: ^1.1.0
-  gpu_tensor: ^1.6.0
-  gpu_pipeline: ^1.6.0
+  gpu_tensor: ^1.6.1
+  gpu_pipeline: ^1.6.1
   meta: ^1.16.0
   # FFI bindings to the first-party native codecs lib (Opus + Media Foundation).
   ffi: ^2.1.4
@@ -47,3 +48,14 @@ flutter:
   assets:
     - packages/miniav_tools_codecs/web/miniav_codecs.js
     - packages/miniav_tools_codecs/web/miniav_codecs.wasm
+    # Compiled worker payload (`dart run spawn:build`), served at
+    # assets/packages/miniav_tools_codecs/workers/build/… — the URL
+    # SpawnEntry's asset id resolves to. Committed, so an app consuming this
+    # package builds nothing.
+    - packages/miniav_tools_codecs/workers/build/demux_worker.dart.js
+    - packages/miniav_tools_codecs/workers/build/codec_worker.dart.js
+    - packages/miniav_tools_codecs/workers/build/audio_playback_worker.dart.js
+    # The AudioWorklet processor. Plain JS, not a compiled payload: it is
+    # constructed inside the worklet global scope, which has no DOM and no
+    # module loader, and its whole body must stay a bounded copy loop.
+    - packages/miniav_tools_codecs/web/miniav_audio_ring_worklet.js

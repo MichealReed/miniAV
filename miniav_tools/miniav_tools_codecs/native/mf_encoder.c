@@ -1630,6 +1630,14 @@ static int mfenc_send_d3d11_impl(void *session, void *shared_handle,
   return r;
 }
 
+/* The ID3D11Device the MFT is bound to, for diagnostics. Whether this equals
+ * the producer's device decides whether frames need importing at all, and that
+ * question was previously unanswerable from a log. */
+static void *mfenc_get_device_impl(void *session) {
+  MfVidEnc *s = (MfVidEnc *)session;
+  return (s) ? (void *)s->device : NULL;
+}
+
 /* 1 when the session has a D3D11 device bound (zero-copy input available). */
 static int mfenc_has_d3d11_impl(void *session) {
   MfVidEnc *s = (MfVidEnc *)session;
@@ -2005,6 +2013,18 @@ MFENC_API int miniav_shim_mfenc_last_import_error(void *session, char *out,
   if (n > cap) n = cap;
   memcpy(out, s->imp_err, (size_t)n);
   return n;
+}
+
+typedef struct { void *s; void *result; } ArgGetDev;
+static int job_get_device(void *vp) {
+  ArgGetDev *a = (ArgGetDev *)vp;
+  a->result = mfenc_get_device_impl(a->s);
+  return 0;
+}
+MFENC_API void *miniav_shim_mfenc_get_device(void *session) {
+  ArgGetDev a = {session, NULL};
+  if (mfenc_on_worker(job_get_device, &a, -1) != 0) return NULL;
+  return a.result;
 }
 
 MFENC_API int miniav_shim_mfenc_repeat_last(void *session, int64_t pts_us,

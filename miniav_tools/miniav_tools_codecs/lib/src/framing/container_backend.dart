@@ -7,6 +7,8 @@
 /// can't handle. Bytes input/output only (file paths stay with FFmpeg).
 library;
 
+import 'dart:typed_data';
+
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
 import 'adts_container.dart';
@@ -17,6 +19,7 @@ import 'mp3_container.dart';
 import 'mp4_container.dart';
 import 'ogg_container.dart';
 import 'wav_container.dart';
+import 'worker_demuxer.dart';
 
 class ContainerFramingBackend extends MiniAVToolsBackend {
   static const String backendName = 'container_framing';
@@ -155,26 +158,74 @@ class ContainerFramingBackend extends MiniAVToolsBackend {
   Future<PlatformDemuxer?> createDemuxer(DemuxerConfig config) async {
     final input = config.input;
     if (input is! BytesDemuxerInput) return null; // bytes-only
-    final bytes = input.bytes;
+
+    if (_preferWorker(config.backendOptions)) {
+      final worker = await WorkerDemuxer.tryOpen(
+        input.bytes,
+        container: config.container,
+      );
+      if (worker != null) return worker;
+      // No worker to be had. Parsing in process is exactly what this did
+      // before, so fall through rather than fail.
+    }
+
     try {
-      final container = config.container ?? sniff(bytes);
-      switch (container) {
-        case Container.wav:
-          return WavDemuxer.open(bytes);
-        case Container.ogg:
-          return OggDemuxer.open(bytes);
-        case Container.adts:
-          return AdtsDemuxer.open(bytes);
-        case Container.mp3:
-          return Mp3Demuxer.open(bytes);
-        case Container.mp4:
-        case Container.m4a:
-          return Mp4Demuxer.open(bytes);
-        default:
-          return null;
-      }
+      return openInProcess(input.bytes, config.container);
     } on CodecInitException {
       return null; // fall through to FFmpeg
+    }
+  }
+
+  /// Whether to demux on a worker. OFF unless asked for, on every platform.
+  ///
+  /// This shipped preferring the worker on web, on the reasoning that a couple
+  /// of thousand lines of MP4 box parsing had no business on the UI thread.
+  /// Measurement (test/worker_pipeline_bench_test.dart, Chrome) says that
+  /// reasoning was wrong on the facts, and the worker loses on every axis:
+  ///
+  /// | | in process | on a worker |
+  /// |---|---|---|
+  /// | read 4000 packets | 19 ms wall, **0.0 ms main-thread blocked** | 309 ms wall, 0.9 ms blocked |
+  /// | open, 20 000 samples | 8 ms wall, **0.0 ms blocked** | 30 ms wall, **3.3 ms blocked** |
+  ///
+  /// Reading a packet is a table lookup — ~5 us, 200 000/s — so it was never
+  /// on the UI thread in any amount worth moving, and a round trip per packet
+  /// costs 63 us. Worse, `tryOpen` COPIES the whole container to the worker,
+  /// and that copy is one uninterruptible 3.3 ms block for a 20 MB file: the
+  /// worker introduces the exact jank it was built to remove, to avoid a parse
+  /// that blocks for zero.
+  ///
+  /// Kept, tested and one flag away because the balance flips if a parser ever
+  /// gets genuinely expensive (a format needing a full index build) or if the
+  /// input arrives already on the worker side so nothing has to be copied.
+  /// Turn on with `backendOptions['worker'] = 'true'`.
+  static bool _preferWorker(Map<String, String> options) =>
+      options['worker'] == 'true';
+
+  /// Opens a pure-Dart demuxer over [bytes], in the calling isolate.
+  ///
+  /// Shared with the worker-hosted demuxer, which runs exactly this on another
+  /// thread: the two must not be able to disagree about which parser a
+  /// container gets, or a file would demux differently depending on whether a
+  /// worker payload happened to be present.
+  ///
+  /// Returns null when no parser claims the container; throws
+  /// [CodecInitException] when one claims it and then fails.
+  static PlatformDemuxer? openInProcess(Uint8List bytes, Container? container) {
+    switch (container ?? sniff(bytes)) {
+      case Container.wav:
+        return WavDemuxer.open(bytes);
+      case Container.ogg:
+        return OggDemuxer.open(bytes);
+      case Container.adts:
+        return AdtsDemuxer.open(bytes);
+      case Container.mp3:
+        return Mp3Demuxer.open(bytes);
+      case Container.mp4:
+      case Container.m4a:
+        return Mp4Demuxer.open(bytes);
+      default:
+        return null;
     }
   }
 

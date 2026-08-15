@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.5
+
+- Add SharedAudioRing: a lock-free single-producer/single-consumer ring of interleaved f32 PCM in shared memory, so decoded audio reaches an audio thread without the main thread in between. Add the demux wire protocol shared by every worker-hosted demuxer.
+
 ## 0.5.4
 
 - Documentation only: the colour-contract doc comment no longer names a

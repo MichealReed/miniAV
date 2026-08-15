@@ -1690,6 +1690,18 @@ class Recorder {
     } catch (_) {
       /* not a ffmpeg-d3d11 encoder */
     }
+    // Whether the encoder ended up on the SAME device as the frame producer
+    // decides whether GPU frames need importing at all. Reported here because
+    // it is otherwise invisible, and a mismatch presents as every frame being
+    // refused with no clue as to why.
+    String deviceTag = '';
+    if (platform is MfVideoEncoder) {
+      final encDev = platform.boundD3d11Device;
+      final ctxDev = _backendContext?.d3d11DeviceHandle ?? 0;
+      deviceTag =
+          ' device=0x${encDev.toRadixString(16)}'
+          '${encDev == ctxDev && encDev != 0 ? " (shared with capture — no import needed)" : " MISMATCH vs capture 0x${ctxDev.toRadixString(16)} — GPU frames must be imported"}';
+    }
     Recorder._log(
       'video encoder = ${enc.backendName} '
       '(${platform.runtimeType})${vendorTag ?? ''} for ${effectiveCodec.name} '

@@ -857,6 +857,12 @@ external int mfencHasD3d11(Pointer<Void> s);
 external int mfencLastImportError(
     Pointer<Void> session, Pointer<Uint8> out, int cap);
 
+/// The `ID3D11Device*` the MFT is bound to, or nullptr.
+@Native<Pointer<Void> Function(Pointer<Void>)>(
+  symbol: 'miniav_shim_mfenc_get_device',
+)
+external Pointer<Void> mfencGetDevice(Pointer<Void> session);
+
 /// Re-send the surface most recently given to the MFT under a new timestamp —
 /// a duplicate frame without re-importing anything. Returns 0 accepted,
 /// 1 drain-and-retry, -1 nothing to repeat.

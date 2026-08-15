@@ -25,7 +25,7 @@ dependencies:
   # Native container/muxer + display-adapter binding for the Phase-2 modes.
   # Guarded behind a conditional import so the web build never touches dart:io.
   miniav_tools_ffmpeg: 0.5.2
-  minigpu: ^1.6.0
+  minigpu: ^1.6.1
 
 dev_dependencies:
   flutter_test:

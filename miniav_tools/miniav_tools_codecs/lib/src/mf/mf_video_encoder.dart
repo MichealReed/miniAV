@@ -116,6 +116,20 @@ class MfVideoEncoder implements PlatformEncoder, Finalizable {
     return mfencIsHardware(_handle) != 0;
   }
 
+  /// The `ID3D11Device*` this encoder is bound to, as an address.
+  ///
+  /// Compare against the device the frame producer uses. When they match, a GPU
+  /// frame needs no import at all; when they differ, every frame depends on the
+  /// producer's texture being shareable -- and whether that was the case has
+  /// been the difference between a working recording and one silently missing
+  /// its video track. Surfaced because a log cannot otherwise answer it.
+  late final int boundD3d11Device = _readBoundDevice();
+
+  int _readBoundDevice() {
+    _check();
+    return mfencGetDevice(_handle).address;
+  }
+
   /// Duck-typed by the recorder's encoder-open log (it probes `vendor` +
   /// `encoderName` via `dynamic` to avoid depending on any codec package), so
   /// a recording log says which MFT actually ran rather than just "mf_encode".

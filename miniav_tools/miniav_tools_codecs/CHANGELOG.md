@@ -1,18 +1,24 @@
 # Changelog
 
+## 0.7.5
+
+- Increment downstream deps
+- Increment downstream deps
+- Increment downstream deps
+
 ## 0.7.4
 
-- New Release
 - MP4: a decode timestamp that steps backwards is now REPAIRED rather than refused. finish() used to throw over media that was already fully written, leaving ftyp+mdat with no moov - a container no player opens - so one reordered packet early in a session destroyed the whole recording. Out-of-order packets are now counted as they arrive, naming the track and the sample so a bad session is knowable while it still runs, and clamped forward by the smallest amount that makes the sample table legal when the index is built; Mp4Muxer.timingReports reports both. Recordings with no reordering are byte-identical to before. finish() also no longer leaks the file handle when the index cannot be built.
+
 - MP4: a track's codec configuration record can now change part-way through a recording, via Mp4Muxer.setTrackConfig - for an encoder reopened after a graphics device reset, which issues its own parameter sets. Identical records are a no-op; different ones get a second stsd sample entry with the later chunks pointing at it, rather than samples being written under a record that does not describe them.
+
 - Media Foundation: a shared-handle import failure now tells an encoder on a different adapter (nothing ever imported) apart from a capture that died (frames imported, then stopped), instead of always blaming the adapter.
-- MP4: a decode timestamp that steps backwards is now REPAIRED rather than refused. finish() used to throw over media that was already fully written, leaving ftyp+mdat with no moov - a container no player opens - so one reordered packet early in a session destroyed the whole recording. Out-of-order packets are now counted as they arrive, naming the track and the sample so a bad session is knowable while it still runs, and clamped forward by the smallest amount that makes the sample table legal when the index is built; Mp4Muxer.timingReports reports both. Recordings with no reordering are byte-identical to before. finish() also no longer leaks the file handle when the index cannot be built.
-- MP4: a track's codec configuration record can now change part-way through a recording, via Mp4Muxer.setTrackConfig - for an encoder reopened after a graphics device reset, which issues its own parameter sets. Identical records are a no-op; different ones get a second stsd sample entry with the later chunks pointing at it, rather than samples being written under a record that does not describe them.
-- Media Foundation: a shared-handle import failure now tells an encoder on a different adapter (nothing ever imported) apart from a capture that died (frames imported, then stopped), instead of always blaming the adapter.
+
 - `AudioRingSink.open` now verifies `destination.maxChannelCount` can carry
   the requested channel count and declines otherwise, so a surround request
   on stereo-capped hardware falls back cleanly instead of being silently
   down-mixed (or per-browser, dropped).
+
 - For channel counts above 2 the sink addresses the destination discretely
   (`channelInterpretation: 'discrete'`, explicit channel counts on the node
   chain) so a finished multichannel speaker feed is not run through the Web

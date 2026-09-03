@@ -1,6 +1,6 @@
 name: miniav_web
 description: A web implementation of the miniav library.
-version: 0.7.3
+version: 0.7.4
 repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_web
 
 environment:
@@ -8,7 +8,7 @@ environment:
   flutter: ">=3.3.0"
 
 dependencies:
-  miniav_platform_interface: ^0.7.1
+  miniav_platform_interface: ^0.7.4
   web: ^1.1.1
   flutter:
     sdk: flutter

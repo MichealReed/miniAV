@@ -1,9 +1,12 @@
 # miniav_ffi CHANGELOG
 
+## 0.7.4
+
+- Increment downstream deps
 ## 0.7.3
 
-- New Release
 - New `MiniAV_Audio_SetCaptureMirror`: the capture callback also writes each block into a caller-owned single-producer/single-consumer ring, so a consumer on another thread - a web worker sharing the wasm linear memory - can drain captured audio without calling into wasm at all. The ring header is eight u32 slots (monotonic write/read cursors, capacity, channels, dropped-frame count, sample rate), so occupancy is unambiguous across a 2^32 wrap with no full/empty flag; `base = NULL` detaches. The cursor accesses map onto Interlocked intrinsics under MSVC, which has no `__atomic_*` builtins.
+
 - **`MiniAV_AudioOutput_Configure` no longer opens the wrong device.** A
   `device_id` that matched no enumerated playback device was replaced by the
   SYSTEM DEFAULT and reported as success, so a caller asking for one endpoint
@@ -18,6 +21,7 @@
   - Behaviour change in an error path: a caller relying on the silent
     substitution will now see a failure instead of unexpected audio. Callers
     that need a guaranteed-audible output should retry with `""`.
+
 - `MiniAV_AudioOutput_GetDefaultFormat` now honours its `device_id` argument
   (it was `MINIAV_UNUSED` and always answered for the system default device,
   while the interface promised "for a device"). The id is the device name,

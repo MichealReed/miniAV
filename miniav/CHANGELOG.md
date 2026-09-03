@@ -1,9 +1,12 @@
 # miniav CHANGELOG
 
+## 0.7.4
+
+- Increment downstream deps
 ## 0.7.3
 
-- New Release
 - Surface `openCaptureMirror` / `closeCaptureMirror` on the audio-input facade: hand captured audio to another thread instead of to `startCapture`'s callback, and detach to resume the ordinary delivery path. Null where unsupported - the caller's fallback is the callback path.
+
 ## 0.7.2
 
 - released 08/13/26 - MR

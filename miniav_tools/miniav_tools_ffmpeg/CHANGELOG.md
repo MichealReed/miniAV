@@ -1,9 +1,13 @@
 # Changelog
 
+## 0.5.8
+
+- Increment downstream deps
+- Increment downstream deps
+- Increment downstream deps
+
 ## 0.5.7
 
-- New Release
-- Version alignment with the miniav_tools 0.5.7 family release.
 - Version alignment with the miniav_tools 0.5.7 family release.
 
 ## 0.5.6

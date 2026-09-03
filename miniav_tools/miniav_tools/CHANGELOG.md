@@ -1,9 +1,13 @@
 # Changelog
 
+## 0.5.8
+
+- Increment downstream deps
+- Increment downstream deps
+- Increment downstream deps
+
 ## 0.5.7
 
-- New Release
-- Expose Muxer.platform, mirroring AudioEncoder.platform, so a caller can reach backend-specific diagnostics - in particular Mp4Muxer.timingReports, which says whether the container had to repair a producer's decode order.
 - Expose Muxer.platform, mirroring AudioEncoder.platform, so a caller can reach backend-specific diagnostics - in particular Mp4Muxer.timingReports, which says whether the container had to repair a producer's decode order.
 
 ## 0.5.6

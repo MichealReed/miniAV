@@ -1,9 +1,13 @@
 # Changelog
 
+## 0.5.7
+
+- Increment downstream deps
+- Increment downstream deps
+- Increment downstream deps
+
 ## 0.5.6
 
-- New Release
-- Export the audio-ring cursor primitives so a second ring with its own layout - miniAV's capture mirror, whose header is defined in C - can reuse the acquire-load ordering rather than duplicating it. Map gpuWebVideoFrame buffers to the webVideoFrame frame-source kind.
 - Export the audio-ring cursor primitives so a second ring with its own layout - miniAV's capture mirror, whose header is defined in C - can reuse the acquire-load ordering rather than duplicating it. Map gpuWebVideoFrame buffers to the webVideoFrame frame-source kind.
 
 ## 0.5.5

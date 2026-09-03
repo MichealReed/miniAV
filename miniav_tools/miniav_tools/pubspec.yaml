@@ -1,16 +1,16 @@
 name: miniav_tools
 description: Cross-platform audio/video codec & container facade with zero-copy GPU buffer support.
-version: 0.5.6
+version: 0.5.8
 repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_tools/miniav_tools
 environment:
   sdk: ^3.11.4
 
 dependencies:
-  miniav_tools_platform_interface: ^0.5.4
+  miniav_tools_platform_interface: ^0.5.7
   # Imported directly (audio_encoder.dart uses miniav_platform_types); until
   # 0.5.5 this resolved only through the platform-interface's own dependency,
   # which `dart pub publish` rightly rejects.
-  miniav_platform_interface: ^0.7.2
+  miniav_platform_interface: ^0.7.4
 
 dev_dependencies:
   lints: ^5.0.0

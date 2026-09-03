@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.6
+
+- Increment downstream deps
+- Increment downstream deps
+- Increment downstream deps
+
 ## 0.2.5
 
 - Play web audio entirely off the main thread where the page supports shared memory: a worker demuxes and decodes into a ring an AudioWorklet reads, and the media clock is taken from what the audio device has consumed rather than what was written. Falls back to the existing audio pump everywhere else. Adds PlayerStats.audioUnderruns and MiniavPlayer.usingWorkerAudio, and drives ManagedMediaSource on iPhone where classic MediaSource does not exist.

@@ -46,25 +46,84 @@ class CodecsWasm {
     final g = globalContext;
     // Inject the glue script once; it installs the global `MiniavCodecs` factory.
     if (g.getProperty<JSAny?>('MiniavCodecs'.toJS).isUndefinedOrNull) {
-      final loaded = Completer<void>();
-      final script = web.HTMLScriptElement()
-        ..src = _glueUrl
-        ..async = true;
-      script.onload = (() {
-        if (!loaded.isCompleted) loaded.complete();
-      }).toJS;
-      script.onerror = ((JSAny _) {
-        if (!loaded.isCompleted) {
-          loaded.completeError(StateError('failed to load $_glueUrl'));
-        }
-      }).toJS;
-      web.document.head!.appendChild(script);
-      await loaded.future;
+      if (g.getProperty<JSAny?>('document'.toJS).isUndefinedOrNull) {
+        // Worker scope: no DOM, no <script> injection — but
+        // `importScripts` exists and is synchronous. `_glueUrl` is
+        // page-relative; a worker's relative URLs resolve against the WORKER
+        // SCRIPT's location (assets/packages/.../workers/build/x.dart.js), so
+        // recover the app base from it: everything up to its own '/assets/'.
+        g.callMethodVarArgs<JSAny?>(
+            'importScripts'.toJS, [_workerGlueUrl().toJS]);
+      } else {
+        final loaded = Completer<void>();
+        final script = web.HTMLScriptElement()
+          ..src = _glueUrl
+          ..async = true;
+        script.onload = (() {
+          if (!loaded.isCompleted) loaded.complete();
+        }).toJS;
+        script.onerror = ((JSAny _) {
+          if (!loaded.isCompleted) {
+            loaded.completeError(StateError('failed to load $_glueUrl'));
+          }
+        }).toJS;
+        web.document.head!.appendChild(script);
+        await loaded.future;
+      }
     }
     // Call the MODULARIZE factory → Promise<module instance>.
+    //
+    // 🔴 `locateFile` is REQUIRED, not a nicety: the factory resolves
+    // `miniav_codecs.wasm` against Emscripten's internal `scriptDirectory`,
+    // which in a WORKER comes from the worker script's own location — not the
+    // corrected `importScripts` URL — so the wasm fetch 404'd
+    // ("wasm streaming compile failed: HTTP status code is not ok", then
+    // "BufferSource argument is empty" abort) even though the glue loaded
+    // fine. Resolve every module file against this package's asset dir
+    // explicitly, in both scopes.
     final factory = g.getProperty<JSFunction>('MiniavCodecs'.toJS);
-    final promise = factory.callAsFunction() as JSPromise<JSObject>;
+    final assetDir = _assetDirUrl();
+    final config = JSObject();
+    config.setProperty(
+      'locateFile'.toJS,
+      ((JSString path, JSString _) => '$assetDir${path.toDart}'.toJS).toJS,
+    );
+    final promise =
+        factory.callAsFunction(null, config) as JSPromise<JSObject>;
     _m = await promise.toDart;
+  }
+
+  /// This package's asset directory, resolved for the CURRENT scope: page-
+  /// relative on the main thread; against the app base recovered from the
+  /// worker script's URL (everything up to its own `/assets/`) in a worker.
+  static String _assetDirUrl() {
+    const rel = 'assets/packages/miniav_tools_codecs/web/';
+    if (!globalContext.getProperty<JSAny?>('document'.toJS).isUndefinedOrNull) {
+      return rel;
+    }
+    final loc = globalContext
+        .getProperty<JSObject>('location'.toJS)
+        .getProperty<JSString>('href'.toJS)
+        .toDart;
+    final i = loc.lastIndexOf('/assets/');
+    if (i < 0) return rel;
+    return '${loc.substring(0, i + 1)}$rel';
+  }
+
+  /// [_glueUrl] resolved for a worker scope: against the app base recovered
+  /// from the worker script's own URL (`self.location.href`), assuming the
+  /// Flutter convention that all assets — including the running worker payload
+  /// — are served under `<base>/assets/`. Falls back to the raw relative URL
+  /// (resolved against the worker script's directory) when the marker is
+  /// absent, e.g. a test serving the glue next to a hand-placed worker.
+  static String _workerGlueUrl() {
+    final loc = globalContext
+        .getProperty<JSObject>('location'.toJS)
+        .getProperty<JSString>('href'.toJS)
+        .toDart;
+    final i = loc.lastIndexOf('/assets/');
+    if (i < 0) return _glueUrl;
+    return '${loc.substring(0, i + 1)}$_glueUrl';
   }
 
   // --- raw module calls -----------------------------------------------------

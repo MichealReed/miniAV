@@ -85,7 +85,15 @@ typedef struct MiniAVLoopbackContext {
   bool is_running;
 
   MiniAVAudioInfo configured_video_format;
+  // What the caller ASKED for.
   MiniAVLoopbackTargetInfo current_target_info;
+  // What the backend actually ACHIEVED — written by configure_loopback, never
+  // by the caller's request. MINIAV_LOOPBACK_TARGET_PROCESS means the audio is
+  // genuinely scoped to that PID; MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO means it
+  // is the whole machine's, whatever was requested. MINIAV_LOOPBACK_TARGET_NONE
+  // means this backend does not report actual scope (macOS/Linux today).
+  // Read back through MiniAV_Loopback_GetActiveTargetInfo.
+  MiniAVLoopbackTargetInfo active_target_info;
   char current_target_device_id[MINIAV_DEVICE_ID_MAX_LEN];
 
   // Set via MiniAV_Loopback_SetContextLostCallback. May be NULL.

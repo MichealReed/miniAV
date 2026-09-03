@@ -7,6 +7,7 @@ import 'package:miniav_platform_interface/miniav_platform_types.dart';
 
 import '../miniav_ffi_bindings.dart' as bindings;
 import '../miniav_ffi_subscriptions.dart';
+import 'package:miniav_ffi/miniav_ffi_callback_trace.dart';
 import '../miniav_ffi_types.dart'; // For ...FFIToPlatform and MiniAVBufferFFI
 
 /// FFI implementation of [MiniLoopbackPlatformInterface].
@@ -218,6 +219,7 @@ class MiniAVFFILoopbackContextPlatform
       }
     }
 
+    traceCallbackOpen('loopback.frameCallback');
     _callbackHandle =
         ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>.listener(
           ffiCallback,
@@ -236,6 +238,7 @@ class MiniAVFFILoopbackContextPlatform
   }
 
   Future<void> _cleanupCallback() async {
+    traceCallbackClose('loopback.frameCallback');
     _callbackHandle?.close();
     _callbackHandle = null;
   }
@@ -255,12 +258,23 @@ class MiniAVFFILoopbackContextPlatform
 
     final res = bindings.MiniAV_Loopback_StopCapture(_contextHandle!);
 
-    await _cleanupCallback();
-
-    // Only warn on unexpected errors, not "already stopped" errors
-    if (res != bindings.MiniAVResultCode.MINIAV_SUCCESS &&
-        res != bindings.MiniAVResultCode.MINIAV_ERROR_NOT_RUNNING) {
-      print('Warning: MiniAV_Loopback_StopCapture failed: ${res.name}');
+    // A non-success code here means the native WASAPI capture THREAD did not
+    // join (MINIAV_ERROR_TIMEOUT after a 5 s wait) — it is still running and
+    // still holds this callable's function pointer. The C side deliberately
+    // leaks its context on that path for exactly that reason; closing the
+    // callable anyway turns the leak into a use-after-free that aborts the
+    // VM ("Callback invoked after it has been deleted"). Leak the callable
+    // to match.
+    if (res == bindings.MiniAVResultCode.MINIAV_SUCCESS ||
+        res == bindings.MiniAVResultCode.MINIAV_ERROR_NOT_RUNNING) {
+      await _cleanupCallback();
+    } else {
+      _callbackHandle = null; // dropped, deliberately not closed
+      print(
+        'Warning: MiniAV_Loopback_StopCapture failed: ${res.name} — the '
+        'capture thread may still be running, so its callback is leaked '
+        'rather than closed.',
+      );
     }
   }
 

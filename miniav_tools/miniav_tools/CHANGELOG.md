@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.6
+
+- Version bump so the dependency on miniav_tools_platform_interface can move
+  to ^0.5.4. No API or behaviour change.
+
+## 0.5.5
+
+- Declare `miniav_platform_interface` as a direct dependency. It was imported
+  directly (`AudioEncoder` uses `miniav_platform_types`) but resolved only
+  through `miniav_tools_platform_interface`'s own dependency — working by luck,
+  and breaking the moment that transitive edge changes. `dart pub publish`
+  flags this as an error.
+
 ## 0.5.4
 
 - **Internal pins are now caret ranges, not exact versions.** Exact pins made

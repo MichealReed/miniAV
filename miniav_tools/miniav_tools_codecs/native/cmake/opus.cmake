@@ -21,6 +21,8 @@ if(OPUS_USE_SYSTEM)
             IMPORTED_LOCATION "${OPUS_LIBRARY}"
             INTERFACE_INCLUDE_DIRECTORIES "${OPUS_INCLUDE_DIR}")
         set(OPUS_FOUND TRUE)
+        # We did not pick this build's scratch mode; say so honestly.
+        set(MINIAV_OPUS_SCRATCH_MODE "system" CACHE INTERNAL "")
         message(STATUS "Found system libopus: ${OPUS_LIBRARY}")
     endif()
 endif()
@@ -87,11 +89,43 @@ if(NOT OPUS_FOUND)
 
     target_compile_definitions(opus PRIVATE OPUS_BUILD)
 
+    # --- libopus temporary-allocation mode (THREAD SAFETY — read before edit) --
+    # libopus needs exactly one of VAR_ARRAYS / USE_ALLOCA /
+    # NONTHREADSAFE_PSEUDOSTACK to say where its per-call scratch arrays live.
+    #
+    #   VAR_ARRAYS                 C99 VLAs — per call, on the thread stack.
+    #   USE_ALLOCA                 _alloca/alloca — per call, on the thread stack.
+    #   NONTHREADSAFE_PSEUDOSTACK  ONE process-global 120 000-byte malloc'd
+    #                              buffer with an UNSYNCHRONISED global bump
+    #                              pointer (`global_stack` in celt/stack_alloc.h),
+    #                              shared by every thread in the process.
+    #
+    # MSVC has no VLAs, so this used to pick NONTHREADSAFE_PSEUDOSTACK — the
+    # last-resort mode upstream reserves for embedded single-threaded builds.
+    # Two threads inside libopus at once then allocate the SAME scratch bytes
+    # and lose each other's updates to `global_stack`, so the bump pointer
+    # walks past the 120 000-byte buffer and libopus memcpys over the heap.
+    # Measured with a 2..8-thread harness under clang-cl ASan: "WRITE of size
+    # 4096 ... 320 bytes after 120000-byte region allocated by
+    # opus_alloc_scratch", from run_prefilter() in celt_encoder.c. In Dart that
+    # showed up as `dart test` at DEFAULT concurrency (several isolates = several
+    # OS threads) aborting with whatever the damaged heap hit next —
+    # 0xC0000005 / 0xC0000374 / 0xC0000094 / 0xC0000409, never at the culprit.
+    #
+    # USE_ALLOCA is what upstream's own CMake picks for MSVC (VAR_ARRAYS >
+    # USE_ALLOCA > pseudostack, see opus CMakeLists.txt) and it is thread-safe:
+    # the scratch is per-call stack. Peak use is bounded by the same figure the
+    # pseudostack was sized for (~120 KB), which fits a default 1 MB thread stack.
+    # DO NOT set NONTHREADSAFE_PSEUDOSTACK here again.
     if(MSVC)
-        target_compile_definitions(opus PRIVATE NONTHREADSAFE_PSEUDOSTACK)
+        set(MINIAV_OPUS_SCRATCH_MODE "USE_ALLOCA")
     else()
-        target_compile_definitions(opus PRIVATE VAR_ARRAYS)
+        set(MINIAV_OPUS_SCRATCH_MODE "VAR_ARRAYS")
     endif()
+    target_compile_definitions(opus PRIVATE ${MINIAV_OPUS_SCRATCH_MODE})
+    # Surfaced to the C wrapper as miniav_opus_scratch_mode() so a test can
+    # assert the thread-safe mode instead of waiting for a corrupted heap.
+    set(MINIAV_OPUS_SCRATCH_MODE "${MINIAV_OPUS_SCRATCH_MODE}" CACHE INTERNAL "")
 
     # Generic (no SIMD / no RTCD) toggle
     if(EMSCRIPTEN OR OPUS_DISABLE_INTRINSICS)

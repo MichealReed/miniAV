@@ -28,6 +28,24 @@
 #  define MOPUS_API __attribute__((visibility("default")))
 #endif
 
+/* Which temporary-allocation mode libopus was compiled with — see the long
+ * note in cmake/opus.cmake. "NONTHREADSAFE_PSEUDOSTACK" means every thread in
+ * the process shares ONE 120 000-byte scratch buffer through an unsynchronised
+ * bump pointer, which corrupts the heap the moment two threads encode or decode
+ * at the same time. Exported so a test can fail the build config instead of the
+ * process, because the damage never surfaces at the culprit. */
+#ifndef MINIAV_OPUS_SCRATCH_MODE
+#  define MINIAV_OPUS_SCRATCH_MODE "unknown"
+#endif
+
+/* Returns the libopus scratch mode as a static NUL-terminated string:
+ * "VAR_ARRAYS" / "USE_ALLOCA" (both thread-safe, per-call stack),
+ * "NONTHREADSAFE_PSEUDOSTACK" (process-global scratch — NOT thread-safe), or
+ * "system" when linking a system libopus whose mode we did not choose. */
+MOPUS_API const char *miniav_opus_scratch_mode(void) {
+  return MINIAV_OPUS_SCRATCH_MODE;
+}
+
 typedef struct {
   OpusDecoder *dec;
   int channels;
@@ -136,6 +154,23 @@ MOPUS_API int miniav_opus_enc_encode(void *handle, const float *pcm,
   MiniAvOpusEnc *e = (MiniAvOpusEnc *)handle;
   if (!e || !pcm || !out) return OPUS_BAD_ARG;
   return opus_encode_float(e->enc, pcm, frames_per_channel, out, out_cap);
+}
+
+/* Encoder lookahead (algorithmic delay) in samples AT THE ENCODER'S sample
+ * rate. This is the exact number of priming samples a decoder must discard, and
+ * therefore what RFC 7845's OpusHead `pre-skip` field has to carry (scaled to
+ * 48 kHz by the caller — pre-skip is always expressed at 48 kHz). It is NOT a
+ * constant: it varies with the sample rate and with the mode libopus settles
+ * on, so it has to be asked for rather than assumed. Returns 0 on a bad handle
+ * or a failed ctl. */
+MOPUS_API int miniav_opus_enc_lookahead(void *handle) {
+  MiniAvOpusEnc *e = (MiniAvOpusEnc *)handle;
+  if (!e || !e->enc) return 0;
+  opus_int32 lookahead = 0;
+  if (opus_encoder_ctl(e->enc, OPUS_GET_LOOKAHEAD(&lookahead)) != OPUS_OK) {
+    return 0;
+  }
+  return (int)lookahead;
 }
 
 MOPUS_API void miniav_opus_enc_destroy(void *handle) {

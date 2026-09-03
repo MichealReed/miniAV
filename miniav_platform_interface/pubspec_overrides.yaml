@@ -1,0 +1,5 @@
+dependency_overrides:
+  miniav_ffi:
+    path: ../miniav_ffi
+  miniav_web:
+    path: ../miniav_web

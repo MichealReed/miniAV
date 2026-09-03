@@ -12,7 +12,7 @@ import 'dart:typed_data';
 import 'package:miniav/miniav.dart';
 import 'package:miniav_tools/miniav_tools.dart';
 import 'package:miniav_tools_codecs/miniav_tools_codecs.dart'
-    show MfVideoEncoder, registerFirstPartyBackends;
+    show ContainerFramingBackend, MfVideoEncoder, registerFirstPartyBackends;
 import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
 import 'package:minigpu/minigpu.dart';
 
@@ -79,6 +79,12 @@ class Recorder {
   /// host supports it (Windows + NVENC/AMF/QSV/MF). Has no effect on
   /// non-Windows or when no source benefits.
   final bool preferZeroCopy;
+
+  /// Set in [_prepare]: at least one file sink can only be written by
+  /// `FfmpegMuxer`, so this recording's audio must be FFmpeg-encoded. See
+  /// [recordingRequiresFfmpegMuxer] for why that coupling exists and
+  /// [_audioBackendPreference] for what it does.
+  bool _ffmpegMuxerRequired = false;
 
   /// Cached shared context handed to every backend factory call.
   /// Borrows the process-global [_sharedGpu] + Dawn `ID3D11Device*` (as int).
@@ -164,6 +170,25 @@ class Recorder {
       // each backend reports capability honestly and FFmpeg still wins where it
       // is genuinely the better path (see registerFirstPartyBackends).
       registerFirstPartyBackends();
+
+      // Route BEFORE anything is negotiated: which muxer each file sink needs
+      // constrains which backend may encode this recording's audio. Registering
+      // the first-party backends above makes OS AAC (priority 55) outbid FFmpeg
+      // (50) for AAC, and FfmpegMuxer cannot describe an audio track it did not
+      // encode — so for a sink only FFmpeg can write, the audio negotiation has
+      // to be pinned to FFmpeg too. Deciding it here, from the configs, is the
+      // only place the answer can still change anything.
+      _ffmpegMuxerRequired = recordingRequiresFfmpegMuxer(
+        fileSinks: [
+          for (final s in _sinkConfigs)
+            if (s is FileRecorderSink) (container: s.container, path: s.path),
+        ],
+        videoCodecs: _configuredVideoCodecs(),
+        audioCodecs: _configuredAudioCodecs(),
+        audioTracks: _configuredAudioTrackCount(),
+      );
+      if (_ffmpegMuxerRequired) _checkFfmpegAudioReachable();
+
       await ensureFFmpegLoaded();
 
       // Lazily try to bring up the shared GPU device for zero-copy. Only
@@ -660,9 +685,14 @@ class Recorder {
   Future<void> _maybeInitSharedGpu() async {
     if (!preferZeroCopy) return;
     if (!Platform.isWindows) return;
-    // No screen source means no candidate for D3D11 zero-copy today.
-    final hasScreen = _sourceConfigs.any((s) => s is ScreenRecorderSource);
-    if (!hasScreen) return;
+    // A screen or camera source is a candidate for D3D11 zero-copy: the camera
+    // MF backend produces GPU shared NT handles under GPU output preference,
+    // exactly as the screen capture path does. Anything else (audio-only) needs
+    // no shared GPU device.
+    final hasGpuVideoSource = _sourceConfigs.any(
+      (s) => s is ScreenRecorderSource || s is CameraRecorderSource,
+    );
+    if (!hasGpuVideoSource) return;
     await ensureSharedGpu();
     final gpu = _sharedGpu;
     if (gpu == null) {
@@ -733,9 +763,198 @@ class Recorder {
     ffmpegD3d11WarmUp(dev);
   }
 
+  /// GPU-input capabilities of the negotiable encoders for [codec], probed once
+  /// so the screen and camera track builders decide capture output preference
+  /// and the per-frame encode path identically. [encWidth]/[encHeight] are the
+  /// ENCODER (post-downscale) dimensions — codec promotion and the D3D11 probe
+  /// must use them, not the raw capture size, or a 4K→1080p downscale asks
+  /// "does HEVC work?" for an encoder that later opens as h264 at the small size.
+  ///
+  /// Returns `(effectiveCodec, hasD3d11Encoder, hasMinigpuGpuEncoder,
+  /// hasSharedHandleEncoder)`. `useGpuOutput` is the OR of the three flags.
+  Future<(VideoCodec, bool, bool, bool)> _detectVideoEncoderGpuCaps(
+    VideoCodec codec, {
+    required int encWidth,
+    required int encHeight,
+    required bool wantHw,
+    required String label,
+  }) async {
+    final effectiveCodec = FfmpegBackend.bestCodecForResolution(
+      width: encWidth,
+      height: encHeight,
+      hwAccel: wantHw,
+      preferred: codec,
+    );
+    // (a) FFmpeg D3D11VA encoder that opens with the shared Dawn device (the
+    // foreign-texture / shared-handle path). Probed, not just symbol-checked.
+    final hasD3d11Encoder =
+        _backendContext != null &&
+        Platform.isWindows &&
+        await ffmpegD3d11EncoderCompatibleWith(
+          effectiveCodec,
+          _backendContext!.d3d11DeviceHandle,
+        );
+    if (_backendContext != null &&
+        Platform.isWindows &&
+        !hasD3d11Encoder &&
+        ffmpegD3d11EncoderAvailable(effectiveCodec)) {
+      // Symbol check passed but the probe failed — a vendor is registered
+      // (e.g. NVENC) but cannot open with the injected Dawn D3D11 device (Dawn
+      // on an Intel iGPU while only NVENC/AMF are present). CPU output is used.
+      Recorder._log(
+        '$label: D3D11 zero-copy pre-check: no vendor opened with '
+        'device=0x${_backendContext!.d3d11DeviceHandle.toRadixString(16)} — '
+        '${effectiveCodec.name} vendors are registered but incompatible with '
+        'this adapter. Falling back to CPU capture. '
+        '(Check the log for per-vendor failure details.)',
+        RecorderLogLevel.warning,
+      );
+    }
+    // (b) A minigpu-style encoder that takes GPU buffer input (e.g.
+    // MinigpuAv1Pipeline). A CAPABILITY question answered before the encoder
+    // exists — NOT a prediction of who wins createEncoder (minigpu's priority 30
+    // is below FFmpeg's 50). Requires a processor to produce the buffer, so it
+    // only justifies GPU output on a track that has one (screen).
+    final hasMinigpuGpuEncoder =
+        _backendContext != null &&
+        Platform.isWindows &&
+        MiniAVToolsPlatform.instance.backends.any(
+          (b) =>
+              b.supportsEncode(effectiveCodec) &&
+              b.acceptedFrameSources.contains(FrameSourceKind.gpuTexture),
+        );
+    // (c) A backend that takes a capture buffer's shared NT handle directly (the
+    // MF encoder). This justifies GPU output even when the FFmpeg D3D11 probe
+    // above failed — its direct-passthrough path opens the handle on its own
+    // device and never touches Dawn, so that adapter mismatch does not apply.
+    final hasSharedHandleEncoder =
+        _backendContext != null &&
+        Platform.isWindows &&
+        MiniAVToolsPlatform.instance.backends.any(
+          (b) =>
+              b.supportsEncode(effectiveCodec) &&
+              b.acceptedFrameSources.contains(
+                FrameSourceKind.miniavBufferD3D11,
+              ),
+        );
+    return (
+      effectiveCodec,
+      hasD3d11Encoder,
+      hasMinigpuGpuEncoder,
+      hasSharedHandleEncoder,
+    );
+  }
+
   // -----------------------------------------------------------------------
   // Build helpers
   // -----------------------------------------------------------------------
+
+  /// Video codecs the declared sources are configured with (pre-negotiation).
+  Set<VideoCodec> _configuredVideoCodecs() => {
+    for (final s in _sourceConfigs)
+      if (s is ScreenRecorderSource)
+        s.codec
+      else if (s is CameraRecorderSource)
+        s.codec,
+  };
+
+  /// Audio codecs the declared sources are configured with (pre-negotiation).
+  Set<AudioCodec> _configuredAudioCodecs() => {
+    for (final s in _sourceConfigs)
+      if (s is MicRecorderSource)
+        s.codec
+      else if (s is LoopbackRecorderSource)
+        s.codec
+      else if (s is MixedAudioRecorderSource)
+        s.codec,
+  };
+
+  /// How many audio TRACKS the declared sources will produce. Not derivable
+  /// from [_configuredAudioCodecs], which is a set — two mics on the same codec
+  /// are one element there and two tracks here, and WAV/ADTS hold exactly one.
+  int _configuredAudioTrackCount() => _sourceConfigs
+      .where(
+        (s) =>
+            s is MicRecorderSource ||
+            s is LoopbackRecorderSource ||
+            s is MixedAudioRecorderSource,
+      )
+      .length;
+
+  /// The preference audio encoders negotiate under.
+  ///
+  /// Normally [backendPreference] — the first-party OS AAC encoder outranks
+  /// FFmpeg and winning is the point. When a file sink forces `FfmpegMuxer`,
+  /// audio is PINNED to FFmpeg instead, because that muxer can only describe
+  /// audio FFmpeg encoded (see [recordingRequiresFfmpegMuxer]).
+  BackendPreference get _audioBackendPreference => _ffmpegMuxerRequired
+      ? BackendPreference.pinned(FfmpegBackend.backendName)
+      : backendPreference;
+
+  /// Fail loudly when the caller's own backend preference makes the FFmpeg
+  /// audio pin impossible — before a device is opened, and with the coupling
+  /// spelled out. The alternative is the muxer throwing "Audio tracks must be
+  /// bound to a FfmpegAudioEncoder" from inside writeHeader, which says nothing
+  /// about the container choice that actually caused it.
+  void _checkFfmpegAudioReachable() {
+    // Capability before preference. The pin is CONTAINER-shaped — it only says
+    // "FfmpegMuxer has to write this file" — so on its own it will happily pin
+    // audio to a backend that has no encoder for the configured codec. The
+    // negotiation then yields nothing and the caller sees
+    // "No registered backend supports AudioCodec.pcmS16le", naming a codec
+    // PcmBackend does in fact support. Ask the real question here.
+    final ffmpegBackends = MiniAVToolsPlatform.instance.backends.where(
+      (b) => b.name == FfmpegBackend.backendName,
+    );
+    final ffmpeg = ffmpegBackends.isEmpty ? null : ffmpegBackends.first;
+    final unencodable = _configuredAudioCodecs()
+        .where((c) => ffmpeg == null || !ffmpeg.supportsAudioEncode(c))
+        .toList();
+    if (unencodable.isNotEmpty) {
+      final alternatives = ffmpeg == null
+          ? const <String>[]
+          : [
+              for (final c in AudioCodec.values)
+                if (ffmpeg.supportsAudioEncode(c)) c.name,
+            ];
+      throw CodecInitException(
+        'recorder',
+        'this recording has audio and at least one file sink whose container '
+            'only FFmpeg can write, so FfmpegMuxer must write it — and that '
+            'muxer can only describe audio FFmpeg itself encoded. FFmpeg has '
+            'no encoder for ${unencodable.map((c) => c.name).join(", ")}'
+            '${ffmpeg == null ? ' (the FFmpeg backend is not registered)' : ''}'
+            ', so no backend choice satisfies both. Either record '
+            '${alternatives.isEmpty ? 'a codec FFmpeg can encode' : alternatives.join('/')} '
+            'for this container, or write one the first-party muxer handles — '
+            'MP4/M4A for any mix, WAV for a single PCM track, ADTS (.aac) for '
+            'a single AAC one — since it takes already-encoded packets from '
+            'any backend.',
+      );
+    }
+
+    final pref = backendPreference;
+    final String restriction;
+    if (pref is PinnedBackendPreference) {
+      if (pref.backendName == FfmpegBackend.backendName) return;
+      restriction = 'pinned the "${pref.backendName}" backend';
+    } else if (pref is ExcludedBackendPreference &&
+        pref.backendNames.contains(FfmpegBackend.backendName)) {
+      restriction = 'excluded the "${FfmpegBackend.backendName}" backend';
+    } else {
+      return;
+    }
+    throw CodecInitException(
+      'recorder',
+      'this recording has audio and at least one file sink whose container '
+          'only FFmpeg can write, so FfmpegMuxer must write it — and that muxer '
+          'needs a live FFmpeg encoder per audio track (AVChannelLayout setup '
+          'requires an AVCodecContext), so the audio must be FFmpeg-encoded. '
+          'You $restriction. Either write MP4/M4A, WAV (single PCM track) or '
+          'ADTS/.aac (single AAC track) — the first-party muxer takes '
+          'already-encoded packets from any backend — or drop the restriction.',
+    );
+  }
 
   Future<_TrackRuntime> _buildTrack(int index, RecorderSource cfg) async {
     switch (cfg) {
@@ -824,71 +1043,18 @@ class Recorder {
     );
     final (precheckW, precheckH) =
         precheckTarget ?? (videoFormat.width, videoFormat.height);
-    final effectiveCodecForGpuCheck = FfmpegBackend.bestCodecForResolution(
-      width: precheckW,
-      height: precheckH,
-      hwAccel: wantHwForGpuCheck,
-      preferred: cfg.codec,
+    final (
+      effectiveCodecForGpuCheck,
+      hasD3d11Encoder,
+      hasMinigpuGpuEncoder,
+      hasSharedHandleEncoder,
+    ) = await _detectVideoEncoderGpuCaps(
+      cfg.codec,
+      encWidth: precheckW,
+      encHeight: precheckH,
+      wantHw: wantHwForGpuCheck,
+      label: 'screen',
     );
-    final hasD3d11Encoder =
-        _backendContext != null &&
-        Platform.isWindows &&
-        await ffmpegD3d11EncoderCompatibleWith(
-          effectiveCodecForGpuCheck,
-          _backendContext!.d3d11DeviceHandle,
-        );
-    if (_backendContext != null &&
-        Platform.isWindows &&
-        !hasD3d11Encoder &&
-        ffmpegD3d11EncoderAvailable(effectiveCodecForGpuCheck)) {
-      // The symbol check passed but the probe failed — a vendor is registered
-      // (e.g. NVENC) but cannot open with the injected Dawn D3D11 device.
-      // This happens when Dawn is on an Intel iGPU but only NVENC/AMF encoders
-      // are present (wrong adapter). CPU output will be used instead.
-      Recorder._log(
-        'screen: D3D11 zero-copy pre-check: no vendor opened with '
-        'device=0x${_backendContext!.d3d11DeviceHandle.toRadixString(16)} — '
-        '${effectiveCodecForGpuCheck.name} vendors are registered but '
-        'incompatible with this adapter. Falling back to CPU capture. '
-        '(Check the log for per-vendor failure details.)',
-        RecorderLogLevel.warning,
-      );
-    }
-    // Also enable GPU output when a minigpu-style encoder that accepts GPU
-    // buffer input is registered for this codec (e.g. MinigpuAv1Pipeline).
-    // We discover the actual encoder only after _openVideoEncoder below, but
-    // we need the flag now to decide outputPreference.  Pre-check: the
-    // BackendContext must be present and any registered backend for cfg.codec
-    // must accept gpuTexture frames.
-    // NOTE: intentionally NOT gated on !hasD3d11Encoder.  The encoder backend
-    // priorities (minigpu=60 > ffmpeg=50) already ensure minigpu wins the
-    // encoder selection.  Blocking this check on D3D11 availability caused the
-    // log to (incorrectly) report "D3D11 zero-copy" even when the actual
-    // encode path is the minigpu GPU buffer hot-path.
-    final hasMinigpuGpuEncoder =
-        _backendContext != null &&
-        Platform.isWindows &&
-        MiniAVToolsPlatform.instance.backends.any(
-          (b) =>
-              b.supportsEncode(effectiveCodecForGpuCheck) &&
-              b.acceptedFrameSources.contains(FrameSourceKind.gpuTexture),
-        );
-    // A backend that takes a capture buffer's shared NT handle (the MF encoder)
-    // also justifies GPU capture output, even when the FFmpeg D3D11 probe above
-    // failed — its direct-passthrough path needs the handle and never touches
-    // the Dawn device, so the adapter mismatch that fails that probe does not
-    // apply. Without this the capture is configured for CPU output and the
-    // handle never exists to pass through.
-    final hasSharedHandleEncoder =
-        _backendContext != null &&
-        Platform.isWindows &&
-        MiniAVToolsPlatform.instance.backends.any(
-          (b) =>
-              b.supportsEncode(effectiveCodecForGpuCheck) &&
-              b.acceptedFrameSources.contains(
-                FrameSourceKind.miniavBufferD3D11,
-              ),
-        );
     final useGpuOutput =
         hasD3d11Encoder || hasMinigpuGpuEncoder || hasSharedHandleEncoder;
     // The GPU processor (bilinear scale + effects chain) imports the capture's
@@ -1278,23 +1444,99 @@ class Recorder {
       );
     }
 
+    // Decide capture output preference the same way the screen builder does.
+    // The camera has no scale/effects processor, so the only zero-copy shape
+    // that applies is the DIRECT PASSTHROUGH — the capture's shared NT handle
+    // straight to the encoder. A minigpu GPU-buffer encoder needs a processor
+    // to produce the buffer and the FFmpeg foreign-texture path needs one to
+    // rescale, so neither is a candidate here; only a shared-handle encoder
+    // (the MF one) is. The passthrough itself is source-agnostic and lives in
+    // _encodeOne above the processor gate, so the camera needs no processor.
+    final wantHw =
+        cfg.hwAccel == HwAccelPreference.preferred ||
+        cfg.hwAccel == HwAccelPreference.required;
+    final (_, _, _, hasSharedHandleEncoder) = await _detectVideoEncoderGpuCaps(
+      cfg.codec,
+      encWidth: format.width,
+      encHeight: format.height,
+      wantHw: wantHw,
+      label: 'camera[${cfg.deviceId}]',
+    );
+    var useGpuOutput = hasSharedHandleEncoder;
+    format = MiniAVVideoInfo(
+      width: format.width,
+      height: format.height,
+      pixelFormat: format.pixelFormat,
+      frameRateNumerator: format.frameRateNumerator,
+      frameRateDenominator: format.frameRateDenominator,
+      outputPreference: useGpuOutput
+          ? MiniAVOutputPreference.gpu
+          : MiniAVOutputPreference.cpu,
+    );
+
     final ctx = await MiniCamera.createContext();
     await ctx.configure(cfg.deviceId, format);
 
-    // Only pass the BackendContext (D3D11 zero-copy device) if the camera
-    // was configured for GPU output.  The camera MF backend only delivers
-    // gpuD3D11Handle buffers when outputPreference=gpu; for CPU output the
-    // BackendContext must be suppressed or FfmpegD3d11HwEncoder will be
-    // opened but receive CPU frames, throwing on every encode.
-    final cameraUsesGpu = format.outputPreference == MiniAVOutputPreference.gpu;
-    final encResult = await _openVideoEncoder(
+    // Pass the BackendContext (D3D11 zero-copy device) only on the GPU path —
+    // the camera MF backend delivers gpuD3D11Handle buffers only under GPU
+    // output preference; for CPU output the context must be suppressed or a
+    // D3D11 encoder opens and then throws on the CPU frames it receives.
+    // requiredFrameSource biases negotiation toward a backend that takes the
+    // shared handle, so we don't configure GPU capture and then discover the
+    // winner only accepts CPU frames.
+    var encResult = await _openVideoEncoder(
       format,
       cfg.codec,
       cfg.bitrateBps,
       cfg.hwAccel,
       quality: cfg.quality,
       encoderOptions: cfg.encoderOptions,
-      noContext: !cameraUsesGpu,
+      noContext: !useGpuOutput,
+      requiredFrameSource: useGpuOutput
+          ? FrameSourceKind.miniavBufferD3D11
+          : null,
+    );
+
+    // Confirm the negotiated encoder actually accepts the capture's shared NT
+    // handle. If not, the camera has no processor to fall back on — a GPU buffer
+    // has empty planes, so there is no CPU fallback and every frame would fail.
+    // Reconfigure for CPU output and reopen without the D3D11 context.
+    final directD3d11Passthrough = useGpuOutput &&
+        encResult.encoder.platform.supportsD3d11SharedHandleInput;
+    if (useGpuOutput && !directD3d11Passthrough) {
+      Recorder._log(
+        'camera[${cfg.deviceId}]: selected encoder does not accept the capture '
+        'shared handle — reconfiguring for CPU output.',
+        RecorderLogLevel.warning,
+      );
+      useGpuOutput = false;
+      format = MiniAVVideoInfo(
+        width: format.width,
+        height: format.height,
+        pixelFormat: format.pixelFormat,
+        frameRateNumerator: format.frameRateNumerator,
+        frameRateDenominator: format.frameRateDenominator,
+        outputPreference: MiniAVOutputPreference.cpu,
+      );
+      await ctx.configure(cfg.deviceId, format);
+      encResult = await _openVideoEncoder(
+        format,
+        cfg.codec,
+        cfg.bitrateBps,
+        cfg.hwAccel,
+        quality: cfg.quality,
+        encoderOptions: cfg.encoderOptions,
+        noContext: true,
+      );
+    }
+
+    Recorder._log(
+      directD3d11Passthrough
+          ? 'camera[${cfg.deviceId}] encode path: capture NT handle → '
+                '${encResult.encoder.backendName} '
+                '(direct passthrough, no GPU processing)'
+          : 'camera[${cfg.deviceId}] encode path: CPU frames → '
+                '${encResult.encoder.backendName}',
     );
 
     return _VideoTrackRuntime(
@@ -1308,6 +1550,7 @@ class Recorder {
       frameRateDen: format.frameRateDenominator,
       captureCtx: ctx,
       idleFramePolicy: cfg.idleFramePolicy,
+      directD3d11Passthrough: directD3d11Passthrough,
       startFn: (cb) => ctx.startCapture(cb),
       stopFn: () => ctx.stopCapture(),
       destroyFn: () => ctx.destroy(),
@@ -1447,6 +1690,18 @@ class Recorder {
     } catch (_) {
       /* not a ffmpeg-d3d11 encoder */
     }
+    // Whether the encoder ended up on the SAME device as the frame producer
+    // decides whether GPU frames need importing at all. Reported here because
+    // it is otherwise invisible, and a mismatch presents as every frame being
+    // refused with no clue as to why.
+    String deviceTag = '';
+    if (platform is MfVideoEncoder) {
+      final encDev = platform.boundD3d11Device;
+      final ctxDev = _backendContext?.d3d11DeviceHandle ?? 0;
+      deviceTag =
+          ' device=0x${encDev.toRadixString(16)}'
+          '${encDev == ctxDev && encDev != 0 ? " (shared with capture — no import needed)" : " MISMATCH vs capture 0x${ctxDev.toRadixString(16)} — GPU frames must be imported"}';
+    }
     Recorder._log(
       'video encoder = ${enc.backendName} '
       '(${platform.runtimeType})${vendorTag ?? ''} for ${effectiveCodec.name} '
@@ -1488,15 +1743,16 @@ class Recorder {
     final ctx = await factory();
     await configure(ctx, format);
 
+    final encoderConfig = AudioEncoderConfig(
+      codec: codec,
+      sampleRate: format.sampleRate,
+      channels: format.channels,
+      bitrateBps: bitrate ?? defaultAudioBitrate,
+      backendOptions: const {'global_header': '1'},
+    );
     final encoder = await MiniAVTools.createAudioEncoder(
-      AudioEncoderConfig(
-        codec: codec,
-        sampleRate: format.sampleRate,
-        channels: format.channels,
-        bitrateBps: bitrate ?? defaultAudioBitrate,
-        backendOptions: const {'global_header': '1'},
-      ),
-      preference: backendPreference,
+      encoderConfig,
+      preference: _audioBackendPreference,
       context: _backendContext,
     );
     Recorder._log(
@@ -1509,6 +1765,7 @@ class Recorder {
       index: index,
       label: label,
       encoder: encoder,
+      encoderConfig: encoderConfig,
       audioCodec: codec,
       sampleRate: format.sampleRate,
       channels: format.channels,
@@ -1547,15 +1804,16 @@ class Recorder {
     await loopCtx.configure(cfg.loopbackDeviceId, targetFormat);
 
     // 3. Single audio encoder.
+    final encoderConfig = AudioEncoderConfig(
+      codec: cfg.codec,
+      sampleRate: targetSampleRate,
+      channels: targetChannels,
+      bitrateBps: cfg.bitrateBps ?? defaultAudioBitrate,
+      backendOptions: const {'global_header': '1'},
+    );
     final encoder = await MiniAVTools.createAudioEncoder(
-      AudioEncoderConfig(
-        codec: cfg.codec,
-        sampleRate: targetSampleRate,
-        channels: targetChannels,
-        bitrateBps: cfg.bitrateBps ?? defaultAudioBitrate,
-        backendOptions: const {'global_header': '1'},
-      ),
-      preference: backendPreference,
+      encoderConfig,
+      preference: _audioBackendPreference,
       context: _backendContext,
     );
 
@@ -1579,6 +1837,7 @@ class Recorder {
       index: index,
       label: 'mixed[mic=${cfg.micDeviceId},loop=${cfg.loopbackDeviceId}]',
       encoder: encoder,
+      encoderConfig: encoderConfig,
       audioCodec: cfg.codec,
       micCtx: micCtx,
       loopCtx: loopCtx,
@@ -1600,63 +1859,179 @@ class Recorder {
   /// and the file extension offers no hint.
   ///
   /// Rules:
-  /// - video + audio → MKV (handles any codec mix)
+  /// - video + audio → MP4 when the first-party writer takes the codec mix,
+  ///   else MKV (handles any codec mix)
   /// - video only    → MP4
   /// - audio only    → M4A for AAC, MP3 for MP3, OGG for Opus, else MKV
-  static Container _autoContainer(List<_TrackRuntime> tracks) {
-    final hasVideo = tracks.any((t) => t is _VideoTrackRuntime);
-    final hasAudio = tracks.any((t) => t is _AudioTrackRuntime);
-    final audioCodecs = tracks
-        .whereType<_AudioTrackRuntime>()
-        .map((t) => t.audioCodec)
-        .toSet();
+  static Container _autoContainer(List<TrackInfo> tracks) {
+    final videoCodecs = tracks.whereType<VideoTrackInfo>().map((t) => t.codec);
+    final audioCodecs = tracks.whereType<AudioTrackInfo>().map((t) => t.codec);
     return containerForTrackMix(
-      hasVideo: hasVideo,
-      hasAudio: hasAudio,
-      audioCodecs: audioCodecs,
+      hasVideo: videoCodecs.isNotEmpty,
+      hasAudio: audioCodecs.isNotEmpty,
+      videoCodecs: videoCodecs.toSet(),
+      audioCodecs: audioCodecs.toSet(),
     );
+  }
+
+  /// Re-open every audio track that has no FFmpeg bridge on the FFmpeg
+  /// backend, so `FfmpegMuxer` can read codecpar out of a live AVCodecContext.
+  ///
+  /// The routing in [_prepare] answers this from the CONFIGS and gets it right
+  /// whenever the first-party writer accepts the sink; this is the other case —
+  /// it accepted the config but refused at open (e.g. an MF encoder that has no
+  /// parameter sets until its first keyframe), which no config can predict.
+  ///
+  /// Failures are logged, not thrown: the caller re-derives the bridge map and
+  /// reports the coupling with the sink and container in hand.
+  Future<void> _repinAudioTracksToFfmpeg(
+    String path,
+    Container container,
+  ) async {
+    _ffmpegMuxerRequired = true;
+    for (final t in _tracks) {
+      try {
+        if (!await t.repinAudioEncoderToFfmpeg(_backendContext)) continue;
+        Recorder._log(
+          'audio encoder for ${t.label} re-opened on '
+          '${FfmpegBackend.backendName} so FfmpegMuxer can write $path as '
+          '${container.name}',
+        );
+      } catch (e) {
+        Recorder._log(
+          're-opening ${t.label} on ${FfmpegBackend.backendName} failed: $e',
+          RecorderLogLevel.error,
+        );
+      }
+    }
   }
 
   Future<_SinkRuntime> _buildSink(RecorderSink sink) async {
     switch (sink) {
       case FileRecorderSink():
+        // Build TrackInfo list + encoder bridge map. Track infos carry the
+        // negotiated codecs, so the container heuristic and the first-party
+        // capability check below both see what will actually be written.
+        var tracks = <TrackInfo>[];
+        var encoderForTrack = <int, FfmpegEncoderBridge>{};
+        var audioWithoutBridge = <String>[];
+        // Re-derivable: the FFmpeg fallback below may re-open audio encoders,
+        // which changes every one of these three.
+        void collectTracks() {
+          tracks = <TrackInfo>[];
+          encoderForTrack = <int, FfmpegEncoderBridge>{};
+          audioWithoutBridge = <String>[];
+          for (final t in _tracks) {
+            final info = t.toTrackInfo();
+            tracks.add(info);
+            final bridge = t.encoderBridge;
+            if (bridge != null) {
+              encoderForTrack[t.index] = bridge;
+            } else if (info is AudioTrackInfo) {
+              audioWithoutBridge.add(t.label);
+            }
+          }
+        }
+
+        collectTracks();
+
         // Pick container: explicit override → extension sniff → track-mix heuristic.
         final container =
             sink.container ??
             _sniffContainer(sink.path) ??
-            _autoContainer(_tracks);
+            _autoContainer(tracks);
 
-        // Build TrackInfo list + encoder bridge map.
-        final tracks = <TrackInfo>[];
-        final encoderForTrack = <int, FfmpegEncoderBridge>{};
-        for (final t in _tracks) {
-          tracks.add(t.toTrackInfo());
-          final bridge = t.encoderBridge;
-          if (bridge != null) encoderForTrack[t.index] = bridge;
-        }
-
-        final muxerConfig = MuxerConfig(
+        MuxerConfig muxerConfig() => MuxerConfig(
           container: container,
           output: FileMuxerOutput(sink.path),
           tracks: tracks,
         );
 
-        // FFmpeg, deliberately, even for containers the first-party writer
-        // handles. The ISO-BMFF writer assembles the WHOLE file in memory and
-        // emits it at finish(), which is fine for a bounded clip and completely
-        // wrong for an open-ended recording — an hour of 4K would sit in RAM.
-        // FfmpegMuxer streams to disk as it goes.
+        // First-party writers: ISO-BMFF for MP4/M4A, RIFF for WAV, raw framing
+        // for ADTS. All three stream to the path as packets arrive (MP4 puts
+        // ftyp + mdat up front, appends samples, and patches moov and the mdat
+        // size at finish; WAV patches its two RIFF lengths; ADTS has nothing to
+        // patch), so an open-ended recording costs sample-table memory rather
+        // than the media — the whole-file-in-RAM behaviour that used to make
+        // FFmpeg the only option here is gone. They also take already-encoded
+        // packets from any backend, which is what frees audio to negotiate away
+        // from FFmpeg at all — and for a PCM `.wav` it is the ONLY route, since
+        // FFmpeg has no PCM encoder to bind a codecpar to.
+        if (firstPartyMuxerCanWrite(
+          container: container,
+          videoCodecs: tracks.whereType<VideoTrackInfo>().map((t) => t.codec),
+          audioCodecs: tracks.whereType<AudioTrackInfo>().map((t) => t.codec),
+        )) {
+          Muxer? opened;
+          try {
+            // PIN rather than negotiate: FFmpeg also muxes MP4, and this is a
+            // routing decision, not a capability contest.
+            opened = await MiniAVTools.createMuxer(
+              muxerConfig(),
+              preference: BackendPreference.pinned(
+                ContainerFramingBackend.backendName,
+              ),
+            );
+            await opened.writeHeader();
+            Recorder._log(
+              'muxer = ${opened.backendName} for ${container.name} → '
+              '${sink.path}',
+            );
+            return _FileSinkRuntime(muxer: opened, path: sink.path);
+          } catch (e) {
+            // writeHeader() may have already opened the file. Release the
+            // handle before FFmpeg tries to write the same path — on Windows a
+            // live handle makes the fallback fail too.
+            try {
+              await opened?.close();
+            } catch (_) {}
+            // The negotiator reports "no backend" when the muxer declines; the
+            // reason it declined (e.g. an H.264 track whose extraData carries
+            // no usable SPS) is recorded by the backend itself. Log the real
+            // cause — falling back silently is how a first-party path stays
+            // broken.
+            final cause = ContainerFramingBackend.lastMuxerInitFailure ?? e;
+            Recorder._log(
+              'first-party ${container.name} muxer unavailable for '
+              '${sink.path}: $cause — falling back to FFmpeg',
+              RecorderLogLevel.warning,
+            );
+          }
+        }
+
+        // FFmpeg for everything else (MKV/WebM/TS/…), and as the fallback
+        // above. FfmpegMuxer needs a live AVCodecContext per audio track to
+        // fill codecpar — ch_layout is not reachable through the Dart-side
+        // AVCodecParameters prefix — so it can only mux audio FFmpeg encoded.
+        // _prepare pins audio to FFmpeg when a sink is known up front to need
+        // this muxer; reaching here with an unbound audio track means we got
+        // here by fallback instead.
         //
-        // This keeps a known hazard: FfmpegMuxer needs a live AVCodecContext per
-        // audio track to fill codecpar, so it can only mux audio that FFmpeg
-        // itself encoded. If an audio track ever negotiates to a non-FFmpeg
-        // encoder here, `encoderForTrack` comes back short and the muxer throws
-        // at writeHeader. The real fix is either codecpar synthesis without a
-        // live context, or a streaming first-party writer -- not buffering the
-        // recording in memory to dodge it.
+        // Recover rather than fail. In the configuration the first-party route
+        // is the DEFAULT for — Windows, MF H.264 + MF AAC → rec.mp4 — no track
+        // has an FFmpeg bridge, so a refusal above would otherwise turn this
+        // "fallback" into a hard start() failure and no recording at all. The
+        // capture contexts are already open and nothing has been captured yet,
+        // so re-opening the audio encoders on FFmpeg costs only the open.
+        if (audioWithoutBridge.isNotEmpty) {
+          await _repinAudioTracksToFfmpeg(sink.path, container);
+          collectTracks();
+        }
+        if (audioWithoutBridge.isNotEmpty) {
+          throw CodecInitException(
+            'recorder',
+            'cannot write ${sink.path} as ${container.name}: it needs '
+                'FfmpegMuxer, which cannot mux audio it did not encode, '
+                'track(s) ${audioWithoutBridge.join(", ")} are on a non-FFmpeg '
+                'encoder, and re-opening them on FFmpeg did not succeed (the '
+                'log above says why). If a first-party MP4/M4A/WAV/ADTS route '
+                'was attempted for this sink, the warning above says why it '
+                'was refused.',
+          );
+        }
         final muxer = Muxer(
-          FfmpegMuxer.open(muxerConfig, encoderForTrack: encoderForTrack),
-          'ffmpeg',
+          FfmpegMuxer.open(muxerConfig(), encoderForTrack: encoderForTrack),
+          FfmpegBackend.backendName,
         );
         await muxer.writeHeader();
         return _FileSinkRuntime(muxer: muxer, path: sink.path);
@@ -1722,6 +2097,127 @@ abstract class _TrackRuntime {
   TrackInfo toTrackInfo();
   FfmpegEncoderBridge? get encoderBridge;
   TrackChunk toChunk(EncodedPacket pkt);
+
+  /// Re-open this track's AUDIO encoder pinned to the FFmpeg backend, keeping
+  /// the capture context, and return `true` when one was swapped.
+  ///
+  /// `false` for video tracks (FfmpegMuxer synthesises video codecpar from
+  /// [VideoTrackInfo]) and for audio already on FFmpeg. Only safe before
+  /// capture starts — the replaced encoder is closed without a flush — which is
+  /// the only place [Recorder._buildSink] calls it from.
+  Future<bool> repinAudioEncoderToFfmpeg(BackendContext? context) async =>
+      false;
+}
+
+/// Keeps a video encoder's cache of IMPORTED PRODUCER TEXTURES in step with
+/// the producer that owns them.
+///
+/// A D3D11 encoder that imports the producer's textures (the Media Foundation
+/// one) caches them keyed on the texture POINTER and pins each one with a
+/// reference. The pin is what makes a pointer a safe key: free a texture and
+/// the next allocation may land on the same address, and a pointer-keyed hit
+/// would then encode a stale picture forever with success reported at every
+/// step. The price is that up to a handful of the producer's surfaces stay
+/// resident in VRAM after the producer has finished with them — ~135 MB at 4K —
+/// until something says they are dead. This is that something.
+///
+/// The capability is resolved as a method TEAR-OFF rather than as
+/// `encoder is MfVideoEncoder` deliberately: the native invalidation was
+/// already correct and covered by its own tests — what was missing was any
+/// caller at all — and a concrete-type gate is exactly the shape that no test
+/// double can satisfy, so the wiring would stay unprovable.
+class EncoderImportCache {
+  EncoderImportCache(this.encoder, {this.importsProducerTextures = true});
+
+  /// The encoder whose imports this drops.
+  final PlatformEncoder encoder;
+
+  /// Whether the track that owns this cache ever hands the PRODUCER's own
+  /// texture to [encoder].
+  ///
+  /// False for a video track that always goes through the GPU processor: what
+  /// the encoder imports there is the processor's shared-OUTPUT ring, which is
+  /// encoder-sized and untouched by a producer resize. Reporting a resize on
+  /// such a track would drop a cache whose contents the geometry does not
+  /// describe — and take the encoder's retained repeat source down with it —
+  /// for nothing. True for direct passthrough (which feeds the capture's own
+  /// texture whenever it is already encoder-sized) and for a track with no
+  /// processor at all (a GPU-output camera), which is the case that actually
+  /// pins producer surfaces frame after frame.
+  final bool importsProducerTextures;
+
+  /// The encoder's invalidation entry point, or `null` when it keeps no import
+  /// cache (every encoder but the Media Foundation one). Resolved once —
+  /// [noteProducerSize] is on the video hot path.
+  late final int Function()? _invalidate = _probe();
+
+  int Function()? _probe() {
+    final Object? member;
+    try {
+      member = (encoder as dynamic).invalidateImports;
+    } on NoSuchMethodError {
+      return null; // no import cache — nothing to keep in step
+    }
+    return member is int Function() ? member : null;
+  }
+
+  /// Whether [encoder] keeps an import cache at all.
+  bool get supported => _invalidate != null;
+
+  /// Producer geometry the cached imports were taken from. Zero until the first
+  /// frame: a first size is not a change.
+  int _srcWidth = 0;
+  int _srcHeight = 0;
+
+  /// How many times the cache has actually been dropped. The call is otherwise
+  /// invisible from outside the encoder.
+  int get invalidations => _invalidations;
+  int _invalidations = 0;
+
+  /// Note a captured frame about to be encoded.
+  ///
+  /// Filters out everything that cannot have populated the cache — CPU frames,
+  /// and tracks that never feed the encoder the producer's own texture (see
+  /// [importsProducerTextures]) — then defers to [noteProducerSize]. Returns
+  /// entries released, or -1 when nothing was done.
+  ///
+  /// A non-negative return is ALSO the caller's signal that the encoder's
+  /// retained repeat source is gone: invalidation releases it (a duplicate of
+  /// a pre-change picture would be stale), and nothing outside the encoder can
+  /// observe that. Any recorder-side record of "a duplicate can still be
+  /// emitted" has to be dropped with it, or a CFR idle filler claims a grid
+  /// slot the encoder can no longer fill and leaves a permanent hole.
+  int noteFrame(MiniAVBuffer buffer) {
+    if (!importsProducerTextures) return -1;
+    if (buffer.contentType != MiniAVBufferContentType.gpuD3D11Handle) return -1;
+    final producer = buffer.data;
+    if (producer is! MiniAVVideoBuffer) return -1;
+    return noteProducerSize(producer.width, producer.height);
+  }
+
+  /// Note the geometry of a producer frame about to be encoded.
+  ///
+  /// A different size means the producer rebuilt its textures — a display mode
+  /// change, a re-created capture pool — so everything imported from the old
+  /// ones is dead weight. Returns the number of cache entries released, or -1
+  /// when nothing was done (unchanged geometry, first frame, or no cache).
+  int noteProducerSize(int width, int height) {
+    if (width == _srcWidth && height == _srcHeight) return -1;
+    final first = _srcWidth == 0 && _srcHeight == 0;
+    _srcWidth = width;
+    _srcHeight = height;
+    return first ? -1 : invalidate();
+  }
+
+  /// Drop every imported producer texture unconditionally — for when the
+  /// producer tore its textures down wholesale (ring rebuilt, source swapped)
+  /// rather than merely resized. Returns entries released, or -1 for no cache.
+  int invalidate() {
+    final fn = _invalidate;
+    if (fn == null) return -1;
+    _invalidations++;
+    return fn();
+  }
 }
 
 /// A captured video frame waiting in [_VideoTrackRuntime]'s bounded encode
@@ -1835,6 +2331,17 @@ class _VideoTrackRuntime extends _TrackRuntime {
     frameRateNum: frameRateNum,
     frameRateDen: frameRateDen,
     cfr: cfrOutput,
+  );
+
+  /// Keeps the encoder's imported-producer-texture cache in step with the
+  /// producer (see [EncoderImportCache]).
+  late final EncoderImportCache _imports = EncoderImportCache(
+    encoder.platform,
+    // Direct passthrough submits the capture's own texture; a track with no
+    // processor (GPU-output camera) submits nothing else. Every other shape
+    // only ever submits the processor's encoder-sized output ring, which a
+    // producer resize does not touch.
+    importsProducerTextures: directD3d11Passthrough || processor == null,
   );
 
   /// Last live frame retained for the duplicator on the direct-passthrough
@@ -2163,7 +2670,6 @@ class _VideoTrackRuntime extends _TrackRuntime {
       if (ptsUs <= _lastVideoPtsUs) ptsUs = _lastVideoPtsUs + 1;
       _lastVideoPtsUs = ptsUs;
       final proc = processor!;
-      _lastSharedTex = ready.tex; // duplicator source (see _maybeDuplicateLast)
       final src = D3D11TextureFrameSource(
         texturePtr: ready.tex.d3d11TexturePtr,
         width: proc.outputWidth,
@@ -2171,6 +2677,12 @@ class _VideoTrackRuntime extends _TrackRuntime {
         pixelFormat: MiniAVPixelFormat.rgba32,
       );
       final pkt = await _encStage(() => encoder.encode(src));
+      // Retain as the duplicator source only AFTER the encode returns (see
+      // _maybeDuplicateLast). The CFR idle filler treats a valid source as
+      // proof it can fill the slot it is about to claim; a source whose encode
+      // threw cannot fill one — repeatLastFrame has no last frame to repeat —
+      // and the claimed slot would stay empty forever.
+      _lastSharedTex = ready.tex;
       if (pkt != null) {
         _statsPacketsOut++;
         _statsTotalPktBytes += pkt.data.length;
@@ -2261,6 +2773,15 @@ class _VideoTrackRuntime extends _TrackRuntime {
     // duplicator's source instead of being released in the finally below.
     var retainBuffer = false;
     try {
+      // Keep the encoder's imported-producer-texture cache in step with the
+      // producer before anything decides what to encode: a resize kills those
+      // surfaces whether or not this particular frame makes it out. A drop
+      // takes the encoder's retained repeat source with it, and that is
+      // invisible from outside the encoder — so the duplicator's proof that a
+      // repeat is still possible has to be cleared here too, or a CFR idle
+      // slot gets claimed and never filled. See [EncoderImportCache.noteFrame].
+      if (_imports.noteFrame(buffer) >= 0) _lastSharedTex = null;
+
       // PTS from the pacer: the capture-time timestamp recorded at enqueue in
       // VFR mode (falling back to now() if the frame was encoded outside the
       // queue), the claimed grid-slot time in CFR mode. This keeps PTS spacing
@@ -2282,11 +2803,58 @@ class _VideoTrackRuntime extends _TrackRuntime {
       if (ptsUs <= _lastVideoPtsUs) ptsUs = _lastVideoPtsUs + 1;
       _lastVideoPtsUs = ptsUs;
 
-      // --- GPU-backed paths ---------------------------------------------
-      // All cases require a GpuScreenProcessor and a D3D11-handle buffer.
+      // --- Direct D3D11 passthrough (source-agnostic; no processor needed) ---
+      // A GPU-handle frame that is already encoder-sized and whose encoder
+      // accepts the capture's shared NT handle needs no processing at all: hand
+      // the handle straight to the encoder, which opens it on its own device and
+      // copies it with the COPY engine. This is IDENTICAL for a screen capture
+      // with no scale/effects and for a GPU-output camera — neither needs a
+      // GpuScreenProcessor. The check lives ABOVE the processor gate so a
+      // processor-less source (camera) reaches it too. A size-mismatched frame
+      // (a screen mid-stream display-mode change) falls through to the
+      // processor's rescale below; a fixed-format source (camera) never makes
+      // one. Passthrough is mutually exclusive with the readback / gpu-buffer
+      // modes (the builder never sets it alongside them), so this cannot
+      // intercept a frame one of those owns.
+      final isGpuHandle =
+          buffer.contentType == MiniAVBufferContentType.gpuD3D11Handle;
+      if (directD3d11Passthrough && isGpuHandle) {
+        final vb = buffer.data;
+        if (vb is MiniAVVideoBuffer &&
+            vb.width == width &&
+            vb.height == height) {
+          final src = FrameSource.miniavBuffer(buffer);
+          final pkt = await _encStage(() => encoder.encode(src));
+          // Retain this frame as the duplicator's source and release the
+          // previously retained one. The NT handle + capture-side texture stay
+          // valid until the buffer is released.
+          final prev = _lastDirectBuffer;
+          _lastDirectBuffer = buffer;
+          retainBuffer = true;
+          _lastSharedTex = null; // direct frame supersedes any old texture
+          if (prev != null) MiniAV.releaseBufferSync(prev);
+          if (pkt != null) {
+            _statsPacketsOut++;
+            _statsTotalPktBytes += pkt.data.length;
+            if (pkt.data.length < _statsMinPktBytes)
+              _statsMinPktBytes = pkt.data.length;
+            if (pkt.data.length > _statsMaxPktBytes)
+              _statsMaxPktBytes = pkt.data.length;
+            await rec.dispatchPacket(
+              this,
+              pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
+            );
+          }
+          return;
+        }
+        // Size mismatch → fall through to the processor rescale (screen); with
+        // no processor the normal path below surfaces a rate-limited size error.
+      }
+
+      // --- GPU processor paths (scale/effects, readback, gpu-buffer) ---------
+      // These genuinely need a GpuScreenProcessor and a D3D11-handle buffer.
       final proc = processor;
-      if (proc != null &&
-          buffer.contentType == MiniAVBufferContentType.gpuD3D11Handle) {
+      if (proc != null && isGpuHandle) {
         if (processorGpuBuffer) {
           // (C) GPU buffer hot path: processor returns a packed RGBA8 GPU
           // Buffer that the minigpu encoder (e.g. MinigpuAv1Pipeline) consumes
@@ -2334,53 +2902,15 @@ class _VideoTrackRuntime extends _TrackRuntime {
           );
           return;
         } else if (!processorCpuReadback) {
-          // (A0) Direct BGRA passthrough: no scale/effects configured and the
-          // frame is already encoder-sized — hand the capture's shared NT
-          // handle straight to the D3D11 encoder, which opens it on its own
-          // device and copies it with the COPY engine. Zero shader-core work
-          // per frame, so a GPU saturated by another workload has nothing of
-          // ours to starve. Size-mismatched frames (mid-stream display mode
-          // change) fall through to the GPU processor below, which rescales.
-          if (directD3d11Passthrough) {
-            final vb = buffer.data;
-            if (vb is MiniAVVideoBuffer &&
-                vb.width == width &&
-                vb.height == height) {
-              final src = FrameSource.miniavBuffer(buffer);
-              final pkt = await _encStage(() => encoder.encode(src));
-              // Retain this frame as the duplicator's source and release the
-              // previously retained one. The NT handle + capture-side texture
-              // stay valid until the buffer is released.
-              final prev = _lastDirectBuffer;
-              _lastDirectBuffer = buffer;
-              retainBuffer = true;
-              _lastSharedTex = null; // direct frame supersedes any old texture
-              if (prev != null) MiniAV.releaseBufferSync(prev);
-              if (pkt != null) {
-                _statsPacketsOut++;
-                _statsTotalPktBytes += pkt.data.length;
-                if (pkt.data.length < _statsMinPktBytes)
-                  _statsMinPktBytes = pkt.data.length;
-                if (pkt.data.length > _statsMaxPktBytes)
-                  _statsMaxPktBytes = pkt.data.length;
-                await rec.dispatchPacket(
-                  this,
-                  pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
-                );
-              }
-              return;
-            }
-          }
-          // (A) Zero-copy GPU encode: processor returns a SharedOutputTexture
-          // that the D3D11 hardware encoder reads directly — no PCIe round-trip.
+          // (A) Zero-copy GPU encode WITH scale/effects, or the rescale path for
+          // a passthrough frame whose size no longer matches the encoder (a
+          // screen mid-stream mode change): the processor returns a
+          // SharedOutputTexture the D3D11 hardware encoder reads directly — no
+          // PCIe round-trip. The no-work, correctly-sized passthrough is handled
+          // above, before the processor gate, so it also serves processor-less
+          // sources (a GPU-output camera).
           final sharedTex = await _gpuStage(() => proc.process(buffer));
           if (sharedTex != null) {
-            // Remember for the frame duplicator: when capture goes idle on a
-            // static screen, the duplicator re-encodes this same texture at
-            // the target frame rate so playback stays smooth.  The processor
-            // owns the texture; we just hold a reference and check isValid
-            // before using it from the timer.
-            _lastSharedTex = sharedTex;
             // A processor-produced texture supersedes any frame retained by
             // the direct-passthrough path (e.g. after a mode-change fallback).
             final staleDirect = _lastDirectBuffer;
@@ -2395,6 +2925,17 @@ class _VideoTrackRuntime extends _TrackRuntime {
               pixelFormat: MiniAVPixelFormat.rgba32,
             );
             final pkt = await _encStage(() => encoder.encode(src));
+            // Remember for the frame duplicator: when capture goes idle on a
+            // static screen, the duplicator re-encodes this same texture at
+            // the target frame rate so playback stays smooth.  The processor
+            // owns the texture; we just hold a reference and check isValid
+            // before using it from the timer.
+            //
+            // Only AFTER a successful encode: the CFR idle filler reads this as
+            // proof that the slot it is about to claim CAN be filled, and a
+            // texture the encoder rejected would leave that slot permanently
+            // empty (repeatLastFrame has nothing to repeat).
+            _lastSharedTex = sharedTex;
             if (pkt != null) {
               _statsPacketsOut++;
               _statsTotalPktBytes += pkt.data.length;
@@ -2613,6 +3154,18 @@ class _VideoTrackRuntime extends _TrackRuntime {
     if (rec == null) return;
     final intervalUs = _minFrameIntervalUs;
     if (intervalUs <= 0) return;
+    // A retained texture the processor has destroyed took the whole shared-
+    // output ring with it, so every slot the encoder imported is now a freed
+    // address it is still holding a reference to. Unlike a resize this is not
+    // visible in any frame's geometry — the ring is encoder-sized either way —
+    // so it has to be said explicitly. Ahead of the policy branch on purpose:
+    // the `black` policy never looks at the texture and would otherwise leave
+    // the imports pinned for the rest of the recording.
+    final retainedTex = _lastSharedTex;
+    if (retainedTex != null && !retainedTex.isValid) {
+      _lastSharedTex = null;
+      _imports.invalidate();
+    }
     final nowUs = rec.now();
     int fillPtsUs;
     if (cfrOutput) {
@@ -2620,10 +3173,13 @@ class _VideoTrackRuntime extends _TrackRuntime {
       // passed (see FramePacer.claimIdleSlot). Check that a fill source
       // exists BEFORE claiming — a claimed slot we cannot fill would become
       // a permanent timeline hole.
+      // _lastSharedTex is known valid here (dead ones were dropped above) and
+      // is only ever set after an encode the encoder ACCEPTED, so it doubles
+      // as proof that its retained repeat source exists.
       final hasSource =
           idleFramePolicy == VideoIdleFramePolicy.black ||
           _lastDirectBuffer != null ||
-          (_lastSharedTex?.isValid ?? false);
+          _lastSharedTex != null;
       if (!hasSource) return;
       final slotPts = _pacer.claimIdleSlot(nowUs);
       if (slotPts == null) return;
@@ -2652,14 +3208,9 @@ class _VideoTrackRuntime extends _TrackRuntime {
         });
         return;
       }
+      // Already checked for validity above, before the policy branch.
       final tex = _lastSharedTex;
       if (tex == null) return;
-      // If the processor disposed the texture (e.g. resolution change), drop
-      // our reference so we don't dereference freed memory next tick.
-      if (!tex.isValid) {
-        _lastSharedTex = null;
-        return;
-      }
       _encoding = true;
       final fut = _encodeDuplicate(rec, tex, fillPtsUs);
       _inFlight.add(fut);
@@ -2893,6 +3444,7 @@ class _AudioTrackRuntime extends _TrackRuntime {
     required super.index,
     required super.label,
     required this.encoder,
+    required this.encoderConfig,
     required this.audioCodec,
     required this.sampleRate,
     required this.channels,
@@ -2903,7 +3455,12 @@ class _AudioTrackRuntime extends _TrackRuntime {
     required this.destroyFn,
   });
 
-  final AudioEncoder encoder;
+  /// Not final: [repinAudioEncoderToFfmpeg] swaps it during sink construction.
+  AudioEncoder encoder;
+
+  /// The config [encoder] was opened with, kept so it can be re-opened on a
+  /// different backend without re-deriving the capture format.
+  final AudioEncoderConfig encoderConfig;
   final AudioCodec audioCodec;
   final int sampleRate;
   final int channels;
@@ -3218,12 +3775,34 @@ class _AudioTrackRuntime extends _TrackRuntime {
     codec: audioCodec,
     sampleRate: sampleRate,
     channels: channels,
+    // Codec-private data (OpusHead, AudioSpecificConfig) when the encoder
+    // exposes it. Omitting it is not merely a lost optimisation: a muxer that
+    // has to synthesise the header can only derive it from rate/channels, and
+    // Opus's pre-skip — the encoder's own lookahead — is not in either, so the
+    // file ships PreSkip = 0 and every sample plays late by the priming.
+    extraData: encoder.extraData,
   );
 
   @override
   FfmpegEncoderBridge? get encoderBridge {
     final p = encoder.platform;
     return p is FfmpegEncoderBridge ? p as FfmpegEncoderBridge : null;
+  }
+
+  @override
+  Future<bool> repinAudioEncoderToFfmpeg(BackendContext? context) async {
+    if (encoderBridge != null) return false;
+    final replacement = await MiniAVTools.createAudioEncoder(
+      encoderConfig,
+      preference: BackendPreference.pinned(FfmpegBackend.backendName),
+      context: context,
+    );
+    final previous = encoder;
+    encoder = replacement;
+    try {
+      await previous.close();
+    } catch (_) {}
+    return true;
   }
 
   @override
@@ -3255,6 +3834,7 @@ class _MixedAudioTrackRuntime extends _TrackRuntime {
     required super.index,
     required super.label,
     required this.encoder,
+    required this.encoderConfig,
     required this.audioCodec,
     required this.micCtx,
     required this.loopCtx,
@@ -3265,7 +3845,12 @@ class _MixedAudioTrackRuntime extends _TrackRuntime {
     this.masterChain,
   });
 
-  final AudioEncoder encoder;
+  /// Not final: [repinAudioEncoderToFfmpeg] swaps it during sink construction.
+  AudioEncoder encoder;
+
+  /// The config [encoder] was opened with, kept so it can be re-opened on a
+  /// different backend without re-deriving the mix format.
+  final AudioEncoderConfig encoderConfig;
   final AudioCodec audioCodec;
   final MiniAudioInputContext micCtx;
   final MiniLoopbackContext loopCtx;
@@ -3794,12 +4379,31 @@ class _MixedAudioTrackRuntime extends _TrackRuntime {
     codec: audioCodec,
     sampleRate: _outSampleRate,
     channels: _outChannels,
+    // See _AudioTrackRuntime.toTrackInfo: without this the muxer synthesises a
+    // header, and a synthesised OpusHead carries PreSkip = 0.
+    extraData: encoder.extraData,
   );
 
   @override
   FfmpegEncoderBridge? get encoderBridge {
     final p = encoder.platform;
     return p is FfmpegEncoderBridge ? p as FfmpegEncoderBridge : null;
+  }
+
+  @override
+  Future<bool> repinAudioEncoderToFfmpeg(BackendContext? context) async {
+    if (encoderBridge != null) return false;
+    final replacement = await MiniAVTools.createAudioEncoder(
+      encoderConfig,
+      preference: BackendPreference.pinned(FfmpegBackend.backendName),
+      context: context,
+    );
+    final previous = encoder;
+    encoder = replacement;
+    try {
+      await previous.close();
+    } catch (_) {}
+    return true;
   }
 
   @override

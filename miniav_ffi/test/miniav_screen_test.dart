@@ -1,7 +1,72 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
 import 'package:test/test.dart';
 import 'package:miniav_platform_interface/miniav_platform_interface.dart';
 import 'package:miniav_ffi/miniav_ffi.dart';
+
+/// Renders SILENCE to the default output device for the life of the caller.
+///
+/// WASAPI loopback only produces packets while something is actively
+/// rendering to the endpoint, so the "WITH AUDIO" test below used to measure
+/// whether the developer happened to have music playing: it failed 10/10 on a
+/// quiet machine (`Video Frames: 953, Audio Frames: 0`) and passed whenever
+/// audio happened to be going. That is an uncontrolled environmental
+/// precondition, not a property of the code under test.
+///
+/// Silence is deliberate on both counts: it keeps the endpoint streaming
+/// (which is all loopback needs) and it is INAUDIBLE, so running the suite
+/// never makes noise at whoever is at the machine.
+///
+/// Returns null when it can't start, in which case the caller skips rather
+/// than reporting a failure it cannot attribute.
+Future<Process?> _spawnSilentRender() async {
+  if (!Platform.isWindows) return null;
+  try {
+    // 3 s of 48 kHz stereo 16-bit silence, looped by the player.
+    const sampleRate = 48000, channels = 2, seconds = 3;
+    final dataBytes = sampleRate * channels * 2 * seconds;
+    final wav = BytesBuilder();
+    void u32(int v) => wav.add(Uint8List(4)..buffer.asByteData().setUint32(0, v, Endian.little));
+    void u16(int v) => wav.add(Uint8List(2)..buffer.asByteData().setUint16(0, v, Endian.little));
+    wav.add('RIFF'.codeUnits); u32(36 + dataBytes); wav.add('WAVE'.codeUnits);
+    wav.add('fmt '.codeUnits); u32(16); u16(1); u16(channels);
+    u32(sampleRate); u32(sampleRate * channels * 2); u16(channels * 2); u16(16);
+    wav.add('data'.codeUnits); u32(dataBytes);
+    wav.add(Uint8List(dataBytes)); // all zeros == silence
+
+    final f = File('${Directory.systemTemp.path}\\miniav_test_silence.wav')
+      ..writeAsBytesSync(wav.takeBytes());
+
+    // Same leak discipline as the recorder's capture animator: a test process
+    // that dies on a crash or timeout must not strand a child holding an
+    // audio endpoint open. Watchdog exits when THIS process is gone, with a
+    // hard cap as a backstop.
+    return await Process.start(
+      'powershell',
+      [
+        '-NoProfile', '-WindowStyle', 'Hidden', '-Command',
+        r'''
+$p = [int]$env:MINIAV_SILENCE_PARENT_PID
+$player = New-Object Media.SoundPlayer $env:MINIAV_SILENCE_WAV
+$player.PlayLooping()
+$deadline = (Get-Date).AddSeconds(120)
+while ((Get-Date) -lt $deadline) {
+  Start-Sleep -Milliseconds 500
+  if ($p -gt 0) { try { $null = Get-Process -Id $p -ErrorAction Stop } catch { break } }
+}
+$player.Stop()
+''',
+      ],
+      environment: {
+        'MINIAV_SILENCE_PARENT_PID': '$pid',
+        'MINIAV_SILENCE_WAV': f.path,
+      },
+    );
+  } catch (_) {
+    return null;
+  }
+}
 
 void main() {
   late MiniScreenPlatformInterface screen;
@@ -248,6 +313,23 @@ void main() {
             );
             return;
           }
+
+          // Loopback captures nothing from an idle endpoint, so drive one
+          // ourselves instead of depending on the machine being noisy.
+          final silence = await _spawnSilentRender();
+          if (silence == null) {
+            markTestSkipped(
+              'could not start a silent render stream; WASAPI loopback has '
+              'nothing to capture on an idle endpoint, so this would test the '
+              'environment rather than the capture path',
+            );
+            return;
+          }
+          // addTearDown, not try/finally: this runs on EVERY exit path,
+          // including a failed expect() that throws past the rest of the body.
+          addTearDown(silence.kill);
+          // Let the endpoint actually come up before capture starts.
+          await Future<void>.delayed(const Duration(milliseconds: 600));
 
           final firstDisplay = displays.first;
           // IMPORTANT: Enable audio capture

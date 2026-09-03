@@ -459,7 +459,6 @@ void main() {
   group('Regression — absolute QPC epoch produces 59-hour container', () {
     test('using buffer.timestampUs as epoch offsets PTS by ~59 hours', () {
       const sampleRate = 44100;
-      const samplesPerCallback = 441;
       // Machine has been on for 59 hours; QPC value in µs.
       const qpcEpoch = 59 * 3600 * 1000000; // ~212.4 billion µs
       const masterNow = 50000; // rec.now() = 50 ms since recording start

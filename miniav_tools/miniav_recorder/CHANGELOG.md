@@ -1,5 +1,94 @@
 # Changelog
 
+## 0.5.11
+
+- Report the encoder's D3D11 device alongside the capture context's, so a device mismatch - which otherwise shows up as every GPU frame being refused with no explanation - is visible in the log.
+
+## 0.5.10
+
+- released 08/13/26 - MR
+
+## 0.5.9
+
+- Floor `miniav_tools_codecs` at ^0.7.0 (streamed MP3 decode fix; `^0.6.9`
+  cannot admit it).
+- **Audio-only `.wav` (PCM) and `.aac`/ADTS file sinks now record.** Both route
+  to the first-party streaming muxers, which take already-encoded packets and
+  need no encoder handle. `.wav` was previously impossible by any route:
+  `firstPartyMuxerCanWrite` gated to MP4/M4A, so the sink fell to `FfmpegMuxer`,
+  which can only describe audio FFmpeg encoded — and FFmpeg has no PCM encoder.
+  `.aac` was unmapped as an extension and got an M4A written into it. MP4, M4A
+  and MKV routing is unchanged.
+- New `firstPartyMuxerCanWrite(audioTracks:)`. WAV and ADTS hold exactly one
+  audio track and neither writer reads `EncodedPacket.trackIndex`, so a second
+  track would be interleaved into the first one's stream rather than refused.
+  A `Set<AudioCodec>` cannot express that — two same-codec tracks collapse to
+  one element — so state the count; `null` falls back to the element count,
+  which is exact for a per-track iterable.
+- **Audio tracks describe themselves to the muxer with the encoder's extra
+  data.** Both audio `toTrackInfo()` implementations omitted it (the video one
+  did not), so a first-party muxer had to synthesise the codec-private header —
+  and a synthesised OpusHead carries PreSkip = 0, which drops the encoder's
+  lookahead and plays every sample ~6.5 ms late. Not derivable, unlike AAC's
+  AudioSpecificConfig: nothing in the sample rate or channel count holds it.
+- `containerForExtension` maps `.aac`/`.adts` → `Container.adts`, and
+  `containerForTrackMix` answers WAV (not MKV) for audio-only PCM. `.ogg` is
+  unchanged: `OggMuxer` still has no streaming `FileMuxerOutput` mode.
+- **`MfVideoEncoder.invalidateImports()` now has a caller.** The recorder drops
+  the encoder's imported-texture cache when the producer's frame geometry
+  changes and when the GPU processor's shared-output ring is torn down. That
+  cache pins each producer surface with a reference — which is what makes a
+  texture pointer a safe key — so nothing had been releasing them; a 4K screen
+  recording held ~135 MB of dead VRAM until LRU eviction happened past it. New
+  `EncoderImportCache` holds the policy; a ring rebuild is invisible in frame
+  geometry (the ring is encoder-sized) and so must be reported explicitly.
+- `EncoderImportCache.noteFrame(buffer)` replaces the raw `noteProducerSize`
+  call site, and takes `importsProducerTextures`. Only a track that submits the
+  producer's own texture reports a resize: direct passthrough, or a track with
+  no GPU processor at all (a GPU-output camera — previously missed entirely,
+  since the old call site sat behind a `processor != null` guard). A pure
+  processor track's cache holds the processor's encoder-sized output ring,
+  which a producer resize does not touch.
+- Trap: invalidating also releases the encoder's retained repeat source, and
+  nothing outside the encoder can observe that. The recorder now clears the
+  duplicator's last shared texture whenever a drop actually happens; otherwise a
+  `cfrOutput` + `duplicate` recording claims a grid slot that `repeatLastFrame`
+  then refuses to fill, and the hole is permanent.
+- The dead-ring check moved ahead of the idle-frame-policy branch, so `black`
+  reports a torn-down ring too instead of leaving the imports pinned. Policy
+  `none` starts no timer and still cannot report one.
+- Fixed a comment claiming backend priorities put minigpu (60) above FFmpeg
+  (50): minigpu is 30 and loses. The check it annotates is a capability query
+  answered before any encoder exists, not a prediction of who wins.
+
+## 0.5.8
+
+- **Audio negotiation is container-aware.** `_prepare` resolves each file sink's
+  container up front and only pins audio to FFmpeg when a sink genuinely needs
+  `FfmpegMuxer` (which can only mux audio FFmpeg itself encoded). An MP4/M4A
+  recording therefore keeps the OS AAC encoder, where before it was either
+  forced onto FFmpeg or failed at `start()`. When the coupling cannot be
+  satisfied — a caller-pinned non-FFmpeg backend, or a codec FFmpeg has no
+  encoder for — `start()` throws a `CodecInitException` naming the codec and the
+  container before a device is opened, instead of an opaque
+  `NoBackendForCodecException` later.
+- **MP4/M4A file sinks and clips use the first-party ISO-BMFF writer** whenever
+  the negotiated codec mix allows it. It streams to disk, so an open-ended
+  recording no longer sits in RAM. If it declines, the real cause is logged and
+  the sink falls back to `FfmpegMuxer`, re-pinning bridgeless audio encoders to
+  FFmpeg so the fallback can actually mux.
+- **Behaviour change: the default container for video+audio is MP4, not MKV,**
+  when both codec sets are known and first-party writable. Unstated codecs still
+  answer MKV, so callers that never named a codec are unaffected.
+- Opus is accepted alongside AAC for first-party MP4/M4A clips.
+- The clip path's temporary audio encoder is pinned to FFmpeg only on the
+  FFmpeg-muxer fallback, and FFmpeg is loaded on that path; a standalone
+  `ClipBuffer.saveClip` now registers the backends it needs instead of relying
+  on a `Recorder` having run first.
+- The CFR/idle duplicate slot is claimed only after the encode returns, so a
+  first frame that fails to encode no longer leaves a hole the pacer thinks is
+  filled.
+
 ## 0.5.7
 
 - Idle/CFR duplicate frames now ask the encoder to repeat its last frame rather

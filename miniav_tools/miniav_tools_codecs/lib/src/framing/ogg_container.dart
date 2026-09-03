@@ -16,8 +16,10 @@ import 'dart:typed_data';
 
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
+import '../opus/opus_bitstream.dart';
+
 const List<int> _oggS = [0x4F, 0x67, 0x67, 0x53]; // "OggS"
-const List<int> _opusHeadMagic = [0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64];
+const List<int> _opusHeadMagic = opusHeadMagic;
 const List<int> _opusTagsMagic = [0x4F, 0x70, 0x75, 0x73, 0x54, 0x61, 0x67, 0x73];
 
 bool _startsWith(Uint8List d, List<int> magic) {
@@ -31,13 +33,30 @@ bool _startsWith(Uint8List d, List<int> magic) {
 /// Ogg demuxer: parses all pages up-front (input is fully in memory) into a flat
 /// list of Opus audio packets, skipping the header packets.
 class OggDemuxer implements PlatformDemuxer {
-  OggDemuxer._(this.tracks, this._packets, this._sampleRate);
+  OggDemuxer._(
+    this.tracks,
+    this._packets,
+    this._startSamples,
+    this._durSamples,
+    this._totalSamples,
+  );
 
   @override
   final List<TrackInfo> tracks;
 
   final List<Uint8List> _packets;
-  final int _sampleRate;
+
+  /// Per-audio-packet start position on the PLAYBACK timeline, in 48 kHz
+  /// samples (pre-skip already removed, so packet 0 starts at 0).
+  final List<int> _startSamples;
+
+  /// Per-audio-packet duration in 48 kHz samples, from its TOC byte.
+  final List<int> _durSamples;
+
+  /// Playable length in 48 kHz samples: the final page's granule position minus
+  /// the pre-skip, which is the one number that also accounts for end-trimming.
+  final int _totalSamples;
+
   int _idx = 0;
   bool _closed = false;
 
@@ -50,6 +69,10 @@ class OggDemuxer implements PlatformDemuxer {
     // --- Reassemble packets across pages via the lacing table. -------------
     final rawPackets = <Uint8List>[];
     final pending = BytesBuilder();
+    // The last page's granule position: total decoded 48 kHz samples, pre-skip
+    // included (RFC 7845 §4). Authoritative for duration — an encoder shortens
+    // it to trim the zero-padding it added to fill the final frame.
+    var lastGranule = -1;
     var pos = 0;
     while (pos + 27 <= data.lengthInBytes) {
       if (!_matchOggS(data, pos)) {
@@ -77,6 +100,13 @@ class OggDemuxer implements PlatformDemuxer {
         }
         // segLen == 255 → packet continues into the next segment/page.
       }
+      // Granule position: 64-bit LE at byte 6. -1 (all ones) means "no packet
+      // finishes on this page", so it is not a length.
+      final gLo = data.getUint32(pos + 6, Endian.little);
+      final gHi = data.getUint32(pos + 10, Endian.little);
+      if (!(gLo == 0xFFFFFFFF && gHi == 0xFFFFFFFF)) {
+        lastGranule = (gHi << 32) | gLo;
+      }
       pos = payloadOff;
     }
 
@@ -102,6 +132,42 @@ class OggDemuxer implements PlatformDemuxer {
       audioStart = 2;
     }
     final audio = rawPackets.sublist(audioStart);
+    final preSkip = opusHeadPreSkip(opusHead);
+
+    // Per-packet timing from the TOC byte, on the PLAYBACK timeline (pre-skip
+    // removed). 20 ms is only the default frame size — 10/40/60 ms packets are
+    // legal and common, so the old `index * 20000` was off by up to 3x on
+    // ordinary files, and so was the matching seek.
+    final starts = List<int>.filled(audio.length, 0);
+    final durs = List<int>.filled(audio.length, 0);
+    var cum = 0;
+    for (var i = 0; i < audio.length; i++) {
+      final d = opusPacketSamples48k(audio[i]);
+      // A packet we cannot price would desynchronise everything after it; fall
+      // back to the 20 ms default rather than stamping it zero-length.
+      durs[i] = d > 0 ? d : 960;
+      final start = cum - preSkip;
+      starts[i] = start > 0 ? start : 0;
+      cum += durs[i];
+    }
+    // The final granule is the encoder's own answer, and the only one that
+    // knows about tail-trimming; the TOC sum is the fallback for a stream whose
+    // last page carries no granule.
+    final total =
+        (lastGranule > preSkip ? lastGranule : cum) - preSkip;
+
+    // Durations on the SAME timeline as the starts. The trimmed samples are not
+    // playable, so charging a packet its full TOC length while its start has
+    // already been pulled back makes the emitted timeline self-contradictory:
+    // packet 0 would overlap packet 1, and the durations would sum past
+    // [durationUs] — which a remuxer that builds its sample table out of
+    // EncodedPacket.durationUs (MP4's stts) writes straight into the file.
+    // Each packet spans up to the next one's start; the last spans to the end.
+    for (var i = 0; i < audio.length; i++) {
+      final end = i + 1 < audio.length ? starts[i + 1] : (total > 0 ? total : 0);
+      final d = end - starts[i];
+      durs[i] = d < 0 ? 0 : (d > durs[i] ? durs[i] : d);
+    }
 
     final track = AudioTrackInfo(
       codec: AudioCodec.opus,
@@ -109,22 +175,24 @@ class OggDemuxer implements PlatformDemuxer {
       channels: channels,
       extraData: CodecExtraData.audio(AudioCodec.opus, opusHead),
     );
-    return OggDemuxer._([track], audio, sampleRate);
+    return OggDemuxer._([track], audio, starts, durs, total < 0 ? 0 : total);
   }
+
+  static int _us(int samples48k) => samples48k * 1000000 ~/ 48000;
 
   @override
   Future<EncodedPacket?> readPacket() async {
     _checkOpen();
     if (_idx >= _packets.length) return null;
     final data = _packets[_idx];
-    // Approximate pts: Opus frames are typically 20 ms. Exact per-packet timing
-    // is recovered downstream from decoded sample counts + OpusHead pre-skip.
-    final ptsUs = _idx * 20000;
+    final ptsUs = _us(_startSamples[_idx]);
+    final durUs = _us(_durSamples[_idx]);
     _idx++;
     return EncodedPacket(
       data: data,
       ptsUs: ptsUs,
       dtsUs: ptsUs,
+      durationUs: durUs,
       isKeyframe: true,
     );
   }
@@ -132,13 +200,23 @@ class OggDemuxer implements PlatformDemuxer {
   @override
   Future<void> seek(int timestampUs) async {
     _checkOpen();
-    final target = timestampUs ~/ 20000;
-    _idx = target.clamp(0, _packets.length);
+    // Land on the packet that CONTAINS the target: the last one starting at or
+    // before it. Dividing by a fixed 20 ms was wrong for every other frame size.
+    var lo = 0, hi = _startSamples.length - 1, found = 0;
+    while (lo <= hi) {
+      final mid = (lo + hi) >> 1;
+      if (_us(_startSamples[mid]) <= timestampUs) {
+        found = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    _idx = _startSamples.isEmpty ? 0 : found;
   }
 
   @override
-  int? get durationUs =>
-      _sampleRate > 0 ? _packets.length * 20000 : null; // approximate
+  int? get durationUs => _packets.isEmpty ? null : _us(_totalSamples);
 
   @override
   bool get isSeekable => true;
@@ -214,10 +292,13 @@ class OggMuxer implements PlatformMuxer {
     // Page 1: OpusTags.
     out.add(_page(_buildOpusTags(), headerType: 0x00, seq: seq++, granule: 0));
 
-    // Audio packets, one per page, granulepos accumulating 20 ms (960 @ 48 kHz).
+    // Audio packets, one per page. granulepos = total decoded 48 kHz samples so
+    // far INCLUDING the pre-skip (RFC 7845 §4), read from each packet's own TOC
+    // — a fixed 960 mistimed every stream that is not 20 ms per packet.
     var granule = 0;
     for (var i = 0; i < _packets.length; i++) {
-      granule += 960;
+      final d = opusPacketSamples48k(_packets[i]);
+      granule += d > 0 ? d : 960;
       final last = i == _packets.length - 1;
       out.add(_page(
         _packets[i],

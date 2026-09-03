@@ -54,10 +54,18 @@ MiniAVTools.createEncoder(config,
 | Video decode | `mf_decode` | H.264, HEVC → D3D11 texture | Windows |
 | Audio | `mf_aac` | AAC encode + decode (OS codec; license-clean) | Windows |
 | Audio | `opus` | Opus decode (libopus) | all |
-| Audio | `sw_audio` | MP3, FLAC, Vorbis decode | all |
+| Audio | `sw_audio` | MP3 decode (dr_mp3) | all |
 | Audio | `pcm` | pcmS16le, pcmF32le | all |
-| Container | `container_framing` | WAV, Ogg, ADTS, MP4 demux + mux | all |
+| Container | `container_framing` | WAV, Ogg, ADTS, MP4/M4A demux + mux; MP3 demux | all |
 | Video encode | `minigpu` | MJPEG in WGSL compute shaders | any Dawn GPU |
+
+`sw_audio` claims MP3 and nothing else. `SwAudioDecoder` also drives dr_flac and
+stb_vorbis, but only for a WHOLE-FILE feed: those entry points take a complete
+container and the decoder ignores `AudioDecoderConfig.extraData`, which is where
+a demuxer puts the FLAC STREAMINFO / Vorbis setup headers it stripped. Claiming
+them for negotiation would be terminal rather than optimistic — this backend
+outranks FFmpeg and its `open()` cannot decline — so **demuxed FLAC and Vorbis
+decode through `miniav_tools_ffmpeg`**, which is not optional for them.
 
 Colour conversion (`GpuRgbaToYuv420Converter`, `dartI420ToRgba` and friends)
 lives here too and is the canonical implementation.
@@ -126,7 +134,9 @@ await pipeline.dispose();
 - [`miniav_tools_platform_interface`](../miniav_tools_platform_interface)
 
 Native code (Media Foundation shims, libopus, dr_mp3/dr_flac/stb_vorbis) builds
-from source via `hook/build.dart` into the `codecs_native` asset.
+from source via `hook/build.dart` into the `codecs_native` asset. dr_flac and
+stb_vorbis are linked but only reachable through a whole-file
+`SwAudioDecoder` feed — see the note under "What it provides".
 
 ## See also
 

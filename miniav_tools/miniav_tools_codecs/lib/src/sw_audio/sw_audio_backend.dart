@@ -1,5 +1,5 @@
-/// First-party software audio-decode backend: MP3 / FLAC / Vorbis (FFmpeg-free,
-/// via dr_mp3 / dr_flac / stb_vorbis in the codecs native asset).
+/// First-party software audio-decode backend: MP3 (FFmpeg-free, via dr_mp3 in
+/// the codecs native asset).
 library;
 
 import 'dart:async';
@@ -11,12 +11,31 @@ import 'sw_audio_decoder.dart';
 class SwAudioBackend extends MiniAVToolsBackend {
   static const String backendName = 'sw_audio';
 
-  /// Above FFmpeg (50) so these first-party decoders are preferred for MP3 /
-  /// FLAC / Vorbis; open never fails (data arrives later), and these libs are
-  /// battle-tested, so no fall-through is needed for the common case.
+  /// Above FFmpeg (50) so MP3 decode is first-party; [SwAudioDecoder.open]
+  /// never fails (data arrives later), so whatever is claimed here is FINAL —
+  /// there is no fall-through once this backend wins.
   static const int defaultPriority = 55;
 
-  static const _codecs = {AudioCodec.mp3, AudioCodec.flac, AudioCodec.vorbis};
+  /// MP3 only, and that is a capability statement, not a shortlist of what the
+  /// native asset can do.
+  ///
+  /// dr_flac and stb_vorbis are linked and [SwAudioDecoder] drives them, but
+  /// their entry points (`drflac_open_memory` / `stb_vorbis_open_memory`) take
+  /// a WHOLE CONTAINER, and this decoder ignores `AudioDecoderConfig.extraData`
+  /// — which is exactly where a demuxer puts the FLAC STREAMINFO / Vorbis setup
+  /// headers it stripped. So a DEMUXED flac/vorbis stream (the only way the
+  /// negotiator is ever asked for one) has no headers in front of it and fails
+  /// every batch. Claiming those codecs here therefore did not mean "decoded
+  /// first-party", it meant "never decoded at all": priority 55 outranks FFmpeg
+  /// and open() cannot decline, so nothing downstream could recover.
+  /// Un-claiming them routes flac/vorbis to ffmpeg (50), whose decoders are
+  /// incremental and take extraData. Reclaiming them needs header synthesis
+  /// from extraData first — a later release.
+  ///
+  /// Whole-file feeds still work through [SwAudioDecoder] directly (it accepts
+  /// all three, in one packet or chunked); this is about what the NEGOTIATOR
+  /// may hand a packet stream to.
+  static const _codecs = {AudioCodec.mp3};
 
   @override
   String get name => backendName;

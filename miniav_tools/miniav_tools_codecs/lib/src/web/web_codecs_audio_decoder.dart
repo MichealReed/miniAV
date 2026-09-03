@@ -22,7 +22,10 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 import 'web_audio_interop.dart' as wc;
 import 'web_backend.dart';
 
-String _audioCodecString(AudioCodec codec, Map<String, String> opts) {
+/// WebCodecs codec string for [codec]. Library-visible so the backend can ask
+/// `AudioDecoder.isConfigSupported` about the exact string it would configure
+/// with. (The encoder keeps its own copy — same table, opposite direction.)
+String audioCodecString(AudioCodec codec, Map<String, String> opts) {
   if (opts.containsKey('codecString')) return opts['codecString']!;
   return switch (codec) {
     AudioCodec.aac => 'mp4a.40.2', // AAC-LC
@@ -40,6 +43,15 @@ class WebCodecsAudioDecoder implements PlatformAudioDecoder {
   wc.AudioDecoder? _decoder;
   final List<DecodedAudio> _pending = [];
   Object? _lastError;
+
+  /// Woken by [_handleData] / [_handleError]. See [_awaitOutput].
+  Completer<void>? _output;
+
+  void _wake() {
+    final waiter = _output;
+    _output = null;
+    if (waiter != null && !waiter.isCompleted) waiter.complete();
+  }
 
   void _handleData(JSAny? dataJs) {
     if (dataJs == null || dataJs.isUndefined) return;
@@ -65,10 +77,38 @@ class WebCodecsAudioDecoder implements PlatformAudioDecoder {
       );
     } finally {
       data.close();
+      _wake();
     }
   }
 
-  void _handleError(JSAny? errJs) => _lastError = errJs;
+  void _handleError(JSAny? errJs) {
+    _lastError = errJs;
+    _wake();
+  }
+
+  /// Waits for the decoder's next output callback, or [_kOutputGrace].
+  ///
+  /// This used to poll: `await Future.delayed(Duration.zero)` up to sixteen
+  /// times, checking after each. That reads as "yield briefly", but dart2js
+  /// compiles it to `setTimeout(0)` and browsers CLAMP nested timeouts to 4 ms
+  /// — so the decoder's callback would fire in ~0.1 ms and we would not LOOK
+  /// for another 4 ms. Measured: 5.0 ms median to decode a packet holding
+  /// 20 ms of audio, i.e. a quarter of the sink's refill budget spent waiting
+  /// on a timer, before anything else on the page competes. That is what
+  /// underruns the audio ring and clicks.
+  ///
+  /// Waiting on the callback itself removes the timer from the common path
+  /// entirely. The grace only runs when a packet legitimately produces nothing
+  /// — Opus pre-skip, a decoder still priming — which must return empty rather
+  /// than hang.
+  Future<void> _awaitOutput() async {
+    if (_pending.isNotEmpty || _lastError != null) return;
+    final waiter = _output = Completer<void>();
+    await waiter.future.timeout(_kOutputGrace, onTimeout: () {});
+    _output = null;
+  }
+
+  static const Duration _kOutputGrace = Duration(milliseconds: 20);
 
   void _throwIfError() {
     final e = _lastError;
@@ -87,15 +127,16 @@ class WebCodecsAudioDecoder implements PlatformAudioDecoder {
       wc.EncodedAudioChunkInit(
         type: packet.isKeyframe ? 'key' : 'delta',
         timestamp: packet.ptsUs,
-        data: packet.data.buffer.toJS,
+        // The VIEW, not `.buffer`: a demuxed packet is routinely a window into
+        // a larger container buffer, and the whole backing store would feed the
+        // decoder neighbouring packets as if they were this one.
+        data: packet.data.toJS,
       ),
     );
     dec.decode(chunk);
-    // Let the output task run; return whatever decoded (0+).
-    for (var i = 0; i < 16 && _pending.isEmpty && _lastError == null; i++) {
-      if (dec.decodeQueueSize == 0 && i > 0) break;
-      await Future<void>.delayed(Duration.zero);
-    }
+    // Wait for the output callback, not for a timer; return whatever decoded
+    // (0+). See [_awaitOutput].
+    await _awaitOutput();
     _throwIfError();
     final out = List<DecodedAudio>.from(_pending);
     _pending.clear();
@@ -120,6 +161,9 @@ class WebCodecsAudioDecoder implements PlatformAudioDecoder {
     } catch (_) {}
     _decoder = null;
     _pending.clear();
+    // A decode racing this close is waiting on a callback that will now never
+    // come; release it rather than leave it on the grace timeout.
+    _wake();
   }
 
   static Future<WebCodecsAudioDecoder> create(AudioDecoderConfig config) async {
@@ -134,7 +178,7 @@ class WebCodecsAudioDecoder implements PlatformAudioDecoder {
       );
     }
     final dec = WebCodecsAudioDecoder._();
-    final codecStr = _audioCodecString(config.codec, config.backendOptions);
+    final codecStr = audioCodecString(config.codec, config.backendOptions);
     dec._decoder = wc.AudioDecoder(
       wc.AudioDecoderInit(
         output: (JSAny? d) {
@@ -145,17 +189,31 @@ class WebCodecsAudioDecoder implements PlatformAudioDecoder {
         }.toJS,
       ),
     );
+    // Codec-private data: AAC AudioSpecificConfig, FLAC STREAMINFO, Vorbis
+    // headers. MP3 has none.
+    //
+    // `description` must be OMITTED entirely when there is none — passing it as
+    // null sets the key to JS `null`, and WebCodecs then fails converting it to
+    // a BufferSource with "Failed to read the 'description' property from
+    // 'AudioDecoderConfig'". (A named argument explicitly passed as null is
+    // still emitted into the JS object literal; only an argument left off is
+    // absent.) This is why MP3 could not play on web at all.
     final extra = config.extraData;
-    dec._decoder!.configure(
-      wc.AudioDecoderConfig(
-        codec: codecStr,
-        sampleRate: sampleRate,
-        numberOfChannels: channels,
-        description: (extra != null && extra.isNotEmpty)
-            ? Uint8List.fromList(extra).toJS
-            : null,
-      ),
-    );
+    // Tight copy so `description` is exactly those bytes — `extra` may be a
+    // view into a larger buffer.
+    final cfg = (extra != null && extra.isNotEmpty)
+        ? wc.AudioDecoderConfig(
+            codec: codecStr,
+            sampleRate: sampleRate,
+            numberOfChannels: channels,
+            description: Uint8List.fromList(extra).toJS,
+          )
+        : wc.AudioDecoderConfig(
+            codec: codecStr,
+            sampleRate: sampleRate,
+            numberOfChannels: channels,
+          );
+    dec._decoder!.configure(cfg);
     dec._throwIfError();
     return dec;
   }

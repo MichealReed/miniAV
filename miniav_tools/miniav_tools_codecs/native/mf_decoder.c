@@ -51,13 +51,20 @@
 #define MFDEC_CODEC_HEVC 1
 
 /* Public frame descriptor returned to Dart. Keep in lock-step with the Dart
- * struct layout in mf_d3d11_decoder.dart. */
+ * struct layout in codecs_native.dart.
+ *
+ * width/height are the DISPLAY size (the bitstream's conformance/crop window),
+ * which is what a consumer must render. The texture is the CODED size — CTU /
+ * macroblock padded, e.g. 240 -> 256 (HEVC), 1080 -> 1088 — with the valid
+ * region at (crop_x, crop_y). See miniav_shim_mfdec_map_nv12_region. */
 typedef struct MiniAVMfDecFrame {
   intptr_t out_shared_handle; /* NT HANDLE for cross-device present (M2)     */
   intptr_t out_texture_ptr;   /* ID3D11Texture2D* (same-device Dawn import)  */
-  int32_t width;
-  int32_t height;
+  int32_t width;              /* display width                               */
+  int32_t height;             /* display height                              */
   int32_t pixel_format;       /* 0 = NV12                                    */
+  int32_t crop_x;             /* display-region origin in the coded texture  */
+  int32_t crop_y;
   int32_t _pad;
   int64_t pts_us;
 } MiniAVMfDecFrame;
@@ -72,7 +79,8 @@ typedef struct InSampleNode {
 typedef struct OutFrameNode {
   ID3D11Texture2D *texture; /* shareable NV12 (owned until release_frame)   */
   HANDLE shared_handle;     /* NT handle (owned until release_frame)        */
-  int width, height;
+  int width, height;        /* display size                                  */
+  int crop_x, crop_y;       /* display origin inside the coded texture       */
   int64_t pts_us;
   struct OutFrameNode *next;
 } OutFrameNode;
@@ -88,7 +96,9 @@ typedef struct MfDecSession {
   int codec;
   int is_async;
   int output_configured;
-  int width, height;
+  int width, height;   /* CODED size of the negotiated output type           */
+  int disp_x, disp_y;  /* display region inside the coded frame (0 = none)   */
+  int disp_w, disp_h;  /* 0 until an output type has been negotiated         */
   int streaming; /* have we sent NOTIFY_BEGIN_STREAMING/START_OF_STREAM      */
   int draining;  /* END_OF_STREAM/DRAIN issued                              */
   int64_t pending_input_pts; /* pts of the next sample to feed (100ns)      */
@@ -147,13 +157,17 @@ static IMFSample *in_pop(MfDecSession *s) {
 }
 
 static void out_push(MfDecSession *s, ID3D11Texture2D *tex, HANDLE h,
-                     int w, int hgt, int64_t pts_us) {
+                     int w, int hgt, int crop_x, int crop_y, int64_t pts_us) {
   OutFrameNode *n = (OutFrameNode *)calloc(1, sizeof(OutFrameNode));
   if (!n) return;
   n->texture = tex;
   n->shared_handle = h;
   n->width = w;
   n->height = hgt;
+  /* Snapshot the crop with the frame: a renegotiation can change the aperture
+   * while earlier frames are still queued. */
+  n->crop_x = crop_x;
+  n->crop_y = crop_y;
   n->pts_us = pts_us;
   if (s->out_tail) s->out_tail->next = n; else s->out_head = n;
   s->out_tail = n;
@@ -169,6 +183,8 @@ static int out_pop(MfDecSession *s, MiniAVMfDecFrame *out) {
   out->width = n->width;
   out->height = n->height;
   out->pixel_format = 0; /* NV12 */
+  out->crop_x = n->crop_x;
+  out->crop_y = n->crop_y;
   out->pts_us = n->pts_us;
   free(n);
   return 1;
@@ -272,6 +288,69 @@ static int mfdec_configure_input(MfDecSession *s) {
   return 0;
 }
 
+/* Adopt a negotiated output type: coded frame size + display region.
+ *
+ * Video codes in macroblocks/CTUs, so the CODED frame is padded up to the
+ * block size (H.264: 240 -> 240 but 200 -> 208; HEVC: 240 -> 256, 1080 ->
+ * 1088) and the padding rows hold decoder garbage. The bitstream carries a
+ * crop rectangle (H.264 frame_cropping / HEVC conformance window) which MF
+ * surfaces as MF_MT_MINIMUM_DISPLAY_APERTURE — the only correct size to report
+ * and to copy out. MF_MT_GEOMETRIC_APERTURE is the documented fallback; when
+ * neither is present the coded size IS the display size (no crop), which keeps
+ * every block-aligned stream byte-identical to an uncropped copy. */
+static void mfdec_adopt_output_type(MfDecSession *s, IMFMediaType *mt) {
+  UINT64 fs = 0;
+  if (SUCCEEDED(IMFMediaType_GetUINT64(mt, &MF_MT_FRAME_SIZE, &fs))) {
+    s->width = (int)(fs >> 32);
+    s->height = (int)(fs & 0xFFFFFFFF);
+  }
+  s->disp_x = 0;
+  s->disp_y = 0;
+  s->disp_w = s->width;
+  s->disp_h = s->height;
+
+  MFVideoArea area;
+  UINT32 got = 0;
+  memset(&area, 0, sizeof(area));
+  HRESULT hr = IMFMediaType_GetBlob(mt, &MF_MT_MINIMUM_DISPLAY_APERTURE,
+                                    (UINT8 *)&area, sizeof(area), &got);
+  if (FAILED(hr) || got < sizeof(area)) {
+    memset(&area, 0, sizeof(area));
+    got = 0;
+    hr = IMFMediaType_GetBlob(mt, &MF_MT_GEOMETRIC_APERTURE, (UINT8 *)&area,
+                              sizeof(area), &got);
+  }
+  if (FAILED(hr) || got < sizeof(area)) return; /* no aperture -> no crop */
+
+  /* MFOffset is fixed-point (fract/value); a decoder crop window is always
+   * whole-pixel, so the fractional part is dropped. */
+  int x = (int)area.OffsetX.value;
+  int y = (int)area.OffsetY.value;
+  int w = (int)area.Area.cx;
+  int h = (int)area.Area.cy;
+  /* NV12 chroma is 2x2 subsampled: an odd origin or extent would split a chroma
+   * pair. The origin is rounded DOWN to even and the extent grown by the same
+   * shift (then up to even), so the window still COVERS the whole valid region
+   * — at worst one padding column/row of slop — instead of sliding off the far
+   * edge and dropping a real column/row. */
+  w += x - (x & ~1);
+  h += y - (y & ~1);
+  x &= ~1;
+  y &= ~1;
+  w = (w + 1) & ~1;
+  h = (h + 1) & ~1;
+  if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > s->width ||
+      y + h > s->height) {
+    return; /* implausible aperture — keep the coded size */
+  }
+  s->disp_x = x;
+  s->disp_y = y;
+  s->disp_w = w;
+  s->disp_h = h;
+  MFDEC_TRACE("[mfdec] output type: coded %dx%d display %dx%d @%d,%d\n",
+              s->width, s->height, w, h, x, y);
+}
+
 /* Choose the NV12 output type after the MFT has parsed enough bitstream to
  * know the frame size (called on stream-change / lazily). */
 static int mfdec_configure_output(MfDecSession *s) {
@@ -288,10 +367,16 @@ static int mfdec_configure_output(MfDecSession *s) {
     if (IsEqualGUID(&sub, &MFVideoFormat_NV12)) {
       hr = IMFTransform_SetOutputType(s->mft, 0, ot, 0);
       if (SUCCEEDED(hr)) {
-        UINT64 fs = 0;
-        if (SUCCEEDED(IMFMediaType_GetUINT64(ot, &MF_MT_FRAME_SIZE, &fs))) {
-          s->width = (int)(fs >> 32);
-          s->height = (int)(fs & 0xFFFFFFFF);
+        /* Read the size + aperture back from the type the MFT actually
+         * adopted: a decoder may stamp the crop window only onto its current
+         * type, not onto the candidate returned by GetOutputAvailableType. */
+        IMFMediaType *cur = NULL;
+        if (SUCCEEDED(IMFTransform_GetOutputCurrentType(s->mft, 0, &cur)) &&
+            cur) {
+          mfdec_adopt_output_type(s, cur);
+          IMFMediaType_Release(cur);
+        } else {
+          mfdec_adopt_output_type(s, ot);
         }
         s->output_configured = 1;
       }
@@ -394,9 +479,14 @@ static int mfdec_extract_frame(MfDecSession *s, IMFSample *sample,
     IDXGIResource1_Release(res1);
   }
 
-  int w = s->width > 0 ? s->width : (int)desc.Width;
-  int h = s->height > 0 ? s->height : (int)desc.Height;
-  out_push(s, shareable, shared_handle, w, h, pts_us);
+  /* Report the DISPLAY size; the texture keeps the coded size (see the
+   * MiniAVMfDecFrame doc). Falls back to the coded size, then to the texture,
+   * when no output type has been negotiated yet. */
+  int w = s->disp_w > 0 ? s->disp_w
+                        : (s->width > 0 ? s->width : (int)desc.Width);
+  int h = s->disp_h > 0 ? s->disp_h
+                        : (s->height > 0 ? s->height : (int)desc.Height);
+  out_push(s, shareable, shared_handle, w, h, s->disp_x, s->disp_y, pts_us);
   return 0;
 }
 
@@ -723,21 +813,35 @@ MIO_API int miniav_shim_mfdec_receive(void *session, MiniAVMfDecFrame *out) {
   }
 }
 
-/* Copy a shareable NV12 texture to CPU, tightly packed (Y plane then
- * interleaved UV). Returns bytes written, <0 on error. */
-MIO_API int miniav_shim_mfdec_map_nv12(void *session, intptr_t texture_ptr,
-                                       uint8_t *dst, int dst_cap) {
-  MfDecSession *s = (MfDecSession *)session;
-  ID3D11Texture2D *tex = (ID3D11Texture2D *)texture_ptr;
+/* Copy the (crop_x, crop_y, crop_w, crop_h) region of a shareable NV12 texture
+ * to CPU, tightly packed (Y plane then interleaved UV). The region is the
+ * display aperture: the texture is coded-size, so copying all of it would hand
+ * the caller the CTU/macroblock padding rows as picture content. A zero/absent
+ * crop_w or crop_h means the whole texture. Returns bytes written, <0 on
+ * error. */
+static int mfdec_map_region(MfDecSession *s, ID3D11Texture2D *tex, int crop_x,
+                            int crop_y, int crop_w, int crop_h, uint8_t *dst,
+                            int dst_cap) {
   if (!s || !tex || !dst) return -1;
 
   D3D11_TEXTURE2D_DESC desc;
   ID3D11Texture2D_GetDesc(tex, &desc);
-  int w = (int)desc.Width, h = (int)desc.Height;
-  int needed = w * h + (w * (h / 2)); /* NV12: Y + interleaved UV */
+  int tw = (int)desc.Width, th = (int)desc.Height;
+  int x = crop_x, y = crop_y, w = crop_w, h = crop_h;
+  if (w <= 0 || h <= 0) { x = 0; y = 0; w = tw; h = th; }
+  /* NV12: the origin must be even or a chroma pair would be split. */
+  x &= ~1;
+  y &= ~1;
+  if (x < 0 || y < 0 || x >= tw || y >= th) return -3;
+  if (x + w > tw) w = tw - x;
+  if (y + h > th) h = th - y;
+  int ch = (h + 1) / 2;                /* chroma rows for an odd height     */
+  int needed = w * h + w * ch;         /* NV12: Y + interleaved UV          */
   if (dst_cap < needed) return -2;
 
-  if (!s->staging || s->staging_w != w || s->staging_h != h) {
+  /* Staging is keyed on the CODED size (the texture), so a crop adds no
+   * allocation and the staging texture is still reused across frames. */
+  if (!s->staging || s->staging_w != tw || s->staging_h != th) {
     if (s->staging) { ID3D11Texture2D_Release(s->staging); s->staging = NULL; }
     D3D11_TEXTURE2D_DESC sd = desc;
     sd.ArraySize = 1;
@@ -749,8 +853,8 @@ MIO_API int miniav_shim_mfdec_map_nv12(void *session, intptr_t texture_ptr,
     if (FAILED(ID3D11Device_CreateTexture2D(s->device, &sd, NULL,
                                             &s->staging)))
       return -1;
-    s->staging_w = w;
-    s->staging_h = h;
+    s->staging_w = tw;
+    s->staging_h = th;
   }
 
   ID3D11DeviceContext_CopyResource(s->context, (ID3D11Resource *)s->staging,
@@ -763,21 +867,45 @@ MIO_API int miniav_shim_mfdec_map_nv12(void *session, intptr_t texture_ptr,
 
   const uint8_t *src = (const uint8_t *)map.pData;
   int pitch = (int)map.RowPitch;
-  /* Y plane */
+  /* Y plane, aperture rows only */
   uint8_t *o = dst;
-  for (int y = 0; y < h; y++) {
-    memcpy(o, src + (size_t)y * pitch, (size_t)w);
+  for (int row = 0; row < h; row++) {
+    memcpy(o, src + (size_t)(y + row) * pitch + x, (size_t)w);
     o += w;
   }
-  /* UV plane follows the Y plane in the same texture, at row offset `h`
-   * (NV12 in a single texture: UV rows start after Y rows). */
-  const uint8_t *uv = src + (size_t)h * pitch;
-  for (int y = 0; y < h / 2; y++) {
-    memcpy(o, uv + (size_t)y * pitch, (size_t)w);
+  /* UV plane follows the Y plane in the same texture, at row offset `th` — the
+   * CODED height, not the cropped one (NV12 in a single texture: UV rows start
+   * after ALL Y rows). One UV row covers two luma rows, and one UV byte covers
+   * one luma column, so the crop maps to (y/2) rows down and x bytes across. */
+  const uint8_t *uv = src + (size_t)th * pitch + (size_t)(y / 2) * pitch + x;
+  for (int row = 0; row < ch; row++) {
+    memcpy(o, uv + (size_t)row * pitch, (size_t)w);
     o += w;
   }
   ID3D11DeviceContext_Unmap(s->context, (ID3D11Resource *)s->staging, 0);
   return needed;
+}
+
+/* Whole-texture map (coded size, padding included). Kept for callers that
+ * genuinely want the coded surface; the display-region map below is what the
+ * decoder's own frames use. */
+MIO_API int miniav_shim_mfdec_map_nv12(void *session, intptr_t texture_ptr,
+                                       uint8_t *dst, int dst_cap) {
+  return mfdec_map_region((MfDecSession *)session,
+                          (ID3D11Texture2D *)texture_ptr, 0, 0, 0, 0, dst,
+                          dst_cap);
+}
+
+/* Map only the display aperture of a decoded frame: pass the frame's
+ * crop_x/crop_y/width/height. Returns bytes written (w*h*3/2), <0 on error. */
+MIO_API int miniav_shim_mfdec_map_nv12_region(void *session,
+                                              intptr_t texture_ptr, int crop_x,
+                                              int crop_y, int crop_w,
+                                              int crop_h, uint8_t *dst,
+                                              int dst_cap) {
+  return mfdec_map_region((MfDecSession *)session,
+                          (ID3D11Texture2D *)texture_ptr, crop_x, crop_y,
+                          crop_w, crop_h, dst, dst_cap);
 }
 
 MIO_API int miniav_shim_mfdec_drain(void *session) {

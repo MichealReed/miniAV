@@ -1,0 +1,26 @@
+# Tests that need a real browser are tagged `browser` so a VM run skips them
+# by platform and a CI leg can select them by name:
+#
+#   dart test -p chrome --tags browser
+#
+# Declaring the tag here is what keeps `dart test` from warning about it.
+tags:
+  browser:
+    # A browser test that touches WebCodecs waits on real decode callbacks.
+    timeout: 2x
+  # Reports numbers, asserts nothing. Never a CI gate — a shared runner's
+  # timings are noise. Run by hand:
+  #   dart test -p chrome test/worker_pipeline_bench_test.dart --tags bench
+  bench:
+    timeout: 4x
+
+# The audio-ring suite needs SharedArrayBuffer, which a browser normally grants
+# only to a cross-origin-isolated page (COOP: same-origin + COEP: require-corp).
+# The package:test server sends neither header and has no option to, so Chrome
+# is asked for shared memory directly instead. Without this the sink under test
+# correctly declines to open and the suite would pass while proving nothing —
+# which is why it asserts shared memory is real before running.
+override_platforms:
+  chrome:
+    settings:
+      arguments: "--enable-features=SharedArrayBuffer --autoplay-policy=no-user-gesture-required"

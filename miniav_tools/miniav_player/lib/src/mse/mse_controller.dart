@@ -22,10 +22,25 @@ library;
 
 import 'dart:async';
 import 'dart:js_interop';
+import 'dart:js_interop_unsafe';
 import 'dart:typed_data';
 import 'dart:ui_web' as ui_web;
 
 import 'package:web/web.dart' as web;
+
+/// WebKit's `ManagedMediaSource` — the ONLY MSE flavour on iPhone (classic
+/// `MediaSource` never shipped there; MMS arrived in iOS 17.1). It subclasses
+/// MediaSource in the browser, so `implements web.MediaSource` is truthful and
+/// the whole SourceBuffer machinery below works on it unchanged. Two extras it
+/// demands: the media element must opt out of remote playback (AirPlay) before
+/// `src` is assigned, and it fires `startstreaming`/`endstreaming` to say when
+/// appending is wanted — appending outside that window invites QuotaExceeded,
+/// because the UA actively evicts to save battery.
+@JS('ManagedMediaSource')
+extension type _ManagedMediaSource._(JSObject _) implements web.MediaSource {
+  external factory _ManagedMediaSource();
+  external static bool isTypeSupported(String type);
+}
 
 class MseController {
   MseController._(this._video, this.viewType);
@@ -33,9 +48,17 @@ class MseController {
   /// True on this (web) platform.
   static bool get isSupportedPlatform => true;
 
+  static bool get _hasClassicMse => globalContext.has('MediaSource');
+  static bool get _hasManagedMse => globalContext.has('ManagedMediaSource');
+
   /// Whether a MIME+codecs string is playable via MSE in this browser.
-  static bool isTypeSupported(String mimeWithCodecs) =>
-      web.MediaSource.isTypeSupported(mimeWithCodecs);
+  /// Guarded: referencing `MediaSource.isTypeSupported` on an iPhone (where
+  /// the global does not exist) is a ReferenceError, not a false.
+  static bool isTypeSupported(String mimeWithCodecs) {
+    if (_hasClassicMse) return web.MediaSource.isTypeSupported(mimeWithCodecs);
+    if (_hasManagedMse) return _ManagedMediaSource.isTypeSupported(mimeWithCodecs);
+    return false;
+  }
 
   /// Play a whole in-memory container (progressive). [mimeType] is the plain
   /// container type, e.g. `video/mp4` or `video/webm` (no codecs= needed).
@@ -62,7 +85,34 @@ class MseController {
     final video = _newVideoElement();
     final viewType = _register(video);
     final ctrl = MseController._(video, viewType).._wireElementEvents();
-    final media = web.MediaSource();
+    final web.MediaSource media;
+    if (_hasClassicMse) {
+      media = web.MediaSource();
+    } else if (_hasManagedMse) {
+      media = _ManagedMediaSource();
+      // MMS refuses to open on an element that could hand off to AirPlay
+      // unless an AirPlay source alternative is provided; opting out is the
+      // documented single-source path. Must be set BEFORE src.
+      video.disableRemotePlayback = true;
+      // Append only while the UA wants data. MMS evicts aggressively to save
+      // battery; appending outside the window is how QuotaExceeded happens.
+      media.addEventListener(
+        'startstreaming',
+        ((web.Event _) {
+          ctrl._streamingPaused = false;
+          ctrl._pump();
+        }).toJS,
+      );
+      media.addEventListener(
+        'endstreaming',
+        ((web.Event _) => ctrl._streamingPaused = true).toJS,
+      );
+    } else {
+      throw StateError(
+        'Neither MediaSource nor ManagedMediaSource exists in this browser — '
+        'MSE stream mode is unavailable (blob mode still works).',
+      );
+    }
     ctrl._media = media;
     ctrl._objectUrl = web.URL.createObjectURL(media);
     video.src = ctrl._objectUrl!;
@@ -100,6 +150,11 @@ class MseController {
   String? _objectUrl;
   bool _disposed = false;
   bool _endOfStreamRequested = false;
+
+  /// ManagedMediaSource only: true between `endstreaming` and the next
+  /// `startstreaming`, while the UA does not want appends. Always false on
+  /// classic MediaSource.
+  bool _streamingPaused = false;
 
   final _readyCompleter = Completer<void>();
   final _firstFrameCompleter = Completer<void>();
@@ -201,6 +256,10 @@ class MseController {
   void _pump() {
     final sb = _sourceBuffer;
     if (sb == null || _disposed || _pending.isEmpty || sb.updating) return;
+    // Held segments resume from the 'startstreaming' listener. End-of-stream
+    // is exempt: with all data delivered there is nothing left to evict for,
+    // and holding it would leave duration unknown forever.
+    if (_streamingPaused && !_endOfStreamRequested) return;
     final next = _pending.removeAt(0);
     try {
       sb.appendBuffer(next.toJS as web.BufferSource);

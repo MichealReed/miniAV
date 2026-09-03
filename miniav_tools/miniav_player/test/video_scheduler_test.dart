@@ -198,6 +198,87 @@ void main() {
       s.dispose();
     });
 
+    test('waitUntilPresented returns once the queue reaches the screen',
+        () async {
+      // Positive control for the two give-up tests below: the same setup, with
+      // the clock actually running, finishes by presenting — so their `false`
+      // is a give-up, not a broken harness.
+      var now = 0;
+      final clock = PlayerClock(nowUs: () => now);
+      final presented = <int>[];
+      final s = VideoScheduler(
+        mode: PlayerLatencyMode.paced,
+        clock: clock,
+        present: (f) async => presented.add(f.ptsUs),
+      );
+      s.submit(frame(0)); // anchors + presents
+      s.submit(frame(50000));
+      await Future<void>.delayed(Duration.zero);
+      expect(s.pendingCount, 1);
+      now += 50000; // the held frame is due
+      s.pump();
+      expect(await s.waitUntilPresented(), isTrue);
+      expect(presented, [0, 50000]);
+      s.dispose();
+    });
+
+    test('a paused clock gives up on the stall bound, not the absolute one',
+        () async {
+      // A pause during the end-of-stream tail wait freezes media time, so the
+      // head frame is never due. That is a stall, not pacing: without it the
+      // wait mistook the frozen clock for "the frame's time has not come yet",
+      // reset the stall watch every poll and ran the FULL absolute backstop.
+      var now = 0;
+      final clock = PlayerClock(nowUs: () => now);
+      final s = VideoScheduler(
+        mode: PlayerLatencyMode.paced,
+        clock: clock,
+        present: (f) async {},
+      );
+      clock.anchor(0);
+      s.submit(frame(10000000)); // 10 s out: never due while paused
+      clock.pause();
+      final sw = Stopwatch()..start();
+      final ok = await s.waitUntilPresented(
+        stallTimeout: const Duration(milliseconds: 100),
+        maxWait: const Duration(seconds: 5),
+      );
+      sw.stop();
+      expect(ok, isFalse);
+      expect(sw.elapsed, lessThan(const Duration(seconds: 1)),
+          reason: 'the paused clock was read as a legitimate pacing wait, so '
+              'the wait ran to its absolute backstop instead of its stall '
+              'bound');
+      s.dispose();
+    });
+
+    test('shouldAbort drops the wait', () async {
+      // How a caller whose own state moved on (pause / seek / close) gets out:
+      // the queue cannot drain until it acts, so holding it here is the stall.
+      final clock = PlayerClock(nowUs: () => 0);
+      final s = VideoScheduler(
+        mode: PlayerLatencyMode.paced,
+        clock: clock,
+        present: (f) async {},
+      );
+      clock.anchor(-10000000); // nothing is ever due
+      s.submit(frame(0));
+      var abort = false;
+      final sw = Stopwatch()..start();
+      final wait = s.waitUntilPresented(
+        stallTimeout: const Duration(seconds: 5),
+        maxWait: const Duration(seconds: 30),
+        shouldAbort: () => abort,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      abort = true;
+      expect(await wait, isFalse);
+      sw.stop();
+      expect(sw.elapsed, lessThan(const Duration(seconds: 1)));
+      expect(s.pendingCount, 1); // gave up WITH frames pending
+      s.dispose();
+    });
+
     test('clear drops queued frames', () async {
       final clock = PlayerClock(nowUs: () => 0);
       final s = VideoScheduler(

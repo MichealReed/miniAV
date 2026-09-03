@@ -1,6 +1,7 @@
 #define COBJMACROS // Enables C-style COM interface calling
 #include "camera_context_win_mf.h"
 #include "../../../include/miniav_buffer.h" // Assumed to be updated for shared handles
+#include "../../common/miniav_com_win.h"
 #include "../../common/miniav_logging.h"
 #include "../../common/miniav_time.h"
 #include "../../common/miniav_utils.h"
@@ -165,13 +166,17 @@ MFPlatform_Release(IMFSourceReaderCallback *pThis) {
   MFPlatformContext *pCtx = (MFPlatformContext *)pThis;
   ULONG uCount = InterlockedDecrement(&pCtx->ref_count);
   if (uCount == 0) {
-    // The MFPlatformContext itself is owned by MiniAVCameraContext's
-    // platform_ctx and freed in mf_destroy_platform. We don't free it here.
-    // However, if this callback object were allocated independently, it would
-    // be freed here.
+    // This object IS the IMFSourceReaderCallback the source reader was created
+    // with, so Media Foundation holds a reference and drops it asynchronously
+    // on an RTWorkQ thread — after IMFSourceReader_Release has already
+    // returned. Freeing it from mf_destroy_platform instead (as this used to)
+    // is a use-after-free: MFReadWrite then calls through a freed vtable from
+    // the work queue and the process dies with 0xC0000005 at a heap address.
+    // The last reference wins, whichever thread holds it.
+    DeleteCriticalSection(&pCtx->critical_section);
+    miniav_free(pCtx);
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "MFPlatform_Release: ref_count is 0, but not freeing "
-               "MFPlatformContext as it's owned by MiniAVCameraContext.");
+               "MFPlatform_Release: last reference dropped, context freed.");
   }
   return uCount;
 }
@@ -180,7 +185,11 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
     IMFSourceReaderCallback *pThis, HRESULT hrStatus, DWORD dwStreamIndex,
     DWORD dwStreamFlags, LONGLONG llTimestamp, IMFSample *pSample) {
   MFPlatformContext *mf_ctx = (MFPlatformContext *)pThis;
-  MiniAVCameraContext *parent_ctx = mf_ctx->parent_ctx;
+  // Read INSIDE the critical section below — mf_destroy_platform clears
+  // parent_ctx under the same lock, and a callback that latched the pointer
+  // before blocking on the lock would otherwise use it after the owning
+  // MiniAVCameraContext was freed.
+  MiniAVCameraContext *parent_ctx = NULL;
   HRESULT hr = S_OK; // hr for internal operations, hrStatus is from MF
   IMFMediaBuffer *media_buffer = NULL;
   BYTE *raw_buffer_data = NULL;
@@ -193,6 +202,7 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   ID3D11Texture2D *gpu_texture_for_payload = NULL;
 
   EnterCriticalSection(&mf_ctx->critical_section);
+  parent_ctx = mf_ctx->parent_ctx;
 
   if (!parent_ctx || !parent_ctx->is_running || !mf_ctx->is_streaming) {
     miniav_log(
@@ -817,32 +827,44 @@ static MiniAVResultCode mf_init_platform(MiniAVCameraContext *ctx) {
              "MF: Initializing platform context (real). Thread ID: %lu",
              GetCurrentThreadId());
   HRESULT hr_mf_startup;
-
-  HRESULT hr_com_init =
-      CoInitializeEx(NULL, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+  HRESULT hr_com_init = S_FALSE;
   BOOL com_initialized_here = FALSE;
+  BOOL mf_started_here = FALSE;
 
-  if (SUCCEEDED(hr_com_init)) {
-    com_initialized_here = (hr_com_init == S_OK);
-  } else if (hr_com_init == RPC_E_CHANGED_MODE) {
-    // Flutter already initialized COM in STA mode - that's fine
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-               "MF: Using existing STA COM mode from Flutter");
-    com_initialized_here = FALSE;
-  } else {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR, "MF: CoInitializeEx failed: 0x%X",
-               hr_com_init);
-    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
-  }
-
-  hr_mf_startup = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-  if (FAILED(hr_mf_startup)) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR, "MF: MFStartup failed: 0x%X",
-               hr_mf_startup);
-    if (SUCCEEDED(hr_com_init) && hr_com_init != RPC_E_CHANGED_MODE) {
-      CoUninitialize();
+  if (!miniav_com_legacy_percall()) {
+    // COM apartment membership and the MF Startup/Shutdown count are owned by
+    // the library for the life of the process — see miniav_com_win.h.
+    if (!miniav_mf_ensure()) {
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
     }
-    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+    miniav_com_trace("mf_init_platform", 0);
+  } else {
+    hr_com_init =
+        CoInitializeEx(NULL, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+    miniav_com_trace("legacy CoInitializeEx/mf_init_platform",
+                     (unsigned long)hr_com_init);
+    if (SUCCEEDED(hr_com_init)) {
+      com_initialized_here = (hr_com_init == S_OK);
+    } else if (hr_com_init == RPC_E_CHANGED_MODE) {
+      // Host already initialized COM in STA mode - that's fine
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG, "MF: Using existing STA COM mode");
+      com_initialized_here = FALSE;
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR, "MF: CoInitializeEx failed: 0x%X",
+                 hr_com_init);
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+    }
+
+    hr_mf_startup = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    if (FAILED(hr_mf_startup)) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR, "MF: MFStartup failed: 0x%X",
+                 hr_mf_startup);
+      if (com_initialized_here) {
+        CoUninitialize();
+      }
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+    }
+    mf_started_here = TRUE;
   }
 
   MFPlatformContext *mf_ctx =
@@ -850,8 +872,10 @@ static MiniAVResultCode mf_init_platform(MiniAVCameraContext *ctx) {
   if (!mf_ctx) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "MF: Failed to allocate MFPlatformContext.");
-    MFShutdown();
-    if (SUCCEEDED(hr_com_init) && hr_com_init != RPC_E_CHANGED_MODE) {
+    if (mf_started_here) {
+      MFShutdown();
+    }
+    if (com_initialized_here) {
       CoUninitialize();
     }
     return MINIAV_ERROR_OUT_OF_MEMORY;
@@ -872,8 +896,10 @@ static MiniAVResultCode mf_init_platform(MiniAVCameraContext *ctx) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "MF: Failed to initialize critical section.");
     miniav_free(mf_ctx);
-    MFShutdown();
-    if (SUCCEEDED(hr_com_init) && hr_com_init != RPC_E_CHANGED_MODE) {
+    if (mf_started_here) {
+      MFShutdown();
+    }
+    if (com_initialized_here) {
       CoUninitialize();
     }
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
@@ -890,12 +916,22 @@ static MiniAVResultCode mf_destroy_platform(MiniAVCameraContext *ctx) {
   if (ctx && ctx->platform_ctx) {
     MFPlatformContext *mf_ctx = (MFPlatformContext *)ctx->platform_ctx;
 
-    // ... (existing streaming stop and source_reader release) ...
-    if (mf_ctx->is_streaming) {
+    // Retire the callback's view of the world under the same lock the callback
+    // takes, so any OnReadSample already queued on an MF work-queue thread
+    // observes parent_ctx == NULL and returns without touching the parent
+    // context (which the caller frees as soon as we return) or the D3D objects
+    // released below.
+    BOOL was_streaming;
+    EnterCriticalSection(&mf_ctx->critical_section);
+    was_streaming = mf_ctx->is_streaming;
+    mf_ctx->is_streaming = FALSE;
+    mf_ctx->parent_ctx = NULL;
+    LeaveCriticalSection(&mf_ctx->critical_section);
+
+    if (was_streaming) {
       miniav_log(
           MINIAV_LOG_LEVEL_WARN,
           "MF: Destroying platform while still streaming. Attempting to stop.");
-      mf_ctx->is_streaming = FALSE;
       if (mf_ctx->source_reader) {
         IMFSourceReader_Flush(mf_ctx->source_reader,
                               MF_SOURCE_READER_ALL_STREAMS);
@@ -920,13 +956,27 @@ static MiniAVResultCode mf_destroy_platform(MiniAVCameraContext *ctx) {
       mf_ctx->dxgi_manager = NULL;
     }
 
-    DeleteCriticalSection(&mf_ctx->critical_section);
-    miniav_free(mf_ctx);
     ctx->platform_ctx = NULL;
+    if (miniav_mf_legacy_callback_free()) {
+      // POSITIVE CONTROL: the original behaviour — free the callback object
+      // outright, ignoring the reference Media Foundation still holds.
+      DeleteCriticalSection(&mf_ctx->critical_section);
+      miniav_free(mf_ctx);
+    } else {
+      // Drop OUR reference only. Media Foundation may still hold one (the
+      // source reader releases its callback asynchronously); the object frees
+      // itself in MFPlatform_Release when the last reference goes, on
+      // whichever thread that happens to be.
+      MFPlatform_Release((IMFSourceReaderCallback *)mf_ctx);
+    }
   }
 
-  MFShutdown();
-  CoUninitialize();
+  if (miniav_com_legacy_percall()) {
+    // Unbalanced by construction: tears the process-global MF count and this
+    // thread's apartment down regardless of who else is using them.
+    MFShutdown();
+    CoUninitialize();
+  }
   miniav_log(MINIAV_LOG_LEVEL_INFO, "MF: Platform context destroyed (real).");
   return MINIAV_SUCCESS;
 }
@@ -947,40 +997,45 @@ static MiniAVResultCode mf_enumerate_devices(MiniAVDeviceInfo **devices_out,
   BOOL com_initialized_here = FALSE;
   BOOL mf_started_here = FALSE;
 
-  // Initialize COM for this function's scope if not already initialized
-  HRESULT hr_com_init =
-      CoInitializeEx(NULL, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
-
-  if (SUCCEEDED(hr_com_init)) {
-    if (hr_com_init == S_OK) { // S_OK means COM was initialized by this call
-      com_initialized_here = TRUE;
+  if (!miniav_com_legacy_percall()) {
+    if (!miniav_mf_ensure()) {
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
     }
-    // If S_FALSE, COM was already initialized, proceed.
-  } else if (hr_com_init == RPC_E_CHANGED_MODE) {
-    // Flutter already initialized COM in STA mode - that's fine
-    miniav_log(
-        MINIAV_LOG_LEVEL_DEBUG,
-        "MF: Using existing STA COM mode from Flutter in enumerate_devices");
-    com_initialized_here = FALSE;
+    miniav_com_trace("mf_enumerate_devices", 0);
   } else {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "MF: CoInitializeEx failed in enumerate_devices: 0x%X",
-               hr_com_init);
-    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
-  }
+    HRESULT hr_com_init =
+        CoInitializeEx(NULL, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+    miniav_com_trace("legacy CoInitializeEx/mf_enumerate_devices",
+                     (unsigned long)hr_com_init);
 
-  // Initialize Media Foundation for this function's scope
-  HRESULT hr_mf_startup = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-  if (FAILED(hr_mf_startup)) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "MF: MFStartup failed in enumerate_devices: 0x%X",
-               hr_mf_startup);
-    if (com_initialized_here) {
-      CoUninitialize();
+    if (SUCCEEDED(hr_com_init)) {
+      if (hr_com_init == S_OK) { // S_OK means COM was initialized by this call
+        com_initialized_here = TRUE;
+      }
+      // If S_FALSE, COM was already initialized, proceed.
+    } else if (hr_com_init == RPC_E_CHANGED_MODE) {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                 "MF: Using existing STA COM mode in enumerate_devices");
+      com_initialized_here = FALSE;
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "MF: CoInitializeEx failed in enumerate_devices: 0x%X",
+                 hr_com_init);
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
     }
-    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+
+    HRESULT hr_mf_startup = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    if (FAILED(hr_mf_startup)) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "MF: MFStartup failed in enumerate_devices: 0x%X",
+                 hr_mf_startup);
+      if (com_initialized_here) {
+        CoUninitialize();
+      }
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+    }
+    mf_started_here = TRUE;
   }
-  mf_started_here = TRUE; // Assume MFStartup needs a corresponding MFShutdown
 
   hr = MFCreateAttributes(&attributes, 1);
   if (FAILED(hr)) {
@@ -1118,37 +1173,44 @@ static MiniAVResultCode mf_get_supported_formats(const char *device_id_utf8,
   BOOL com_initialized_here = FALSE;
   BOOL mf_started_here = FALSE;
 
-  // Initialize COM for this function's scope if not already initialized
-  HRESULT hr_com_init =
-      CoInitializeEx(NULL, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
-  if (SUCCEEDED(hr_com_init)) {
-    if (hr_com_init == S_OK) { // S_OK means COM was initialized by this call
-      com_initialized_here = TRUE;
+  if (!miniav_com_legacy_percall()) {
+    if (!miniav_mf_ensure()) {
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
     }
-    // If S_FALSE, COM was already initialized, proceed.
-  } else if (hr_com_init == RPC_E_CHANGED_MODE) {
-    miniav_log(MINIAV_LOG_LEVEL_DEBUG, "MF: Using existing STA COM mode");
-    com_initialized_here = FALSE;
+    miniav_com_trace("mf_get_supported_formats", 0);
   } else {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "MF: CoInitializeEx failed in get_supported_formats: 0x%X",
-               hr_com_init);
-    // No resources allocated yet that need MF specific cleanup
-    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
-  }
-
-  // Initialize Media Foundation for this function's scope
-  HRESULT hr_mf_startup = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-  if (FAILED(hr_mf_startup)) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "MF: MFStartup failed in get_supported_formats: 0x%X",
-               hr_mf_startup);
-    if (com_initialized_here) {
-      CoUninitialize();
+    HRESULT hr_com_init =
+        CoInitializeEx(NULL, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+    miniav_com_trace("legacy CoInitializeEx/mf_get_supported_formats",
+                     (unsigned long)hr_com_init);
+    if (SUCCEEDED(hr_com_init)) {
+      if (hr_com_init == S_OK) { // S_OK means COM was initialized by this call
+        com_initialized_here = TRUE;
+      }
+      // If S_FALSE, COM was already initialized, proceed.
+    } else if (hr_com_init == RPC_E_CHANGED_MODE) {
+      miniav_log(MINIAV_LOG_LEVEL_DEBUG, "MF: Using existing STA COM mode");
+      com_initialized_here = FALSE;
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "MF: CoInitializeEx failed in get_supported_formats: 0x%X",
+                 hr_com_init);
+      // No resources allocated yet that need MF specific cleanup
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
     }
-    return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+
+    HRESULT hr_mf_startup = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    if (FAILED(hr_mf_startup)) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "MF: MFStartup failed in get_supported_formats: 0x%X",
+                 hr_mf_startup);
+      if (com_initialized_here) {
+        CoUninitialize();
+      }
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+    }
+    mf_started_here = TRUE;
   }
-  mf_started_here = TRUE;
 
   WCHAR device_id_wchar[MINIAV_DEVICE_ID_MAX_LEN];
   MultiByteToWideChar(CP_UTF8, 0, device_id_utf8, -1, device_id_wchar,

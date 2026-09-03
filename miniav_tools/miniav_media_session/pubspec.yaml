@@ -1,0 +1,32 @@
+name: miniav_media_session
+description: OS media-session integration for miniav_tools. Publishes now-playing metadata to the system shell (Windows SMTC, macOS/iOS Now Playing, Android MediaSession, Linux MPRIS, browser Media Session) and routes hardware media keys, lock-screen and headset controls back to your player.
+version: 0.1.0
+repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_tools/miniav_media_session
+
+environment:
+  sdk: ^3.11.4
+
+dependencies:
+  meta: ^1.16.0
+  # FFI bindings to the native session lib (native/ → miniav_media_session_native).
+  ffi: ^2.1.4
+  # Browser Media Session API interop. Only reached behind the conditional
+  # import in lib/src/backend_factory.dart; never compiled on native.
+  web: ^1.1.0
+  # Linux MPRIS. MPRIS is a D-Bus wire protocol, not an OS API, so the Linux
+  # backend is pure Dart rather than another native TU — no libdbus system
+  # dependency, and it can be analysed and unit-tested on any host.
+  dbus: ^0.7.11
+  # Native-assets build-hook deps. These MUST be real dependencies, not
+  # dev_dependencies: a consumer does not get our dev_dependencies, so
+  # hook/build.dart could not resolve its own imports and the native asset
+  # would silently fail to build for everyone downstream (miniav_tools_codecs
+  # 0.6.1 shipped past exactly that).
+  code_assets: ^1.2.1
+  hooks: ^2.0.2
+  logging: ^1.2.0
+  native_toolchain_cmake: ^0.2.7
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.25.0

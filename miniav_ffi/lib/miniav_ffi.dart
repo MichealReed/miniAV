@@ -1,7 +1,9 @@
 import 'dart:convert';
 import 'dart:ffi' as ffi;
+import 'dart:isolate';
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
+import 'package:miniav_ffi/miniav_ffi_log_port.dart';
 import 'package:miniav_ffi/modules/miniav_ffi_audio_input.dart';
 import 'package:miniav_ffi/modules/miniav_ffi_audio_output.dart';
 import 'package:miniav_ffi/modules/miniav_ffi_loopback.dart';
@@ -81,55 +83,63 @@ class MiniAVFFIPlatform extends MiniAVPlatformInterface {
   }
 
   // ---- Log callback --------------------------------------------------------
-  // A single NativeCallable that forwards MiniAV C-library log messages to a
-  // Dart closure. The callable is kept alive for the lifetime of the
-  // registration; it is closed and replaced on each new setLogCallback call.
+  // Delivery is a Dart NATIVE PORT, not a NativeCallable.
+  //
+  // MiniAV_SetLogCallback installs a PROCESS-GLOBAL function pointer. A
+  // NativeCallable there is owned by ONE isolate, and when that isolate exits
+  // the VM deletes the trampoline while the C library keeps the pointer — the
+  // next log line from a capture thread (or from inside a leaf FFI call such
+  // as MiniAV_ReleaseBuffer) aborts the whole process. A whole-suite
+  // `dart test` run reproduces this every time, because each test file is its
+  // own isolate inside one VM process. A closed port is merely inert.
+  //
+  // PROCESS-GLOBAL, LAST WRITER WINS: with several isolates registered only
+  // the most recent one receives log lines — exactly the old function-pointer
+  // behaviour, minus the crash.
 
-  ffi.NativeCallable<bindings.MiniAVLogCallbackFunction>? _logCallable;
+  /// Receive port for native log lines in THIS isolate.
+  ReceivePort? _logPort;
 
-  /// Decodes a null-terminated C string using [Utf8Decoder] with
-  /// [allowMalformed] so that log messages containing non-UTF-8 bytes
-  /// (e.g. device names with Latin-1 characters) never throw.
-  static String _decodeCString(ffi.Pointer<ffi.Char> ptr) {
-    if (ptr.address == 0) return '';
-    final bytes = ptr.cast<ffi.Uint8>();
-    var len = 0;
-    while (bytes[len] != 0) len++;
-    return const Utf8Decoder(
-      allowMalformed: true,
-    ).convert(Uint8List.view(bytes.asTypedList(len).buffer, 0, len));
-  }
+  /// Whether `MiniAV_InitDartApi` has succeeded in this isolate.
+  bool _dartApiInitialised = false;
 
   @override
   void setLogCallback(void Function(int level, String message)? callback) {
-    // Install the new native callback first, then close the old NativeCallable
-    // to guarantee we never invoke a closed callable.
-    final old = _logCallable;
-    _logCallable = null;
+    final old = _logPort;
+    _logPort = null;
 
     if (callback == null) {
-      bindings.MiniAV_SetLogCallback(ffi.nullptr, ffi.nullptr);
+      miniavSetLogPort(0);
       old?.close();
       return;
     }
 
-    // NativeCallable.listener dispatches on the Dart event loop, so the Dart
-    // closure can freely use Dart objects (including stderr). The native side
-    // hands over a HEAP-ALLOCATED message (it must outlive the asynchronous
-    // dispatch) which we own and must release via MiniAV_Free after decoding.
-    final nc = ffi.NativeCallable<bindings.MiniAVLogCallbackFunction>.listener((
-      int levelInt,
-      ffi.Pointer<ffi.Char> message,
-      ffi.Pointer<ffi.Void> _,
-    ) {
-      final text = _decodeCString(message);
-      if (message.address != 0) {
-        bindings.MiniAV_Free(message.cast());
+    if (!_dartApiInitialised) {
+      if (miniavInitDartApi(ffi.NativeApi.initializeApiDLData) != 0) {
+        // Built without the Dart API (web/wasm) or an SDK mismatch. Leave the
+        // native library on its stderr sink rather than risk the crash-prone
+        // function-pointer path.
+        old?.close();
+        return;
       }
-      callback(levelInt, text);
+      _dartApiInitialised = true;
+    }
+
+    final port = ReceivePort('miniav_ffi.log');
+    port.listen((dynamic message) {
+      // Wire format: [int32 level, Uint8List utf8Bytes]. Bytes rather than a
+      // string because device names may carry non-UTF-8 (Latin-1) sequences;
+      // allowMalformed keeps those from throwing.
+      if (message is! List || message.length != 2) return;
+      callback(
+        message[0] as int,
+        const Utf8Decoder(
+          allowMalformed: true,
+        ).convert(message[1] as Uint8List),
+      );
     });
-    bindings.MiniAV_SetLogCallback(nc.nativeFunction, ffi.nullptr);
-    _logCallable = nc;
+    _logPort = port;
+    miniavSetLogPort(port.sendPort.nativePort);
     old?.close();
   }
 

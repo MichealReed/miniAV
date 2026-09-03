@@ -62,6 +62,38 @@ MINIAV_API MiniAVResultCode MiniAV_GetVersion(uint32_t *major, uint32_t *minor,
 MINIAV_API const char *MiniAV_GetVersionString(void);
 MINIAV_API MiniAVResultCode MiniAV_SetLogCallback(MiniAVLogCallback callback,
                                                   void *user_data);
+
+// --- Dart native-port log delivery -----------------------------------------
+// The log registry is PROCESS-GLOBAL, so a Dart NativeCallable installed via
+// MiniAV_SetLogCallback outlives the isolate that created it: once that
+// isolate exits, the VM has deleted the trampoline but this library still
+// holds the pointer, and the next log line from a capture thread aborts the
+// whole process. A Dart port id is inert once its isolate is gone, so Dart
+// embedders MUST use these two instead.
+//
+// Call MiniAV_InitDartApi(NativeApi.initializeApiDLData) once, then
+// MiniAV_SetLogPort(receivePort.sendPort.nativePort). Messages arrive as
+// [int32 level, Uint8List utf8Message] — the bytes are copied into the
+// message, so there is nothing to free. Pass 0 to stop delivery.
+//
+// LAST WRITER WINS across isolates, exactly like the function pointer did.
+// Returns MINIAV_ERROR_NOT_SUPPORTED when built without the Dart API
+// (e.g. the web/wasm build).
+MINIAV_API MiniAVResultCode MiniAV_InitDartApi(void *initialize_api_dl_data);
+MINIAV_API MiniAVResultCode MiniAV_SetLogPort(int64_t port);
+
+// --- ABI size probe --------------------------------------------------------
+// Returns sizeof() of a struct that crosses the FFI boundary, or 0 if the name
+// is unknown. Foreign-language bindings MUST assert their own struct size
+// against this: a binding generated before a field was APPENDED is smaller
+// than the C struct, so the binding's allocation under-sizes and the first
+// struct assignment in C reads past its end. Enumerate with
+// MiniAV_ABI_StructCount / MiniAV_ABI_StructNameAt so a struct added on the C
+// side cannot be silently left unchecked. See src/common/miniav_abi.c.
+MINIAV_API uint32_t MiniAV_ABI_StructSize(const char *struct_name);
+MINIAV_API uint32_t MiniAV_ABI_StructCount(void);
+MINIAV_API const char *MiniAV_ABI_StructNameAt(uint32_t index);
+
 MINIAV_API MiniAVResultCode MiniAV_SetLogLevel(MiniAVLogLevel level);
 MINIAV_API const char *MiniAV_GetErrorString(MiniAVResultCode code);
 // Releases every native resource backing a delivered MiniAVBuffer. MUST be
@@ -254,6 +286,21 @@ MINIAV_API MiniAVResultCode MiniAV_Loopback_GetDefaultFormat(
     const char *target_device_id, MiniAVAudioInfo *format_out);
 MINIAV_API MiniAVResultCode MiniAV_Loopback_GetConfiguredFormat(
     MiniAVLoopbackContextHandle context, MiniAVAudioInfo *format_out);
+
+// Read back the scope the backend ACTUALLY achieved, which is not necessarily
+// the one that was requested. A caller that asked for one process's audio must
+// be able to tell that from the whole machine's, and the PCM itself cannot be
+// told apart.
+//   MINIAV_LOOPBACK_TARGET_PROCESS      - genuinely scoped to
+//                                         TARGETHANDLE.process_id
+//   MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO - the whole system, whatever was asked
+//   MINIAV_LOOPBACK_TARGET_NONE         - this backend does not report scope
+// Windows always reports PROCESS or SYSTEM_AUDIO. Per-process capture that
+// cannot be delivered fails MiniAV_Loopback_Configure by default; setting
+// MINIAV_LOOPBACK_ALLOW_SYSTEM_FALLBACK=1 lets it degrade to whole-system
+// instead, in which case this is how the caller finds out.
+MINIAV_API MiniAVResultCode MiniAV_Loopback_GetActiveTargetInfo(
+    MiniAVLoopbackContextHandle context, MiniAVLoopbackTargetInfo *info_out);
 MINIAV_API MiniAVResultCode
 MiniAV_Loopback_CreateContext(MiniAVLoopbackContextHandle *context_out);
 MINIAV_API MiniAVResultCode

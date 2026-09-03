@@ -124,6 +124,11 @@ class CodecsWasm {
         bitrateBps.toJS,
         application.toJS,
       ]);
+  /// Encoder lookahead in samples at the encoder's rate — the priming a decoder
+  /// must discard, i.e. OpusHead's pre-skip once scaled to 48 kHz.
+  int encoderLookahead(int handle) =>
+      _int('_miniav_opus_enc_lookahead', [handle.toJS]);
+
   void destroyEncoder(int handle) =>
       _void('_miniav_opus_enc_destroy', [handle.toJS]);
 

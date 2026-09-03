@@ -6,6 +6,20 @@ import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
 import 'package:test/test.dart';
 
 void main() {
+  // `Recorder.setLogLevel` installs PROCESS-GLOBAL native log routes, and one
+  // of them — `Minigpu.setLogCallback` — is still a `NativeCallable`. Several
+  // tests below leave the level at `verbose`, so without this the isolate
+  // exits with that registration live: the VM deletes the trampoline, the GPU
+  // library keeps the pointer, and the next line a Dawn thread logs during a
+  // LATER test file aborts the whole `dart test` process
+  // ("Callback invoked after it has been deleted", no isolate on the thread).
+  // Dropping to `quiet` unregisters it before this isolate goes away.
+  //
+  // This is cleanup hygiene, not the cure. The cure is for that registry to
+  // deliver over a Dart native port the way the MiniAV and FFmpeg log routes
+  // now do — a closed port is inert, a deleted trampoline is fatal.
+  tearDownAll(() => Recorder.setLogLevel(RecorderLogLevel.quiet));
+
   // -------------------------------------------------------------------------
   // RecorderLogLevel ↔ MiniAVLogLevel mapping
   // -------------------------------------------------------------------------

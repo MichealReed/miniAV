@@ -5,6 +5,9 @@
 /// 20 ms Opus frames, encodes each with `opus_encode_float`, and emits bare
 /// Opus packets + an `OpusHead` [extraData] — the same shape the FFmpeg libopus
 /// path produced, with zero FFmpeg in the process.
+///
+/// The emitted `OpusHead` carries libopus's real lookahead as the RFC 7845
+/// pre-skip, so a player trims the encoder's priming instead of playing it.
 library;
 
 import 'dart:ffi';
@@ -14,12 +17,13 @@ import 'package:ffi/ffi.dart';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 
 import '../codecs_native.dart';
+import 'opus_bitstream.dart';
 
 /// Max compressed bytes for one Opus frame (libopus recommends 4000).
 const int _kMaxPacketBytes = 4000;
 
 class OpusAudioEncoder implements PlatformAudioEncoder {
-  OpusAudioEncoder._(this._handle, this._sampleRate, this._channels)
+  OpusAudioEncoder._(this._handle, this._sampleRate, this._channels, this.preSkip48k)
     : _frameSamplesPerCh = _sampleRate ~/ 50, // 20 ms frames
       _leftover = Float32List((_sampleRate ~/ 50) * _channels),
       _in = calloc<Float>((_sampleRate ~/ 50) * _channels),
@@ -27,9 +31,19 @@ class OpusAudioEncoder implements PlatformAudioEncoder {
     _frameSamplesTotal = _frameSamplesPerCh * _channels;
     _extraData = CodecExtraData.audio(
       AudioCodec.opus,
-      _buildOpusHead(_channels, _sampleRate),
+      buildOpusHead(_channels, _sampleRate, preSkip48k),
     );
   }
+
+  /// Pre-skip written into the emitted OpusHead: libopus's real lookahead for
+  /// this encoder, expressed at 48 kHz (the unit RFC 7845 mandates).
+  ///
+  /// A decoder discards this many samples from the front of the stream. Writing
+  /// 0 here — which this encoder used to do — leaves the encoder's priming in
+  /// the file: an audible click at the start and every later sample stamped
+  /// ~6.5 ms early against video. Our own round-trip could not see it, because
+  /// our decoder honours whatever pre-skip it reads.
+  final int preSkip48k;
 
   final Pointer<Void> _handle;
   final int _sampleRate;
@@ -66,7 +80,13 @@ class OpusAudioEncoder implements PlatformAudioEncoder {
       kOpusApplicationAudio,
     );
     if (handle == nullptr) return null;
-    return OpusAudioEncoder._(handle, sampleRate, channels);
+    // OpusHead's pre-skip is always in 48 kHz samples, whatever the encoder
+    // runs at, so scale libopus's answer (which is at `sampleRate`) up.
+    final lookahead = opusEncLookahead(handle);
+    final preSkip48k = lookahead <= 0
+        ? 0
+        : (lookahead * 48000 + sampleRate ~/ 2) ~/ sampleRate;
+    return OpusAudioEncoder._(handle, sampleRate, channels, preSkip48k);
   }
 
   @override
@@ -190,21 +210,5 @@ class OpusAudioEncoder implements PlatformAudioEncoder {
         break;
     }
     return out;
-  }
-
-  /// Build a minimal OpusHead (RFC 7845): magic + version + channels + pre-skip
-  /// + input rate + output gain + mapping family 0.
-  static Uint8List _buildOpusHead(int channels, int inputSampleRate) {
-    final b = Uint8List(19);
-    final bd = ByteData.sublistView(b);
-    const magic = [0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64]; // 'OpusHead'
-    b.setRange(0, 8, magic);
-    b[8] = 1; // version
-    b[9] = channels;
-    bd.setUint16(10, 0, Endian.little); // pre-skip (0 — we don't trim)
-    bd.setUint32(12, inputSampleRate, Endian.little);
-    bd.setUint16(16, 0, Endian.little); // output gain
-    b[18] = 0; // channel mapping family 0 (mono/stereo)
-    return b;
   }
 }

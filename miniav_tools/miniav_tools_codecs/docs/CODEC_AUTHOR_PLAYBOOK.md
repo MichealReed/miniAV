@@ -46,7 +46,7 @@ re-learning the traps. Every rule here was earned in a real debugging session.
   `RgbaYuvCoeffs` `.of(matrix, fullRange:)`, `dartI420ToRgba` /
   `dartRgbaToI420` / `dartI422ToRgba`). That package is pure Dart with no
   build hooks, so web builds, backend packages, and external consumers
-  (livetensor) share the math without dragging in FFI/minigpu. The tables are
+  share the math without dragging in FFI/minigpu. The tables are
   MIRRORED in this package's `native/frame_convert.c` (`pick()` /
   `inv_pick()`; matrix: 0=601, 1=709, 2=2020-NCL) and in the GPU kernels'
   params. If you touch one, touch all of them; the byte-exact tests

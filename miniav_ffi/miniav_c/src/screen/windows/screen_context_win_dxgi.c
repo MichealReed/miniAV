@@ -814,6 +814,28 @@ static MiniAVResultCode dxgi_configure_display(MiniAVScreenContext *ctx,
       // loopback_audio_ctx is already NULL or will be set to NULL
     }
   }
+
+  // HONESTY GATE (behaviour change, 0.7.1): audio was EXPLICITLY requested and
+  // could not be provided. This used to return MINIAV_SUCCESS ("video can
+  // still work"), which is indistinguishable from a working A/V capture. Kept
+  // in lockstep with the WGC backend so both Windows screen paths answer the
+  // same way. A caller that wants video regardless re-configures with
+  // capture_audio = false.
+  if (dxgi_ctx->parent_ctx->capture_audio_requested &&
+      !dxgi_ctx->audio_loopback_enabled_and_configured) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "DXGI: audio capture was requested for display %s but no audio "
+               "loopback could be configured — failing the configure instead "
+               "of silently returning a video-only capture.",
+               display_id_utf8);
+    if (dxgi_ctx->loopback_audio_ctx) {
+      MiniAV_Loopback_DestroyContext(dxgi_ctx->loopback_audio_ctx);
+      dxgi_ctx->loopback_audio_ctx = NULL;
+    }
+    ctx->is_configured = false;
+    LeaveCriticalSection(&dxgi_ctx->critical_section);
+    return MINIAV_ERROR_NOT_SUPPORTED;
+  }
   // --- End Audio Loopback Configuration ---
 
   // Mark configured so GetConfiguredFormats works on this backend (WGC and
@@ -898,13 +920,15 @@ static MiniAVResultCode dxgi_start_capture(MiniAVScreenContext *ctx,
         dxgi_ctx->app_callback_internal, // Use the same callback
         dxgi_ctx->app_callback_user_data_internal);
     if (res != MINIAV_SUCCESS) {
+      // HONESTY GATE (behaviour change, 0.7.1): audio was configured at the
+      // caller's explicit request; a video-only start is not what was asked
+      // for. Video has not started yet here, so nothing is left running.
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "DXGI: Failed to start audio loopback capture: %s. Proceeding "
-                 "with video only.",
+                 "DXGI: Failed to start audio loopback capture: %s. Failing "
+                 "StartCapture rather than starting video only.",
                  MiniAV_GetErrorString(res));
-      // Optionally, you might want to disable
-      // audio_loopback_enabled_and_configured here or allow video to continue.
-      // For now, just log and continue.
+      LeaveCriticalSection(&dxgi_ctx->critical_section);
+      return res;
     } else {
       miniav_log(MINIAV_LOG_LEVEL_INFO,
                  "DXGI: Audio loopback capture started.");

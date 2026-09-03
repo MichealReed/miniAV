@@ -107,14 +107,6 @@ List<int> _audioFixedPtsList(
   );
 }
 
-/// Returns [count] audio PTSs using the BROKEN formula (no start offset).
-List<int> _audioBrokenPtsList(int samplesPerChunk, int sampleRate, int count) {
-  return List.generate(
-    count,
-    (i) => _brokenAudioPts(i * samplesPerChunk, sampleRate),
-  );
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 void main() {
   // ── A. Broken formula produces constant AV desync ─────────────────────────

@@ -1,0 +1,31 @@
+name: miniav_media_session_flutter
+description: Android companion for miniav_media_session. Supplies the JVM-side MediaSession that a code asset cannot reach, so hardware and Bluetooth media buttons route into the app and lock-screen controls work.
+version: 0.1.0
+repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_tools/miniav_media_session_flutter
+
+environment:
+  sdk: ^3.11.4
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  miniav_media_session: ^0.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^5.0.0
+
+flutter:
+  plugin:
+    platforms:
+      # Android ONLY, and that is the whole point of this package existing.
+      # Windows SMTC and Apple Now Playing are reached from the code asset in
+      # miniav_media_session; Linux MPRIS is pure Dart there; web is
+      # navigator.mediaSession. Android's MediaSession needs a Context and its
+      # notification needs a foreground Service, neither of which exist outside
+      # the JVM — so it is the one platform that needs a plugin at all.
+      android:
+        package: com.practicalxr.miniav_media_session_flutter
+        pluginClass: MiniavMediaSessionFlutterPlugin

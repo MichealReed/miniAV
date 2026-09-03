@@ -12,14 +12,61 @@
 // ksmedia.h was for KSDATAFORMAT_... GUIDs, which seem resolved now, but good
 // to keep if used.
 #include <ksmedia.h>
+
+// Per-process loopback activation parameters. The SDK gates this header on
+// NTDDI_VERSION >= NTDDI_WIN10_FE (0x0A00000A, the Windows 10 build 20348 /
+// Server 2022 wave) *and* on the APP partition, so simply #including it is not
+// enough to know the types arrived. Rather than guess, gate on the same
+// condition the SDK uses and provide a byte-identical fallback declaration
+// otherwise — the layout is an OS ABI contract read by mmdevapi.dll, so the
+// fallback is not a guess, and it keeps this file buildable against an SDK
+// older than 10.0.20348 (where the runtime call will simply fail and be
+// reported honestly).
+#if defined(NTDDI_VERSION) && (NTDDI_VERSION >= 0x0A00000A) &&                 \
+    WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
+#include <audioclientactivationparams.h>
+#define MINIAV_WASAPI_SDK_ACTIVATION_PARAMS 1
+#else
+#define VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK L"VAD\\Process_Loopback"
+typedef enum {
+  PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE = 0,
+  PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE = 1
+} PROCESS_LOOPBACK_MODE;
+typedef struct AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+  DWORD TargetProcessId;
+  PROCESS_LOOPBACK_MODE ProcessLoopbackMode;
+} AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS;
+typedef enum {
+  AUDIOCLIENT_ACTIVATION_TYPE_DEFAULT = 0,
+  AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK = 1
+} AUDIOCLIENT_ACTIVATION_TYPE;
+typedef struct AUDIOCLIENT_ACTIVATION_PARAMS {
+  AUDIOCLIENT_ACTIVATION_TYPE ActivationType;
+  union {
+    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS ProcessLoopbackParams;
+  } DUMMYUNIONNAME;
+} AUDIOCLIENT_ACTIVATION_PARAMS;
+#endif
+
+// The SDK declares the params union with the DUMMYUNIONNAME macro, which
+// expands to NOTHING unless NONAMELESSUNION is defined — i.e. the union is
+// normally anonymous and `params.DUMMYUNIONNAME.X` is a syntax error, not the
+// portable spelling it looks like.
+#if defined(NONAMELESSUNION)
+#define MINIAV_PROC_LOOPBACK_PARAMS(p) ((p).DUMMYUNIONNAME.ProcessLoopbackParams)
+#else
+#define MINIAV_PROC_LOOPBACK_PARAMS(p) ((p).ProcessLoopbackParams)
+#endif
 #endif
 
 // Step 3: Include your project's headers
+#include "../../common/miniav_com_win.h"
 #include "../../common/miniav_logging.h"
 #include "../../common/miniav_time.h"
 #include "../../common/miniav_utils.h" // For miniav_calloc, miniav_free, miniav_strdup, MINIAV_UNUSED
 #include "loopback_context_win_wasapi.h" // This header should declare types but not try to define these system GUIDs
 #include <stdio.h> // For swprintf_s
+#include <stdlib.h> // For getenv (test-only stress flags)
 
 #ifdef _WIN32
 
@@ -78,6 +125,34 @@ const IID IID_IAudioSessionManager = {
     0x692C,
     0x4A3D,
     {0x95, 0x6A, 0x26, 0x10, 0x44, 0x4F, 0x74, 0xCC}};
+
+// {41D949AB-9862-444A-80F6-C261334DA5EB}
+static const IID MiniAV_IID_IActivateAudioInterfaceCompletionHandler = {
+    0x41d949ab,
+    0x9862,
+    0x444a,
+    {0x80, 0xf6, 0xc2, 0x61, 0x33, 0x4d, 0xa5, 0xeb}};
+
+// {00000000-0000-0000-C000-000000000046}
+static const IID MiniAV_IID_IUnknown = {
+    0x00000000,
+    0x0000,
+    0x0000,
+    {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+
+// {00000003-0000-0000-C000-000000000046}
+static const IID MiniAV_IID_IMarshal = {
+    0x00000003,
+    0x0000,
+    0x0000,
+    {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+
+// {94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}
+static const IID MiniAV_IID_IAgileObject = {
+    0x94ea2b94,
+    0xe9cc,
+    0x49e0,
+    {0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90}};
 
 // --- Helper Functions ---
 
@@ -203,6 +278,37 @@ static DWORD WINAPI wasapi_capture_thread_proc(LPVOID param) {
                           platform_ctx->buffer_event_handle};
   DWORD wait_count = platform_ctx->event_driven_capture ? 2 : 1;
   BOOL device_invalidated = FALSE;
+
+  // Join the MTA explicitly for the life of THIS thread.
+  //
+  // This thread calls IAudioCaptureClient/IAudioClient methods, and until now
+  // it never joined an apartment at all. It worked only because the process
+  // holds a permanent MTA usage reference (see miniav_com_win.h), which makes
+  // an uninitialized thread an implicit MTA member, and because these are
+  // direct in-process vtable calls with no marshalling. That is an accident of
+  // the current design, not a contract: COM's rule is that a thread using COM
+  // must be an apartment member.
+  //
+  // A DEDICATED thread is the one place the CoInitializeEx/CoUninitialize pair
+  // is actually correct — we create it, we join it, and both calls happen on
+  // the SAME thread with balanced lifetime. That is precisely what is NOT true
+  // of per-FFI-call COM (the Dart VM hands an isolate's consecutive calls to
+  // different pool threads), which is the bug miniav_com_win.c exists to fix.
+  // The process-lifetime MTA reference also guarantees the CoUninitialize
+  // below can never be the last one out and tear the MTA down.
+  //
+  // RPC_E_CHANGED_MODE would mean someone already put this thread in an STA;
+  // impossible for a thread we just created, but if it ever happens we must
+  // NOT call CoUninitialize (we would be unbalancing someone else's init).
+  const HRESULT co_hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+  const BOOL co_owned = SUCCEEDED(co_hr);
+  if (!co_owned) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "WASAPI: capture thread CoInitializeEx returned 0x%lx; "
+               "continuing on the process MTA reference.",
+               (unsigned long)co_hr);
+  }
+  miniav_com_trace("wasapi_capture_thread_proc", (unsigned long)co_hr);
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "WASAPI: Capture thread started (mode: %s).",
@@ -380,6 +486,13 @@ cleanup_thread:
       ctx->lost_cb((int)MINIAV_ERROR_DEVICE_LOST, ctx->lost_cb_user_data);
     }
   }
+  // Balances the CoInitializeEx at the top, on the SAME thread. Deliberately
+  // after lost_cb: the app's handler may itself touch COM, and it should run
+  // while this thread is still an apartment member. Every exit path in this
+  // function reaches this label, so the pair cannot be skipped.
+  if (co_owned) {
+    CoUninitialize();
+  }
   return 0;
 }
 
@@ -434,14 +547,24 @@ MiniAVResultCode wasapi_init_platform(MiniAVLoopbackContext *ctx) {
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
   }
 
-  HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-  if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR, "WASAPI: CoInitializeEx failed: 0x%lx",
-               hr);
-    CloseHandle(platform_ctx->stop_event_handle); // Clean up created event
-    miniav_free(platform_ctx);
-    ctx->platform_ctx = NULL;
-    return hresult_to_miniavresult(hr);
+  if (!miniav_com_legacy_percall()) {
+    // Apartment membership is process-lifetime and library-owned — see
+    // miniav_com_win.h. Notably this also covers wasapi_capture_thread_proc,
+    // which never called CoInitializeEx at all.
+    miniav_com_ensure_mta();
+    miniav_com_trace("wasapi_init_platform", 0);
+  } else {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    miniav_com_trace("legacy CoInitializeEx/wasapi_init_platform",
+                     (unsigned long)hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR, "WASAPI: CoInitializeEx failed: 0x%lx",
+                 hr);
+      CloseHandle(platform_ctx->stop_event_handle); // Clean up created event
+      miniav_free(platform_ctx);
+      ctx->platform_ctx = NULL;
+      return hresult_to_miniavresult(hr);
+    }
   }
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WASAPI: Platform context initialized.");
@@ -515,7 +638,11 @@ MiniAVResultCode wasapi_destroy_platform(MiniAVLoopbackContext *ctx) {
   miniav_free(platform_ctx);
   ctx->platform_ctx = NULL;
 
-  CoUninitialize();
+  if (miniav_com_legacy_percall()) {
+    // Unbalanced by construction: the matching CoInitializeEx may have run on
+    // a different pool thread, or on a thread another isolate still relies on.
+    CoUninitialize();
+  }
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WASAPI: Platform context destroyed.");
   return MINIAV_SUCCESS;
 }
@@ -609,15 +736,23 @@ waspi_enumerate_targets(MiniAVLoopbackTargetType target_type_filter,
   MiniAVResultCode result_code = MINIAV_SUCCESS;
 
   BOOL com_initialized_here = FALSE;
-  hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-  if (SUCCEEDED(hr)) {
-    com_initialized_here = TRUE;
-    if (hr == S_FALSE)
-      com_initialized_here = FALSE; // Already initialized
-  } else if (hr != RPC_E_CHANGED_MODE) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WASAPI Enum: CoInitializeEx failed: 0x%lx", hr);
-    return hresult_to_miniavresult(hr);
+  if (!miniav_com_legacy_percall()) {
+    miniav_com_ensure_mta();
+    miniav_com_trace("wasapi_enumerate_targets", 0);
+    hr = S_OK;
+  } else {
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    miniav_com_trace("legacy CoInitializeEx/wasapi_enumerate_targets",
+                     (unsigned long)hr);
+    if (SUCCEEDED(hr)) {
+      com_initialized_here = TRUE;
+      if (hr == S_FALSE)
+        com_initialized_here = FALSE; // Already initialized
+    } else if (hr != RPC_E_CHANGED_MODE) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI Enum: CoInitializeEx failed: 0x%lx", hr);
+      return hresult_to_miniavresult(hr);
+    }
   }
 
   temp_devices_list = (MiniAVDeviceInfo *)miniav_calloc(
@@ -1033,6 +1168,407 @@ cleanup_enum:
   return result_code;
 }
 
+// ===========================================================================
+// Per-process loopback (ActivateAudioInterfaceAsync)
+// ===========================================================================
+//
+// The ONLY Windows mechanism that scopes loopback capture to a process is
+// ActivateAudioInterfaceAsync() against the pseudo-endpoint
+// VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, with AUDIOCLIENT_ACTIVATION_PARAMS
+// carrying the target PID. Minimum: Windows 10 build 20348 (Server 2022) /
+// Windows 11 (verified against the AUDIOCLIENT_ACTIVATION_PARAMS reference).
+//
+// WHAT THIS REPLACES. The previous code called
+//     IAudioClient3::InitializeSharedAudioStream(flags, <PID>, fmt, NULL)
+// with the target PID in the third argument, commented "this non-zero PID
+// enables process-specific capture". That argument is PeriodInFrames — a
+// period, in frames. A PID is never a legal period, so the call ALWAYS failed
+// with AUDCLNT_E_INVALID_DEVICE_PERIOD (0x88890021) and the backend fell back
+// to whole-system loopback. Per-process loopback had therefore never worked
+// once: every caller asking for one process's audio silently received the
+// entire system's audio — right format, wrong content, no error, no log above
+// DEBUG. IAudioClient3 has nothing to do with process loopback and is gone.
+//
+// TRAP 1 — THE HANDLER MUST BE AGILE. ActivateAudioInterfaceAsync returns
+//   E_ILLEGAL_METHOD_CALL (0x8000000E) — before it ever looks at the
+//   activation params — if the completion handler is not agile. A plain C
+//   vtable object that answers QueryInterface for IUnknown and the handler
+//   interface only is NOT enough: it must also answer IAgileObject and
+//   delegate IMarshal to a free-threaded marshaler. The C++ samples inherit
+//   this from WRL's FtmBase, which is why the requirement is invisible in the
+//   documentation. Measured here: without IAgileObject the call fails 100% of
+//   the time; with it, 100% success.
+//
+// TRAP 2 — THERE IS NO MIX FORMAT. IAudioClient::GetMixFormat() returns
+//   E_NOTIMPL (0x80004001) on a process-loopback client. Unlike endpoint
+//   loopback, the CALLER picks the format and the capture engine converts into
+//   it (48000, 44100 and 16000 Hz were each accepted for the same target on
+//   this machine). So process loopback genuinely negotiates, and whatever we
+//   set here is what MiniAV_Loopback_GetConfiguredFormat and every delivered
+//   buffer must report.
+//
+// TRAP 3 — A DEAD PID IS SILENT, NOT FAILED. Activating for a PID that does
+//   not exist SUCCEEDS and then delivers an endless stream of zeroed frames.
+//   Nothing in WASAPI will ever say the target is not there. The PID is
+//   therefore validated with OpenProcess() before activation, so "that process
+//   is gone" is an error instead of indistinguishable silence.
+//
+// INCLUDE_TARGET_PROCESS_TREE vs EXCLUDE: include-tree. "Capture this app"
+// means the app as the user sees it, and browsers, Electron shells and game
+// launchers routinely render audio from a child process — excluding the tree
+// would make those targets silent, which is the same class of lie this change
+// exists to remove. EXCLUDE_TARGET_PROCESS_TREE answers the opposite question
+// ("everything except me") and is not what any MiniAV caller asks for.
+
+typedef struct WasapiActivateHandler {
+  IActivateAudioInterfaceCompletionHandlerVtbl *lpVtbl;
+  LONG ref_count;
+  HANDLE completed_event;
+  IUnknown *ftm; // free-threaded marshaler; see TRAP 1
+} WasapiActivateHandler;
+
+static HRESULT STDMETHODCALLTYPE wasapi_activate_handler_qi(
+    IActivateAudioInterfaceCompletionHandler *This, REFIID riid, void **ppv) {
+  WasapiActivateHandler *self = (WasapiActivateHandler *)This;
+  if (!ppv)
+    return E_POINTER;
+  if (IsEqualGUID(riid, &MiniAV_IID_IUnknown) ||
+      IsEqualGUID(riid,
+                  &MiniAV_IID_IActivateAudioInterfaceCompletionHandler) ||
+      IsEqualGUID(riid, &MiniAV_IID_IAgileObject)) {
+    *ppv = This;
+    This->lpVtbl->AddRef(This);
+    return S_OK;
+  }
+  if (IsEqualGUID(riid, &MiniAV_IID_IMarshal) && self->ftm) {
+    return self->ftm->lpVtbl->QueryInterface(self->ftm, riid, ppv);
+  }
+  *ppv = NULL;
+  return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE wasapi_activate_handler_addref(
+    IActivateAudioInterfaceCompletionHandler *This) {
+  return (ULONG)InterlockedIncrement(
+      &((WasapiActivateHandler *)This)->ref_count);
+}
+
+static ULONG STDMETHODCALLTYPE wasapi_activate_handler_release(
+    IActivateAudioInterfaceCompletionHandler *This) {
+  WasapiActivateHandler *self = (WasapiActivateHandler *)This;
+  LONG n = InterlockedDecrement(&self->ref_count);
+  if (n == 0) {
+    // The OS may still hold a reference when we give ours up (e.g. after a
+    // wait timeout), so the object frees ITSELF at zero rather than being
+    // freed by the caller. A stack object here would be a use-after-free.
+    if (self->ftm)
+      self->ftm->lpVtbl->Release(self->ftm);
+    if (self->completed_event)
+      CloseHandle(self->completed_event);
+    miniav_free(self);
+  }
+  return (ULONG)n;
+}
+
+static HRESULT STDMETHODCALLTYPE wasapi_activate_handler_completed(
+    IActivateAudioInterfaceCompletionHandler *This,
+    IActivateAudioInterfaceAsyncOperation *op) {
+  MINIAV_UNUSED(op);
+  SetEvent(((WasapiActivateHandler *)This)->completed_event);
+  return S_OK;
+}
+
+static IActivateAudioInterfaceCompletionHandlerVtbl
+    g_wasapi_activate_handler_vtbl = {
+        wasapi_activate_handler_qi, wasapi_activate_handler_addref,
+        wasapi_activate_handler_release, wasapi_activate_handler_completed};
+
+// TEST-ONLY: MINIAV_LOOPBACK_STRESS_NO_PROCESS_LOOPBACK=1 skips the real
+// per-process activation entirely, restoring the pre-fix situation in which a
+// per-process request cannot be honoured. Combined with
+// MINIAV_LOOPBACK_ALLOW_SYSTEM_FALLBACK=1 it reproduces the exact old bug
+// (whole-system audio handed back as if it were one process's), which is the
+// positive control for src/loopback/test/test_loopback_process_isolation.c.
+// Never set in production.
+static int wasapi_stress_no_process_loopback(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *v = getenv("MINIAV_LOOPBACK_STRESS_NO_PROCESS_LOOPBACK");
+    cached = (v && v[0] == '1') ? 1 : 0;
+    if (cached) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI: MINIAV_LOOPBACK_STRESS_NO_PROCESS_LOOPBACK=1 — real "
+                 "per-process loopback disabled (test-only).");
+    }
+  }
+  return cached;
+}
+
+// OPT-IN: MINIAV_LOOPBACK_ALLOW_SYSTEM_FALLBACK=1 permits a per-process
+// request that cannot be honoured to degrade to whole-system loopback. It is
+// OFF by default: substituting the whole system's audio for one process's is
+// exactly the failure this change exists to remove, and a caller cannot tell
+// the difference from the PCM. When it is on, the substitution is logged at
+// ERROR and MiniAV_Loopback_GetActiveTargetInfo reports SYSTEM_AUDIO, so a
+// caller can still tell.
+static int wasapi_allow_system_fallback(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *v = getenv("MINIAV_LOOPBACK_ALLOW_SYSTEM_FALLBACK");
+    cached = (v && v[0] == '1') ? 1 : 0;
+  }
+  return cached;
+}
+
+// TRAP 3: distinguish "no such process" from "alive but out of reach".
+static BOOL wasapi_process_is_alive(DWORD pid) {
+  if (pid == 0)
+    return FALSE;
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!h)
+    h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+  if (!h) {
+    // ERROR_ACCESS_DENIED means the process EXISTS but we may not open it
+    // (elevated or protected). Process loopback still works against such a
+    // target, so refusing would be its own lie. Anything else — typically
+    // ERROR_INVALID_PARAMETER — means there is no such process.
+    return GetLastError() == ERROR_ACCESS_DENIED;
+  }
+  DWORD exit_code = 0;
+  BOOL alive = TRUE;
+  if (GetExitCodeProcess(h, &exit_code) && exit_code != STILL_ACTIVE)
+    alive = FALSE;
+  CloseHandle(h);
+  return alive;
+}
+
+static BOOL miniav_audio_info_to_wfex(const MiniAVAudioInfo *in,
+                                      WAVEFORMATEX *out) {
+  WORD tag, bits;
+  if (!in || in->sample_rate == 0 || in->channels == 0)
+    return FALSE;
+  switch (in->format) {
+  case MINIAV_AUDIO_FORMAT_U8:
+    tag = WAVE_FORMAT_PCM;
+    bits = 8;
+    break;
+  case MINIAV_AUDIO_FORMAT_S16:
+    tag = WAVE_FORMAT_PCM;
+    bits = 16;
+    break;
+  case MINIAV_AUDIO_FORMAT_S32:
+    tag = WAVE_FORMAT_PCM;
+    bits = 32;
+    break;
+  case MINIAV_AUDIO_FORMAT_F32:
+    tag = WAVE_FORMAT_IEEE_FLOAT;
+    bits = 32;
+    break;
+  default:
+    return FALSE; // F64 / UNKNOWN: WASAPI has no such shared-mode format
+  }
+  memset(out, 0, sizeof(WAVEFORMATEX));
+  out->wFormatTag = tag;
+  out->nChannels = (WORD)in->channels;
+  out->nSamplesPerSec = in->sample_rate;
+  out->wBitsPerSample = bits;
+  out->nBlockAlign = (WORD)((out->nChannels * bits) / 8);
+  out->nAvgBytesPerSec = out->nSamplesPerSec * out->nBlockAlign;
+  out->cbSize = 0;
+  return TRUE;
+}
+
+// One activation attempt. On success the returned client is INITIALIZED for
+// `fmt` with the event handle attached.
+static HRESULT wasapi_activate_process_loopback(DWORD pid, HANDLE buffer_event,
+                                                const WAVEFORMATEX *fmt,
+                                                IAudioClient **client_out) {
+  IActivateAudioInterfaceAsyncOperation *async_op = NULL;
+  IUnknown *activated = NULL;
+  IAudioClient *client = NULL;
+  HRESULT hr_activate = E_FAIL;
+  HRESULT hr;
+
+  WasapiActivateHandler *handler = (WasapiActivateHandler *)miniav_calloc(
+      1, sizeof(WasapiActivateHandler));
+  if (!handler)
+    return E_OUTOFMEMORY;
+  handler->lpVtbl = &g_wasapi_activate_handler_vtbl;
+  handler->ref_count = 1;
+  handler->completed_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+  if (!handler->completed_event) {
+    miniav_free(handler);
+    return HRESULT_FROM_WIN32(GetLastError());
+  }
+  // TRAP 1: without this (plus IAgileObject in QueryInterface) the activation
+  // below fails with E_ILLEGAL_METHOD_CALL and never reaches the audio stack.
+  CoCreateFreeThreadedMarshaler((IUnknown *)handler, &handler->ftm);
+
+  AUDIOCLIENT_ACTIVATION_PARAMS params;
+  memset(&params, 0, sizeof(params));
+  params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+  MINIAV_PROC_LOOPBACK_PARAMS(params).TargetProcessId = pid;
+  MINIAV_PROC_LOOPBACK_PARAMS(params).ProcessLoopbackMode =
+      PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+
+  PROPVARIANT activation_prop;
+  PropVariantInit(&activation_prop);
+  activation_prop.vt = VT_BLOB;
+  activation_prop.blob.cbSize = sizeof(params);
+  activation_prop.blob.pBlobData = (BYTE *)&params;
+
+  hr = ActivateAudioInterfaceAsync(
+      VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IID_IAudioClient,
+      &activation_prop, (IActivateAudioInterfaceCompletionHandler *)handler,
+      &async_op);
+  if (FAILED(hr)) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "WASAPI Cfg: ActivateAudioInterfaceAsync failed: 0x%lx", hr);
+    goto done;
+  }
+
+  if (WaitForSingleObject(handler->completed_event, 5000) != WAIT_OBJECT_0) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "WASAPI Cfg: process-loopback activation did not complete "
+               "within 5s.");
+    hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    goto done;
+  }
+
+  hr = async_op->lpVtbl->GetActivateResult(async_op, &hr_activate, &activated);
+  if (SUCCEEDED(hr) && FAILED(hr_activate))
+    hr = hr_activate;
+  if (FAILED(hr)) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "WASAPI Cfg: process-loopback activation for PID %lu failed: "
+               "0x%lx",
+               pid, hr);
+    goto done;
+  }
+
+  hr = activated->lpVtbl->QueryInterface(activated, &IID_IAudioClient,
+                                         (void **)&client);
+  if (FAILED(hr))
+    goto done;
+
+  // hnsBufferDuration 0 = the engine's default period (measured ~10 ms here);
+  // 20 ms and 200 ms behaved identically. hnsPeriodicity MUST be 0 in shared
+  // mode. Event-driven: the event fires ~100x/s, confirmed by measurement, so
+  // the shared capture thread never has to fall back on its safety timeout.
+  hr = client->lpVtbl->Initialize(
+      client, AUDCLNT_SHAREMODE_SHARED,
+      AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0,
+      fmt, NULL);
+  if (FAILED(hr))
+    goto done;
+
+  hr = client->lpVtbl->SetEventHandle(client, buffer_event);
+  if (FAILED(hr))
+    goto done;
+
+  *client_out = client;
+  client = NULL;
+
+done:
+  if (client)
+    client->lpVtbl->Release(client);
+  if (activated)
+    activated->lpVtbl->Release(activated);
+  if (async_op)
+    async_op->lpVtbl->Release(async_op);
+  handler->lpVtbl->Release(
+      (IActivateAudioInterfaceCompletionHandler *)handler);
+  return hr;
+}
+
+// Configure real per-process loopback. On success platform_ctx owns an
+// initialized audio_client and a capture_format describing exactly what it
+// will deliver.
+static MiniAVResultCode wasapi_configure_process_loopback(
+    LoopbackPlatformContextWinWasapi *platform_ctx, DWORD pid,
+    const MiniAVAudioInfo *requested_format,
+    const WAVEFORMATEX *endpoint_mix_format) {
+  if (!wasapi_process_is_alive(pid)) {
+    miniav_log(MINIAV_LOG_LEVEL_ERROR,
+               "WASAPI Cfg: per-process loopback requested for PID %lu, which "
+               "is not running. Refusing: activation would have succeeded and "
+               "then delivered silence forever.",
+               pid);
+    return MINIAV_ERROR_DEVICE_NOT_FOUND;
+  }
+
+  // Candidates, in order of preference. Process loopback really does convert,
+  // so the caller's request is tried FIRST and normally wins.
+  WAVEFORMATEX candidates[3];
+  const char *why[3];
+  int n = 0;
+  if (requested_format &&
+      miniav_audio_info_to_wfex(requested_format, &candidates[n])) {
+    why[n] = "requested";
+    ++n;
+  }
+  if (endpoint_mix_format) {
+    MiniAVAudioInfo as_info;
+    waveformat_to_miniav_audio_format(endpoint_mix_format, &as_info);
+    if (miniav_audio_info_to_wfex(&as_info, &candidates[n])) {
+      why[n] = "endpoint mix";
+      ++n;
+    }
+  }
+  {
+    MiniAVAudioInfo fallback;
+    memset(&fallback, 0, sizeof(fallback));
+    fallback.format = MINIAV_AUDIO_FORMAT_F32;
+    fallback.channels = 2;
+    fallback.sample_rate = 48000;
+    miniav_audio_info_to_wfex(&fallback, &candidates[n]);
+    why[n] = "48kHz/2ch/F32 default";
+    ++n;
+  }
+
+  HRESULT last_hr = E_FAIL;
+  for (int i = 0; i < n; ++i) {
+    IAudioClient *client = NULL;
+    HRESULT hr = wasapi_activate_process_loopback(
+        pid, platform_ctx->buffer_event_handle, &candidates[i], &client);
+    if (SUCCEEDED(hr) && client) {
+      platform_ctx->capture_format =
+          (WAVEFORMATEX *)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
+      if (!platform_ctx->capture_format) {
+        client->lpVtbl->Release(client);
+        return MINIAV_ERROR_OUT_OF_MEMORY;
+      }
+      memcpy(platform_ctx->capture_format, &candidates[i],
+             sizeof(WAVEFORMATEX));
+      platform_ctx->audio_client = client;
+      platform_ctx->event_driven_capture = TRUE;
+      platform_ctx->process_loopback_active = TRUE;
+      miniav_log(MINIAV_LOG_LEVEL_INFO,
+                 "WASAPI Cfg: per-process loopback ACTIVE for PID %lu "
+                 "(include process tree) at %lu Hz / %u ch / %u-bit %s [%s].",
+                 pid, candidates[i].nSamplesPerSec, candidates[i].nChannels,
+                 candidates[i].wBitsPerSample,
+                 candidates[i].wFormatTag == WAVE_FORMAT_IEEE_FLOAT ? "float"
+                                                                   : "PCM",
+                 why[i]);
+      return MINIAV_SUCCESS;
+    }
+    last_hr = hr;
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "WASAPI Cfg: process loopback for PID %lu rejected the %s "
+               "format (%lu Hz / %u ch / %u-bit): 0x%lx",
+               pid, why[i], candidates[i].nSamplesPerSec,
+               candidates[i].nChannels, candidates[i].wBitsPerSample, hr);
+  }
+
+  miniav_log(MINIAV_LOG_LEVEL_ERROR,
+             "WASAPI Cfg: per-process loopback for PID %lu unavailable (last "
+             "HRESULT 0x%lx). This API needs Windows 10 build 20348 / Windows "
+             "11.",
+             pid, last_hr);
+  return hresult_to_miniavresult(last_hr);
+}
+
 MiniAVResultCode wasapi_configure_loopback(
     MiniAVLoopbackContext *ctx,
     const MiniAVLoopbackTargetInfo *target_info, // Primary identifier
@@ -1046,11 +1582,14 @@ MiniAVResultCode wasapi_configure_loopback(
   HRESULT hr;
   MiniAVResultCode mres = MINIAV_SUCCESS;
   IAudioClient *temp_audio_client = NULL;
-  IAudioClient3 *audio_client3 = NULL;
   IMMDevice *target_imm_device = NULL;
+  BOOL process_scope_active = FALSE;
 
-  MINIAV_UNUSED(
-      requested_format); // WASAPI loopback uses the device's mix format
+  // For WHOLE-ENDPOINT loopback requested_format is a HINT only: the stream
+  // always runs at the endpoint mix format, so it is used only to carry
+  // num_frames through and to log loudly when the caller asked for something
+  // else. For PER-PROCESS loopback it is a real request — that path has no
+  // inherited format and normally honours it verbatim.
 
   // --- Cleanup existing resources if re-configuring ---
   if (platform_ctx->capture_format) {
@@ -1088,8 +1627,16 @@ MiniAVResultCode wasapi_configure_loopback(
   }
 
   platform_ctx->attempt_process_specific_capture = FALSE;
+  platform_ctx->process_loopback_active = FALSE;
   platform_ctx->target_process_id = 0;
   DWORD actual_target_pid_for_init = 0;
+
+  // The scope the backend ACTUALLY achieves, reported by
+  // MiniAV_Loopback_GetActiveTargetInfo. Written here, never by the caller's
+  // request, so "I asked for a process" and "I am getting a process" cannot be
+  // confused. NONE until one of the branches below succeeds.
+  memset(&ctx->active_target_info, 0, sizeof(ctx->active_target_info));
+  ctx->active_target_info.type = MINIAV_LOOPBACK_TARGET_NONE;
 
   // --- Determine target IMMDevice and PID for process-specific capture ---
   if (target_info != NULL) {
@@ -1116,11 +1663,15 @@ MiniAVResultCode wasapi_configure_loopback(
                    "WASAPI Cfg: Resolved HWND to PID: %lu",
                    actual_target_pid_for_init);
       } else {
-        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "WASAPI Cfg: Could not get PID for HWND %p or HWND is NULL. "
-                   "Falling back.",
+        // Same honesty rule as the PID path below: a window target that cannot
+        // be resolved to a process must not quietly become "the whole system".
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "WASAPI Cfg: HWND %p does not resolve to a process — "
+                   "refusing rather than capturing whole-system audio under a "
+                   "window-scoped request.",
                    hwnd);
-        actual_target_pid_for_init = 0; // Fallback
+        mres = MINIAV_ERROR_INVALID_ARG;
+        goto config_cleanup;
       }
       // For window (process-specific), loopback is on the default render
       // device, filtered by PID
@@ -1201,102 +1752,74 @@ MiniAVResultCode wasapi_configure_loopback(
 
   DWORD stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK;
 
-  // --- Attempt Process-Specific Path (IAudioClient3) ---
+  // --- Per-process scope: ActivateAudioInterfaceAsync (see the block comment
+  // above wasapi_configure_process_loopback) ---
   if (platform_ctx->attempt_process_specific_capture &&
       actual_target_pid_for_init != 0) {
-    platform_ctx->target_process_id =
-        actual_target_pid_for_init; // Store for logging/debugging
-    hr = temp_audio_client->lpVtbl->QueryInterface(
-        temp_audio_client, &IID_IAudioClient3, (void **)&audio_client3);
-    if (SUCCEEDED(hr) && audio_client3) {
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "WASAPI Cfg: IAudioClient3 obtained. Attempting "
-                 "process-specific stream for PID: %lu",
-                 actual_target_pid_for_init);
+    platform_ctx->target_process_id = actual_target_pid_for_init;
 
-      hr = temp_audio_client->lpVtbl->GetMixFormat(temp_audio_client,
-                                                   &platform_ctx->mix_format);
-      if (FAILED(hr)) {
-        miniav_log(
-            MINIAV_LOG_LEVEL_ERROR,
-            "WASAPI Cfg: GetMixFormat (for IAudioClient3 path) failed: 0x%lx",
-            hr);
-        mres = hresult_to_miniavresult(hr);
-        audio_client3->lpVtbl->Release(audio_client3);
-        audio_client3 = NULL;
-        goto config_cleanup_after_temp_client;
-      }
-      platform_ctx->capture_format = (WAVEFORMATEX *)CoTaskMemAlloc(
-          sizeof(WAVEFORMATEX) + platform_ctx->mix_format->cbSize);
-      if (!platform_ctx->capture_format) {
-        mres = MINIAV_ERROR_OUT_OF_MEMORY;
-        audio_client3->lpVtbl->Release(audio_client3);
-        audio_client3 = NULL;
-        goto config_cleanup_after_temp_client;
-      }
-      memcpy(platform_ctx->capture_format, platform_ctx->mix_format,
-             sizeof(WAVEFORMATEX) + platform_ctx->mix_format->cbSize);
-
-      AudioClientProperties client_props = {0};
-      client_props.cbSize = sizeof(AudioClientProperties);
-      client_props.bIsOffload = FALSE;
-      client_props.eCategory = AudioCategory_Other;
-      hr = audio_client3->lpVtbl->SetClientProperties(audio_client3,
-                                                      &client_props);
-      if (FAILED(hr)) {
-        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "WASAPI Cfg: SetClientProperties failed: 0x%lx (continuing)",
-                   hr);
-      }
-
-      hr = audio_client3->lpVtbl->InitializeSharedAudioStream(
-          audio_client3,
-          stream_flags, // This should contain AUDCLNT_STREAMFLAGS_LOOPBACK
-          actual_target_pid_for_init, // This non-zero PID enables
-                                      // process-specific capture
-          platform_ctx->capture_format, NULL);
-
-      if (SUCCEEDED(hr)) {
-        platform_ctx->audio_client = (IAudioClient *)
-            audio_client3; // Store IAudioClient3 as IAudioClient
-        temp_audio_client->lpVtbl->Release(
-            temp_audio_client); // temp_audio_client is now superseded
-        temp_audio_client = NULL;
-        // audio_client3 is now platform_ctx->audio_client, don't release
-        // audio_client3 here
-      } else {
-        miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                   "WASAPI Cfg: InitializeSharedAudioStream for PID %lu "
-                   "failed: 0x%lx. Falling back to standard loopback.",
-                   actual_target_pid_for_init, hr);
-        audio_client3->lpVtbl->Release(audio_client3);
-        audio_client3 = NULL;
-        platform_ctx->attempt_process_specific_capture = FALSE;
-        platform_ctx->target_process_id = 0;
-        stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK; // Reset flags
-        platform_ctx->audio_client = temp_audio_client;
-        temp_audio_client =
-            NULL; // temp_audio_client is now platform_ctx->audio_client
-      }
-    } else {
-      miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "WASAPI Cfg: IAudioClient3 not available/QueryInterface "
-                 "failed (0x%lx). Falling back to standard loopback.",
-                 hr);
-      platform_ctx->attempt_process_specific_capture = FALSE;
-      platform_ctx->target_process_id = 0;
-      platform_ctx->audio_client = temp_audio_client;
-      temp_audio_client =
-          NULL; // temp_audio_client is now platform_ctx->audio_client
+    // Process loopback has no mix format of its own (TRAP 2), but the endpoint
+    // mix format is a good second-choice candidate, so read it while we still
+    // hold an endpoint client.
+    WAVEFORMATEX *endpoint_mix = NULL;
+    if (FAILED(temp_audio_client->lpVtbl->GetMixFormat(temp_audio_client,
+                                                       &endpoint_mix))) {
+      endpoint_mix = NULL;
     }
-  } else { // Standard device/system loopback or fallback from
-           // process-specific
-    platform_ctx->attempt_process_specific_capture =
-        FALSE; // Ensure it's false if we didn't even try
-    platform_ctx->target_process_id = 0;
+
+    MiniAVResultCode pres;
+    if (wasapi_stress_no_process_loopback()) {
+      pres = MINIAV_ERROR_NOT_SUPPORTED;
+    } else {
+      pres = wasapi_configure_process_loopback(
+          platform_ctx, actual_target_pid_for_init, requested_format,
+          endpoint_mix);
+    }
+    if (endpoint_mix)
+      CoTaskMemFree(endpoint_mix);
+
+    if (pres == MINIAV_SUCCESS) {
+      process_scope_active = TRUE;
+      temp_audio_client->lpVtbl->Release(temp_audio_client);
+      temp_audio_client = NULL;
+      ctx->active_target_info.type = MINIAV_LOOPBACK_TARGET_PROCESS;
+      ctx->active_target_info.TARGETHANDLE.process_id =
+          (uint32_t)actual_target_pid_for_init;
+    } else if (!wasapi_allow_system_fallback()) {
+      // DEGRADE HONESTLY. The old code silently substituted whole-system
+      // audio here. A caller cannot tell one process's PCM from the whole
+      // machine's by looking at it, so the substitution was undetectable —
+      // and every per-process caller had been receiving it since the feature
+      // was written. Failing is the only answer that cannot be mistaken for
+      // success. Set MINIAV_LOOPBACK_ALLOW_SYSTEM_FALLBACK=1 to opt back in.
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI Cfg: per-process loopback for PID %lu could not be "
+                 "established — FAILING the configure rather than silently "
+                 "substituting whole-system audio. Set "
+                 "MINIAV_LOOPBACK_ALLOW_SYSTEM_FALLBACK=1 to accept the "
+                 "substitution (it is then reported by "
+                 "MiniAV_Loopback_GetActiveTargetInfo).",
+                 actual_target_pid_for_init);
+      mres = pres;
+      goto config_cleanup_after_temp_client;
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI Cfg: per-process loopback for PID %lu unavailable and "
+                 "MINIAV_LOOPBACK_ALLOW_SYSTEM_FALLBACK=1 — capturing THE "
+                 "WHOLE SYSTEM instead. The delivered audio is NOT scoped to "
+                 "that process; MiniAV_Loopback_GetActiveTargetInfo reports "
+                 "SYSTEM_AUDIO.",
+                 actual_target_pid_for_init);
+      platform_ctx->attempt_process_specific_capture = FALSE;
+    }
+  }
+
+  if (!process_scope_active) {
+    // Standard whole-endpoint loopback: the common, VERIFIED path. Unchanged.
     platform_ctx->audio_client = temp_audio_client;
-    temp_audio_client =
-        NULL; // temp_audio_client is now platform_ctx->audio_client
+    temp_audio_client = NULL;
+    ctx->active_target_info.type = MINIAV_LOOPBACK_TARGET_SYSTEM_AUDIO;
+    ctx->active_target_info.TARGETHANDLE.process_id = 0;
   }
 
   // --- Common Initialization (if not done by IAudioClient3 or if fallback)
@@ -1347,17 +1870,10 @@ MiniAVResultCode wasapi_configure_loopback(
     }
   }
 
-  // Initialize IAudioClient if IAudioClient3 path wasn't taken or
-  // failed and fell back to IAudioClient The IAudioClient3 path calls
-  // InitializeSharedAudioStream which is its form of Initialize. So, only
-  // call Initialize if platform_ctx->audio_client is an IAudioClient that
-  // hasn't been initialized yet. A simple way to check: if it's not an
-  // IAudioClient3 (audio_client3 is NULL after attempts) or if we explicitly
-  // fell back.
-  if (!audio_client3 &&
-      platform_ctx->audio_client) { // audio_client3 is NULL if IAudioClient3
-                                    // path wasn't taken or failed before its
-                                    // assignment to platform_ctx->audio_client
+  // Initialize the endpoint IAudioClient. The per-process path already has an
+  // initialized client (Initialize happens inside the activation helper), so
+  // this whole block is skipped there.
+  if (!process_scope_active && platform_ctx->audio_client) {
     REFERENCE_TIME hns_requested_duration = 0;
 
     // Try event-driven mode first (LOOPBACK | EVENTCALLBACK)
@@ -1437,13 +1953,40 @@ MiniAVResultCode wasapi_configure_loopback(
       }
       platform_ctx->event_driven_capture = FALSE;
     }
-  } else if (audio_client3) {
-    // IAudioClient3 path — polling mode (event callback not used)
-    platform_ctx->event_driven_capture = FALSE;
   }
 
+  // Publish the format WASAPI actually negotiated. Endpoint (whole-system)
+  // loopback has no format negotiation at all: the stream always runs at the
+  // endpoint mix format, so `requested_format` is at best a hint there.
+  // Per-process loopback DOES convert, so the request is usually honoured
+  // verbatim — either way this field is read from the WAVEFORMATEX the stream
+  // was actually initialized with. Everything downstream —
+  // MiniAV_Loopback_GetConfiguredFormat and the `info` stamped on every
+  // delivered PCM buffer (see wasapi_capture_thread_proc) — reads this field,
+  // so it MUST describe the bytes we are about to hand out.
   waveformat_to_miniav_audio_format(platform_ctx->capture_format,
                                     &ctx->configured_video_format);
+  // num_frames is a caller-side chunk hint, not something WASAPI negotiates,
+  // and the conversion above zeroes it. Carry the request through so
+  // GetConfiguredFormat still answers with a usable value; per-buffer
+  // info.num_frames is overwritten with the real delivered count anyway.
+  if (requested_format) {
+    ctx->configured_video_format.num_frames = requested_format->num_frames;
+    if (ctx->configured_video_format.sample_rate !=
+            requested_format->sample_rate ||
+        ctx->configured_video_format.channels != requested_format->channels ||
+        ctx->configured_video_format.format != requested_format->format) {
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "WASAPI Cfg: requested %uHz/%uch/fmt%d but the stream runs at "
+                 "%uHz/%uch/fmt%d. That is what will be delivered and "
+                 "reported.",
+                 requested_format->sample_rate, requested_format->channels,
+                 (int)requested_format->format,
+                 ctx->configured_video_format.sample_rate,
+                 ctx->configured_video_format.channels,
+                 (int)ctx->configured_video_format.format);
+    }
+  }
 
   hr = platform_ctx->audio_client->lpVtbl->GetBufferSize(
       platform_ctx->audio_client, &platform_ctx->buffer_frame_count);
@@ -1465,12 +2008,16 @@ MiniAVResultCode wasapi_configure_loopback(
     goto config_cleanup;
   }
 
-  miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-             "WASAPI Cfg: Loopback configured. Buffer frames: %u. Process "
-             "specific: %s (PID: %lu)",
+  miniav_log(MINIAV_LOG_LEVEL_INFO,
+             "WASAPI Cfg: Loopback configured. Buffer frames: %u. Scope: %s",
              platform_ctx->buffer_frame_count,
-             platform_ctx->attempt_process_specific_capture ? "Yes" : "No",
-             platform_ctx->target_process_id);
+             platform_ctx->process_loopback_active
+                 ? "PER-PROCESS (real, ActivateAudioInterfaceAsync)"
+                 : "WHOLE SYSTEM");
+  if (platform_ctx->process_loopback_active) {
+    miniav_log(MINIAV_LOG_LEVEL_INFO, "WASAPI Cfg:   target PID: %lu",
+               platform_ctx->target_process_id);
+  }
   ctx->is_configured = true;
   mres = MINIAV_SUCCESS;
 
@@ -1606,18 +2153,25 @@ wasapi_get_default_format_platform(const char *target_device_id_utf8,
   WAVEFORMATEX *mix_format = NULL;
   BOOL com_initialized_here = FALSE;
 
-  hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-  if (SUCCEEDED(hr)) {
-    com_initialized_here = TRUE;
-    if (hr == S_FALSE) {
-      miniav_log(MINIAV_LOG_LEVEL_DEBUG,
-                 "WASAPI GetDefaultFormat: COM already initialized.");
-      com_initialized_here = FALSE; // Already initialized by someone else
+  if (!miniav_com_legacy_percall()) {
+    miniav_com_ensure_mta();
+    miniav_com_trace("wasapi_get_default_format", 0);
+  } else {
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    miniav_com_trace("legacy CoInitializeEx/wasapi_get_default_format",
+                     (unsigned long)hr);
+    if (SUCCEEDED(hr)) {
+      com_initialized_here = TRUE;
+      if (hr == S_FALSE) {
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "WASAPI GetDefaultFormat: COM already initialized.");
+        com_initialized_here = FALSE; // Already initialized by someone else
+      }
+    } else if (hr != RPC_E_CHANGED_MODE) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WASAPI GetDefaultFormat: CoInitializeEx failed: 0x%lx", hr);
+      return hresult_to_miniavresult(hr);
     }
-  } else if (hr != RPC_E_CHANGED_MODE) {
-    miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WASAPI GetDefaultFormat: CoInitializeEx failed: 0x%lx", hr);
-    return hresult_to_miniavresult(hr);
   }
 
   hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,

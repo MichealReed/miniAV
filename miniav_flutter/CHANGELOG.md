@@ -1,3 +1,12 @@
+## 0.7.2
+
+- released 08/13/26 - MR
+## 0.7.1
+
+- Version bump to keep the miniav 0.7.1 family aligned; inherits the Windows
+  camera teardown and COM/MF lifetime fixes from miniav_ffi 0.7.1. No API
+  change in this package.
+
 ## 0.7.0
 
 ## 1.0.0

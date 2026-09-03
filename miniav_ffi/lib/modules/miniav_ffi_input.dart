@@ -7,6 +7,7 @@ import 'package:miniav_platform_interface/miniav_platform_types.dart';
 import '../miniav_ffi_bindings.dart' as bindings;
 import '../miniav_ffi_subscriptions.dart';
 import '../miniav_ffi_types.dart';
+import 'package:miniav_ffi/miniav_ffi_callback_trace.dart';
 
 /// FFI implementation of [MiniInputPlatformInterface].
 class MiniAVFFIInputPlatform extends MiniInputPlatformInterface {
@@ -124,10 +125,15 @@ class MiniAVFFIInputContextPlatform extends MiniInputContextPlatformInterface {
     void Function(MiniAVMotionEvent event, Object? userData)? onMotion,
     Object? userData,
   }) async {
-    // TODO(input-p0): wire onMotion to MiniAV_Input_SetMotionCallback once the
-    // native MiniAVMotionEvent struct + ffigen bindings land (the C struct +
-    // iOS/Android backends are the parallel P0 work). Accepted + ignored today
-    // so the shared interface signature holds; web fully implements motion.
+    // Motion is NOT delivered by this backend. The native bindings now mirror
+    // the C struct exactly (motion_rate_hz / motion_mode / motion_callback),
+    // but they are written zero/null and MINIAV_INPUT_TYPE_MOTION is never
+    // requested, so no C backend ever starts a sensor and
+    // miniav_input_deliver_motion's null-check keeps the pointer un-called.
+    // Wiring it up is: set the MOTION bit, install a NativeCallable in
+    // motion_callback, and bind MiniAV_Input_GetLatestMotion for the pull API.
+    // Until then `onMotion` is accepted (the shared interface signature) and
+    // provably never invoked here; the web backend implements motion fully.
     _ensureNotDestroyed();
 
     if (_pendingConfig == null) {
@@ -217,10 +223,13 @@ class MiniAVFFIInputContextPlatform extends MiniInputContextPlatformInterface {
   }
 
   Future<void> _cleanupCallbacks() async {
+    traceCallbackClose('input._keyboardCallbackHandle');
     _keyboardCallbackHandle?.close();
     _keyboardCallbackHandle = null;
+    traceCallbackClose('input._mouseCallbackHandle');
     _mouseCallbackHandle?.close();
     _mouseCallbackHandle = null;
+    traceCallbackClose('input._gamepadCallbackHandle');
     _gamepadCallbackHandle?.close();
     _gamepadCallbackHandle = null;
   }
@@ -240,11 +249,24 @@ class MiniAVFFIInputContextPlatform extends MiniInputContextPlatformInterface {
 
     final res = bindings.MiniAV_Input_StopCapture(_contextHandle!);
 
-    await _cleanupCallbacks();
-
-    if (res != bindings.MiniAVResultCode.MINIAV_SUCCESS &&
-        res != bindings.MiniAVResultCode.MINIAV_ERROR_NOT_RUNNING) {
-      print('Warning: MiniAV_Input_StopCapture failed: ${res.name}');
+    // A non-success code means a native thread did not join
+    // (MINIAV_ERROR_TIMEOUT on the hook thread or the gamepad thread). The
+    // hook-thread timeout returns BEFORE the process-wide active-platform
+    // slot is cleared, so the still-installed low-level hook keeps reading
+    // these callback pointers. Closing the callables then is a
+    // use-after-free that aborts the VM; leak them instead.
+    if (res == bindings.MiniAVResultCode.MINIAV_SUCCESS ||
+        res == bindings.MiniAVResultCode.MINIAV_ERROR_NOT_RUNNING) {
+      await _cleanupCallbacks();
+    } else {
+      _keyboardCallbackHandle = null; // dropped, deliberately not closed
+      _mouseCallbackHandle = null;
+      _gamepadCallbackHandle = null;
+      print(
+        'Warning: MiniAV_Input_StopCapture failed: ${res.name} — a capture '
+        'thread may still be running, so its callbacks are leaked rather '
+        'than closed.',
+      );
     }
   }
 

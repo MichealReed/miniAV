@@ -4,6 +4,7 @@ import '../miniav_ffi_types.dart';
 import '../miniav_ffi_bindings.dart' as bindings;
 import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart';
+import 'package:miniav_ffi/miniav_ffi_callback_trace.dart';
 
 class MiniFFICameraPlatform implements MiniCameraPlatformInterface {
   static final FFIDeviceChangeRegistry _deviceChangeRegistry =
@@ -235,6 +236,7 @@ class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
       }
     }
 
+    traceCallbackOpen('camera.frameCallback');
     _callbackHandle =
         ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>.listener(
           ffiCallback,
@@ -269,6 +271,7 @@ class MiniFFICameraContext implements MiniCameraContextPlatformInterface {
   }
 
   Future<void> _cleanupCallback() async {
+    traceCallbackClose('camera.frameCallback');
     _callbackHandle?.close();
     _callbackHandle = null;
     _stopping = false;

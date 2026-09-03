@@ -89,7 +89,7 @@ big frames) — same reason as `IsolateSoftwareEncoder` (which this mirrors 1:1,
 the TransferableTypedData protocol and `errorsAreFatal` handshake).
 
 Why convert on the UI isolate (for now): the per-frame GPU work is a handful of async
-command submissions (~sub-ms CPU). The gsplats420 offload experiment proved
+command submissions (~sub-ms CPU). A prior isolate-offload experiment proved
 GPU-in-worker + present-handle relay works (after main-isolate Dawn pre-init) if this
 ever shows up in a profile — that is the escape hatch, not the default.
 
@@ -278,6 +278,6 @@ web:     EncodedPacket → WebCodecs VideoDecoder → VideoFrame → minigpu_vie
   (round-trip tolerance ≤1 LSB per plane sample where in-gamut).
 - `tool/gpu_player_validate.dart`: GPU kernel output byte-exact vs CPU reference on
   synthetic + gradient frames (run on main isolate; skips in `dart test` — dev-box Dawn
-  limitation, see gsplats420 GPU test env notes).
+  limitation).
 - E2E smoke (manual, examples/): loopback pipe — `Recorder`-side H.264/AAC encode →
   in-process packet channel → player; verify motion smoothness + stats + no UI jank.

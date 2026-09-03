@@ -28,7 +28,10 @@ import 'package:web/web.dart' as web;
 
 import 'web_backend.dart';
 
-String _toWebCodecsString(VideoCodec codec, Map<String, String> opts) {
+/// WebCodecs codec string for [codec]. Library-visible so the backend can ask
+/// `VideoDecoder.isConfigSupported` about the exact string it would configure
+/// with (HEVC/AV1 support varies by browser AND by hardware).
+String toWebCodecsString(VideoCodec codec, Map<String, String> opts) {
   if (opts.containsKey('codecString')) return opts['codecString']!;
   return switch (codec) {
     VideoCodec.h264 => 'avc1.42E01E',
@@ -51,13 +54,47 @@ class WebCodecsVideoDecoder implements PlatformDecoder {
   final List<DecodedFrame> _pending = [];
   Object? _lastError;
 
+  /// Woken by [_handleFrame] / [_handleError]. See [_awaitOutput].
+  Completer<void>? _output;
+
+  void _wake() {
+    final waiter = _output;
+    _output = null;
+    if (waiter != null && !waiter.isCompleted) waiter.complete();
+  }
+
   void _handleFrame(JSAny? frameJs) {
     if (frameJs == null || frameJs.isUndefined) return;
     final frame = frameJs as web.VideoFrame;
-    _pending.add(_WebDecodedFrame(frame));
+    _pending.add(WebDecodedFrame(frame));
+    _wake();
   }
 
-  void _handleError(JSAny? errJs) => _lastError = errJs;
+  void _handleError(JSAny? errJs) {
+    _lastError = errJs;
+    _wake();
+  }
+
+  /// Waits for the decoder's next output callback, or [_kOutputGrace].
+  ///
+  /// This used to poll with `await Future.delayed(Duration.zero)`, which
+  /// dart2js compiles to `setTimeout(0)` — and browsers CLAMP nested timeouts
+  /// to 4 ms, so the callback fires in ~0.1 ms and we do not look for another
+  /// 4 ms. It costs less here than on the audio path (steady state returns a
+  /// frame buffered by the previous call and never waits at all) but it is the
+  /// same defect, and it runs on exactly the calls that matter: priming, and
+  /// the first frame after a seek.
+  ///
+  /// The grace only runs when a packet legitimately produces no frame, which
+  /// must return null rather than hang.
+  Future<void> _awaitOutput() async {
+    if (_pending.isNotEmpty || _lastError != null) return;
+    final waiter = _output = Completer<void>();
+    await waiter.future.timeout(_kOutputGrace, onTimeout: () {});
+    _output = null;
+  }
+
+  static const Duration _kOutputGrace = Duration(milliseconds: 20);
 
   void _throwIfError() {
     final e = _lastError;
@@ -73,25 +110,29 @@ class WebCodecsVideoDecoder implements PlatformDecoder {
     final dec = _decoder;
     if (dec == null) throw StateError('WebCodecsVideoDecoder: not open');
 
-    // Drain a previously-decoded frame first (steady state = 1 in / 1 out).
-    if (_pending.isNotEmpty) return _pending.removeAt(0);
-
-    final data = packet.data;
+    // Submit FIRST, unconditionally. Returning a buffered frame before
+    // submitting would drop this packet on the floor — the caller has already
+    // taken it off its queue and will never offer it again — and a dropped
+    // packet is not one missing frame but a broken reference chain: every P
+    // frame after it decodes against data that never arrived.
     final chunk = web.EncodedVideoChunk(
       web.EncodedVideoChunkInit(
         type: packet.isKeyframe ? 'key' : 'delta',
         timestamp: packet.ptsUs,
-        data: data.buffer.toJS,
+        // The VIEW, not `.buffer`: `packet.data` is routinely a window into a
+        // larger container buffer, and handing over the whole backing store
+        // would feed the decoder neighbouring packets as if they were this one.
+        data: packet.data.toJS,
       ),
     );
     dec.decode(chunk);
 
-    // Let the output callback (a queued task) run. Bounded yields so we
-    // don't spin if this chunk produced no frame (priming/buffering).
-    for (var i = 0; i < 16 && _pending.isEmpty && _lastError == null; i++) {
-      if (dec.decodeQueueSize == 0 && i > 0) break;
-      await Future<void>.delayed(Duration.zero);
-    }
+    // A frame buffered by an earlier call goes out now: one in, one out, with
+    // the queue absorbing the decoder's latency.
+    if (_pending.isNotEmpty) return _pending.removeAt(0);
+
+    // Wait for the output callback, not for a timer. See [_awaitOutput].
+    await _awaitOutput();
     _throwIfError();
     return _pending.isEmpty ? null : _pending.removeAt(0);
   }
@@ -117,12 +158,15 @@ class WebCodecsVideoDecoder implements PlatformDecoder {
       f.close();
     }
     _pending.clear();
+    // A decode racing this close is waiting on a callback that will now never
+    // come; release it rather than leave it on the grace timeout.
+    _wake();
   }
 
   /// Create and configure a decoder from a [DecoderConfig].
   static Future<WebCodecsVideoDecoder> create(DecoderConfig config) async {
     final dec = WebCodecsVideoDecoder._();
-    final codecStr = _toWebCodecsString(config.codec, config.backendOptions);
+    final codecStr = toWebCodecsString(config.codec, config.backendOptions);
 
     dec._decoder = web.VideoDecoder(
       web.VideoDecoderInit(
@@ -153,8 +197,15 @@ class WebCodecsVideoDecoder implements PlatformDecoder {
 
 /// A [DecodedFrame] wrapping a browser `VideoFrame`. Presented directly via
 /// [webVideoFrame]; [readBytes] falls back to an RGBA `copyTo`.
-class _WebDecodedFrame implements DecodedFrame {
-  _WebDecodedFrame(this._frame);
+///
+/// Library-visible because a `VideoFrame` decoded on a worker arrives on the
+/// main thread as a bare transferred frame and needs the same wrapper. One
+/// definition of "what a browser frame is" for both paths: if the two ever
+/// disagreed about pts or display size, the difference would show up as
+/// playback that changes with whether a payload happened to be built.
+class WebDecodedFrame implements DecodedFrame {
+  /// Wraps [_frame], taking ownership: [close] closes it.
+  WebDecodedFrame(this._frame);
 
   final web.VideoFrame _frame;
   bool _closed = false;

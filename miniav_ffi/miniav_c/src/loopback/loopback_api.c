@@ -6,6 +6,7 @@
 #include "../common/miniav_utils.h" // For miniav_calloc, miniav_free, miniav_strdup
 #include "loopback_context.h"
 #include <stdio.h>  // For sscanf
+#include <stdlib.h> // For getenv (test-only stress flags)
 #include <string.h> // For memset, strncpy
 
 // --- Platform-Specific Ops and Init Declarations ---
@@ -33,6 +34,125 @@ extern MiniAVResultCode miniav_loopback_context_platform_init_linux_pipewire(
     MiniAVLoopbackContext *ctx);
 // Potentially add PipeWire or others here too
 #endif
+
+// Case-insensitive prefix test for the target-ID scheme ("hwnd:", "pid:").
+// The producers of these strings are spread across backends (the WGC screen
+// backend emits them, this file parses them) and they did not agree on case:
+// WGC wrote "PID:1234" while this file matched a case-SENSITIVE "pid:", so
+// every per-process audio target fell through to the MMDevice-ID branch,
+// IMMDeviceEnumerator::GetDevice("PID:1234") failed, and window capture
+// silently degraded to video-only. Producers now emit lowercase; this stays
+// case-insensitive so an ID minted by an older build (or typed by a user)
+// still resolves.
+//
+// TEST-ONLY: MINIAV_LOOPBACK_STRESS_CASE_SENSITIVE_ID=1 restores the pre-fix
+// case-SENSITIVE match so src/loopback/test/test_loopback_format_honesty.c has
+// a positive control for the "PID:" vs "pid:" mismatch. Never set in
+// production.
+static int loopback_stress_case_sensitive_id(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *v = getenv("MINIAV_LOOPBACK_STRESS_CASE_SENSITIVE_ID");
+    cached = (v && v[0] == '1') ? 1 : 0;
+    if (cached) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "Loopback: MINIAV_LOOPBACK_STRESS_CASE_SENSITIVE_ID=1 — "
+                 "target-ID prefixes matched case-sensitively (test-only; "
+                 "reintroduces the silent per-window audio failure).");
+    }
+  }
+  return cached;
+}
+
+static int loopback_id_has_prefix(const char *s, const char *lower_prefix) {
+  if (!s || !lower_prefix)
+    return 0;
+  if (loopback_stress_case_sensitive_id())
+    return strncmp(s, lower_prefix, strlen(lower_prefix)) == 0;
+  for (; *lower_prefix; ++s, ++lower_prefix) {
+    char c = *s;
+    if (c >= 'A' && c <= 'Z')
+      c = (char)(c - 'A' + 'a');
+    if (c != *lower_prefix)
+      return 0;
+  }
+  return 1;
+}
+
+// Cache what the backend ACTUALLY negotiated, not what the caller asked for.
+//
+// CONTRACT: the negotiated format wins and is reported back; a request the
+// endpoint cannot provide is honoured as "closest available", never faked.
+// Every backend already works this way internally — WASAPI shared-mode
+// loopback can only run at the endpoint mix format, PipeWire overwrites its
+// cached format from param_changed, CoreAudio overwrites it from the tap/SCK
+// negotiation — so the only thing missing was this file's read-back. It used
+// to overwrite ctx->configured_video_format with the CALLER'S request right
+// after configure_loopback() succeeded, clobbering the real WASAPI mix format
+// the Windows backend had just stored there. Delivered PCM buffers are stamped
+// from that same field, so on a 44.1 kHz or 5.1 endpoint the bytes were
+// correct and the label was wrong: a consumer muxing them wrote the wrong
+// sample rate into the file header (audible pitch/speed corruption) with no
+// error and no log.
+//
+// Failing instead of adapting was rejected: MiniAV_Loopback_GetConfiguredFormat
+// exists precisely as the read-back channel, and both screen backends hardcode
+// a 48 kHz/2 ch request, so a hard failure would remove screen-capture audio
+// entirely on any non-48 kHz endpoint.
+//
+// TEST-ONLY: MINIAV_LOOPBACK_STRESS_REQUESTED_FORMAT=1 restores the PRE-FIX
+// behaviour (cache the request, clobbering the negotiated format) so
+// src/loopback/test/test_loopback_format_honesty.c has a positive control.
+// Never set this in production. Mirrors MINIAV_WGC_STRESS_* in the WGC backend.
+static int loopback_stress_legacy_format(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *v = getenv("MINIAV_LOOPBACK_STRESS_REQUESTED_FORMAT");
+    cached = (v && v[0] == '1') ? 1 : 0;
+    if (cached) {
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "Loopback: MINIAV_LOOPBACK_STRESS_REQUESTED_FORMAT=1 — "
+                 "reporting the REQUESTED format instead of the negotiated one "
+                 "(test-only; reintroduces silent PCM mislabelling).");
+    }
+  }
+  return cached;
+}
+
+static void loopback_cache_negotiated_format(MiniAVLoopbackContext *ctx,
+                                             const MiniAVAudioInfo *requested) {
+  MiniAVAudioInfo negotiated;
+  memset(&negotiated, 0, sizeof(negotiated));
+
+  if (loopback_stress_legacy_format()) {
+    if (requested)
+      ctx->configured_video_format = *requested;
+    return;
+  }
+
+  if (ctx->ops && ctx->ops->get_configured_video_format &&
+      ctx->ops->get_configured_video_format(ctx, &negotiated) ==
+          MINIAV_SUCCESS &&
+      negotiated.sample_rate > 0 && negotiated.channels > 0) {
+    ctx->configured_video_format = negotiated;
+    if (requested &&
+        (negotiated.sample_rate != requested->sample_rate ||
+         negotiated.channels != requested->channels ||
+         negotiated.format != requested->format)) {
+      miniav_log(MINIAV_LOG_LEVEL_INFO,
+                 "Loopback: endpoint negotiated %uHz/%uch/fmt%d (requested "
+                 "%uHz/%uch/fmt%d). Delivered buffers and "
+                 "GetConfiguredFormat report the NEGOTIATED format.",
+                 negotiated.sample_rate, negotiated.channels,
+                 (int)negotiated.format, requested->sample_rate,
+                 requested->channels, (int)requested->format);
+    }
+  } else if (requested) {
+    // Backend cannot report a negotiated format — fall back to the request so
+    // the field is at least populated (pre-existing behaviour).
+    ctx->configured_video_format = *requested;
+  }
+}
 
 // --- Backend Table ---
 // Order matters for default preference.
@@ -347,7 +467,7 @@ MiniAV_Loopback_Configure(MiniAVLoopbackContextHandle context_handle,
       NULL; // For platforms that use device ID string directly
 
   if (target_device_id_str) {
-    if (strncmp(target_device_id_str, "hwnd:", 5) == 0) {
+    if (loopback_id_has_prefix(target_device_id_str, "hwnd:")) {
       memset(&target_info_struct, 0, sizeof(MiniAVLoopbackTargetInfo));
       target_info_struct.type = MINIAV_LOOPBACK_TARGET_WINDOW;
       void *temp_hwnd_ptr = NULL;
@@ -360,7 +480,7 @@ MiniAV_Loopback_Configure(MiniAVLoopbackContextHandle context_handle,
                    target_device_id_str);
         return MINIAV_ERROR_INVALID_ARG;
       }
-    } else if (strncmp(target_device_id_str, "pid:", 4) == 0) {
+    } else if (loopback_id_has_prefix(target_device_id_str, "pid:")) {
       memset(&target_info_struct, 0, sizeof(MiniAVLoopbackTargetInfo));
       target_info_struct.type = MINIAV_LOOPBACK_TARGET_PROCESS;
       if (sscanf(target_device_id_str + 4, "%u",
@@ -393,9 +513,8 @@ MiniAV_Loopback_Configure(MiniAVLoopbackContextHandle context_handle,
 
   if (res == MINIAV_SUCCESS) {
     ctx->is_configured = true;
-    ctx->configured_video_format =
-        *format; // Cache the requested format, backend might adjust and update
-                 // via get_configured_video_format
+    // Cache what the backend NEGOTIATED (see loopback_cache_negotiated_format).
+    loopback_cache_negotiated_format(ctx, format);
     if (target_info_to_pass) {
       ctx->current_target_info = *target_info_to_pass;
       memset(ctx->current_target_device_id, 0, MINIAV_DEVICE_ID_MAX_LEN);
@@ -446,7 +565,7 @@ MiniAVResultCode MiniAV_Loopback_ConfigureWithTargetInfo(
       ctx, target_info, NULL, format); // device_id is NULL
   if (res == MINIAV_SUCCESS) {
     ctx->is_configured = true;
-    ctx->configured_video_format = *format; // Cache requested
+    loopback_cache_negotiated_format(ctx, format);
     ctx->current_target_info = *target_info;
     memset(ctx->current_target_device_id, 0, MINIAV_DEVICE_ID_MAX_LEN);
     miniav_log(MINIAV_LOG_LEVEL_INFO,
@@ -560,6 +679,26 @@ MiniAV_Loopback_GetConfiguredFormat(MiniAVLoopbackContextHandle context_handle,
       "Cannot get configured format: context not configured or op missing.");
   return MINIAV_ERROR_NOT_INITIALIZED;
 }
+MiniAVResultCode
+MiniAV_Loopback_GetActiveTargetInfo(MiniAVLoopbackContextHandle context_handle,
+                                    MiniAVLoopbackTargetInfo *info_out) {
+  MiniAVLoopbackContext *ctx = (MiniAVLoopbackContext *)context_handle;
+  if (!ctx) {
+    return MINIAV_ERROR_INVALID_HANDLE;
+  }
+  if (!info_out) {
+    return MINIAV_ERROR_INVALID_ARG;
+  }
+  memset(info_out, 0, sizeof(*info_out));
+  if (!ctx->is_configured) {
+    return MINIAV_ERROR_NOT_INITIALIZED;
+  }
+  // Deliberately NOT ctx->current_target_info: that is the request. This is
+  // what the backend achieved. See MiniAVLoopbackContext::active_target_info.
+  *info_out = ctx->active_target_info;
+  return MINIAV_SUCCESS;
+}
+
 // --- Loopback device change / context-lost subscriptions ---
 
 static MiniAVDeviceWatcher *g_loopback_watcher = NULL;

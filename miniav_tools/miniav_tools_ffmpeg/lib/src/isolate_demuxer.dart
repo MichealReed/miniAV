@@ -1,24 +1,27 @@
-/// Isolate-hosted demuxer.
+/// Worker-hosted demuxer.
 ///
 /// `av_read_frame` is synchronous FFI, and on live byte-pipe inputs it
 /// BLOCKS until the transport delivers more bytes — so the demuxer must live
-/// on a worker isolate. This wrapper mirrors `IsolateVideoDecoder`'s
-/// protocol; the data path for live streams never hops isolates: the feed
-/// side (main isolate) writes straight into the shim's native byte pipe via
-/// FFI, and the worker's `av_read_frame` unblocks on the C condition
+/// on a worker. Hosted with `package:spawn`, which supplies the handshake,
+/// request/response correlation, and the bounded-then-forced shutdown this
+/// file used to hand-roll. The data path for live streams never hops workers:
+/// the feed side (main isolate) writes straight into the shim's native byte
+/// pipe via FFI, and the worker's `av_read_frame` unblocks on the C condition
 /// variable.
 ///
 /// Shutdown protocol for a possibly-starved live worker: close the pipe
-/// FIRST (main isolate, unblocks the reader with EOF), then send 'close',
-/// then destroy the pipe once the worker confirms.
+/// FIRST (main isolate, unblocks the reader with EOF), then close the worker,
+/// then destroy the pipe. That order is not negotiable and `spawn` cannot do
+/// it for us — killing an isolate does not preempt a blocking native call, so
+/// only the code that owns the pipe can free the reader.
 library;
 
 import 'dart:async';
 import 'dart:ffi';
-import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
+import 'package:spawn/spawn.dart';
 
 import 'ffmpeg_bindings.dart' show ensureFFmpegLoaded;
 import 'ffmpeg_demuxer.dart';
@@ -93,11 +96,71 @@ class _PipeFeeder {
   }
 }
 
+/// The worker: it holds the FFmpeg demuxer and answers requests.
+///
+/// `open` is a request rather than part of the handshake because opening can
+/// fail (and, on a stalled live stream, can block): as a request it gets a
+/// timeout and an error path, where a handshake would only get a hang.
+Future<void> demuxWorker(WorkerChannel channel) async {
+  final init = channel.initialMessage! as Map<String, Object?>;
+  FfmpegDemuxer? demuxer;
+
+  channel.handleRequests((Object? request) async {
+    switch (request) {
+      case 'open':
+        if (!await ensureFFmpegLoaded()) {
+          throw StateError('FFmpeg failed to load in worker isolate');
+        }
+        final mode = init['mode'] as String;
+        final arg = init['arg'];
+        final opened = switch (mode) {
+          'file' => FfmpegDemuxer.openUrl(arg! as String),
+          'bytes' => FfmpegDemuxer.openBytes(arg! as Uint8List),
+          _ => FfmpegDemuxer.openPipe(
+            Pointer<Void>.fromAddress(arg! as int),
+            ownsPipe: false, // main isolate owns + destroys
+          ),
+        };
+        demuxer = opened;
+        return TracksMessage(
+          opened.tracks,
+          opened.durationUs,
+          opened.isSeekable,
+        );
+
+      case 'read':
+        final packet = await demuxer!.readPacket();
+        return packet == null ? null : PacketMessage(packet);
+
+      case ['seek', final int timestampUs]:
+        await demuxer!.seek(timestampUs);
+        return null;
+
+      default:
+        throw StateError('unknown op: $request');
+    }
+  });
+
+  // The host closes the pipe before closing us, so a starved `av_read_frame`
+  // has already returned EOF by the time this resumes.
+  await channel.onClose;
+  try {
+    await demuxer?.close();
+  } on Object {
+    // Teardown is best effort; the host is already gone.
+  }
+}
+
+/// The worker's identity. `protocol:` registers the wire types on both ends.
+const demuxEntry = SpawnEntry.inline(
+  demuxWorker,
+  asset: 'packages/miniav_tools_ffmpeg/workers/demux_worker',
+  protocol: registerDemuxProtocol,
+);
+
 class IsolateDemuxer implements PlatformDemuxer {
   IsolateDemuxer._(
-    this._isolate,
-    this._toWorker,
-    this._fromWorker,
+    this._worker,
     this._tracks,
     this._durationUs,
     this._isSeekable,
@@ -106,9 +169,7 @@ class IsolateDemuxer implements PlatformDemuxer {
     this._feeder,
   );
 
-  final Isolate _isolate;
-  final SendPort _toWorker;
-  final ReceivePort _fromWorker;
+  final Worker _worker;
   final List<TrackInfo> _tracks;
   final int? _durationUs;
   final bool _isSeekable;
@@ -118,8 +179,6 @@ class IsolateDemuxer implements PlatformDemuxer {
   final Pointer<Void>? _pipe;
   final _PipeFeeder? _feeder;
 
-  final Map<int, Completer<List<dynamic>>> _pending = {};
-  int _nextId = 0;
   bool _closed = false;
 
   static Future<IsolateDemuxer> open(DemuxerConfig config) async {
@@ -131,6 +190,7 @@ class IsolateDemuxer implements PlatformDemuxer {
     final input = config.input;
 
     Object? workerArg;
+    List<Object>? transfer;
     var mode = 'file';
     if (input is FileDemuxerInput) {
       workerArg = input.path;
@@ -150,7 +210,8 @@ class IsolateDemuxer implements PlatformDemuxer {
           // Seekable in-worker open from a transferred copy (moov-at-end
           // MP4s need seeks — a forward-only pipe cannot probe them).
           mode = 'bytes';
-          workerArg = TransferableTypedData.fromList([bytes]);
+          workerArg = bytes;
+          transfer = <Object>[bytes.buffer];
         case StreamDemuxerInput(:final stream, :final bufferBytes):
           pipe = shim.bytepipeCreate(bufferBytes);
           if (pipe == nullptr) {
@@ -172,33 +233,16 @@ class IsolateDemuxer implements PlatformDemuxer {
       }
     }
 
-    final fromWorker = ReceivePort();
-    final handshake = Completer<List<dynamic>>();
-    late final IsolateDemuxer self;
-    var ready = false;
-    fromWorker.listen((dynamic msg) {
-      final list = msg as List;
-      if (!ready) {
-        ready = true;
-        handshake.complete(list);
-        return;
-      }
-      final id = list[1] as int;
-      self._pending.remove(id)?.complete(list);
-    });
-
-    final Isolate isolate;
+    final Worker worker;
     try {
-      isolate = await Isolate.spawn(
-        _demuxWorkerMain,
-        [fromWorker.sendPort, mode, workerArg],
-        debugName: 'IsolateDemuxer($mode)',
-        errorsAreFatal: true,
+      worker = await spawn(
+        demuxEntry,
+        message: <String, Object?>{'mode': mode, 'arg': workerArg},
+        transfer: transfer,
       );
-    } catch (e) {
-      fromWorker.close();
+    } on Object catch (e) {
       cleanupPipe();
-      throw CodecInitException(_kBackend, 'isolate spawn failed: $e');
+      throw CodecInitException(_kBackend, 'worker spawn failed: $e');
     }
 
     // Open timeout: a live byte stream that stalls mid-probe
@@ -216,64 +260,59 @@ class IsolateDemuxer implements PlatformDemuxer {
       return mode == 'pipe' ? 15000 : null;
     }();
 
-    final List<dynamic> readyMsg;
+    // Deliberately NOT `request(timeout:)`: on a timeout we still need this
+    // future, to learn when the worker has released the pipe.
+    final opening = worker.request<TracksMessage>('open');
+    // A late failure must not surface as an unhandled async error after we
+    // have already given up on it.
+    unawaited(opening.then((_) {}, onError: (Object _, StackTrace __) {}));
+
+    final TracksMessage info;
     try {
-      readyMsg = openTimeoutMs != null
-          ? await handshake.future.timeout(
-              Duration(milliseconds: openTimeoutMs),
-            )
-          : await handshake.future;
+      info = openTimeoutMs != null
+          ? await opening.timeout(Duration(milliseconds: openTimeoutMs))
+          : await opening;
     } on TimeoutException {
       // Unblock the worker's blocked probe (read cb → EOF → open fails), then
       // wait briefly for it to unwind and release the pipe before destroying.
       if (pipe != null) shim!.bytepipeClose(pipe);
       var workerReleased = false;
       try {
-        await handshake.future.timeout(const Duration(seconds: 2));
-        workerReleased = true; // worker sent its (now-error) handshake
+        await opening.timeout(const Duration(seconds: 2));
+        workerReleased = true; // answered normally
       } on TimeoutException {
-        // Still blocked — leak the pipe rather than risk a use-after-free by
-        // destroying it under a live native reader.
+        // Still blocked inside the native probe — leak the pipe rather than
+        // risk a use-after-free by destroying it under a live reader.
+      } on Object {
+        // Answered by throwing: the open failed, which means it unwound out
+        // of the native call and is no longer touching the pipe.
+        workerReleased = true;
       }
       feeder?.stop();
-      fromWorker.close();
-      isolate.kill(priority: Isolate.immediate);
+      await worker.close(force: true);
       if (workerReleased && pipe != null) shim!.bytepipeDestroy(pipe);
       throw CodecInitException(
         _kBackend,
         'open timed out after ${openTimeoutMs}ms — the stream did not deliver '
         'enough data to probe (dead or stalled connection?)',
       );
-    }
-    if (readyMsg[0] != 'ready') {
-      fromWorker.close();
-      isolate.kill(priority: Isolate.immediate);
+    } on Object catch (e) {
+      // The worker refused to open: a RemoteWorkerError carrying whatever
+      // FfmpegDemuxer threw.
+      await worker.close(force: true);
       cleanupPipe();
-      throw CodecInitException(_kBackend, readyMsg[1] as String);
+      throw CodecInitException(_kBackend, _describe(e));
     }
 
-    return self = IsolateDemuxer._(
-      isolate,
-      readyMsg[1] as SendPort,
-      fromWorker,
-      (readyMsg[2] as List).cast<TrackInfo>(),
-      readyMsg[3] as int?,
-      readyMsg[4] as bool,
+    return IsolateDemuxer._(
+      worker,
+      info.tracks,
+      info.durationUs,
+      info.isSeekable,
       shim,
       pipe,
       feeder,
     );
-  }
-
-  Future<List<dynamic>> _request(List<dynamic> msg) {
-    if (_closed) {
-      throw const CodecRuntimeException(_kBackend, 'demuxer closed');
-    }
-    final id = _nextId++;
-    final completer = Completer<List<dynamic>>();
-    _pending[id] = completer;
-    _toWorker.send([msg[0], id, ...msg.sublist(1)]);
-    return completer.future;
   }
 
   @override
@@ -287,11 +326,16 @@ class IsolateDemuxer implements PlatformDemuxer {
 
   @override
   Future<EncodedPacket?> readPacket() async {
-    final reply = await _request(['read']);
-    if (reply[0] == 'err') {
-      throw CodecRuntimeException(_kBackend, reply[2] as String);
+    if (_closed) {
+      throw const CodecRuntimeException(_kBackend, 'demuxer closed');
     }
-    if (reply[2] as bool != true) {
+    final PacketMessage? reply;
+    try {
+      reply = await _worker.request<PacketMessage?>('read');
+    } on Object catch (e) {
+      throw CodecRuntimeException(_kBackend, _describe(e));
+    }
+    if (reply == null) {
       // EOF — surface a transport error (if the feed died) exactly once.
       final err = _feeder?.error;
       if (err != null) {
@@ -300,14 +344,7 @@ class IsolateDemuxer implements PlatformDemuxer {
       }
       return null;
     }
-    return EncodedPacket(
-      data: (reply[3] as TransferableTypedData).materialize().asUint8List(),
-      ptsUs: reply[4] as int,
-      dtsUs: reply[5] as int,
-      durationUs: reply[6] as int,
-      isKeyframe: reply[7] as bool,
-      trackIndex: reply[8] as int,
-    );
+    return reply.packet;
   }
 
   @override
@@ -318,9 +355,13 @@ class IsolateDemuxer implements PlatformDemuxer {
         'seek unsupported on a non-seekable (live byte stream) input',
       );
     }
-    final reply = await _request(['seek', timestampUs]);
-    if (reply[0] == 'err') {
-      throw CodecRuntimeException(_kBackend, reply[2] as String);
+    if (_closed) {
+      throw const CodecRuntimeException(_kBackend, 'demuxer closed');
+    }
+    try {
+      await _worker.request<Object?>(<Object?>['seek', timestampUs]);
+    } on Object catch (e) {
+      throw CodecRuntimeException(_kBackend, _describe(e));
     }
   }
 
@@ -330,99 +371,21 @@ class IsolateDemuxer implements PlatformDemuxer {
     _feeder?.stop();
     final pipe = _pipe;
     // Unblock a starved av_read_frame BEFORE asking the worker to close.
+    // Killing the worker cannot do this: an isolate inside a blocking FFI
+    // call does not observe a kill until it returns.
     if (pipe != null) _shim!.bytepipeClose(pipe);
-    try {
-      // Bounded: if the worker isolate already died (e.g. a native FFmpeg
-      // crash on corrupt input — no onExit listener is registered), the
-      // 'close' reply never arrives and awaiting it would hang forever.
-      await _request(['close']).timeout(const Duration(seconds: 2));
-    } catch (_) {
-      // Worker may already be gone, or timed out — proceed to force teardown.
-    }
     _closed = true;
-    for (final c in _pending.values) {
-      if (!c.isCompleted) {
-        c.completeError(
-          const CodecRuntimeException(_kBackend, 'demuxer closed'),
-        );
-      }
-    }
-    _pending.clear();
-    _fromWorker.close();
-    _isolate.kill(priority: Isolate.beforeNextEvent);
+    // Bounded, then forced — and in-flight requests are failed for us. If the
+    // worker already died (a native FFmpeg crash on corrupt input), the grace
+    // period expires and the kill still happens.
+    await _worker.close(grace: const Duration(seconds: 2));
     if (pipe != null) _shim!.bytepipeDestroy(pipe);
   }
 }
 
-Future<void> _demuxWorkerMain(List<dynamic> args) async {
-  final toMain = args[0] as SendPort;
-  final mode = args[1] as String;
-
-  final FfmpegDemuxer dem;
-  try {
-    final loaded = await ensureFFmpegLoaded();
-    if (!loaded) {
-      toMain.send(['error', 'FFmpeg failed to load in worker isolate']);
-      return;
-    }
-    dem = switch (mode) {
-      'file' => FfmpegDemuxer.openUrl(args[2] as String),
-      'bytes' => FfmpegDemuxer.openBytes(
-        (args[2] as TransferableTypedData).materialize().asUint8List(),
-      ),
-      _ => FfmpegDemuxer.openPipe(
-        Pointer<Void>.fromAddress(args[2] as int),
-        ownsPipe: false, // main isolate owns + destroys
-      ),
-    };
-  } catch (e) {
-    toMain.send(['error', 'demuxer open failed in worker: $e']);
-    return;
-  }
-
-  final commands = ReceivePort();
-  toMain.send([
-    'ready',
-    commands.sendPort,
-    dem.tracks, // plain const objects — isolate-sendable
-    dem.durationUs,
-    dem.isSeekable,
-  ]);
-
-  await for (final dynamic raw in commands) {
-    final msg = raw as List;
-    final op = msg[0] as String;
-    final id = msg[1] as int;
-    try {
-      switch (op) {
-        case 'read':
-          final pkt = await dem.readPacket();
-          toMain.send([
-            'pkt',
-            id,
-            pkt != null,
-            pkt != null ? TransferableTypedData.fromList([pkt.data]) : null,
-            pkt?.ptsUs ?? 0,
-            pkt?.dtsUs ?? 0,
-            pkt?.durationUs ?? 0,
-            pkt?.isKeyframe ?? false,
-            pkt?.trackIndex ?? 0,
-          ]);
-        case 'seek':
-          await dem.seek(msg[2] as int);
-          toMain.send(['ok', id]);
-        case 'close':
-          try {
-            await dem.close();
-          } catch (_) {}
-          toMain.send(['closed', id, true]);
-          commands.close();
-          return;
-        default:
-          toMain.send(['err', id, 'unknown op: $op']);
-      }
-    } catch (e) {
-      toMain.send(['err', id, e.toString()]);
-    }
-  }
-}
+/// The message from whatever the worker threw, without the wrapper noise.
+String _describe(Object error) => switch (error) {
+  RemoteWorkerError(:final message) => message,
+  StateError(:final message) => message,
+  _ => error.toString(),
+};

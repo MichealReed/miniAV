@@ -11,10 +11,17 @@ if(NOT FFMPEG_INCLUDE_DIR OR NOT FFMPEG_LIB_DIR)
   message(FATAL_ERROR "FFMPEG_INCLUDE_DIR and FFMPEG_LIB_DIR must be set")
 endif()
 
-add_library(miniav_tools_ffmpeg_shim SHARED shim.c)
+# dart_dl/dart_api_dl.c: vendored Dart SDK dynamic-linking shim. It resolves
+# Dart_PostCObject_DL etc. at runtime so the av_log bridge can deliver log
+# lines to a Dart NATIVE PORT rather than a NativeCallable function pointer —
+# a process-global function pointer outlives the isolate that created it and
+# aborts the VM when invoked afterwards.
+add_library(miniav_tools_ffmpeg_shim SHARED shim.c dart_dl/dart_api_dl.c)
 set_target_properties(miniav_tools_ffmpeg_shim PROPERTIES C_STANDARD 11)
 
-target_include_directories(miniav_tools_ffmpeg_shim PRIVATE "${FFMPEG_INCLUDE_DIR}")
+target_include_directories(miniav_tools_ffmpeg_shim PRIVATE
+  "${FFMPEG_INCLUDE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/dart_dl")
 target_link_directories(miniav_tools_ffmpeg_shim PRIVATE "${FFMPEG_LIB_DIR}")
 # avformat: demux open/byte-pipe helpers (shim ABI v15+).
 target_link_libraries(miniav_tools_ffmpeg_shim PRIVATE avcodec avutil avformat)

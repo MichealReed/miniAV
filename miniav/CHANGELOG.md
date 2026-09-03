@@ -1,5 +1,17 @@
 # miniav CHANGELOG
 
+## 0.7.2
+
+- released 08/13/26 - MR
+## 0.7.1
+
+- Picks up miniav_ffi 0.7.1: destroying a Windows camera context no longer
+  frees the Media Foundation source-reader callback while MF still holds it,
+  and COM/MF initialisation is now process-lifetime rather than driven from
+  individual FFI calls (the Dart VM runs an isolate's calls on threads borrowed
+  from a pool, so per-call CoInitializeEx/CoUninitialize could not be balanced).
+  No API change in this package.
+
 ## 0.7.0
 
 ### GPU buffer handoff contract (Windows)

@@ -99,6 +99,17 @@ MiniAVResultCode MiniAV_SetLogCallback(MiniAVLogCallback callback,
   return MINIAV_SUCCESS;
 }
 
+MiniAVResultCode MiniAV_InitDartApi(void *initialize_api_dl_data) {
+  return miniav_init_dart_api(initialize_api_dl_data) == 0
+             ? MINIAV_SUCCESS
+             : MINIAV_ERROR_NOT_SUPPORTED;
+}
+
+MiniAVResultCode MiniAV_SetLogPort(int64_t port) {
+  miniav_set_log_port(port);
+  return MINIAV_SUCCESS;
+}
+
 MiniAVResultCode MiniAV_SetLogLevel(MiniAVLogLevel level) {
   miniav_set_log_level(level);
   return MINIAV_SUCCESS;

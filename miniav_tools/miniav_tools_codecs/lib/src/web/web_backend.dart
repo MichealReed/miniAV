@@ -19,6 +19,7 @@ import 'web_codecs_audio_decoder.dart';
 import 'web_codecs_audio_encoder.dart';
 import 'web_codecs_decoder.dart';
 import 'web_codecs_encoder.dart';
+import 'worker_decoder.dart';
 
 class WebCodecsBackend extends MiniAVToolsBackend {
   static const String backendName = 'webcodecs';
@@ -116,7 +117,20 @@ class WebCodecsBackend extends MiniAVToolsBackend {
   }) async {
     if (!_videoCodecs.contains(config.codec)) return null;
     if (!WebCapability.hasVideoDecoder) return null;
-    return WebCodecsVideoDecoder.create(config);
+    // Symmetry with createEncoder (and with audio decode): HEVC/AV1 support
+    // varies by browser and by hardware, so ask before committing rather than
+    // configuring and throwing.
+    if (!await WebCapability.isVideoDecoderSupported(
+      toWebCodecsString(config.codec, config.backendOptions),
+    )) {
+      return null;
+    }
+    // Prefer the worker: the browser decodes off-thread either way, but the
+    // bridge to it (chunk in, poll the event loop, frame out) was running on
+    // the UI thread. Null means no worker was available — decode in process,
+    // exactly as this did before workers existed.
+    return await WorkerVideoDecoder.tryCreate(config) ??
+        await WebCodecsVideoDecoder.create(config);
   }
 
   @override
@@ -136,7 +150,19 @@ class WebCodecsBackend extends MiniAVToolsBackend {
   }) async {
     if (!_audioCodecs.contains(config.codec)) return null;
     if (!WebCapability.hasAudioDecoder) return null;
-    return WebCodecsAudioDecoder.create(config);
+    // The constructor existing does not mean this codec is implemented. Ask
+    // before committing, so an unsupported codec falls through to a lower
+    // -priority backend (e.g. the decodeAudioData fallback) instead of
+    // configuring and throwing in the caller's face.
+    if (!await WebCapability.isAudioDecoderSupported(
+      audioCodecString(config.codec, config.backendOptions),
+      sampleRate: config.sampleRate ?? 48000,
+      channels: config.channels ?? 2,
+    )) {
+      return null;
+    }
+    return await WorkerAudioDecoder.tryCreate(config) ??
+        await WebCodecsAudioDecoder.create(config);
   }
 
   @override

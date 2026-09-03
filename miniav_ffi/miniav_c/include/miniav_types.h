@@ -313,8 +313,17 @@ typedef void (*MiniAVGamepadCallback)(const MiniAVGamepadEvent *event,
 typedef void (*MiniAVMotionCallback)(const MiniAVMotionEvent *event,
                                      void *user_data);
 
-// Input configuration. NOTE: motion fields are APPENDED so existing
-// keyboard/mouse/gamepad byte offsets are unchanged (ABI-additive).
+// Input configuration.
+//
+// NOTE: the motion fields are APPENDED, so existing keyboard/mouse/gamepad
+// byte OFFSETS are unchanged. That is NOT the same as ABI-compatible: sizeof()
+// grew 48 -> 64, and sizeof() is what callers allocate with and what
+// `ctx->config = *config;` copies. A binding in another language that still
+// describes the 48-byte shape under-allocates, and the copy reads 16 bytes of
+// unrelated heap straight into motion_mode / motion_callback — a garbage
+// function pointer that input_api.c will happily call. Appending a field here
+// means every binding must be regenerated AND its size re-asserted; see
+// MiniAV_ABI_StructSize() in miniav_capture.h.
 typedef struct {
   uint32_t input_types;         // Bitmask of MiniAVInputType
   uint32_t mouse_throttle_hz;   // 0 = no throttle, default = 60
@@ -341,9 +350,14 @@ typedef enum {
 // Receives formatted log messages when registered via MiniAV_SetLogCallback.
 // OWNERSHIP: `message` is heap-allocated and OWNED BY THE RECEIVER — release
 // it with MiniAV_Free once consumed. (It must outlive the call because
-// receivers may dispatch it asynchronously to another thread, e.g. the Dart
-// FFI shim's NativeCallable.listener.) May be invoked from any capture or
-// worker thread.
+// receivers may dispatch it asynchronously to another thread.) May be invoked
+// from any capture or worker thread.
+//
+// NOT FOR DART EMBEDDERS. This registry is process-global, so a Dart
+// NativeCallable installed here outlives the isolate that created it and
+// aborts the VM when a capture thread logs afterwards. Use
+// MiniAV_InitDartApi + MiniAV_SetLogPort instead; they take precedence over
+// this callback when a port is set.
 typedef void (*MiniAVLogCallback)(MiniAVLogLevel level, const char *message,
                                   void *user_data);
 

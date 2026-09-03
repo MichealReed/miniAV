@@ -13,3 +13,7 @@ dependency_overrides:
     path: ../../../minigpu/minigpu_ffi
   minigpu_web:
     path: ../../../minigpu/minigpu_web
+  # spawn is not on pub.dev yet; publishing it is a prerequisite for
+  # publishing this package.
+  spawn:
+    path: ../../../spawn/spawn

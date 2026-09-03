@@ -34,6 +34,22 @@ MiniAVResultCode MiniAV_GetVersion(
 @ffi.Native<ffi.Pointer<ffi.Char> Function()>()
 external ffi.Pointer<ffi.Char> MiniAV_GetVersionString();
 
+/// sizeof() of a C struct that crosses the FFI boundary, or 0 for an unknown
+/// name. `sizeOf<T>()` on the Dart twin MUST equal this: a Dart struct written
+/// before a C field was APPENDED is smaller, so `calloc<T>()` under-allocates
+/// and the first `*dst = *src;` on the C side reads past the allocation.
+/// Asserted for every name in test/abi_struct_size_test.dart.
+@ffi.Native<ffi.Uint32 Function(ffi.Pointer<ffi.Char>)>()
+external int MiniAV_ABI_StructSize(ffi.Pointer<ffi.Char> struct_name);
+
+/// Number of structs in the C ABI table; iterate with [MiniAV_ABI_StructNameAt]
+/// so a struct added on the C side cannot stay silently unchecked in Dart.
+@ffi.Native<ffi.Uint32 Function()>()
+external int MiniAV_ABI_StructCount();
+
+@ffi.Native<ffi.Pointer<ffi.Char> Function(ffi.Uint32)>()
+external ffi.Pointer<ffi.Char> MiniAV_ABI_StructNameAt(int index);
+
 @ffi.Native<ffi.Int Function(MiniAVLogCallback, ffi.Pointer<ffi.Void>)>(
   symbol: 'MiniAV_SetLogCallback',
 )
@@ -1557,6 +1573,116 @@ final class MiniAVGamepadEvent extends ffi.Struct {
   external bool connected;
 }
 
+final class MiniAVVec3 extends ffi.Struct {
+  @ffi.Double()
+  external double x;
+
+  @ffi.Double()
+  external double y;
+
+  @ffi.Double()
+  external double z;
+}
+
+final class MiniAVQuat extends ffi.Struct {
+  @ffi.Double()
+  external double x;
+
+  @ffi.Double()
+  external double y;
+
+  @ffi.Double()
+  external double z;
+
+  @ffi.Double()
+  external double w;
+}
+
+enum MiniAVMotionMode {
+  MINIAV_MOTION_MODE_RAW_DEVICE_FRAME(0),
+  MINIAV_MOTION_MODE_FUSED_SCREEN_STABLE(1);
+
+  final int value;
+  const MiniAVMotionMode(this.value);
+
+  static MiniAVMotionMode fromValue(int value) => switch (value) {
+    0 => MINIAV_MOTION_MODE_RAW_DEVICE_FRAME,
+    1 => MINIAV_MOTION_MODE_FUSED_SCREEN_STABLE,
+    _ => throw ArgumentError('Unknown value for MiniAVMotionMode: $value'),
+  };
+}
+
+enum MiniAVAttitudeRef {
+  MINIAV_ATTITUDE_REF_RELATIVE_DRIFT_FREE(0),
+  MINIAV_ATTITUDE_REF_ABSOLUTE_MAG_NORTH(1);
+
+  final int value;
+  const MiniAVAttitudeRef(this.value);
+
+  static MiniAVAttitudeRef fromValue(int value) => switch (value) {
+    0 => MINIAV_ATTITUDE_REF_RELATIVE_DRIFT_FREE,
+    1 => MINIAV_ATTITUDE_REF_ABSOLUTE_MAG_NORTH,
+    _ => throw ArgumentError('Unknown value for MiniAVAttitudeRef: $value'),
+  };
+}
+
+enum MiniAVDisplayRotation {
+  MINIAV_DISPLAY_ROTATION_0(0),
+  MINIAV_DISPLAY_ROTATION_90(1),
+  MINIAV_DISPLAY_ROTATION_180(2),
+  MINIAV_DISPLAY_ROTATION_270(3);
+
+  final int value;
+  const MiniAVDisplayRotation(this.value);
+
+  static MiniAVDisplayRotation fromValue(int value) => switch (value) {
+    0 => MINIAV_DISPLAY_ROTATION_0,
+    1 => MINIAV_DISPLAY_ROTATION_90,
+    2 => MINIAV_DISPLAY_ROTATION_180,
+    3 => MINIAV_DISPLAY_ROTATION_270,
+    _ => throw ArgumentError('Unknown value for MiniAVDisplayRotation: $value'),
+  };
+}
+
+final class MiniAVMotionEvent extends ffi.Struct {
+  @ffi.Uint64()
+  external int timestamp_us;
+
+  external MiniAVVec3 gyro;
+
+  external MiniAVVec3 accel;
+
+  external MiniAVVec3 linear_accel;
+
+  external MiniAVVec3 gravity;
+
+  external MiniAVVec3 magnetometer;
+
+  @ffi.Bool()
+  external bool has_magnetometer;
+
+  external MiniAVQuat orientation;
+
+  @ffi.UnsignedInt()
+  external int refAsInt;
+
+  MiniAVAttitudeRef get ref => MiniAVAttitudeRef.fromValue(refAsInt);
+
+  @ffi.Double()
+  external double heading_deg;
+
+  @ffi.Bool()
+  external bool has_heading;
+
+  external MiniAVQuat screen_orientation;
+
+  @ffi.UnsignedInt()
+  external int displayAsInt;
+
+  MiniAVDisplayRotation get display =>
+      MiniAVDisplayRotation.fromValue(displayAsInt);
+}
+
 typedef MiniAVKeyboardCallbackFunction =
     ffi.Void Function(
       ffi.Pointer<MiniAVKeyboardEvent> event,
@@ -1593,6 +1719,18 @@ typedef DartMiniAVGamepadCallbackFunction =
     );
 typedef MiniAVGamepadCallback =
     ffi.Pointer<ffi.NativeFunction<MiniAVGamepadCallbackFunction>>;
+typedef MiniAVMotionCallbackFunction =
+    ffi.Void Function(
+      ffi.Pointer<MiniAVMotionEvent> event,
+      ffi.Pointer<ffi.Void> user_data,
+    );
+typedef DartMiniAVMotionCallbackFunction =
+    void Function(
+      ffi.Pointer<MiniAVMotionEvent> event,
+      ffi.Pointer<ffi.Void> user_data,
+    );
+typedef MiniAVMotionCallback =
+    ffi.Pointer<ffi.NativeFunction<MiniAVMotionCallbackFunction>>;
 
 final class MiniAVInputConfig extends ffi.Struct {
   @ffi.Uint32()
@@ -1611,6 +1749,17 @@ final class MiniAVInputConfig extends ffi.Struct {
   external MiniAVGamepadCallback gamepad_callback;
 
   external ffi.Pointer<ffi.Void> user_data;
+
+  @ffi.Uint32()
+  external int motion_rate_hz;
+
+  @ffi.UnsignedInt()
+  external int motion_modeAsInt;
+
+  MiniAVMotionMode get motion_mode =>
+      MiniAVMotionMode.fromValue(motion_modeAsInt);
+
+  external MiniAVMotionCallback motion_callback;
 }
 
 enum MiniAVLogLevel {

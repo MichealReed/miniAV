@@ -23,7 +23,7 @@ class _WarmupTestBackend extends MiniAVToolsBackend {
 
   final Stream<WarmupProgress> Function() warmupFn;
 
-  _WarmupTestBackend(this.name, {this.priority = 99, required this.warmupFn});
+  _WarmupTestBackend(this.name, {required this.warmupFn}) : priority = 99;
 
   @override
   Stream<WarmupProgress> warmup() => warmupFn();
@@ -216,6 +216,16 @@ void main() {
       expect(containerForExtension('music.mp3'), Container.mp3);
     });
 
+    test('aac → Container.adts', () {
+      // Previously unmapped, so `out.aac` fell through to the track-mix
+      // heuristic and got an M4A written into it.
+      expect(containerForExtension('mic.aac'), Container.adts);
+    });
+
+    test('adts → Container.adts', () {
+      expect(containerForExtension('segment.adts'), Container.adts);
+    });
+
     // --- case insensitivity ----------------------------------------------
     test('MP4 (uppercase) → Container.mp4', () {
       expect(containerForExtension('REC.MP4'), Container.mp4);
@@ -327,6 +337,22 @@ void main() {
         Container.mp3,
       );
     });
+
+    for (final codec in [AudioCodec.pcmS16le, AudioCodec.pcmF32le]) {
+      test('audio-only ${codec.name} → wav (was mkv)', () {
+        // MKV was never a working answer for PCM: only FFmpeg writes MKV,
+        // FFmpeg has no PCM encoder, and the recording was rejected before it
+        // started. WAV is the container PCM actually has a writer for.
+        expect(
+          containerForTrackMix(
+            hasVideo: false,
+            hasAudio: true,
+            audioCodecs: {codec},
+          ),
+          Container.wav,
+        );
+      });
+    }
 
     test('audio-only other codec → mkv', () {
       // Any codec not explicitly mapped (e.g. flac) falls back to MKV.

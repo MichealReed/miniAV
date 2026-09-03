@@ -6,11 +6,10 @@
 ///     dart run tool/gpu_player_validate.dart
 ///
 /// This is a `tool/` main-isolate program (NOT a `dart test`) because Dawn
-/// cannot initialize inside `dart test` isolates on the dev box — same
-/// pattern as gsplats420's `gpu_v9_validate.dart`. Flutter is not imported
-/// anywhere in this entry point's graph.
+/// cannot initialize inside `dart test` isolates on the dev box. Flutter is
+/// not imported anywhere in this entry point's graph.
 ///
-/// Trap check baked in (see gsplats420 GPU-encode memory): a WGSL compile
+/// Trap check baked in: a WGSL compile
 /// error can be SILENT — readbacks just return zeros. We content-verify
 /// every output against the CPU reference, and the all-zero case fails the
 /// black-frame guard, so a non-compiling kernel cannot pass.

@@ -70,6 +70,8 @@ external int _aiConfigure(
   int channels,
   int numFrames,
 );
+@JS('_MiniAV_Audio_SetCaptureMirror')
+external int _aiSetCaptureMirror(int ctx, int basePtr, int capacityFrames);
 @JS('_MiniAV_Audio_EnableBufferedCapture')
 external int _aiEnableBuffered(int ctx, int ringFrames);
 // StartCapture suspends under ASYNCIFY (miniaudio device init spins on
@@ -237,6 +239,37 @@ class MiniavWasm {
     int numFrames,
   ) =>
       _aiConfigure(ctx, format, sampleRate, channels, numFrames);
+  /// Hand the capture callback a caller-owned SPSC mirror ring in the SHARED
+  /// wasm heap, so a WORKER can drain captured audio without calling into
+  /// wasm. [basePtr] must stay allocated for the life of the capture; 0
+  /// detaches. See `MiniAV_Audio_SetCaptureMirror` for the header layout.
+  ///
+  /// 🔴 The mirror must be allocated on the MAIN thread. emmalloc in this
+  /// build is not pthread-locked, so a worker must never call malloc/free
+  /// against this heap — it only ever reads and writes the region handed to it.
+  int setCaptureMirror(int ctx, int basePtr, int capacityFrames) =>
+      _aiSetCaptureMirror(ctx, basePtr, capacityFrames);
+
+  /// The wasm heap as a shareable buffer. With `shared:true` linear memory
+  /// this is a SharedArrayBuffer, which is what lets a worker read the mirror
+  /// in place. 🔴 SHARED BY CLONE, never transferred.
+  JSObject get heapBuffer => (_heapf32 as JSObject).getProperty('buffer'.toJS);
+
+  /// Reserve [bytes] in the wasm heap, or 0. MAIN THREAD ONLY — see
+  /// [setCaptureMirror]'s note about emmalloc not being pthread-locked.
+  ///
+  /// Public because the capture MIRROR has to live in this heap and be owned
+  /// by whoever set it up: the C side stores the pointer and writes through it
+  /// from the audio callback, so nothing here can allocate it on the caller's
+  /// behalf without also owning its lifetime.
+  int allocateHeap(int bytes) => bytes <= 0 ? 0 : _malloc(bytes);
+
+  /// Release what [allocateHeap] returned. MAIN THREAD ONLY, and never while
+  /// the C side still holds the pointer — detach the mirror first.
+  void releaseHeap(int ptr) {
+    if (ptr != 0) _free(ptr);
+  }
+
   int enableBufferedCapture(int ctx, int ringFrames) =>
       _aiEnableBuffered(ctx, ringFrames);
 

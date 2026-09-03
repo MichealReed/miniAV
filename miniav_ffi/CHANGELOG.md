@@ -1,5 +1,29 @@
 # miniav_ffi CHANGELOG
 
+## 0.7.3
+
+- New Release
+- New `MiniAV_Audio_SetCaptureMirror`: the capture callback also writes each block into a caller-owned single-producer/single-consumer ring, so a consumer on another thread - a web worker sharing the wasm linear memory - can drain captured audio without calling into wasm at all. The ring header is eight u32 slots (monotonic write/read cursors, capacity, channels, dropped-frame count, sample rate), so occupancy is unambiguous across a 2^32 wrap with no full/empty flag; `base = NULL` detaches. The cursor accesses map onto Interlocked intrinsics under MSVC, which has no `__atomic_*` builtins.
+- **`MiniAV_AudioOutput_Configure` no longer opens the wrong device.** A
+  `device_id` that matched no enumerated playback device was replaced by the
+  SYSTEM DEFAULT and reported as success, so a caller asking for one endpoint
+  silently got another — indistinguishable, from the outside, from the request
+  having worked. It now returns `MINIAV_ERROR_DEVICE_NOT_FOUND`.
+  - An EMPTY `device_id` still means "system default"; that is the supported
+    way to ask for it, and callers who want a fallback can retry with it.
+  - The refusal applies only when device enumeration itself SUCCEEDED. If the
+    device list could not be read at all (a transient COM failure on Windows),
+    the previous default-fallback behaviour is kept — absence cannot be proven
+    without a list.
+  - Behaviour change in an error path: a caller relying on the silent
+    substitution will now see a failure instead of unexpected audio. Callers
+    that need a guaranteed-audible output should retry with `""`.
+- `MiniAV_AudioOutput_GetDefaultFormat` now honours its `device_id` argument
+  (it was `MINIAV_UNUSED` and always answered for the system default device,
+  while the interface promised "for a device"). The id is the device name,
+  matching the portable-id convention `Configure` resolves; an unmatched
+  name falls back to the default with a warning, same policy as `Configure`.
+
 ## 0.7.2
 
 - released 08/13/26 - MR

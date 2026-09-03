@@ -12,7 +12,8 @@ import 'recorder_source.dart';
 export 'audio_effect.dart';
 export 'screen_effect.dart';
 export 'screen_scale_policy.dart';
-export 'recorder_source.dart' show VideoIdleFramePolicy;
+export 'recorder_source.dart'
+    show VideoIdleFramePolicy, VideoCaptureLossPolicy;
 
 class RecorderBuilder {
   final List<RecorderSource> _sources = [];
@@ -71,6 +72,8 @@ class RecorderBuilder {
     VideoIdleFramePolicy idleFramePolicy = VideoIdleFramePolicy.duplicate,
     bool adaptiveGpuThrottle = true,
     bool cfrOutput = false,
+    VideoCaptureLossPolicy lossPolicy = VideoCaptureLossPolicy.reacquire,
+    Duration? reacquireLimit,
   }) {
     _sources.add(
       ScreenRecorderSource(
@@ -89,6 +92,8 @@ class RecorderBuilder {
         idleFramePolicy: idleFramePolicy,
         adaptiveGpuThrottle: adaptiveGpuThrottle,
         cfrOutput: cfrOutput,
+        lossPolicy: lossPolicy,
+        reacquireLimit: reacquireLimit,
       ),
     );
   }

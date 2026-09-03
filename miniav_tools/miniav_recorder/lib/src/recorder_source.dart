@@ -11,7 +11,7 @@ export 'audio_effect.dart';
 export 'screen_effect.dart';
 export 'screen_scale_policy.dart';
 
-/// Controls how [_VideoTrackRuntime] fills the gap when the capture source
+/// Controls how [VideoTrackRuntime] fills the gap when the capture source
 /// delivers frames at a lower rate than the configured fps (e.g. WGC / DXGI
 /// only sending a frame when content changes).
 enum VideoIdleFramePolicy {
@@ -32,6 +32,46 @@ enum VideoIdleFramePolicy {
   /// No idle fill — the encoded stream reflects the capture source cadence,
   /// which may be as low as 1–2 fps on a mostly-static screen.
   none,
+}
+
+/// What a recorder does when its capture TARGET disappears mid-recording.
+///
+/// This is not the same as a source that has gone quiet. The target is gone:
+/// a display was unplugged or re-routed (Win+P, dock/undock, a mode change),
+/// a session was locked or handed to RDP, a captured window was closed. The
+/// platform says so — Windows Graphics Capture closes the capture item — and
+/// everything downstream keeps running: the encoder, the muxer, the audio
+/// tracks, the file.
+///
+/// The choice this enum makes is what happens to the REST of the recording.
+///
+/// A note on what is deliberately absent: nothing here substitutes a
+/// DIFFERENT display for the one that went away. A recorder that silently
+/// starts capturing something else has changed what the file is a recording
+/// of, and no caller can tell from the output that it happened. If the
+/// original target never returns, the video track ends — and [Recorder] says
+/// so at stop. Choosing a new target is the application's call, made with a
+/// user in the loop, and it starts a new recording.
+enum VideoCaptureLossPolicy {
+  /// Re-acquire the SAME target and carry on in the same file and the same
+  /// track. The default, because for a long session the tail is usually worth
+  /// more than the gap: a display that comes back after twenty seconds costs
+  /// twenty seconds of frozen picture, where ending the track costs every
+  /// minute after it.
+  ///
+  /// Retrying is cheap — one re-configure attempt on a backoff that settles
+  /// at [RecorderBuilder.reacquireInterval] — and it stops the moment the
+  /// target returns or the recording does.
+  reacquire,
+
+  /// End the video track where the target was lost, and keep recording every
+  /// other track. Choose this when a short file that is KNOWN complete is
+  /// worth more than a long one with a hole in the middle.
+  ///
+  /// Audio keeps running: an audio track that outlives its video track is
+  /// ordinary in MP4, and the alternative is throwing away sound that was
+  /// captured perfectly well.
+  endTrack,
 }
 
 sealed class RecorderSource {
@@ -116,6 +156,19 @@ class ScreenRecorderSource extends RecorderSource {
   /// stay unfilled. Requires [idleFramePolicy] != none for idle-gap fill.
   final bool cfrOutput;
 
+  /// What to do if the captured display or window goes away mid-recording.
+  /// Defaults to [VideoCaptureLossPolicy.reacquire].
+  final VideoCaptureLossPolicy lossPolicy;
+
+  /// How long to keep trying to re-acquire a lost target before giving up and
+  /// ending the video track. `null` (the default) means for as long as the
+  /// recording runs.
+  ///
+  /// A limit is the right choice when a hole past some length makes the file
+  /// useless anyway; no limit is the right choice when the tail is what you
+  /// are paying for. Ignored under [VideoCaptureLossPolicy.endTrack].
+  final Duration? reacquireLimit;
+
   const ScreenRecorderSource({
     this.displayId,
     this.windowId,
@@ -132,6 +185,8 @@ class ScreenRecorderSource extends RecorderSource {
     this.idleFramePolicy = VideoIdleFramePolicy.duplicate,
     this.adaptiveGpuThrottle = true,
     this.cfrOutput = false,
+    this.lossPolicy = VideoCaptureLossPolicy.reacquire,
+    this.reacquireLimit,
   });
 }
 

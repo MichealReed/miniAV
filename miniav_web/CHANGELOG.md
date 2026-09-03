@@ -1,5 +1,11 @@
 # miniav_web CHANGELOG
 
+## 0.7.3
+
+- New Release
+- Screen capture is zero-readback now. It was a `<video>` -> canvas `drawImage` -> full-frame `getImageData` loop per animation frame - about 8.3 MB of synchronous main-thread readback per 1080p frame, which the browser then re-uploaded to the GPU - plus roughly 1.1 s of deliberate start-up sleeps. It now uses the same pump the camera module always had: `MediaStreamTrackProcessor(maxBufferSize: 1)` handing `VideoFrame`s straight to the consumer, a `requestVideoFrameCallback`-driven `VideoFrame(<video>)` where the processor is missing, and the canvas readback only as a final fallback. The black-frame probing sleeps are gone.
+- Camera and audio input reworked onto the same routes.
+- New `package:miniav_web/capture_mirror.dart`: the capture mirror's consumer on its own entry point, deliberately separate from the `miniav_web.dart` barrel. That barrel is a Flutter web plugin and pulls `package:flutter` in with it, while this path is meant to be drained from a worker whose payload dart2js compiles with no Flutter at all; Dart's import graph is per-library, so this one costs only `dart:typed_data`.
 ## 0.7.2
 
 - released 08/13/26 - MR

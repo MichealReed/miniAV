@@ -25,7 +25,13 @@ export 'src/audio_effect.dart';
 export 'src/clip_buffer.dart';
 export 'src/container_utils.dart';
 export 'src/gpu_screen_processor.dart' show GpuScreenProcessor;
-export 'src/recorder.dart';
+// `TrackRuntime`, `VideoTrackRuntime` and `releaseCaptureBuffer` are internals
+// that tests reach through `src/`. They are nameable there so the capture-loss
+// recovery can be driven without a display to unplug — but they are not API:
+// the runtimes carry a dozen mutable fields, and `releaseCaptureBuffer` is a
+// process-wide hook that nothing outside this package should be able to move.
+export 'src/recorder.dart'
+    hide TrackRuntime, VideoTrackRuntime, releaseCaptureBuffer;
 export 'src/recorder_builder.dart';
 export 'src/recorder_devices.dart';
 export 'src/screen_effect.dart';

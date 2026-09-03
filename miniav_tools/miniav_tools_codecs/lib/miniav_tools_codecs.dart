@@ -43,7 +43,8 @@ export 'src/framing/adts_container.dart'
 export 'src/framing/mp3_container.dart'
     show Mp3Demuxer, Mp3VbrHeader, isMp3Sync, isAdtsSync, isId3Magic,
         id3TagLength;
-export 'src/framing/mp4_container.dart' show Mp4Demuxer, Mp4Muxer;
+export 'src/framing/mp4_container.dart'
+    show Mp4ConfigChange, Mp4Demuxer, Mp4Muxer, Mp4TrackTimingReport;
 export 'src/framing/annexb.dart'
     show isAnnexB, splitAnnexB, buildAvcC, buildHvcC, annexBToLengthPrefixed;
 export 'src/sw_audio/sw_audio_backend.dart' show SwAudioBackend;

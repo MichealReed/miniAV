@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.13
+
+- Increment downstream deps
+- Increment downstream deps
+- Increment downstream deps
+
+## 0.5.12
+
+- Screen capture now survives losing its target. A capture item closing - Win+P, dock/undock, lock, an RDP transition, a display mode change - is re-acquired in place: same file, same track, same encoder, with a frozen frame across the gap. Nothing previously subscribed to the platform's capture-lost notification at all, so a lost display went unnoticed and the recorder re-encoded a dead capture handle at the frame rate for the rest of the session, reporting success at stop.
+
+- A watchdog declares a loss when a source stops producing packets and the platform says nothing, which is the only cover for a graphics device reset. That case escalates to rebuilding the device, processor, encoder and capture context in place; a rebuild that would not match what the container already declares is refused rather than spliced.
+
+- New: VideoCaptureLossPolicy and reacquireLimit on addScreen (default: re-acquire for as long as the recording runs), Recorder.captureStatus and Recorder.captureHealthy for live health during a recording, and Recorder.captureIssues at stop - so a file that is short because its display went away is distinguishable from one that is short because someone stopped early. A window target is never re-acquired, since a destroyed HWND does not come back, and a different display is never substituted.
+
+- A duplicate frame whose encode fails now retires its source instead of re-encoding it forever, the audio track's encodes are chained so a gap fill cannot overtake live audio and hand the muxer a backwards timestamp, and container timing repairs are logged at stop.
+
 ## 0.5.11
 
 - Report the encoder's D3D11 device alongside the capture context's, so a device mismatch - which otherwise shows up as every GPU frame being refused with no explanation - is visible in the log.

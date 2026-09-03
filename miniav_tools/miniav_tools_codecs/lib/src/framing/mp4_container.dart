@@ -758,10 +758,35 @@ Uint8List _slice(ByteData d, int start, int end) =>
 // =============================================================================
 
 class _MuxT {
-  _MuxT(this.info, this.isVideo, this.config, {this.annexB = false});
+  _MuxT(this.info, this.isVideo, Uint8List config, {this.annexB = false})
+      : configs = [config];
   final TrackInfo info;
   final bool isVideo;
-  final Uint8List config; // avcC/hvcC/av1C, or ASC/OpusHead for audio
+
+  /// Codec configuration records — avcC/hvcC/av1C, or ASC/OpusHead for audio.
+  ///
+  /// A LIST, because a track's codec configuration can legitimately change
+  /// part-way through. The case this exists for is a GPU device reset: every
+  /// D3D11 device on the adapter is removed, the encoder has to be reopened,
+  /// and a reopened encoder issues its own parameter sets. Usually they are
+  /// byte-identical (same MFT, same resolution, same profile and rate
+  /// control) and this stays length 1. When they are not, ISO-BMFF's answer
+  /// is a second sample entry in `stsd` with the later chunks pointing at it
+  /// via `stsc`'s `sample_description_index` — which is exactly what this
+  /// carries.
+  ///
+  /// The alternative, writing samples encoded against new parameter sets
+  /// under the old record, produces a file that decodes wrong or not at all
+  /// with success reported at every step.
+  final List<Uint8List> configs;
+
+  /// Index into [configs] that packets are currently being encoded under.
+  int activeConfig = 0;
+
+  /// Per sample, the [configs] entry it was encoded under. Chunk runs are
+  /// derived from this, so a config change forces a chunk boundary in both
+  /// the streaming and in-memory layouts.
+  final List<int> sampleConfig = [];
 
   /// H.264/HEVC only: the source emits Annex-B, so each packet needs rewriting
   /// to length-prefixed NAL units on the way into `mdat`. Decided once from the
@@ -790,6 +815,33 @@ class _MuxT {
   /// track interleaves.
   final List<int> chunkOffsets = [];
   final List<int> chunkCounts = [];
+
+  /// Which [configs] entry each chunk's samples were encoded under.
+  final List<int> chunkConfig = [];
+
+  // ---- Decode-order health, observed as packets arrive --------------------
+  //
+  // A file is only as good as its sample table, and a sample table is only
+  // buildable from a non-decreasing decode clock. Watching that HERE, rather
+  // than only when `moov` is assembled, is what turns "the recording was
+  // already doomed eight seconds in and nothing said so for the next
+  // thirty-one minutes" into something the caller can act on while it still
+  // has somewhere to go.
+
+  /// Highest decode timestamp accepted so far; `null` until the first packet.
+  int? lastDecodeUs;
+
+  /// Packets that arrived with a decode timestamp BELOW their predecessor's,
+  /// and the index and values of the first one.
+  int outOfOrderPackets = 0;
+  int firstOutOfOrderSample = -1;
+  int firstOutOfOrderFromUs = 0;
+  int firstOutOfOrderToUs = 0;
+
+  /// Samples whose decode time [_timing] had to clamp forward, and the total
+  /// microseconds it moved them by.
+  int repairedSamples = 0;
+  int repairedSkewUs = 0;
 
   List<Uint8List>? _samples;
 
@@ -877,6 +929,68 @@ class _Timing {
 /// `moov` first (the "faststart" layout) is a second full pass. This matches
 /// FFmpeg's default; progressive HTTP playback of a file written here needs a
 /// `faststart` remux, local playback does not.
+/// What [Mp4Muxer.setTrackConfig] did with a track's new codec configuration.
+enum Mp4ConfigChange {
+  /// Byte-identical to the record already in force — nothing happened.
+  unchanged,
+
+  /// Matches a record this track already carries; samples point back at it.
+  restored,
+
+  /// New. A second `stsd` sample entry now exists and later chunks point at
+  /// it. Conformant, but readers that use only the first sample entry will
+  /// render everything after this point incorrectly.
+  added,
+}
+
+/// What one track's decode clock did, and what the muxer had to do about it.
+///
+/// Non-zero [outOfOrderPackets] means the PRODUCER handed packets over in the
+/// wrong order — the container repaired it, but the producer is the bug.
+class Mp4TrackTimingReport {
+  const Mp4TrackTimingReport({
+    required this.trackIndex,
+    required this.isVideo,
+    required this.samples,
+    required this.outOfOrderPackets,
+    required this.firstOutOfOrderSample,
+    required this.firstOutOfOrderFromUs,
+    required this.firstOutOfOrderToUs,
+    required this.repairedSamples,
+    required this.repairedSkewUs,
+  });
+
+  final int trackIndex;
+  final bool isVideo;
+  final int samples;
+
+  /// Packets that arrived with a decode timestamp below their predecessor's.
+  final int outOfOrderPackets;
+
+  /// Index of the first such packet, or -1. Populated as packets arrive, so
+  /// it is readable long before [finish].
+  final int firstOutOfOrderSample;
+  final int firstOutOfOrderFromUs;
+  final int firstOutOfOrderToUs;
+
+  /// Samples whose decode time the index build clamped forward, and by how
+  /// much in total. Only populated once the index has been built.
+  final int repairedSamples;
+  final int repairedSkewUs;
+
+  bool get isClean => outOfOrderPackets == 0 && repairedSamples == 0;
+
+  @override
+  String toString() => isClean
+      ? 'track $trackIndex (${isVideo ? 'video' : 'audio'}): '
+          '$samples samples, decode order clean'
+      : 'track $trackIndex (${isVideo ? 'video' : 'audio'}): '
+          '$outOfOrderPackets of $samples packets arrived out of decode order '
+          '(first at sample $firstOutOfOrderSample, '
+          '${firstOutOfOrderFromUs}us -> ${firstOutOfOrderToUs}us); '
+          '$repairedSamples clamped forward, ${repairedSkewUs}us total skew';
+}
+
 class Mp4Muxer implements PlatformMuxer {
   Mp4Muxer._(this._tracks, this._filePath);
 
@@ -907,6 +1021,119 @@ class Mp4Muxer implements PlatformMuxer {
   /// a caller must NOT also wrap it in a "collect the bytes and save them"
   /// adapter.
   bool get ownsFileOutput => _filePath != null;
+
+
+  /// Tell the muxer this track's encoder now emits [config] — its codec
+  /// configuration record (avcC/hvcC/av1C, or Annex-B parameter sets, which
+  /// are converted the same way [open] converts them).
+  ///
+  /// **Why this exists.** A GPU device reset removes every D3D11 device on the
+  /// adapter, so the encoder has to be reopened, and a reopened encoder issues
+  /// its own parameter sets. The record already committed to the file is then
+  /// a claim about samples that were not encoded under it. Writing those
+  /// samples anyway produces a file that decodes wrong or not at all, with
+  /// success reported at every step — the same class of failure as a missing
+  /// `moov`, and just as invisible.
+  ///
+  /// Nothing here is committed until [finish], which is what makes this
+  /// possible at all: the sample entry a reader will see is chosen when the
+  /// index is built, not when the muxer was opened.
+  ///
+  /// Returns [Mp4ConfigChange] saying what happened:
+  ///
+  ///  * `unchanged` — byte-identical to the record in force. The common case
+  ///    for a reopened encoder with the same settings, and a complete no-op.
+  ///  * `restored` — matches a record this track already carries, so samples
+  ///    go back to pointing at it. No new sample entry.
+  ///  * `added` — genuinely new. A second `stsd` entry is written and every
+  ///    subsequent chunk points at it. Conformant, and correctly played by
+  ///    readers that honour `sample_description_index` — but readers that use
+  ///    only the first sample entry will render everything after this point
+  ///    wrong, so a caller that cannot accept that should start a new file
+  ///    here instead.
+  Mp4ConfigChange setTrackConfig(int trackIndex, Uint8List config) {
+    _checkOpen();
+    _checkNotFinished('setTrackConfig');
+    if (trackIndex < 0 || trackIndex >= _tracks.length) {
+      throw CodecRuntimeException('mp4', 'trackIndex $trackIndex out of range');
+    }
+    if (config.isEmpty) {
+      throw const CodecRuntimeException(
+          'mp4', 'setTrackConfig needs a configuration record, not empty bytes');
+    }
+    final t = _tracks[trackIndex];
+    final record = _normalizeConfig(t, config);
+
+    if (_sameBytes(t.configs[t.activeConfig], record)) {
+      return Mp4ConfigChange.unchanged;
+    }
+    for (var i = 0; i < t.configs.length; i++) {
+      if (_sameBytes(t.configs[i], record)) {
+        t.activeConfig = i;
+        return Mp4ConfigChange.restored;
+      }
+    }
+    t.configs.add(record);
+    t.activeConfig = t.configs.length - 1;
+    return Mp4ConfigChange.added;
+  }
+
+  /// The configuration records this track carries. Length > 1 means the
+  /// encoder was reopened mid-recording with different parameter sets.
+  int trackConfigCount(int trackIndex) => _tracks[trackIndex].configs.length;
+
+  /// Accept the same conventions [open] does: an encoder handing back Annex-B
+  /// parameter sets is normalised to a configuration record, so a caller does
+  /// not have to know which convention its encoder uses on a reopen when it
+  /// did not have to know on the first open.
+  Uint8List _normalizeConfig(_MuxT t, Uint8List config) {
+    final bytes = Uint8List.fromList(config);
+    if (!t.isVideo) return bytes;
+    final codec = (t.info as VideoTrackInfo).codec;
+    final annexB = isAnnexB(bytes) &&
+        (codec == VideoCodec.h264 || codec == VideoCodec.hevc);
+    if (!annexB) return bytes;
+    final record = codec == VideoCodec.hevc ? buildHvcC(bytes) : buildAvcC(bytes);
+    if (record == null) {
+      throw CodecRuntimeException(
+        'mp4',
+        '$codec config is Annex-B but carries no usable SPS — cannot build '
+            'the configuration record',
+      );
+    }
+    return record;
+  }
+
+  static bool _sameBytes(Uint8List a, Uint8List b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  /// Per-track decode-order health. Out-of-order counts are live from the
+  /// first packet; repair counts fill in when the index is built at [finish].
+  ///
+  /// A recorder should log this at stop: a non-clean report is the container
+  /// saying it rescued a file whose producer is feeding it packets in the
+  /// wrong order, and that is worth knowing while the machine that did it is
+  /// still in front of you.
+  List<Mp4TrackTimingReport> get timingReports => [
+        for (var i = 0; i < _tracks.length; i++)
+          Mp4TrackTimingReport(
+            trackIndex: i,
+            isVideo: _tracks[i].isVideo,
+            samples: _tracks[i].ptsUs.length,
+            outOfOrderPackets: _tracks[i].outOfOrderPackets,
+            firstOutOfOrderSample: _tracks[i].firstOutOfOrderSample,
+            firstOutOfOrderFromUs: _tracks[i].firstOutOfOrderFromUs,
+            firstOutOfOrderToUs: _tracks[i].firstOutOfOrderToUs,
+            repairedSamples: _tracks[i].repairedSamples,
+            repairedSkewUs: _tracks[i].repairedSkewUs,
+          ),
+      ];
 
   static Mp4Muxer open(MuxerConfig config) {
     if (config.tracks.isEmpty) {
@@ -996,6 +1223,28 @@ class Mp4Muxer implements PlatformMuxer {
       throw CodecRuntimeException('mp4', 'trackIndex $i out of range');
     }
     final t = _tracks[i];
+    t.sampleConfig.add(t.activeConfig);
+
+    // The decode clock a track will actually be indexed on is chosen at
+    // finish (see [_timing]): `dtsUs` when the producer ever sets it, `ptsUs`
+    // otherwise. Neither is known yet for a track whose first packets are all
+    // zero, so watch whichever field this pair of packets makes meaningful --
+    // enough to name the offending sample immediately, which is the whole
+    // point. The authoritative repair still happens in [_timing], over the
+    // list that was actually chosen.
+    final decodeUs = packet.dtsUs != 0 ? packet.dtsUs : packet.ptsUs;
+    final prevDecode = t.lastDecodeUs;
+    if (prevDecode != null && decodeUs < prevDecode) {
+      if (t.outOfOrderPackets == 0) {
+        t.firstOutOfOrderSample = t.dtsUs.length;
+        t.firstOutOfOrderFromUs = prevDecode;
+        t.firstOutOfOrderToUs = decodeUs;
+      }
+      t.outOfOrderPackets++;
+    } else {
+      t.lastDecodeUs = decodeUs;
+    }
+
     t.dtsUs.add(packet.dtsUs);
     t.ptsUs.add(packet.ptsUs);
     t.nominalDurUs.add(packet.durationUs);
@@ -1007,11 +1256,16 @@ class Mp4Muxer implements PlatformMuxer {
       return;
     }
     final bytes = t.reframe(packet);
-    if (_lastStreamedTrack != i) {
-      // Another track wrote in between (or this is the track's first sample):
-      // the run of bytes is no longer contiguous, so start a new chunk.
+    // A new chunk when the byte run breaks (another track wrote in between, or
+    // this is the first sample) OR when the codec configuration changed:
+    // `stsc` carries one sample_description_index per chunk run, so samples
+    // under different configs cannot share a chunk.
+    final configChanged =
+        t.chunkConfig.isNotEmpty && t.chunkConfig.last != t.activeConfig;
+    if (_lastStreamedTrack != i || configChanged) {
       t.chunkOffsets.add(sink.length);
       t.chunkCounts.add(1);
+      t.chunkConfig.add(t.activeConfig);
       _lastStreamedTrack = i;
     } else {
       t.chunkCounts[t.chunkCounts.length - 1]++;
@@ -1038,9 +1292,16 @@ class Mp4Muxer implements PlatformMuxer {
     }
     // The reserved largesize is only knowable now.
     await sink.patchU64(_mdatHeaderOffset + 8, 16 + _mdatLen);
-    await sink.add(_buildMoov());
-    await sink.close();
-    _sink = null;
+    // Whatever happens while the index is assembled, the handle closes. A
+    // throw between patching `mdat` and writing `moov` used to leak the sink
+    // AND leave `_finished` set, so the caller could neither retry nor even
+    // release the file — on top of the header-less container it left on disk.
+    try {
+      await sink.add(_buildMoov());
+    } finally {
+      await sink.close();
+      _sink = null;
+    }
   }
 
   /// The finished container as ordered pieces, or null before [finish] — and
@@ -1136,13 +1397,21 @@ class Mp4Muxer implements PlatformMuxer {
     for (final t in _tracks) {
       t.chunkOffsets.clear();
       t.chunkCounts.clear();
-      if (t.sizes.isNotEmpty) {
-        t.chunkOffsets.add(off);
-        t.chunkCounts.add(t.sizes.length);
-      }
-      for (final s in t.samples) {
-        body.add(s);
-        off += s.length;
+      t.chunkConfig.clear();
+      // One chunk per run of samples sharing a codec configuration. With no
+      // config change that is the single chunk this always wrote.
+      final samples = t.samples;
+      for (var i = 0; i < samples.length; i++) {
+        final cfg = i < t.sampleConfig.length ? t.sampleConfig[i] : 0;
+        if (t.chunkConfig.isEmpty || t.chunkConfig.last != cfg) {
+          t.chunkOffsets.add(off);
+          t.chunkCounts.add(1);
+          t.chunkConfig.add(cfg);
+        } else {
+          t.chunkCounts[t.chunkCounts.length - 1]++;
+        }
+        body.add(samples[i]);
+        off += samples[i].length;
       }
     }
 
@@ -1235,16 +1504,36 @@ class Mp4Muxer implements PlatformMuxer {
     // `dtsUs` is a required field, but producers with no reordering to express
     // commonly leave it at 0 for every packet. When a track never sets it,
     // decode order IS presentation order and PTS is the decode clock.
-    final dts = t.dtsUs.any((v) => v != 0) ? t.dtsUs : t.ptsUs;
+    final declared = t.dtsUs.any((v) => v != 0) ? t.dtsUs : t.ptsUs;
+
+    // REPAIR a decode clock that steps backwards; never refuse one.
+    //
+    // MP4 stores decode DURATIONS, which cannot be negative, so a producer
+    // that hands packets over out of order genuinely cannot be indexed as
+    // given. But this runs at finish(), over media that is already on disk in
+    // full — so throwing here does not prevent a bad file, it destroys a good
+    // recording: `mdat` keeps every frame and `moov` never gets written, which
+    // is a container no player will open. One reordered packet an hour in
+    // would take the whole hour with it.
+    //
+    // So clamp forward by the smallest amount that makes the sample table
+    // legal (one microsecond) and carry on. That compresses the reordered run
+    // into a sliver of the timeline — a real, audible/visible skew of a few
+    // frames — and it is self-correcting: as soon as the producer's own
+    // timestamps overtake the clamp again the table returns to exact. Losing
+    // a few frames of timing beats losing every frame.
+    //
+    // Ties are left alone: two samples sharing a DTS is a producer saying
+    // "use my declared duration", which the duration loop below honours.
+    final dts = List<int>.filled(n, 0);
+    dts[0] = declared[0];
     for (var i = 1; i < n; i++) {
-      if (dts[i] < dts[i - 1]) {
-        throw CodecRuntimeException(
-          'mp4',
-          'DTS goes backwards at sample $i (${dts[i - 1]}us → ${dts[i]}us): '
-              'MP4 stores decode durations, which cannot be negative. Feed '
-              'packets in DTS order — reordering is expressed by PTS, not by '
-              'the order packets arrive in.',
-        );
+      if (declared[i] >= dts[i - 1]) {
+        dts[i] = declared[i];
+      } else {
+        dts[i] = dts[i - 1] + 1;
+        t.repairedSamples++;
+        t.repairedSkewUs += dts[i] - declared[i];
       }
     }
 
@@ -1499,7 +1788,7 @@ class Mp4Muxer implements PlatformMuxer {
       ..._stsd(t),
       ..._stts(tm.durations),
       if (tm.ctts != null) ..._ctts(tm.ctts!),
-      ..._stsc(t.chunkCounts),
+      ..._stsc(t.chunkCounts, t.chunkConfig),
       ..._stsz(t.sizes),
       ...(needCo64 ? _co64(t.chunkOffsets) : _stco(t.chunkOffsets)),
       if (stss != null) ...stss,
@@ -1507,12 +1796,24 @@ class Mp4Muxer implements PlatformMuxer {
     return box('stbl', body);
   }
 
+  /// One sample entry per codec configuration the track was encoded under.
+  ///
+  /// Almost always exactly one. More than one means the encoder was reopened
+  /// mid-recording and came back with different parameter sets — see
+  /// [_MuxT.configs]. A reader that honours `stsc`'s sample_description_index
+  /// plays the whole file correctly; one that reads only the first entry
+  /// renders the tail wrong, which is why [Mp4Muxer.setTrackConfig] reports
+  /// that it happened rather than doing it quietly.
   Uint8List _stsd(_MuxT t) {
-    final entry = t.isVideo ? _videoEntry(t) : _audioEntry(t);
-    return fullBox('stsd', 0, 0, [0, 0, 0, 1, ...entry]);
+    final b = BytesBuilder(copy: false);
+    _u32c(b, t.configs.length, 'stsd entry count');
+    for (var i = 0; i < t.configs.length; i++) {
+      b.add(t.isVideo ? _videoEntry(t, i) : _audioEntry(t, i));
+    }
+    return fullBox('stsd', 0, 0, b.toBytes());
   }
 
-  Uint8List _videoEntry(_MuxT t) {
+  Uint8List _videoEntry(_MuxT t, int cfgIndex) {
     final v = t.info as VideoTrackInfo;
     final fmt = switch (v.codec) {
       VideoCodec.h264 => 'avc1',
@@ -1541,11 +1842,11 @@ class Mp4Muxer implements PlatformMuxer {
     b.zero(32); // compressorname
     b.u16(0x0018); // depth
     b.u16(0xffff); // pre_defined
-    b.bytes(box(cfgType, t.config));
+    b.bytes(box(cfgType, t.configs[cfgIndex]));
     return box(fmt, b.toBytes());
   }
 
-  Uint8List _audioEntry(_MuxT t) {
+  Uint8List _audioEntry(_MuxT t, int cfgIndex) {
     final a = t.info as AudioTrackInfo;
     final b = BoxBuilder();
     b.zero(6);
@@ -1562,10 +1863,10 @@ class Mp4Muxer implements PlatformMuxer {
     // (libavformat does the same), and the ASC/dOps carries the real rate.
     b.u32(a.sampleRate > 0xFFFF ? 0 : a.sampleRate << 16);
     if (a.codec == AudioCodec.opus) {
-      b.bytes(_dOps(t.config, a.channels, a.sampleRate));
+      b.bytes(_dOps(t.configs[cfgIndex], a.channels, a.sampleRate));
       return box('Opus', b.toBytes());
     }
-    b.bytes(_esds(t.config));
+    b.bytes(_esds(t.configs[cfgIndex]));
     return box('mp4a', b.toBytes());
   }
 
@@ -1651,11 +1952,19 @@ class Mp4Muxer implements PlatformMuxer {
 
   /// sample-to-chunk, run-length encoded over [chunkCounts] (one entry per
   /// chunk, in order).
-  Uint8List _stsc(List<int> chunkCounts) {
-    final entries = <List<int>>[]; // [first_chunk, samples_per_chunk]
+  Uint8List _stsc(List<int> chunkCounts, List<int> chunkConfig) {
+    // [first_chunk, samples_per_chunk, sample_description_index]
+    final entries = <List<int>>[];
     for (var c = 0; c < chunkCounts.length; c++) {
-      if (entries.isEmpty || entries.last[1] != chunkCounts[c]) {
-        entries.add([c + 1, chunkCounts[c]]);
+      // 1-based, and 1 for every track that never changed configuration.
+      final desc = (c < chunkConfig.length ? chunkConfig[c] : 0) + 1;
+      // A run continues only while BOTH the sample count and the description
+      // index hold. Collapsing on the count alone would silently carry the
+      // first config across a chunk that was encoded under a different one.
+      if (entries.isEmpty ||
+          entries.last[1] != chunkCounts[c] ||
+          entries.last[2] != desc) {
+        entries.add([c + 1, chunkCounts[c], desc]);
       }
     }
     final b = BytesBuilder(copy: false);
@@ -1663,7 +1972,7 @@ class Mp4Muxer implements PlatformMuxer {
     for (final e in entries) {
       _u32c(b, e[0], 'first_chunk'); // 1-based
       _u32c(b, e[1], 'samples_per_chunk');
-      _u32(b, 1); // sample_description_index
+      _u32c(b, e[2], 'sample_description_index');
     }
     return fullBox('stsc', 0, 0, b.toBytes());
   }

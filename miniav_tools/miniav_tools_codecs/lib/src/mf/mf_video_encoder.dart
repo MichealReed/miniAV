@@ -190,6 +190,12 @@ class MfVideoEncoder implements PlatformEncoder, Finalizable {
   int _submitted = 0;
   int _produced = 0;
 
+  /// Whether a capture SHARED HANDLE has ever opened on the encoder device.
+  /// This is what separates "the encoder is on the wrong adapter" (never
+  /// true) from "the capture died" (true, then imports start failing) — the
+  /// HRESULT alone cannot.
+  bool _sharedHandleImported = false;
+
   /// [existingD3d11Device] is an `ID3D11Device*` (as an address) to encode on.
   /// Pass the device the incoming frames already live on and the per-frame
   /// shared-handle import disappears — the texture is simply ours. Zero means
@@ -375,6 +381,7 @@ class MfVideoEncoder implements PlatformEncoder, Finalizable {
               _handle, Pointer<Void>.fromAddress(addr), frame.timestampUs, force);
         }
         if (r == 0) {
+          _sharedHandleImported = true;
           _submitted++;
           _drain();
           return _pending.isEmpty ? null : _pending.removeAt(0);
@@ -390,20 +397,43 @@ class MfVideoEncoder implements PlatformEncoder, Finalizable {
         // "needs CPU NV12", which names the symptom and hides the cause. Fail
         // loudly and accurately instead.
         //
-        // The likeliest cause is an adapter mismatch: the encoder builds its
-        // D3D11 device on the DEFAULT adapter, and on a hybrid machine that may
-        // not be the adapter the capture texture lives on, so
-        // OpenSharedResource1 refuses the handle. That is systematic, not
-        // transient — every frame would fail — so surfacing it on the first
-        // frame is better than a silently empty recording.
+        // WHICH failure this is, decided by history rather than by guess.
+        //
+        // OpenSharedResource1 returns the same kind of HRESULT for a handle on
+        // the wrong adapter and for a handle whose source texture has been
+        // destroyed, so the error code cannot separate them. What separates
+        // them is whether this session has EVER imported one:
+        //
+        //   never   → configuration. The encoder builds its D3D11 device on
+        //             the DEFAULT adapter, which on a hybrid machine may not
+        //             be the one the capture lives on. Systematic: every
+        //             frame fails, from the first.
+        //   before  → the capture died under us. The adapter has not moved;
+        //             the shared handle stopped resolving because the thing
+        //             behind it went away (a WGC capture item closing when its
+        //             window or display goes, a device reset).
+        //
+        // Naming the first when it is really the second sends whoever reads it
+        // hunting a multi-GPU problem that does not exist — which is exactly
+        // what happened in the field.
         if (frame.buffer.contentType != MiniAVBufferContentType.cpu) {
           throw CodecRuntimeException(
             'mf_encode',
-            'could not open the capture texture on the encoder device. The '
-            'frame is GPU-resident, so there are no CPU pixels to fall back '
-            'to. Most likely the encoder device is on a different adapter '
-            'than the capture; use the FFmpeg D3D11 encoder on this machine. '
-            'NATIVE REASON: ${_reasonOrNone()}',
+            _sharedHandleImported
+                ? 'the capture texture stopped opening on the encoder device '
+                    'after $_submitted frames had already imported cleanly. '
+                    'The adapter has not changed — the SOURCE went away, so '
+                    'the shared handle no longer resolves (a closed capture '
+                    'item, a lost display, a device reset). Restart the '
+                    'capture; re-opening the encoder will not help. '
+                    'NATIVE REASON: ${_reasonOrNone()}'
+                : 'could not open the capture texture on the encoder device, '
+                    'and no frame has ever imported on this session. The '
+                    'frame is GPU-resident, so there are no CPU pixels to '
+                    'fall back to. Most likely the encoder device is on a '
+                    'different adapter than the capture; use the FFmpeg D3D11 '
+                    'encoder on this machine. '
+                    'NATIVE REASON: ${_reasonOrNone()}',
           );
         }
         // A CPU-content buffer that merely carried a stale handle can still go

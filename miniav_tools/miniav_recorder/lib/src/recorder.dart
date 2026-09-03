@@ -12,12 +12,18 @@ import 'dart:typed_data';
 import 'package:miniav/miniav.dart';
 import 'package:miniav_tools/miniav_tools.dart';
 import 'package:miniav_tools_codecs/miniav_tools_codecs.dart'
-    show ContainerFramingBackend, MfVideoEncoder, registerFirstPartyBackends;
+    show
+        ContainerFramingBackend,
+        MfVideoEncoder,
+        Mp4ConfigChange,
+        Mp4Muxer,
+        registerFirstPartyBackends;
 import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
 import 'package:minigpu/minigpu.dart';
 
 import 'adaptive_gpu_throttle.dart';
 import 'bounded_write_queue.dart';
+import 'capture_recovery.dart';
 import 'container_utils.dart';
 import 'frame_pacer.dart';
 import 'gpu_screen_processor.dart';
@@ -29,6 +35,63 @@ import 'track_chunk.dart';
 export 'recorder_log.dart' show RecorderLogLevel, RecorderLogSource;
 
 /// Run-time state of an open [Recorder].
+/// Live health of one capture source, readable at any point during a
+/// recording.
+///
+/// [Recorder.captureIssues] only exists once [Recorder.stop] has run, which is
+/// too late for the case this was built for: a long session where the operator
+/// could have intervened if anything had told them the screen stopped being
+/// recorded forty minutes ago. Poll this instead.
+class RecorderCaptureStatus {
+  const RecorderCaptureStatus({
+    required this.label,
+    required this.lost,
+    required this.ended,
+    required this.lossCount,
+    required this.recoveryCount,
+    required this.rebuildCount,
+    required this.secondsMissing,
+  });
+
+  /// The source this describes, e.g. `screen[HMONITOR:0x…]`.
+  final String label;
+
+  /// The capture target is gone right now and a re-acquire is in progress.
+  /// Frames are not being recorded for this source while this holds.
+  final bool lost;
+
+  /// This source has stopped for good — its target never came back, or the
+  /// policy said not to wait. Every other track keeps recording, and the file
+  /// stays valid; it simply has no more video after this point.
+  final bool ended;
+
+  /// How many times the target has disappeared this session.
+  final int lossCount;
+
+  /// How many of those were recovered.
+  final int recoveryCount;
+
+  /// Recoveries that needed the whole GPU stage rebuilt rather than the
+  /// capture re-configured — a graphics device reset rather than a display
+  /// being re-routed. Worth reporting separately: it points at a driver.
+  final int rebuildCount;
+
+  /// Total seconds of this source missing from the recording, including an
+  /// outage that is still open.
+  final double secondsMissing;
+
+  /// Nothing has gone wrong with this source.
+  bool get healthy => !lost && !ended && lossCount == 0;
+
+  @override
+  String toString() => healthy
+      ? '$label: ok'
+      : '$label: ${ended ? "ENDED" : lost ? "LOST (recovering)" : "recovered"}'
+          ' — $lossCount loss(es), $recoveryCount recovered'
+          '${rebuildCount > 0 ? " ($rebuildCount via device rebuild)" : ""},'
+          ' ${secondsMissing.toStringAsFixed(1)}s missing';
+}
+
 enum RecorderState { idle, starting, running, stopping, stopped, errored }
 
 // ---------------------------------------------------------------------------
@@ -101,7 +164,7 @@ class Recorder {
   final Stopwatch _masterClock = Stopwatch();
 
   // Resolved tracks (encoders + capture handles), in source-declaration order.
-  final List<_TrackRuntime> _tracks = [];
+  final List<TrackRuntime> _tracks = [];
 
   // Per-file-sink muxer; stream sinks have no muxer, just a callback.
   final List<_SinkRuntime> _sinks = [];
@@ -258,6 +321,19 @@ class Recorder {
       }
     }
     _masterClock.stop();
+
+    // Collect capture-level problems BEFORE _tracks is cleared below. A file
+    // that is short because its display went away is not distinguishable from
+    // a file that is short because the user stopped early - not from the
+    // output, and not from a stop() that returned normally. This is the only
+    // place that difference is still knowable.
+    for (final t in _tracks) {
+      final issue = t.captureLossSummary;
+      if (issue != null) {
+        _captureIssues.add(issue);
+        _log(issue, RecorderLogLevel.warning);
+      }
+    }
 
     // 2. Wait for any in-flight encode operations.
     for (final t in _tracks) {
@@ -956,7 +1032,7 @@ class Recorder {
     );
   }
 
-  Future<_TrackRuntime> _buildTrack(int index, RecorderSource cfg) async {
+  Future<TrackRuntime> _buildTrack(int index, RecorderSource cfg) async {
     switch (cfg) {
       case ScreenRecorderSource():
         return _buildScreenTrack(index, cfg);
@@ -1001,10 +1077,19 @@ class Recorder {
     }
   }
 
-  Future<_TrackRuntime> _buildScreenTrack(
+  /// [lockedSize] pins the ENCODER's output dimensions instead of deriving
+  /// them from the display's current format.
+  ///
+  /// Only used when rebuilding a track whose muxer entry already exists. A
+  /// declared track's width and height are written into the file's header and
+  /// cannot be revised, so a display that comes back at a different resolution
+  /// must be rescaled to what the track already promised — which is work the
+  /// GPU processor was already doing for every other reason.
+  Future<TrackRuntime> _buildScreenTrack(
     int index,
-    ScreenRecorderSource cfg,
-  ) async {
+    ScreenRecorderSource cfg, {
+    (int, int)? lockedSize,
+  }) async {
     // Resolve the display ID: accept whatever string enumerateDisplays()
     // returns, or null to mean "use the platform default display".
     String? resolvedDisplayId = cfg.displayId;
@@ -1160,7 +1245,15 @@ class Recorder {
         videoFormat.width,
         videoFormat.height,
       );
-      final (dstW, dstH) = target ?? (videoFormat.width, videoFormat.height);
+      final (dstW, dstH) =
+          lockedSize ?? target ?? (videoFormat.width, videoFormat.height);
+      // Whether the GPU processor has anything to do. Asked as "does the size
+      // actually change", not "is a scale policy set", so a locked size that
+      // differs from a re-acquired display's new resolution engages the
+      // rescale even with no scale policy configured — and a scale policy that
+      // happens to return the source size correctly engages nothing.
+      final needResize =
+          dstW != videoFormat.width || dstH != videoFormat.height;
       final bc = _backendContext;
 
       if (bc == null) {
@@ -1173,7 +1266,7 @@ class Recorder {
           );
         }
         final megaPixels = (videoFormat.width * videoFormat.height) / 1e6;
-        if (megaPixels >= 4.0 && target == null) {
+        if (megaPixels >= 4.0 && !needResize) {
           Recorder._log(
             'WARNING: capturing ${videoFormat.width}x${videoFormat.height} '
             '(${megaPixels.toStringAsFixed(1)} MP) without GPU context and '
@@ -1187,7 +1280,7 @@ class Recorder {
 
       if (!useGpuOutput) {
         // Case B or C depending on whether there is GPU work to do.
-        final hasWork = target != null || cfg.effects.isNotEmpty;
+        final hasWork = needResize || cfg.effects.isNotEmpty;
         if (hasWork) {
           // Case B: GPU downscale + CPU readback.
           Recorder._log(
@@ -1233,7 +1326,7 @@ class Recorder {
       }
 
       // Case A: full GPU zero-copy path.
-      if (target != null) {
+      if (needResize) {
         Recorder._log(
           'screen downscale: '
           '${videoFormat.width}x${videoFormat.height} → ${dstW}x$dstH '
@@ -1321,7 +1414,7 @@ class Recorder {
     final isGpuBufferEncoder = platform.supportsGpuBufferInput;
     final effectiveGpuBuffer =
         processor != null && !processorCpuReadback && isGpuBufferEncoder;
-    // Zero-copy D3D11 sub-modes (see _VideoTrackRuntime):
+    // Zero-copy D3D11 sub-modes (see VideoTrackRuntime):
     //  - no GPU work (no scale/effects)  → direct BGRA passthrough: the capture
     //    NT handle goes straight to the encoder; zero shader-core work/frame.
     //  - GPU work present                → pipelined two-stage encode: GPU
@@ -1384,7 +1477,13 @@ class Recorder {
       effectiveCpuReadback = true;
     }
 
-    return _VideoTrackRuntime(
+    // Captured by value for the re-acquire closure: `videoFormat` is a `var`
+    // that the format-negotiation above reassigns, and a closure over it would
+    // see later writes rather than the shape this track was built for.
+    final reacquireDisplayId = resolvedDisplayId;
+    final reacquireFormat = videoFormat;
+
+    return VideoTrackRuntime(
       index: index,
       label: 'screen[${resolvedDisplayId ?? cfg.windowId}]',
       encoder: encResult.encoder,
@@ -1405,10 +1504,36 @@ class Recorder {
       startFn: (cb) => ctx.startCapture(cb),
       stopFn: () => ctx.stopCapture(),
       destroyFn: () => ctx.destroy(),
+      addLostListenerFn: ctx.addLostListener,
+      lossPolicy: cfg.lossPolicy,
+      reacquireLimit: cfg.reacquireLimit,
+      // Re-acquire is offered for a DISPLAY and not for a window, because the
+      // platform means different things by the two losses.
+      //
+      // A display's capture item closes for reasons that undo themselves —
+      // Win+P, dock/undock, lock, an RDP transition, a mode change. The
+      // monitor is still a monitor; CreateForMonitor on the same HMONITOR
+      // gives a working item back the moment the topology settles.
+      //
+      // A window's item closes when the window is DESTROYED. The HWND is dead
+      // and will not be reissued, so retrying is asking a question that can
+      // only ever be answered no. Ending the track and saying so is the
+      // honest response; picking a different window is the application's
+      // decision to make with its user, not one to infer here.
+      reacquireFn: reacquireDisplayId == null
+          ? null
+          : () async {
+              // A RE-CONFIGURE, not a restart: it drops the dead capture item,
+              // session and frame pool and builds a fresh item from the same
+              // HMONITOR. After a loss the platform's stop is a no-op, so a
+              // bare restart would re-arm handlers on the item that died.
+              await ctx.configureDisplay(reacquireDisplayId, reacquireFormat);
+              return true;
+            },
     );
   }
 
-  Future<_TrackRuntime> _buildCameraTrack(
+  Future<TrackRuntime> _buildCameraTrack(
     int index,
     CameraRecorderSource cfg,
   ) async {
@@ -1539,7 +1664,7 @@ class Recorder {
                 '${encResult.encoder.backendName}',
     );
 
-    return _VideoTrackRuntime(
+    return VideoTrackRuntime(
       index: index,
       label: 'camera[${cfg.deviceId}]',
       encoder: encResult.encoder,
@@ -1777,7 +1902,7 @@ class Recorder {
     );
   }
 
-  Future<_TrackRuntime> _buildMixedAudioTrack(
+  Future<TrackRuntime> _buildMixedAudioTrack(
     int index,
     MixedAudioRecorderSource cfg,
   ) async {
@@ -2045,8 +2170,12 @@ class Recorder {
   // Packet dispatch (called from track runtimes)
   // -----------------------------------------------------------------------
 
-  // ignore: library_private_types_in_public_api
-  Future<void> dispatchPacket(_TrackRuntime track, EncodedPacket packet) async {
+  Future<void> dispatchPacket(TrackRuntime track, EncodedPacket packet) async {
+    // Liveness, recorded in the one place every track's output passes through
+    // rather than at each of the ten sites that build a packet. See
+    // [CaptureWatchdog]: a produced packet is the only proof a capture is
+    // still alive that survives a static screen.
+    track.notePacket(now());
     final routed = packet.copyWith(trackIndex: track.index);
     for (final s in _sinks) {
       switch (s) {
@@ -2065,21 +2194,182 @@ class Recorder {
     }
   }
 
+
+  /// Rebuild a video track's whole GPU stage in place: Dawn's device, the
+  /// screen processor, the encoder and the capture context.
+  ///
+  /// This is the recovery a GPU device reset needs and a lost capture item
+  /// does not. A reset removes every D3D11 device on the adapter at once, so
+  /// re-configuring the capture is not enough — the capture would come back on
+  /// a device that no longer exists. Everything has to be replaced together,
+  /// against the device Dawn recreated for itself.
+  ///
+  /// The container is what constrains this. A declared track's dimensions,
+  /// codec and frame rate are already written; only the codec CONFIGURATION
+  /// record may still change (see [updateTrackConfig]). So a rebuild that
+  /// comes out a different shape is refused rather than spliced — a file whose
+  /// header describes the first half is worse than a file that stops.
+  ///
+  /// Returns true when the track is running again on new hardware objects.
+  Future<bool> rebuildVideoStage(VideoTrackRuntime track) async {
+    if (_state != RecorderState.running) return false;
+    if (track.index < 0 || track.index >= _sourceConfigs.length) return false;
+    final cfg = _sourceConfigs[track.index];
+    if (cfg is! ScreenRecorderSource) {
+      // Only the screen path can rebuild today. A camera's context is built
+      // the same way and could follow; nothing here assumes it cannot.
+      return false;
+    }
+    // Single-flight across tracks: the device re-acquire below mutates
+    // process-global state that every track's encoder is opened against, and
+    // two tracks discovering the same reset at the same moment is the normal
+    // case, not the exotic one.
+    if (_rebuilding) return false;
+    _rebuilding = true;
+    try {
+      // Re-read the D3D11 device Dawn is on NOW. Dawn recreates its own device
+      // after a reset; the process-global handle still points at the removed
+      // one, and an encoder opened against that would fail every frame while
+      // reporting success at open. This is the same re-acquire every recording
+      // session already does at prepare — it has simply never run mid-session.
+      await _maybeInitSharedGpu();
+
+      final fresh = await _buildScreenTrack(
+        track.index,
+        cfg,
+        lockedSize: (track.width, track.height),
+      );
+      if (fresh is! VideoTrackRuntime) return false;
+
+      if (!track.canAdopt(fresh)) {
+        _log(
+          '${track.label} rebuild came out ${fresh.width}x${fresh.height} '
+          '${fresh.videoCodec} where the container already declares '
+          '${track.width}x${track.height} ${track.videoCodec} — refusing to '
+          'splice it. The video track ends here rather than continuing under a '
+          'header that describes something else.',
+          RecorderLogLevel.error,
+        );
+        await VideoTrackRuntime.discardStage(fresh);
+        return false;
+      }
+
+      await track.adoptStage(fresh);
+      _log(
+        '${track.label} GPU stage rebuilt (device, processor, encoder and '
+        'capture all replaced) — recording continues in the same file.',
+        RecorderLogLevel.warning,
+      );
+      return true;
+    } catch (e, st) {
+      _log('${track.label} stage rebuild failed: $e\n$st',
+          RecorderLogLevel.error);
+      return false;
+    } finally {
+      _rebuilding = false;
+    }
+  }
+
+  bool _rebuilding = false;
+
+  /// A track's encoder now emits [config] — its codec configuration record.
+  ///
+  /// Called after anything that could have reopened an encoder. Almost always
+  /// a no-op: a reopened encoder with the same settings issues byte-identical
+  /// parameter sets. When it does not, the container needs to know, because
+  /// the record already committed to the file would otherwise be a claim
+  /// about samples that were not encoded under it.
+  void updateTrackConfig(TrackRuntime track, Uint8List config) {
+    if (config.isEmpty) return;
+    for (final s in _sinks) {
+      if (s is! _FileSinkRuntime) continue;
+      final p = s.muxer.platform;
+      if (p is! Mp4Muxer) continue;
+      try {
+        final change = p.setTrackConfig(track.index, config);
+        if (change == Mp4ConfigChange.added) {
+          _log(
+            '${track.label} encoder came back with DIFFERENT parameter sets — '
+            'a second sample entry was written and later frames point at it. '
+            'Players that honour sample_description_index handle this; ones '
+            'that read only the first entry will render the tail wrong.',
+            RecorderLogLevel.warning,
+          );
+        }
+      } catch (e) {
+        _log('updateTrackConfig(${track.label}): $e', RecorderLogLevel.error);
+      }
+    }
+  }
+
   /// Master-clock pts, in microseconds, at the moment this is called.
   int now() => _masterClock.elapsedMicroseconds;
+
+  final List<String> _captureIssues = [];
+
+  /// Live capture health, one entry per source that can report it.
+  ///
+  /// Safe to poll at any cadence — it reads counters, touches no hardware and
+  /// allocates a handful of small objects. A UI that shows "recording" for
+  /// ninety-five minutes when the screen stopped at minute fifty-four is the
+  /// problem this exists to make impossible; polling this once a second is
+  /// enough to catch it while someone can still act.
+  ///
+  /// Empty before [start].
+  List<RecorderCaptureStatus> get captureStatus => [
+        for (final t in _tracks)
+          if (t.captureStatus case final s?) s,
+      ];
+
+  /// True when every source that can report is capturing normally. Shorthand
+  /// for the common check.
+  bool get captureHealthy => captureStatus.every((s) => s.healthy);
+
+  /// Capture problems this recording survived or ended on, populated at
+  /// [stop]. Empty means every track captured start to finish.
+  ///
+  /// [stop] deliberately still returns normally when this is non-empty: the
+  /// file is valid and everything that was captured is in it, so throwing
+  /// would be a lie about the data. Read this to find out whether the
+  /// recording covers the whole session.
+  List<String> get captureIssues => List.unmodifiable(_captureIssues);
 }
 
 // =========================================================================
 // Track runtime (one per source).
 // =========================================================================
 
-abstract class _TrackRuntime {
-  _TrackRuntime({required this.index, required this.label});
+/// How a capture buffer is handed back to the platform.
+///
+/// A seam, not an abstraction: releasing the same buffer twice is a crash in
+/// native code and releasing it never is a leak that only shows up under an
+/// hour of recording. Both are worth being able to assert on, and neither is
+/// observable through a real release.
+///
+/// Test-only override point; production never assigns it.
+void Function(MiniAVBuffer buffer) releaseCaptureBuffer =
+    MiniAV.releaseBufferSync;
+
+abstract class TrackRuntime {
+  TrackRuntime({required this.index, required this.label});
   final int index;
   final String label;
 
   /// Outstanding encode futures so [Recorder.stop] can wait before flush.
   final List<Future<void>> _inFlight = [];
+
+  /// Master-clock µs at which this track last produced an encoded packet, or
+  /// -1 before the first one.
+  int lastPacketUs = -1;
+
+  /// Encode or GPU-stage failures since that packet. Zeroed by every packet,
+  /// so this is "has work been attempted and failed with nothing to show".
+  int encodeErrorsSincePacket = 0;
+
+  void notePacket(int nowUs) {
+    lastPacketUs = nowUs;
+    encodeErrorsSincePacket = 0;
+  }
 
   Future<void> startCapture(Recorder rec);
   Future<void> stopCapture();
@@ -2097,6 +2387,18 @@ abstract class _TrackRuntime {
   TrackInfo toTrackInfo();
   FfmpegEncoderBridge? get encoderBridge;
   TrackChunk toChunk(EncodedPacket pkt);
+
+  /// One line describing anything that happened to this track's CAPTURE that
+  /// the output cannot show — a target that disappeared, an outage that was
+  /// re-acquired. Null when the capture ran start to finish.
+  ///
+  /// [Recorder.captureIssues] collects these at stop, so a session that lost
+  /// its display for forty minutes says so instead of reporting success and
+  /// leaving a short file to be discovered later.
+  String? get captureLossSummary => null;
+
+  /// Live capture health, or null for a source that cannot lose a target.
+  RecorderCaptureStatus? get captureStatus => null;
 
   /// Re-open this track's AUDIO encoder pinned to the FFmpeg backend, keeping
   /// the capture context, and return `true` when one was swapped.
@@ -2220,7 +2522,7 @@ class EncoderImportCache {
   }
 }
 
-/// A captured video frame waiting in [_VideoTrackRuntime]'s bounded encode
+/// A captured video frame waiting in [VideoTrackRuntime]'s bounded encode
 /// queue. [captureUs] is the wall-clock acceptance time, captured at enqueue so
 /// the emitted PTS reflects when the frame was *captured* (evenly spaced by the
 /// throttle) rather than when the serialized encoder happened to reach it —
@@ -2232,8 +2534,8 @@ class _PendingVideoFrame {
   final int captureUs;
 }
 
-class _VideoTrackRuntime extends _TrackRuntime {
-  _VideoTrackRuntime({
+class VideoTrackRuntime extends TrackRuntime {
+  VideoTrackRuntime({
     required super.index,
     required super.label,
     required this.encoder,
@@ -2254,18 +2556,64 @@ class _VideoTrackRuntime extends _TrackRuntime {
     this.directD3d11Passthrough = false,
     this.pipelinedZeroCopy = false,
     this.cfrOutput = false,
+    this.reacquireFn,
+    this.addLostListenerFn,
+    this.lossPolicy = VideoCaptureLossPolicy.reacquire,
+    this.reacquireLimit,
   });
 
-  final Encoder encoder;
+  // ---- The STAGE: everything a GPU device reset destroys -----------------
+  //
+  // A capture-item loss leaves all of this alone and only the capture target
+  // is rebuilt. A device reset does not: it removes every D3D11 device on the
+  // adapter, so Dawn's device, the GPU processor's resources, the encoder's
+  // device and the capture context all die together and every one of them has
+  // to be replaced in place. See [adoptStage].
+  //
+  // What is NOT here is deliberate. [index], [width], [height], [videoCodec]
+  // and the frame rate are written into the container's track header before
+  // the first frame and cannot be revised, so a rebuild must reproduce them
+  // exactly or be refused. [_pacer] stays too, which is what keeps a CFR grid
+  // continuous across the outage rather than restarting it.
+  Encoder encoder;
   final VideoCodec videoCodec;
   final int width;
   final int height;
   final int frameRateNum;
   final int frameRateDen;
-  final Object captureCtx;
-  final Future<void> Function(void Function(MiniAVBuffer, Object?)) startFn;
-  final Future<void> Function() stopFn;
-  final Future<void> Function() destroyFn;
+  Object captureCtx;
+  Future<void> Function(void Function(MiniAVBuffer, Object?)) startFn;
+  Future<void> Function() stopFn;
+  Future<void> Function() destroyFn;
+
+  /// Rebuild the capture target after it was lost, WITHOUT touching the
+  /// encoder. On Windows Graphics Capture this is a re-configure: it drops
+  /// the dead capture item, session and frame pool and builds a fresh item
+  /// from the same display or window. A bare re-start would not do — after a
+  /// loss the platform's stop is a no-op, so re-starting re-arms handlers on
+  /// the item that already died.
+  ///
+  /// Returns false when the target is not there to be re-acquired (a display
+  /// still absent, a window that is gone for good), which is a retry, not a
+  /// fault. Throws for anything else.
+  ///
+  /// Null for sources with no re-acquire path; those end the track on loss.
+  Future<bool> Function()? reacquireFn;
+
+  /// Subscribe to the platform's capture-lost notification. A method tear-off
+  /// rather than a type test on [captureCtx], for the reason spelled out on
+  /// [EncoderImportCache]: a concrete-type gate is the one shape no test
+  /// double can satisfy, so the wiring would be unprovable.
+  void Function() Function(MiniAVContextLostListener)? addLostListenerFn;
+
+  /// What to do when the capture target disappears. See
+  /// [VideoCaptureLossPolicy] — including why nothing here ever substitutes a
+  /// different display for the one that went away.
+  final VideoCaptureLossPolicy lossPolicy;
+
+  /// How long to keep re-acquiring before ending the track; null = for as
+  /// long as the recording runs.
+  final Duration? reacquireLimit;
 
   /// Optional GPU screen processor (downscale + effects chain). Non-null when:
   /// (a) the zero-copy GPU path is live — [processorCpuReadback] is false, and
@@ -2273,18 +2621,18 @@ class _VideoTrackRuntime extends _TrackRuntime {
   /// (b) GPU context is available but hardware encoding is not —
   ///     [processorCpuReadback] is true, and [processToBytes] is used to run
   ///     GPU downscale and read the result back to CPU for software/CPU-HW encode.
-  final GpuScreenProcessor? processor;
+  GpuScreenProcessor? processor;
 
   /// When true, [processor] runs GPU downscale + effects and returns CPU bytes
   /// via [processToBytes] rather than a D3D11 shared texture. This lets the GPU
   /// handle the expensive bilinear resize (e.g. 4K→1080p) even when the
   /// hardware D3D11 encoder is unavailable.
-  final bool processorCpuReadback;
+  bool processorCpuReadback;
 
   /// When true, [processor] stays on-GPU and the result is passed directly to
   /// the encoder as a GPU [Buffer] via [encodeFromGpuBuffer] (zero CPU
   /// round-trip).  Takes priority over [processorCpuReadback].
-  final bool processorGpuBuffer;
+  bool processorGpuBuffer;
 
   /// Controls how the encoder fills gaps when the capture source delivers
   /// fewer frames than the configured fps. See [VideoIdleFramePolicy].
@@ -2309,14 +2657,14 @@ class _VideoTrackRuntime extends _TrackRuntime {
   /// shader-core work per frame, so a saturated GPU has nothing to starve.
   /// Frames whose size mismatches the encoder (mid-stream mode change) fall
   /// back to the GPU processor, which rescales.
-  final bool directD3d11Passthrough;
+  bool directD3d11Passthrough;
 
   /// When true (zero-copy D3D11 path WITH GPU work), the per-frame GPU stage
   /// and the encode stage run as a two-stage pipeline: the GPU processing of
   /// frame N+1 overlaps the encode of frame N, each stage internally
   /// serialized. Requires the processor's shared-texture ring (depth ≥ 2) so
   /// the stage-1 write never touches the texture stage 2 is reading.
-  final bool pipelinedZeroCopy;
+  bool pipelinedZeroCopy;
 
   /// When true, output PTS are quantized to the exact fps grid and every grid
   /// slot is filled exactly once — live frames claim their nearest slot,
@@ -2335,7 +2683,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
 
   /// Keeps the encoder's imported-producer-texture cache in step with the
   /// producer (see [EncoderImportCache]).
-  late final EncoderImportCache _imports = EncoderImportCache(
+  late EncoderImportCache _imports = EncoderImportCache(
     encoder.platform,
     // Direct passthrough submits the capture's own texture; a track with no
     // processor (GPU-output camera) submits nothing else. Every other shape
@@ -2343,6 +2691,26 @@ class _VideoTrackRuntime extends _TrackRuntime {
     // producer resize does not touch.
     importsProducerTextures: directD3d11Passthrough || processor == null,
   );
+
+  /// The buffer currently retained as the duplicator's source, if any.
+  /// Readable and settable so a test can assert it is released exactly once —
+  /// releasing a capture buffer twice is a crash inside native code, and never
+  /// releasing it is a leak that only shows up after an hour of recording.
+  MiniAVBuffer? get duplicatorSource => _lastDirectBuffer;
+  set duplicatorSource(MiniAVBuffer? b) => _lastDirectBuffer = b;
+
+  /// How many buffers are retired and awaiting release.
+  int get retiredBufferCount => _retiredDirectBuffers.length;
+
+  /// Give up on [buffer] as a duplicator source. It is released once in-flight
+  /// encodes have drained, never before — an encode may still be reading it.
+  ///
+  /// Happens for two unrelated reasons, which is why it is a list and not a
+  /// slot: the capture target died, or re-encoding this buffer failed. Both
+  /// can occur before a single drain, and a slot would silently lose whichever
+  /// came second.
+  void retireDuplicatorSource(MiniAVBuffer buffer) =>
+      _retiredDirectBuffers.add(buffer);
 
   /// Last live frame retained for the duplicator on the direct-passthrough
   /// path (swap-released when the next live frame lands; released on stop).
@@ -2392,6 +2760,77 @@ class _VideoTrackRuntime extends _TrackRuntime {
   Timer? _dupTimer;
   SharedOutputTexture? _lastSharedTex;
   Recorder? _recForDup;
+
+  // ---- Capture-target loss and re-acquire --------------------------------
+  //
+  // Field report (miniav_recorder 0.5.9, session f2bb70b3): a WGC capture item
+  // closed 54 minutes into a 95-minute session. Nothing was wrong with the
+  // machine — an independent capture of the SAME desktop stayed connected for
+  // the remaining 41 minutes and the audio tracks never stopped — but the
+  // recorder had no way to hear that its target had gone, so it re-encoded the
+  // dead capture buffer at the frame rate for the rest of the session and
+  // reported success at stop. 1 in 6 sessions.
+  //
+  // Two separate defects made that possible and both are fixed here: nothing
+  // subscribed to the platform's capture-lost notification, and a duplicate
+  // whose encode failed never retired its source (see [_encodeDuplicateDirect]).
+
+  /// Unsubscribe for [addLostListenerFn].
+  void Function()? _lostUnsub;
+
+  CaptureWatchdog? _watchdog;
+
+  /// The re-acquire state machine. Null until [startCapture]; it needs the
+  /// recorder's master clock. See [CaptureRecovery] for why re-acquiring beats
+  /// reporting, and for what is deliberately never attempted.
+  CaptureRecovery? _recovery;
+
+  /// Capture buffers retired as duplicator sources — because the target died,
+  /// or because re-encoding one failed. Their shared handles no longer
+  /// resolve, but an encode may still be reading them, so they are released
+  /// only once in-flight work has drained.
+  ///
+  /// A list rather than a single slot: retirement can happen more than once
+  /// between drains (a failed duplicate, a live frame re-arming the source, a
+  /// second failed duplicate), and a single slot would silently drop every
+  /// buffer after the first.
+  final List<MiniAVBuffer> _retiredDirectBuffers = [];
+
+  /// Watches for a capture that has gone silent WITHOUT the platform saying
+  /// so — the case the lost-callback cannot cover. See [CaptureWatchdog].
+  Timer? _watchdogTimer;
+  int _captureStartedAtUs = -1;
+  int _silentLosses = 0;
+
+  /// True while the target is gone and the track has not given up.
+  bool get captureLost => _recovery?.lost ?? false;
+
+  @override
+  RecorderCaptureStatus? get captureStatus {
+    final r = _recovery;
+    if (r == null) return null;
+    return RecorderCaptureStatus(
+      label: label,
+      lost: r.lost,
+      ended: r.ended,
+      lossCount: r.lossCount,
+      recoveryCount: r.recoveryCount,
+      rebuildCount: r.hardRecoveryCount,
+      secondsMissing: r.totalLostUs / 1000000,
+    );
+  }
+
+  @override
+  String? get captureLossSummary {
+    final base = _recovery?.summary;
+    if (base == null) return null;
+    // Which detector fired matters: a platform-reported loss is a known
+    // event, while a watchdog loss is one nothing else would have caught.
+    return _silentLosses == 0
+        ? base
+        : '$base ($_silentLosses detected by the watchdog, not reported by '
+            'the platform)';
+  }
 
   // Encode-error rate limiting: log the first error immediately, then at
   // most once every [_errorLogIntervalMs] ms, to avoid 30-per-second spam
@@ -2489,11 +2928,86 @@ class _VideoTrackRuntime extends _TrackRuntime {
   @override
   Future<void> startCapture(Recorder rec) async {
     _statsSw = Stopwatch()..start();
+    _recForDup = rec;
+    _subscribeCaptureLost(rec);
     _startDupTimer(rec);
-    await startFn((MiniAVBuffer buffer, Object? _) {
-      if (_stopping) {
+    _startWatchdog(rec);
+    await startFn(_onFrame(rec));
+  }
+
+  /// Poll for a capture that has stopped producing without saying so.
+  ///
+  /// One second is far below the silence window it is testing against, so the
+  /// poll rate costs nothing and the detection latency is set by the window
+  /// rather than by this.
+  void _startWatchdog(Recorder rec) {
+    armWatchdog(rec.now());
+    if (_watchdog == null) return;
+    _watchdogTimer?.cancel();
+    _watchdogTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => checkWatchdog(rec.now()),
+    );
+  }
+
+  /// Build the silence watchdog and start its grace period at [nowUs].
+  ///
+  /// Separate from the timer that drives it so the DECISION and its
+  /// consequences can be exercised without waiting a second per tick — the
+  /// wiring between this and [CaptureRecovery] is the part that has been
+  /// wrong before, not the arithmetic on either side of it.
+  void armWatchdog(int nowUs) {
+    _watchdog = CaptureWatchdog(
+      frameIntervalUs: _minFrameIntervalUs,
+      idleFillActive: idleFramePolicy != VideoIdleFramePolicy.none,
+    );
+    _captureStartedAtUs = nowUs;
+  }
+
+  /// One watchdog tick. Returns true when it declared the capture lost.
+  bool checkWatchdog(int nowUs) {
+    final wd = _watchdog;
+    final recovery = _recovery;
+    if (wd == null || recovery == null) return false;
+    // Recovery already owns the situation, or the recording is ending.
+    if (_stopping || recovery.lost || recovery.ended) return false;
+    if (!wd.shouldDeclareLost(
+      nowUs: nowUs,
+      lastPacketUs: lastPacketUs,
+      errorsSincePacket: encodeErrorsSincePacket,
+      startedAtUs: _captureStartedAtUs,
+    )) {
+      return false;
+    }
+    _silentLosses++;
+    Recorder._log(
+      '$label produced no packet for '
+      '${(wd.silenceThresholdUs / 1000000).toStringAsFixed(1)}s '
+      '($encodeErrorsSincePacket encode error(s) since) — the platform never '
+      'reported a loss, so this is the watchdog calling it. Re-acquiring.',
+      RecorderLogLevel.warning,
+    );
+    _releaseDeadCaptureState();
+    // Restart the clock so a re-acquire that does not fix it re-fires on the
+    // silence window rather than immediately.
+    _captureStartedAtUs = nowUs;
+    lastPacketUs = -1;
+    encodeErrorsSincePacket = 0;
+    recovery.noteLost(watchdogLossReason);
+    return true;
+  }
+
+  /// Reason code for a loss nobody reported. Distinct from any platform code
+  /// so a log line says which detector fired.
+  static const int watchdogLossReason = -1;
+
+  /// The capture callback. A method rather than an inline closure so a
+  /// re-acquire can hand the platform the same one (see [_attemptReacquire]).
+  void Function(MiniAVBuffer, Object?) _onFrame(Recorder rec) =>
+      (MiniAVBuffer buffer, Object? _) {
+      if (_stopping || captureLost) {
         // Drop and release.
-        MiniAV.releaseBufferSync(buffer);
+        releaseCaptureBuffer(buffer);
         return;
       }
       _statsFramesIn++;
@@ -2529,7 +3043,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
       }
       if (drop) {
         _statsThrottleDropped++; // surplus vs target rate (or slot taken)
-        MiniAV.releaseBufferSync(buffer);
+        releaseCaptureBuffer(buffer);
         return;
       }
       // Bounded-queue back-pressure (replaces the depth-1 `_busy` gate). Enqueue
@@ -2540,10 +3054,243 @@ class _VideoTrackRuntime extends _TrackRuntime {
       if (_frameQueue.length > _maxQueueDepth) {
         final dropped = _frameQueue.removeAt(0);
         _statsBusyDropped++; // real back-pressure — encode can't keep up
-        MiniAV.releaseBufferSync(dropped.buffer);
+        releaseCaptureBuffer(dropped.buffer);
       }
       _pumpQueue(rec);
+      };
+
+
+
+  /// Whether [fresh] may replace this track's stage.
+  ///
+  /// The container is what constrains a rebuild. A declared track's
+  /// dimensions, codec and frame rate are written into the file's header
+  /// before the first frame and cannot be revised — only the codec
+  /// CONFIGURATION record may still change, and [Recorder.updateTrackConfig]
+  /// handles that. So a rebuild that comes out a different shape is refused:
+  /// a file whose header describes only its first half is worse than one that
+  /// stops honestly.
+  bool canAdopt(VideoTrackRuntime fresh) =>
+      fresh.width == width &&
+      fresh.height == height &&
+      fresh.videoCodec == videoCodec &&
+      fresh.frameRateNum == frameRateNum &&
+      fresh.frameRateDen == frameRateDen;
+
+  /// Take over [fresh]'s capture, processor and encoder, and destroy this
+  /// track's own — a device reset survived without the file noticing.
+  ///
+  /// [fresh] is a fully built track runtime that was never started. Only its
+  /// stage is wanted; the shell is discarded by the caller. Building a whole
+  /// runtime to harvest it is deliberate: the alternative is a second copy of
+  /// four hundred lines of capability negotiation that would drift from the
+  /// original the first time either changed.
+  ///
+  /// The old stage is torn down FIRST and its failures ignored. After a device
+  /// reset every object in it is bound to a removed device, so closing them is
+  /// expected to fail — and a throw there must not lose the working stage that
+  /// has already been built.
+  Future<void> adoptStage(VideoTrackRuntime fresh) async {
+    // Nothing may be encoding while the encoder is swapped underneath it.
+    await drainInFlight();
+    _releaseDeadCaptureState();
+    _releaseRetiredBuffers();
+
+    try {
+      await stopFn();
+    } catch (_) {}
+    try {
+      await encoder.close();
+    } catch (_) {}
+    try {
+      processor?.dispose();
+    } catch (_) {}
+    try {
+      await destroyFn();
+    } catch (_) {}
+
+    encoder = fresh.encoder;
+    processor = fresh.processor;
+    captureCtx = fresh.captureCtx;
+    startFn = fresh.startFn;
+    stopFn = fresh.stopFn;
+    destroyFn = fresh.destroyFn;
+    reacquireFn = fresh.reacquireFn;
+    addLostListenerFn = fresh.addLostListenerFn;
+    // Capability flags come WITH the stage. A rebuild can legitimately land on
+    // a different path — the GPU came back but zero-copy did not — and keeping
+    // the old flags would send frames down a route the new encoder cannot
+    // take, which fails silently rather than loudly.
+    processorCpuReadback = fresh.processorCpuReadback;
+    processorGpuBuffer = fresh.processorGpuBuffer;
+    directD3d11Passthrough = fresh.directD3d11Passthrough;
+    pipelinedZeroCopy = fresh.pipelinedZeroCopy;
+
+    // The import cache pins textures on the OLD encoder's device. Rebuilt, not
+    // invalidated: invalidating tells the old encoder to drop its pins, and
+    // the old encoder no longer exists.
+    _imports = EncoderImportCache(
+      encoder.platform,
+      importsProducerTextures: directD3d11Passthrough || processor == null,
+    );
+    _lastEncodeError = null;
+
+    // The first frame from the new encoder should be a keyframe. Nothing
+    // downstream can predict where an outage ended, so a seek landing just
+    // after one would otherwise have to run back to the previous IDR — across
+    // a discontinuity, through frames the new encoder never produced.
+    try {
+      await encoder.requestKeyframe();
+    } catch (_) {
+      // Not every backend can force one, and a P-frame here is cosmetic.
+    }
+
+    // The lost-callback belonged to the context that was just destroyed.
+    final recovery = _recovery;
+    if (recovery != null) bindLostListener(recovery);
+  }
+
+  /// Release [fresh]'s stage without ever having used it — the rebuild came
+  /// out incompatible with what the container already promised.
+  static Future<void> discardStage(VideoTrackRuntime fresh) async {
+    try {
+      await fresh.encoder.close();
+    } catch (_) {}
+    try {
+      fresh.processor?.dispose();
+    } catch (_) {}
+    try {
+      await fresh.destroyFn();
+    } catch (_) {}
+  }
+
+  // ---- Capture-target loss and re-acquire ---------------------------------
+
+  void _subscribeCaptureLost(Recorder rec) {
+    final recovery = CaptureRecovery(
+      label: label,
+      policy: lossPolicy,
+      reacquireLimit: reacquireLimit,
+      nowUs: rec.now,
+      log: (String message, {bool severe = false}) => Recorder._log(
+        message,
+        severe ? RecorderLogLevel.error : RecorderLogLevel.warning,
+      ),
+      quiesce: () => _quiesceLostCapture(rec),
+      // The escalation. Only the screen path can rebuild today; for anything
+      // else this is null and the recovery stays on the cheap repair.
+      hardReacquire: reacquireFn == null
+          ? null
+          : () => rec.rebuildVideoStage(this),
+      restart: () async {
+        await startFn(_onFrame(rec));
+        // A re-acquired capture has produced nothing yet; without this the
+        // watchdog would judge it on the outage it just recovered from.
+        _captureStartedAtUs = rec.now();
+        lastPacketUs = -1;
+        encodeErrorsSincePacket = 0;
+        // Re-read the encoder's configuration record. A capture-item loss
+        // leaves the encoder untouched and this is a no-op, which is the
+        // point: the check costs nothing and it is the one place a recovery
+        // that DID have to rebuild the encoder (a device reset takes every
+        // D3D11 device on the adapter with it) can tell the container before
+        // the first frame under new parameter sets is written.
+        final cfg = encoder.platform.extraData?.bytes;
+        if (cfg != null && cfg.isNotEmpty) {
+          rec.updateTrackConfig(this, Uint8List.fromList(cfg));
+        }
+        // Re-arm the duplicator. The CFR grid needs nothing: claimPts caps
+        // inline backfill at FramePacer.maxInlineBackfill and jumps the slot
+        // cursor forward, so an outage of any length becomes a timeline hole
+        // rather than a burst of catch-up frames -- already the pacer's
+        // documented behaviour for a long stall, and an outage is exactly a
+        // long stall.
+        _startDupTimer(rec);
+      },
+      // Null when there is no path at all (a window), and late-bound when
+      // there is, because [adoptStage] replaces the field. See
+      // [CaptureRecovery.lateBound] for why both halves matter.
+      reacquire: CaptureRecovery.lateBound(() => reacquireFn),
+    );
+    bindLostListener(recovery);
+  }
+
+  /// Point the platform's capture-lost callback at [recovery], and make it
+  /// the recovery this track uses.
+  ///
+  /// Called again after every [adoptStage], and that is not optional: the
+  /// subscription belongs to the capture context, and a rebuild destroys the
+  /// context it was made against. Leaving it would make a SECOND loss
+  /// invisible — the recorder would have recovered once and then gone quiet
+  /// for the rest of the session, which is the exact failure this whole path
+  /// exists to prevent.
+  void bindLostListener(CaptureRecovery recovery) {
+    _recovery = recovery;
+    final previous = _lostUnsub;
+    _lostUnsub = null;
+    if (previous != null) {
+      // The context this disposer belongs to may already be destroyed.
+      try {
+        previous();
+      } catch (_) {}
+    }
+    final subscribe = addLostListenerFn;
+    if (subscribe == null) return;
+    // The platform fires this from a capture thread and forbids synchronous
+    // teardown from inside it, so the listener does nothing but hand the work
+    // to the event loop.
+    _lostUnsub = subscribe((int reason) {
+      scheduleMicrotask(() {
+        if (_stopping) return;
+        _releaseDeadCaptureState();
+        recovery.noteLost(reason);
+      });
     });
+  }
+
+  /// Drop everything tied to the capture that just died, so nothing downstream
+  /// keeps using it. Runs synchronously the moment the loss is known — this is
+  /// what stops the failure loop, because the duplicator would otherwise go on
+  /// handing the encoder a shared handle that no longer resolves.
+  void _releaseDeadCaptureState() {
+    _dupTimer?.cancel();
+    _dupTimer = null;
+    _readyFrame = null;
+    _lastSharedTex = null;
+    _imports.invalidate();
+    for (final pending in _frameQueue) {
+      releaseCaptureBuffer(pending.buffer);
+    }
+    _frameQueue.clear();
+    // NOT released here: an encode may still be reading it. _quiesceLostCapture
+    // releases them once in-flight work has drained.
+    final retained = _lastDirectBuffer;
+    _lastDirectBuffer = null;
+    if (retained != null) retireDuplicatorSource(retained);
+  }
+
+  /// Release every retired duplicator source. Only safe once in-flight encodes
+  /// have drained — [Recorder._shutdown] and [_quiesceLostCapture] are the two
+  /// places where that holds.
+  void _releaseRetiredBuffers() {
+    if (_retiredDirectBuffers.isEmpty) return;
+    for (final b in _retiredDirectBuffers) {
+      releaseCaptureBuffer(b);
+    }
+    _retiredDirectBuffers.clear();
+  }
+
+  /// Let in-flight encodes finish, then release the dead capture's buffers and
+  /// stop the platform side, so a re-configure is legal.
+  Future<void> _quiesceLostCapture(Recorder rec) async {
+    await drainInFlight();
+    _releaseRetiredBuffers();
+    // After a loss the platform's stop is a no-op, but a lost-listener can
+    // also fire for something the session survived, and there the stop is what
+    // makes the re-configure legal.
+    try {
+      await stopFn();
+    } catch (_) {}
   }
 
   /// Starts encoding the next queued frame iff the (strictly serialized) encode
@@ -2609,6 +3356,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
         // rate-limited error counter rather than feeding a mismatched frame
         // to the D3D11 encoder.
         _statsEncodeErrors++;
+      encodeErrorsSincePacket++;
         _lastEncodeError = 'non-D3D11 buffer on pipelined zero-copy path';
         return;
       }
@@ -2618,6 +3366,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
       _readyFrame = (tex: tex, captureUs: pending.captureUs);
     } catch (e, st) {
       _statsEncodeErrors++;
+      encodeErrorsSincePacket++;
       _lastEncodeError = e;
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       if (_lastErrorLogMs == 0 ||
@@ -2631,7 +3380,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
     } finally {
       // The pixels now live in the processor's shared texture (or the frame
       // was dropped) — the capture buffer is no longer needed either way.
-      MiniAV.releaseBufferSync(buffer);
+      releaseCaptureBuffer(buffer);
     }
   }
 
@@ -2697,6 +3446,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
       }
     } catch (e, st) {
       _statsEncodeErrors++;
+      encodeErrorsSincePacket++;
       _lastEncodeError = e;
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       if (_lastErrorLogMs == 0 ||
@@ -2832,7 +3582,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
           _lastDirectBuffer = buffer;
           retainBuffer = true;
           _lastSharedTex = null; // direct frame supersedes any old texture
-          if (prev != null) MiniAV.releaseBufferSync(prev);
+          if (prev != null) releaseCaptureBuffer(prev);
           if (pkt != null) {
             _statsPacketsOut++;
             _statsTotalPktBytes += pkt.data.length;
@@ -2916,7 +3666,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
             final staleDirect = _lastDirectBuffer;
             if (staleDirect != null) {
               _lastDirectBuffer = null;
-              MiniAV.releaseBufferSync(staleDirect);
+              releaseCaptureBuffer(staleDirect);
             }
             final src = D3D11TextureFrameSource(
               texturePtr: sharedTex.d3d11TexturePtr,
@@ -3055,6 +3805,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
       }
     } catch (e, st) {
       _statsEncodeErrors++;
+      encodeErrorsSincePacket++;
       _lastEncodeError = e;
       // Rate-limit: log on first occurrence and at most every 5 seconds after.
       final nowMs = DateTime.now().millisecondsSinceEpoch;
@@ -3064,13 +3815,18 @@ class _VideoTrackRuntime extends _TrackRuntime {
         Recorder._log('$label encode error: $e\n$st', RecorderLogLevel.error);
       }
     } finally {
-      if (!retainBuffer) MiniAV.releaseBufferSync(buffer);
+      if (!retainBuffer) releaseCaptureBuffer(buffer);
     }
   }
 
   @override
   Future<void> stopCapture() async {
     _stopping = true;
+    _lostUnsub?.call();
+    _lostUnsub = null;
+    _recovery?.cancel();
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
     _dupTimer?.cancel();
     _dupTimer = null;
     _lastSharedTex = null;
@@ -3083,7 +3839,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
     // waiting in the queue would otherwise leak their native buffers. Release
     // them now (stopFn() has halted the source, so no new frames will enqueue).
     for (final pending in _frameQueue) {
-      MiniAV.releaseBufferSync(pending.buffer);
+      releaseCaptureBuffer(pending.buffer);
     }
     _frameQueue.clear();
   }
@@ -3281,6 +4037,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
       }
     } catch (e, st) {
       _statsEncodeErrors++;
+      encodeErrorsSincePacket++;
       _lastEncodeError = e;
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       if (_lastErrorLogMs == 0 ||
@@ -3322,13 +4079,29 @@ class _VideoTrackRuntime extends _TrackRuntime {
       }
     } catch (e, st) {
       _statsEncodeErrors++;
+      encodeErrorsSincePacket++;
       _lastEncodeError = e;
+      // RETIRE the source. A duplicate is a re-encode of a buffer we retained
+      // ourselves - if it fails, it will fail identically every time the idle
+      // timer fires, because nothing about it changes. Keeping it made the
+      // recorder re-encode a dead capture handle ~30 times a second for 41
+      // minutes (see the capture-loss note above), reporting the same error
+      // into a 5-second rate limiter so the log showed a trickle rather than
+      // the flood it was. `_lastSharedTex` already has an isValid gate above;
+      // the direct-passthrough buffer had nothing equivalent.
+      //
+      // Dropping the reference costs at most a duplicate: the next LIVE frame
+      // re-arms it. If no live frame comes, there was nothing to duplicate.
+      if (identical(_lastDirectBuffer, buf)) {
+        _lastDirectBuffer = null;
+        retireDuplicatorSource(buf);
+      }
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       if (_lastErrorLogMs == 0 ||
           nowMs - _lastErrorLogMs > _errorLogIntervalMs) {
         _lastErrorLogMs = nowMs;
         Recorder._log(
-          '$label direct duplicate encode error: $e\n$st',
+          '$label direct duplicate encode error (source retired): $e\n$st',
           RecorderLogLevel.error,
         );
       }
@@ -3362,6 +4135,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
       }
     } catch (e, st) {
       _statsEncodeErrors++;
+      encodeErrorsSincePacket++;
       _lastEncodeError = e;
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       if (_lastErrorLogMs == 0 ||
@@ -3382,7 +4156,9 @@ class _VideoTrackRuntime extends _TrackRuntime {
     // nothing can still be reading the buffer.
     final retained = _lastDirectBuffer;
     _lastDirectBuffer = null;
-    if (retained != null) MiniAV.releaseBufferSync(retained);
+    if (retained != null) releaseCaptureBuffer(retained);
+    // Anything retired that no re-acquire attempt got round to releasing.
+    _releaseRetiredBuffers();
     try {
       await destroyFn();
     } catch (_) {}
@@ -3439,7 +4215,7 @@ class _VideoTrackRuntime extends _TrackRuntime {
   }
 }
 
-class _AudioTrackRuntime extends _TrackRuntime {
+class _AudioTrackRuntime extends TrackRuntime {
   _AudioTrackRuntime({
     required super.index,
     required super.label,
@@ -3555,6 +4331,12 @@ class _AudioTrackRuntime extends _TrackRuntime {
   int _expectedCaptureUs = 0;
   bool _captureTsValid = false;
 
+  /// Sequential encode chain. Every chunk — live or gap fill — is appended
+  /// here, so the packets this track hands the muxer are always in the order
+  /// their PTSs were assigned. See the note at the live-chunk enqueue for why
+  /// arrival order and not just PTS order is what has to be guaranteed.
+  Future<void> _encodeChain = Future<void>.value();
+
   @override
   Future<void> startCapture(Recorder rec) async {
     await startFn((MiniAVBuffer buffer, Object? _) {
@@ -3661,11 +4443,21 @@ class _AudioTrackRuntime extends _TrackRuntime {
       }
       final ptsUs = _audioEpochUs + _samplesEmitted * 1000000 ~/ sampleRate;
       _samplesEmitted += frameCount;
-      final fut = _encodeAudio(rec, pcm, fmt, frameCount, ptsUs).whenComplete(
-        () {
-          unawaited(MiniAV.releaseBuffer(buffer));
-        },
+      // Chain, never fire-and-forget: the PTS above is monotonic by
+      // construction, but the muxer is indexed on ARRIVAL order, and two
+      // overlapping encodes reach dispatchPacket in whatever order their
+      // futures happen to settle. That is not theoretical — [_emitSilenceFrames]
+      // above launches a gap fill of up to a second immediately before this
+      // 10 ms chunk, so the small one can easily overtake the large one and
+      // hand the muxer a decode timestamp that steps backwards by the whole
+      // gap. [_MixedAudioTrackRuntime] has always chained for this reason;
+      // this path was the one that did not.
+      _encodeChain = _encodeChain.then<void>(
+        (_) => _encodeAudio(rec, pcm, fmt, frameCount, ptsUs),
       );
+      final fut = _encodeChain.whenComplete(() {
+        unawaited(MiniAV.releaseBuffer(buffer));
+      });
       _inFlight.add(fut);
       fut.whenComplete(() => _inFlight.remove(fut));
     });
@@ -3730,7 +4522,11 @@ class _AudioTrackRuntime extends _TrackRuntime {
     while (remaining > 0) {
       final n = remaining < chunkFrames ? remaining : chunkFrames;
       final ptsUs = _audioEpochUs + _samplesEmitted * 1000000 ~/ sampleRate;
-      final fut = _encodeAudio(rec, _silentPcm(n), audioFormat, n, ptsUs);
+      final pcm = _silentPcm(n);
+      _encodeChain = _encodeChain.then<void>(
+        (_) => _encodeAudio(rec, pcm, audioFormat, n, ptsUs),
+      );
+      final fut = _encodeChain;
       _inFlight.add(fut);
       fut.whenComplete(() => _inFlight.remove(fut));
       _samplesEmitted += n;
@@ -3829,7 +4625,7 @@ class _AudioTrackRuntime extends _TrackRuntime {
 double _dbToLinear(double db) =>
     db == 0.0 ? 1.0 : math.pow(10.0, db / 20.0).toDouble();
 
-class _MixedAudioTrackRuntime extends _TrackRuntime {
+class _MixedAudioTrackRuntime extends TrackRuntime {
   _MixedAudioTrackRuntime({
     required super.index,
     required super.label,
@@ -4511,6 +5307,26 @@ class _FileSinkRuntime implements _SinkRuntime {
     // Drain every queued packet to the muxer BEFORE writing the trailer.
     await _muxQueue.drain();
     await muxer.finish();
+    _logTimingRepairs();
+  }
+
+  /// Say so when the container had to repair this recording's decode order.
+  ///
+  /// The muxer rescues the file either way, which is the right call — but a
+  /// rescued file means a PRODUCER handed packets over out of order, and that
+  /// bug is invisible from the output. Without this line the only symptom is a
+  /// few frames of skew somewhere in a multi-gigabyte file, which nobody will
+  /// ever trace back. With it, the session that did it says so at stop.
+  void _logTimingRepairs() {
+    final p = muxer.platform;
+    if (p is! Mp4Muxer) return;
+    for (final r in p.timingReports) {
+      if (r.isClean) continue;
+      Recorder._log(
+        'mux timing repaired in $path — $r',
+        RecorderLogLevel.warning,
+      );
+    }
   }
 
   @override

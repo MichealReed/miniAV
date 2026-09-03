@@ -1,6 +1,6 @@
 name: miniav_ffi
 description: A Dart FFI library for the miniav project, providing bindings to the native miniav C library.
-version: 0.7.2
+version: 0.7.3
 repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_ffi
 
 environment:

@@ -222,6 +222,8 @@ class MiniAVBufferSource extends FrameSource {
         return FrameSourceKind.miniavBufferDmabuf;
       case MiniAVBufferContentType.gpuAHardwareBuffer:
         return FrameSourceKind.miniavBufferAHardwareBuffer;
+      case MiniAVBufferContentType.gpuWebVideoFrame:
+        return FrameSourceKind.webVideoFrame;
     }
   }
 }

@@ -1,6 +1,6 @@
 name: miniav_web
 description: A web implementation of the miniav library.
-version: 0.7.2
+version: 0.7.3
 repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_web
 
 environment:

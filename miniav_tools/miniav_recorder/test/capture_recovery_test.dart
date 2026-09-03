@@ -159,7 +159,9 @@ void main() {
       await h.settle(20);
       final s = h.recovery.summary!;
       expect(s, contains('re-acquired 1'));
-      expect(s, contains('of video missing'));
+      // Not 'of video': this summary is now written for a microphone as
+      // often as for a display.
+      expect(s, contains('missing from this track'));
     });
 
     test('a second loss is counted, and both outages add up', () async {
@@ -402,12 +404,14 @@ void _watchdogTests() {
       );
 
   group('the watchdog does not fire on a healthy capture', () {
-    test('a static screen with idle fill is healthy, however long it sits',
-        () {
-      // THE trap this whole design is built around: screen capture delivers
-      // no frames at all while nothing moves. Watching arrivals would call
-      // every idle desktop a dead capture. Watching PACKETS does not, because
-      // the duplicator keeps emitting them.
+    test('the OUTPUT test never fires while duplicates keep arriving', () {
+      // Screen capture delivers no frames at all while nothing moves, so
+      // watching arrivals alone would call every idle desktop a dead capture.
+      // Watching packets does not — the duplicator keeps emitting them.
+      //
+      // Read this narrowly. It says the duplicator is alive. It says NOTHING
+      // about the capture, which is why sourceWentSilent exists: a frozen
+      // capture produces this exact pattern for as long as you let it.
       final w = wd();
       for (final minutes in [1, 10, 60]) {
         expect(
@@ -418,7 +422,7 @@ void _watchdogTests() {
             startedAtUs: 0,
           ),
           isFalse,
-          reason: 'a duplicate is proof of life at minute $minutes',
+          reason: 'the duplicator is alive at minute $minutes',
         );
       }
     });
@@ -553,6 +557,91 @@ void _watchdogTests() {
 
     test('a source-controlled rate still gets the floor', () {
       expect(wd(fps: 0).silenceThresholdUs, CaptureWatchdog.minSilenceUs);
+    });
+  });
+
+  group('the source-silence window', () {
+    // The blind spot the output test cannot cover. With idle fill on — the
+    // screen default — a capture that dies goes on producing packets at the
+    // full frame rate, because the duplicator re-encodes its last frame
+    // forever. Output looks perfect; the picture is frozen.
+    test('a recent frame is healthy', () {
+      expect(
+        wd().sourceWentSilent(
+            nowUs: 9 * _us, lastSourceFrameUs: 5 * _us, startedAtUs: 0),
+        isFalse,
+      );
+    });
+
+    test('silence past the window is not', () {
+      expect(
+        wd().sourceWentSilent(
+            nowUs: 16 * _us, lastSourceFrameUs: 5 * _us, startedAtUs: 0),
+        isTrue,
+      );
+    });
+
+    test('a capture that never delivered anything is judged from the start',
+        () {
+      // Otherwise a source that produces nothing from the very first frame is
+      // the one case that never gets caught.
+      final w = wd();
+      expect(
+        w.sourceWentSilent(
+            nowUs: 5 * _us, lastSourceFrameUs: -1, startedAtUs: 0),
+        isFalse,
+        reason: 'still inside the window',
+      );
+      expect(
+        w.sourceWentSilent(
+            nowUs: 30 * _us, lastSourceFrameUs: -1, startedAtUs: 0),
+        isTrue,
+      );
+    });
+
+    test('nothing is judged before the capture has started', () {
+      expect(
+        wd().sourceWentSilent(
+            nowUs: 999 * _us, lastSourceFrameUs: -1, startedAtUs: -1),
+        isFalse,
+      );
+    });
+
+    test('the window is far longer than the output window', () {
+      // They answer different questions. Output silence is unambiguous;
+      // source silence is what a still desktop looks like.
+      final w = wd();
+      expect(w.sourceSilenceThresholdUs,
+          greaterThan(w.silenceThresholdUs * 3));
+    });
+
+    test('each unproductive declaration doubles the wait, up to a cap', () {
+      // What keeps the false positive cheap: a genuinely static screen trips
+      // the window, gets re-acquired, still delivers nothing — and each
+      // pointless attempt buys twice as long before the next.
+      final w = wd();
+      expect(w.sourceSilenceThresholdUs, CaptureWatchdog.minSourceSilenceUs);
+      w.widenSourceSilence();
+      expect(w.sourceSilenceThresholdUs,
+          CaptureWatchdog.minSourceSilenceUs * 2);
+      for (var i = 0; i < 20; i++) {
+        w.widenSourceSilence();
+      }
+      expect(w.sourceSilenceThresholdUs, CaptureWatchdog.maxSourceSilenceUs,
+          reason: 'capped, not unbounded');
+    });
+
+    test('a frame arriving earns the short window back', () {
+      // A real death after a recovery has to be caught in ten seconds again,
+      // not sixty.
+      final w = wd();
+      for (var i = 0; i < 5; i++) {
+        w.widenSourceSilence();
+      }
+      expect(w.sourceSilenceThresholdUs,
+          greaterThan(CaptureWatchdog.minSourceSilenceUs));
+      w.noteSourceAlive();
+      expect(w.sourceSilenceThresholdUs, CaptureWatchdog.minSourceSilenceUs);
     });
   });
 }

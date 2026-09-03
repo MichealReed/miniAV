@@ -1,9 +1,34 @@
 # Changelog
 
+## 0.5.14
+
+- Watchdog fixes
+- **A frozen capture is now detected.** The silence watchdog read encoded packets, on the reasoning that a healthy static screen still emits a duplicate every frame interval, so packet silence is already pathological. True — and the converse is what broke it: the idle-frame duplicator goes on re-encoding its last frame when the capture underneath is dead, so the one detector meant to catch "capture stopped and nothing said so" was blind in the default configuration. Seen in the field on a display mode change (5120x1440 to 3840x1440): the platform never reported a loss, a few frames arrived at the new size, then nothing for the remaining fifty seconds while the packet counter climbed and the picture sat frozen. The watchdog now also watches frames from the SOURCE, which the duplicator cannot forge.
+
+- The watchdog now asks the platform instead of always waiting out the window. Three seconds of source silence - which a moving screen never reaches - triggers one question: is the display still attached, and is it still the size the capture is delivering? A display that has been re-routed or resized while the capture hands over nothing is a stale capture item, and saying so needs no guesswork. Cuts the frozen stretch from ten seconds to about three for a mode change or an unplug; the ten-second window remains the fallback for a stall the display itself does not show.
+
+- A watchdog outage is now timed from when the capture went quiet, not from when the watchdog concluded it. Both silences are decided after a window has elapsed and the recording was already frozen for all of it, so timing from the declaration counted only the recovery: three ten-second freezes were reported as "0.8s missing". That number is what an operator uses to decide whether a session is usable.
+
+- Source silence uses a much longer window than output silence (10s vs 3s), because the two mean different things: screen capture is event-driven, so a desktop where nothing moves legitimately delivers nothing for minutes. Each re-acquire that fails to bring frames back doubles the window, up to a minute, and a frame arriving earns the short window back — so a real death is caught in ten seconds while a genuinely still desktop settles at roughly one re-configure a minute, each covered by the duplicator and invisible in the file.
+
+- **Every capture source now hears its device die, reports it, and re-acquires it — not just the screen.** The loss machinery lived on the video runtime because video was the only path wired to it, and none of it is about pictures. Microphone, loopback, camera and both inputs of a mixed-audio track are on it now. The signal had been there the whole time: WASAPI calls its lost callback on `AUDCLNT_E_DEVICE_INVALIDATED`, Media Foundation ends the sample stream, and `addLostListener` carried both to Dart. Nothing subscribed. One Win+P took out a display and the HDMI audio endpoint that belonged to the same monitor; the video loss was reported and the audio simply stopped, four seconds absent from the file with "Recording stopped" reported as success.
+
+- A mixed-audio track tracks its two inputs separately, because they fail independently — a render endpoint dies with the monitor while the microphone beside it keeps working. This is the worst place to lose an input silently: the mix is driven by the loopback callback, so a dead endpoint stops the whole track, microphone included.
+
+- `Recorder.captureStatus` and `Recorder.captureIssues` now report one entry per capture SOURCE rather than per track, so a mixed track's microphone and endpoint appear under their own names. Both already returned lists; nothing at the call site changes.
+
+- New on `addCamera` / `addMic` / `addLoopback` / `addMixedAudio`: `lossPolicy` and `reacquireLimit`, matching `addScreen`. `VideoCaptureLossPolicy` is now `CaptureLossPolicy` — the old name is a typedef for it and keeps working.
+
+- Re-acquiring a lost display now looks for the display, not for the handle it used to have. A display device id is a live platform handle - on Windows literally an HMONITOR - and Windows destroys its monitor objects and issues new ones on every topology change, which is exactly the family of losses this recovers from. Every re-acquire was therefore asking for a monitor that had stopped existing: a Win+P test lost ten seconds of video to a display that was attached and capturable the whole time. Each attempt now re-resolves the target by the platform's display name, so a display that comes back under a new handle is picked up. A still-live id is always preferred, so platforms whose ids are already stable are unaffected.
+
+- A screen track built without an explicit display id no longer re-picks "the default display" when it rebuilds. After a topology change that can be a different monitor, and a recording that continued on one would have looked correct in every log line and in the file.
+
+- A capture target that is simply absent now reports as absent - once, and then rarely - instead of an error and a stack trace every few seconds for the length of the outage. New `CaptureTargetUnavailable`, which `start()` throws too, so an application that asked for a display that is not attached is told that instead of `MINIAV_ERROR_SYSTEM_CALL_FAILED`.
+
+- A stage rebuild checks its target is present before re-acquiring the graphics device and warming the encoder SDK, and refuses a target reporting a 0x0 size rather than deriving an encoder configuration from it.
+
 ## 0.5.13
 
-- Increment downstream deps
-- Increment downstream deps
 - Increment downstream deps
 
 ## 0.5.12

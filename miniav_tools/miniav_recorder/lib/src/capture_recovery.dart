@@ -26,7 +26,7 @@ library;
 import 'dart:async';
 import 'dart:math' as math;
 
-import 'recorder_source.dart' show VideoCaptureLossPolicy;
+import 'recorder_source.dart' show CaptureLossPolicy;
 
 /// Rebuild the capture target. `true` when it came back; `false` when it is
 /// simply not there yet, which is a retry rather than a fault. Throwing is
@@ -49,7 +49,11 @@ typedef HardReacquireFn = Future<bool> Function();
 
 typedef RecoveryLogFn = void Function(String message, {bool severe});
 
-/// Drives one video track's response to losing its capture target.
+/// Drives one capture SOURCE's response to losing its target.
+///
+/// One per source, not per track: a mixed-audio track owns a microphone and a
+/// render endpoint that fail independently, and one of them dying is not a
+/// reason to stop waiting for the other.
 ///
 /// Deliberately owns no capture, encoder or platform type: everything it
 /// touches arrives as a callback. That is what lets the sequence below — the
@@ -69,7 +73,7 @@ class CaptureRecovery {
   }) : _delay = delay ?? Future<void>.delayed;
 
   final String label;
-  final VideoCaptureLossPolicy policy;
+  final CaptureLossPolicy policy;
 
   /// How long to keep trying before ending the track; null = for as long as
   /// the recording runs.
@@ -82,8 +86,9 @@ class CaptureRecovery {
   final QuiesceFn quiesce;
   final RestartFn restart;
 
-  /// Null when this source has no re-acquire path at all — a camera, or a
-  /// window, whose HWND is destroyed rather than temporarily unavailable.
+  /// Null when this source has no re-acquire path at all — a window, whose
+  /// HWND is destroyed rather than temporarily unavailable, so retrying asks a
+  /// question that can only ever be answered no.
   final ReacquireFn? reacquire;
 
   /// The escalation, for a loss that re-configuring cannot fix.
@@ -152,8 +157,8 @@ class CaptureRecovery {
   /// callback drops anything that arrives while it holds.
   bool get lost => _lost && !_ended;
 
-  /// True once this has stopped trying. Terminal for the video track; every
-  /// other track keeps recording.
+  /// True once this has stopped trying. Terminal for this track; every other
+  /// track keeps recording.
   bool get ended => _ended;
 
   int get lossCount => _lossCount;
@@ -175,21 +180,35 @@ class CaptureRecovery {
 
   /// Whether a re-acquire will even be attempted.
   bool get canReacquire =>
-      reacquire != null && policy == VideoCaptureLossPolicy.reacquire;
+      reacquire != null && policy == CaptureLossPolicy.reacquire;
 
   /// The platform says the target is gone. Safe to call from a capture
   /// thread's marshalled callback: it starts the attempt loop and returns.
-  void noteLost(int reason) {
+  ///
+  /// [sinceUs] is when the capture actually stopped, for a detector that
+  /// concludes it after the fact. The watchdog is exactly that: it declares a
+  /// loss only once a silence window has elapsed, and the recording was
+  /// already frozen for all of it. Defaulting to "now" would time the outage
+  /// from the moment somebody noticed — which turned three ten-second freezes
+  /// into a reported 0.8 seconds missing, because only the three 0.3-second
+  /// recoveries were counted. Omit it for a platform callback, which arrives
+  /// when the loss happens.
+  void noteLost(int reason, {int? sinceUs}) {
     if (_cancelled || _ended || _lost) return;
     _lost = true;
     _lossCount++;
-    _lostAtUs = nowUs();
+    // Never later than now, and never before the recording started: a bad
+    // clock from a caller must not make the outage negative.
+    final now = nowUs();
+    _lostAtUs = (sinceUs != null && sinceUs >= 0 && sinceUs < now)
+        ? sinceUs
+        : now;
     _attempts = 0;
 
     if (!canReacquire) {
       log(
-        '$label capture target lost (reason $reason) — ending this video '
-        'track; other tracks continue.',
+        '$label capture target lost (reason $reason) — ending this track; '
+        'other tracks continue.',
         severe: true,
       );
       _end(reacquire == null
@@ -299,10 +318,10 @@ class CaptureRecovery {
     }
     _ended = true;
     log(
-      '$label video capture ENDED early ($why). The file stays valid and '
-      'every other track keeps recording; the video track simply stops here. '
-      'A different capture target is not substituted — that would change what '
-      'the recording is of, without saying so.',
+      '$label capture ENDED early ($why). The file stays valid and every '
+      'other track keeps recording; this one simply stops here. A different '
+      'capture target is not substituted — that would change what the '
+      'recording is of, without saying so.',
       severe: true,
     );
   }
@@ -314,14 +333,14 @@ class CaptureRecovery {
     final lost = (totalLostUs / 1000000).toStringAsFixed(1);
     if (_ended) {
       return '$label: capture target lost $_lossCount time(s) and did not '
-          'return — video ends ${lost}s before the recording does';
+          'return — this track ends ${lost}s before the recording does';
     }
     final how = _hardRecoveries > 0
         ? ' ($_hardRecoveries needed the GPU stage rebuilt — a device reset, '
             'not just a lost target)'
         : '';
     return '$label: capture target lost $_lossCount time(s), re-acquired '
-        '$_recoveryCount$how — ${lost}s of video missing';
+        '$_recoveryCount$how — ${lost}s missing from this track';
   }
 }
 
@@ -373,11 +392,82 @@ class CaptureWatchdog {
         frameIntervalUs > 0 ? frameIntervalUs * silentIntervals : 0,
       );
 
-  /// True when the capture should be treated as lost.
+  /// Starting window for SOURCE silence — no frame from the capture itself.
+  ///
+  /// Far longer than [silenceThresholdUs] because the two silences mean
+  /// different things. Output silence is unambiguous. Source silence is not:
+  /// screen capture is event-driven, so a desktop where nothing moves
+  /// legitimately delivers nothing at all, for minutes.
+  static const int minSourceSilenceUs = 10000000;
+
+  /// Ceiling for the widened window. See [widenSourceSilence].
+  static const int maxSourceSilenceUs = 60000000;
+
+  /// How long the source may be quiet before it is worth ASKING the platform
+  /// whether the target still looks the way the capture was set up for.
+  ///
+  /// Much shorter than [minSourceSilenceUs] because the answer is evidence
+  /// rather than a guess, and because the question is never asked while frames
+  /// are arriving — a moving screen never reaches three seconds of silence.
+  static const int probeSilenceUs = 3000000;
+
+  int _sourceSilenceUs = minSourceSilenceUs;
+
+  /// How long the source may currently stay silent before this calls it.
+  int get sourceSilenceThresholdUs => _sourceSilenceUs;
+
+  /// True when the CAPTURE SOURCE has stopped delivering frames.
+  ///
+  /// The blind spot [shouldDeclareLost] cannot cover. That one reads output,
+  /// and with [VideoIdleFramePolicy.duplicate] the output is manufactured: the
+  /// duplicator re-encodes the last frame forever, so a source that died goes
+  /// on producing packets at the full frame rate and looks perfectly alive
+  /// from there. The recording is a frozen picture, which is the one outcome
+  /// indistinguishable from a healthy still one — in the output. Not here.
+  ///
+  /// [lastSourceFrameUs] is when the capture last delivered a frame, or -1 if
+  /// it never has; [startedAtUs] then stands in, so a capture that never
+  /// produces anything is caught too.
+  bool sourceWentSilent({
+    required int nowUs,
+    required int lastSourceFrameUs,
+    required int startedAtUs,
+  }) {
+    final since = lastSourceFrameUs >= 0 ? lastSourceFrameUs : startedAtUs;
+    if (since < 0) return false;
+    return nowUs - since >= _sourceSilenceUs;
+  }
+
+  /// A source-silence loss was just declared; widen the window.
+  ///
+  /// This is what keeps the false positive cheap. A genuinely static screen
+  /// will trip the window, get re-acquired, and go on delivering nothing —
+  /// so each unproductive attempt doubles the wait, up to
+  /// [maxSourceSilenceUs]. A dead capture is caught in the first ten seconds;
+  /// a still desktop settles at roughly one pointless re-configure a minute,
+  /// each of which the duplicator covers so the file never shows it.
+  ///
+  /// The alternative was to demand certainty before acting, and there is none
+  /// available: nothing the platform offers distinguishes "composing nothing
+  /// because nothing changed" from "composing nothing because this item is
+  /// dead". Between a cheap wrong guess every minute and a recording that
+  /// freezes for fifty seconds, the guess is the better trade.
+  void widenSourceSilence() =>
+      _sourceSilenceUs = math.min(maxSourceSilenceUs, _sourceSilenceUs * 2);
+
+  /// Frames are arriving again, so the window earns its way back down and the
+  /// next real death is caught in ten seconds rather than sixty.
+  void noteSourceAlive() => _sourceSilenceUs = minSourceSilenceUs;
+
+  /// True when the capture's OUTPUT has stopped.
+  ///
+  /// Catches the pipeline dying — the encoder, the GPU stage, the duplicator.
+  /// It cannot catch the SOURCE dying while the duplicator lives; that is
+  /// [sourceWentSilent].
   ///
   /// [lastPacketUs] is when this track last produced an encoded packet, or -1
   /// if it never has. [errorsSincePacket] counts encode or GPU-stage failures
-  /// since then — the signal that separates a dead capture from a quiet one.
+  /// since then — the signal that separates a dead pipeline from a quiet one.
   bool shouldDeclareLost({
     required int nowUs,
     required int lastPacketUs,
@@ -398,9 +488,12 @@ class CaptureWatchdog {
     // failed.
     if (!idleFillActive) return errorsSincePacket > 0;
 
-    // With idle fill, silence alone is already pathological: a healthy static
-    // screen emits a duplicate every frame interval. An error since the last
-    // packet only confirms it.
+    // With idle fill, output silence alone is already pathological: a healthy
+    // static screen emits a duplicate every frame interval. An error since the
+    // last packet only confirms it.
+    //
+    // Note what this does NOT say. A duplicate proves the DUPLICATOR is alive,
+    // never that the capture is — see [sourceWentSilent].
     return true;
   }
 }

@@ -31,7 +31,7 @@ Future<void> main(List<String> args) async {
     if (a.startsWith('--loop=')) loopId = a.substring('--loop='.length);
   }
 
-  final secs = positional.isNotEmpty ? int.tryParse(positional[0]) ?? 10 : 10;
+  final secs = positional.isNotEmpty ? int.tryParse(positional[0]) ?? 60 : 60;
   final out = positional.length >= 2 ? positional[1] : 'loopback.mp4';
 
   MiniAV.setLogLevel(MiniAVLogLevel.warn);

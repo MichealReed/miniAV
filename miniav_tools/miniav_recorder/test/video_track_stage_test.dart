@@ -25,6 +25,22 @@ import 'package:test/test.dart';
 // Fakes
 // ---------------------------------------------------------------------------
 
+/// A capture frame as the platform delivers it, CPU-side.
+MiniAVBuffer _cpuFrame(int width, int height) => MiniAVBuffer(
+      type: MiniAVBufferType.video,
+      contentType: MiniAVBufferContentType.cpu,
+      timestampUs: 0,
+      dataSizeBytes: width * height * 4,
+      data: MiniAVVideoBuffer(
+        width: width,
+        height: height,
+        pixelFormat: MiniAVPixelFormat.bgra32,
+        strideBytes: [width * 4],
+        planes: [Uint8List(width * height * 4)],
+        nativeHandles: const [],
+      ),
+    );
+
 class _FakeEncoder implements PlatformEncoder {
   _FakeEncoder(this.log, this.name, {this.extra});
 
@@ -73,6 +89,10 @@ class _Stage {
   bool stopThrows = false;
   bool destroyThrows = false;
   bool started = false;
+
+  /// The capture callback the track registered, so a test can deliver a frame
+  /// the way the platform does.
+  void Function(MiniAVBuffer, Object?)? onFrame;
   int lostSubscriptions = 0;
   int lostUnsubscribes = 0;
   bool unsubscribeThrows = false;
@@ -85,6 +105,7 @@ class _Stage {
     int fpsNum = 30,
     Uint8List? extraData,
     bool withReacquire = true,
+    bool canRebuildStage = true,
   }) {
     final fake = _FakeEncoder(log, name, extra: extraData);
     encoder = Encoder(fake, 'fake');
@@ -99,9 +120,11 @@ class _Stage {
       frameRateNum: fpsNum,
       frameRateDen: 1,
       captureCtx: Object(),
+      canRebuildStage: canRebuildStage,
       startFn: (cb) async {
         log.add('start:$name');
         started = true;
+        onFrame = cb;
       },
       stopFn: () async {
         log.add('stop:$name');
@@ -310,6 +333,39 @@ void main() {
     });
   });
 
+  group('escalating to a stage rebuild', () {
+    // Escalation is ONE-WAY: after CaptureRecovery.softAttemptsBeforeHard soft
+    // failures the recovery never tries the cheap repair again. So a source
+    // that Recorder.rebuildVideoStage REFUSES must never be offered the
+    // escalation — it would be parked on a path that always answers false, and
+    // a camera that came back on the fourth attempt would never be picked up.
+    //
+    // This is not hypothetical: it is what wiring a re-acquire into the camera
+    // path did, because the gate had been "does this source have a re-acquire
+    // at all", which was the same question while the screen was the only
+    // source that did.
+    test('a screen track escalates', () {
+      final s = _Stage([], 'screen');
+      final t = s.build();
+      expect(t.canRebuildStage, isTrue);
+    });
+
+    test('a track the rebuild refuses does not escalate', () {
+      final s = _Stage([], 'camera');
+      final t = s.build(canRebuildStage: false);
+      expect(t.canRebuildStage, isFalse,
+          reason: 'a camera re-acquires, but its stage is not rebuilt');
+    });
+
+    test('having a re-acquire path does not by itself mean it can rebuild', () {
+      // The two were conflated. Pin them apart.
+      final s = _Stage([], 'camera');
+      final t = s.build(withReacquire: true, canRebuildStage: false);
+      expect(t.reacquireFn, isNotNull);
+      expect(t.canRebuildStage, isFalse);
+    });
+  });
+
   group('the capture-lost subscription follows the stage', () {
     test('a rebuild re-subscribes, so a SECOND loss is still heard', () async {
       // The failure this prevents: recover once, then go quiet for the rest of
@@ -423,6 +479,146 @@ void _watchdogWiringTests() {
       h.track.checkWatchdog(10 * us);
       expect(h.track.lastPacketUs, -1);
       expect(h.track.encodeErrorsSincePacket, 0);
+    });
+
+    test('a FROZEN capture is caught, though its output never stops', () {
+      // The occurrence (2026-09-03, loopback_mp4): a display mode change
+      // 5120x1440 -> 3840x1440. WGC never fired Closed, delivered a few frames
+      // at the new size, then nothing for the remaining ~50s — while the
+      // duplicator kept the packet counter climbing to 1980 and the picture
+      // sat frozen. Every output-based check said the track was healthy.
+      final h = armed();
+      // A duplicate every frame interval, exactly as the real one does, and
+      // not one frame from the source.
+      for (var t = 1; t <= 30; t++) {
+        h.track.notePacket(t * us ~/ 30);
+      }
+      h.track.notePacket(20 * us);
+      expect(h.track.checkWatchdog(20 * us + 1000), isTrue,
+          reason: 'fresh packets, dead source');
+      expect(h.recovery.lossCount, 1);
+      expect(h.track.captureLost, isTrue);
+    });
+
+    test('the outage is timed from the freeze, not from the noticing', () {
+      // The report said 0.8s missing for three ten-second freezes, because it
+      // counted only the recoveries. That number is what an operator uses to
+      // decide whether a session is usable.
+      var clock = 0;
+      final s = _Stage(log, 'wd');
+      final t = s.build(fpsNum: 30);
+      final r = CaptureRecovery(
+        label: 'screen[test]',
+        policy: CaptureLossPolicy.reacquire,
+        reacquireLimit: null,
+        nowUs: () => clock,
+        log: (m, {bool severe = false}) {},
+        quiesce: () async {},
+        restart: () async {},
+        reacquire: () async => true,
+        delay: (d) => Completer<void>().future,
+      );
+      t.bindLostListener(r);
+      t.armWatchdog(0);
+
+      // Frozen from 4s; the duplicator keeps emitting; noticed at 20s.
+      t.lastSourceFrameUs = 4 * us;
+      t.notePacket(20 * us);
+      clock = 20 * us;
+      expect(t.checkWatchdog(20 * us), isTrue);
+      expect(r.totalLostUs, 16 * us,
+          reason: 'the picture froze at 4s, not at 20s');
+    });
+
+    test('a source frame keeps it alive, however long ago the last one was',
+        () {
+      final h = armed();
+      h.track.lastSourceFrameUs = 19 * us;
+      h.track.notePacket(20 * us);
+      expect(h.track.checkWatchdog(20 * us), isFalse);
+      expect(h.recovery.lossCount, 0);
+    });
+
+    test('the source clock restarts on the declaration', () {
+      // Otherwise a re-acquire that does not fix it re-declares on the very
+      // next tick instead of waiting the window out again.
+      //
+      // The clock starts at a REAL value, not at -1: asserting it is -1
+      // afterwards proves nothing if it was -1 to begin with.
+      final h = armed();
+      h.track.lastSourceFrameUs = 1 * us;
+      h.track.notePacket(20 * us);
+      expect(h.track.checkWatchdog(20 * us + 1000), isTrue);
+      expect(h.track.lastSourceFrameUs, -1);
+    });
+
+    test('an unproductive declaration widens the window', () {
+      final h = armed();
+      final before = h.track.watchdog!.sourceSilenceThresholdUs;
+      h.track.notePacket(20 * us);
+      expect(h.track.checkWatchdog(20 * us + 1000), isTrue);
+      expect(h.track.watchdog!.sourceSilenceThresholdUs, before * 2,
+          reason: 'in case the screen really was just static');
+    });
+
+    test('frames flowing again earn the short window back', () {
+      final h = armed();
+      h.track.watchdog!.widenSourceSilence();
+      h.track.watchdog!.widenSourceSilence();
+      h.track.lastSourceFrameUs = 5 * us;
+      h.track.notePacket(5 * us);
+      expect(h.track.checkWatchdog(5 * us + 1000), isFalse);
+      expect(h.track.watchdog!.sourceSilenceThresholdUs,
+          CaptureWatchdog.minSourceSilenceUs);
+    });
+
+    test('a frame from the SOURCE is what marks the source alive', () {
+      // Every other test here sets lastSourceFrameUs by hand, which leaves the
+      // one line on the frame path that sets it for real completely
+      // unexercised — and that line is the entire mechanism.
+      final s = _Stage(log, 'wd');
+      final t = s.build(fpsNum: 30);
+      final rec = (RecorderBuilder()
+            ..addLoopback(deviceId: 'x')
+            ..addStreamOutput((_) {}))
+          .build();
+      t.armWatchdog(0);
+      unawaited(t.startCapture(rec));
+      expect(s.onFrame, isNotNull, reason: 'the track registered a callback');
+      expect(t.lastSourceFrameUs, -1);
+
+      // Everything past the assignment is the encode path, which this fake
+      // stage cannot service — and does not need to. The assignment is the
+      // first thing the callback does with a frame it accepted.
+      try {
+        s.onFrame!(_cpuFrame(64, 64), null);
+      } catch (_) {}
+
+      expect(t.lastSourceFrameUs, isNonNegative,
+          reason: 'a delivered frame is the liveness the duplicator cannot '
+              'forge');
+    });
+
+    test('the source dimensions come from the frames, not the encoder', () {
+      // The probe compares what the platform is DELIVERING against what the
+      // display currently is. Reading the encoder's dimensions instead would
+      // compare a 4096x1152 downscale against a 5120x1440 monitor and call
+      // every healthy recording stale.
+      final st = _Stage(log, 'wd');
+      final t = st.build(width: 4096, height: 1152, fpsNum: 30);
+      final rec = (RecorderBuilder()
+            ..addLoopback(deviceId: 'x')
+            ..addStreamOutput((_) {}))
+          .build();
+      t.armWatchdog(0);
+      unawaited(t.startCapture(rec));
+      expect(t.sourceWidth, 0);
+      try {
+        st.onFrame!(_cpuFrame(5120, 1440), null);
+      } catch (_) {}
+      expect(t.sourceWidth, 5120);
+      expect(t.sourceHeight, 1440);
+      expect(t.width, 4096, reason: 'the encoder side is untouched');
     });
 
     test('a produced packet clears the error count that fed the decision', () {
@@ -569,7 +765,7 @@ void _bufferAccountingTests() {
 // end, so this is the signal that has to be right while recording.
 // ---------------------------------------------------------------------------
 void _liveStatusTests() {
-  group('captureStatus reports health while the recording runs', () {
+  group('captureStatuses report health while the recording runs', () {
     late List<String> log;
     setUp(() {
       log = [];
@@ -591,14 +787,14 @@ void _liveStatusTests() {
 
     test('a track with no recovery yet reports nothing', () {
       final t = _Stage(log, 'x').build();
-      expect(t.captureStatus, isNull,
+      expect(t.captureStatuses, isEmpty,
           reason: 'before startCapture there is nothing to report');
     });
 
     test('a healthy capture reads healthy', () {
       final t = _Stage(log, 'x').build();
       t.bindLostListener(parked());
-      final s = t.captureStatus!;
+      final s = t.captureStatuses.single;
       expect(s.healthy, isTrue);
       expect(s.lost, isFalse);
       expect(s.ended, isFalse);
@@ -632,7 +828,7 @@ void _liveStatusTests() {
       expect(t.checkWatchdog(clock), isTrue);
 
       clock = 25000000;
-      final s = t.captureStatus!;
+      final s = t.captureStatuses.single;
       expect(s.lost, isTrue);
       expect(s.healthy, isFalse);
       expect(s.lossCount, 1);
@@ -656,7 +852,7 @@ void _liveStatusTests() {
       t.bindLostListener(r);
       r.noteLost(7);
 
-      final s = t.captureStatus!;
+      final s = t.captureStatuses.single;
       expect(s.ended, isTrue);
       expect(s.healthy, isFalse);
       expect(s.toString(), contains('ENDED'));

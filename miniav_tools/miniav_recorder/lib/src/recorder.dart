@@ -34,6 +34,130 @@ import 'track_chunk.dart';
 
 export 'recorder_log.dart' show RecorderLogLevel, RecorderLogSource;
 
+/// Why a display no longer looks like the one a quiet capture is attached to,
+/// or null when it still does.
+///
+/// The one question that separates a still desktop from a dead capture: both
+/// deliver nothing, and only one of them is bound to a display that has since
+/// changed shape or gone away. [deliveredW]/[deliveredH] are what the platform
+/// last handed over — NOT the encoder's dimensions, which are pinned by what
+/// the container already declared and would differ from the monitor on any
+/// recording that downscales.
+///
+/// Deliberately conservative. Everything it cannot establish is null, leaving
+/// the decision to the silence window, because a wrong "yes" here re-acquires
+/// a capture that was working. Pure, so the comparison that decides is
+/// exercised without a monitor to re-route.
+String? displayDriftReason({
+  required String display,
+  required bool attached,
+  required int deliveredW,
+  required int deliveredH,
+  required int currentW,
+  required int currentH,
+}) {
+  if (!attached) return 'display $display is no longer attached';
+  // Nothing delivered yet, so there is nothing to compare against.
+  if (deliveredW <= 0 || deliveredH <= 0) return null;
+  if (currentW <= 0 || currentH <= 0) {
+    return 'display $display reports no size at all';
+  }
+  if (currentW != deliveredW || currentH != deliveredH) {
+    return 'display $display is now ${currentW}x$currentH but the capture is '
+        'still delivering ${deliveredW}x$deliveredH';
+  }
+  return null;
+}
+
+/// The capture target a track was built for is not present right now.
+///
+/// Distinct from a failure because it is the EXPECTED answer for the whole
+/// length of the outage this recorder recovers from: a display that has been
+/// re-routed by Win+P or undocked is absent for as long as the user leaves it
+/// that way, and every attempt in between is supposed to come back empty.
+///
+/// Separating it earns two things. A re-acquire can wait through it quietly
+/// instead of printing an identical error and stack trace every few seconds —
+/// which is what buries the one line that says something is wrong. And an
+/// application that gets this from [Recorder.start] learns something it can act
+/// on: the display it asked for is not attached, so ask the user for a
+/// different one, rather than "MINIAV_ERROR_SYSTEM_CALL_FAILED".
+class CaptureTargetUnavailable implements Exception {
+  const CaptureTargetUnavailable(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// The device id that names [requestedId]'s device in [devices] right now.
+///
+/// Returns [requestedId] when that id is still live, a DIFFERENT id when the
+/// same device is present under a new one, and null when no single device
+/// answers to it.
+///
+/// **A device id can be a live platform handle rather than a name.** The
+/// clearest case is a display: on Windows the id is literally an HMONITOR
+/// pointer (`HMONITOR:0x...`), and Windows destroys its monitor objects and
+/// issues new ones whenever the desktop topology changes -- Win+P,
+/// dock/undock, a mode change, an RDP transition. The old handle does not come
+/// back. `GetMonitorInfo` on it fails, so the capture reports 0x0, and
+/// `CreateForMonitor` on it fails, and will keep failing for as long as anyone
+/// retries.
+///
+/// That is precisely the family of losses [CaptureLossPolicy.reacquire] exists
+/// for, so re-acquiring against the stored id could never have worked. What
+/// survives is the platform's device NAME (`\\.\DISPLAY1` on Windows) -- the
+/// same key an application matches on when it picks a device to record.
+///
+/// Applied to every device class, not only displays. Audio endpoint ids and
+/// camera symbolic links are far more stable than an HMONITOR, so they take
+/// the first branch and behave exactly as before; the cost of asking is one
+/// enumeration per re-acquire attempt, and the benefit is that a class whose
+/// ids turn out NOT to be stable -- on some driver, on some platform -- is
+/// already handled rather than discovered in a field log.
+///
+/// Two limits of the name identity, since this leans on it:
+///
+/// * A name can follow a PORT rather than a thing. `\\.\DISPLAY1` names an
+///   adapter output: unplug one monitor and plug a different one into the same
+///   port and the name follows the port. Within the transient family -- the
+///   device goes away and the same setup comes back -- it is exact, and that
+///   is the case this recovers.
+/// * A still-live id always wins, so a class whose ids are already stable
+///   (a portal token, a CGDirectDisplayID, an MMDevice endpoint id) never
+///   reaches the name path at all.
+///
+/// Pure, so the transitions it exists for can be exercised directly: all of
+/// them are statements about what the enumeration says, and none of them need
+/// a device to physically unplug.
+String? resolveDeviceTarget({
+  required String requestedId,
+  required String? knownName,
+  required List<MiniAVDeviceInfo> devices,
+}) {
+  for (final d in devices) {
+    if (d.deviceId == requestedId) return requestedId;
+  }
+  if (knownName == null || knownName.isEmpty) {
+    // Never seen alive, so there is nothing to re-resolve BY. Hand the id back
+    // and let the configure attempt produce the platform's own error rather
+    // than inventing a target here.
+    return requestedId;
+  }
+  MiniAVDeviceInfo? match;
+  for (final d in devices) {
+    if (d.name != knownName) continue;
+    // Two devices under one name: the name has stopped identifying a single
+    // device, and picking one of them would be choosing a recording target on
+    // the user's behalf. Wait instead.
+    if (match != null) return null;
+    match = d;
+  }
+  return match?.deviceId;
+}
+
 /// Run-time state of an open [Recorder].
 /// Live health of one capture source, readable at any point during a
 /// recording.
@@ -328,8 +452,7 @@ class Recorder {
     // output, and not from a stop() that returned normally. This is the only
     // place that difference is still knowable.
     for (final t in _tracks) {
-      final issue = t.captureLossSummary;
-      if (issue != null) {
+      for (final issue in t.captureLossSummaries) {
         _captureIssues.add(issue);
         _log(issue, RecorderLogLevel.warning);
       }
@@ -1042,14 +1165,19 @@ class Recorder {
         return _buildAudioTrack(
           index,
           deviceId: cfg.deviceId,
+          deviceKind: 'microphone',
           codec: cfg.codec,
           bitrate: cfg.bitrateBps,
           sampleRate: cfg.sampleRate,
           channels: cfg.channels,
+          lossPolicy: cfg.lossPolicy,
+          reacquireLimit: cfg.reacquireLimit,
+          enumerate: MiniAudioInput.enumerateDevices,
           factory: () async => MiniAudioInput.createContext(),
-          configure: (ctx, fmt) =>
-              (ctx as MiniAudioInputContext).configure(cfg.deviceId, fmt),
-          getDefault: () => MiniAudioInput.getDefaultFormat(cfg.deviceId),
+          configure: (ctx, id, fmt) =>
+              (ctx as MiniAudioInputContext).configure(id, fmt),
+          getDefault: MiniAudioInput.getDefaultFormat,
+          lostListener: (ctx) => (ctx as MiniAudioInputContext).addLostListener,
           start: (ctx, cb) => (ctx as MiniAudioInputContext).startCapture(cb),
           stop: (ctx) => (ctx as MiniAudioInputContext).stopCapture(),
           destroy: (ctx) => (ctx as MiniAudioInputContext).destroy(),
@@ -1059,14 +1187,19 @@ class Recorder {
         return _buildAudioTrack(
           index,
           deviceId: cfg.deviceId,
+          deviceKind: 'audio endpoint',
           codec: cfg.codec,
           bitrate: cfg.bitrateBps,
           sampleRate: cfg.sampleRate,
           channels: cfg.channels,
+          lossPolicy: cfg.lossPolicy,
+          reacquireLimit: cfg.reacquireLimit,
+          enumerate: MiniLoopback.enumerateDevices,
           factory: () async => MiniLoopback.createContext(),
-          configure: (ctx, fmt) =>
-              (ctx as MiniLoopbackContext).configure(cfg.deviceId, fmt),
-          getDefault: () => MiniLoopback.getDefaultFormat(cfg.deviceId),
+          configure: (ctx, id, fmt) =>
+              (ctx as MiniLoopbackContext).configure(id, fmt),
+          getDefault: MiniLoopback.getDefaultFormat,
+          lostListener: (ctx) => (ctx as MiniLoopbackContext).addLostListener,
           start: (ctx, cb) => (ctx as MiniLoopbackContext).startCapture(cb),
           stop: (ctx) => (ctx as MiniLoopbackContext).stopCapture(),
           destroy: (ctx) => (ctx as MiniLoopbackContext).destroy(),
@@ -1092,20 +1225,56 @@ class Recorder {
   }) async {
     // Resolve the display ID: accept whatever string enumerateDisplays()
     // returns, or null to mean "use the platform default display".
-    String? resolvedDisplayId = cfg.displayId;
-    if (resolvedDisplayId == null && cfg.windowId == null) {
+    //
+    // Two ids, deliberately. The REQUESTED one is this track's identity and
+    // never changes; the RESOLVED one is whatever handle names that display at
+    // this instant, and on a rebuild after a topology change it is a different
+    // string. Conflating them is what made re-acquire spend its whole life
+    // asking for a monitor that no longer existed -- see [resolveDisplayTarget].
+    String? requestedDisplayId = _pinnedDisplayIds[index] ?? cfg.displayId;
+    if (requestedDisplayId == null && cfg.windowId == null) {
       final displays = await MiniScreen.enumerateDisplays();
       if (displays.isEmpty) {
         throw StateError('addScreen: no displays found on this platform');
       }
-      resolvedDisplayId = displays
-          .firstWhere((d) => d.isDefault, orElse: () => displays.first)
-          .deviceId;
+      final picked = displays.firstWhere(
+        (d) => d.isDefault,
+        orElse: () => displays.first,
+      );
+      requestedDisplayId = picked.deviceId;
+      if (picked.name.isNotEmpty) {
+        _deviceNames[_nameKey('display', picked.deviceId)] = picked.name;
+      }
+    }
+    String? resolvedDisplayId = requestedDisplayId;
+    if (requestedDisplayId != null) {
+      _pinnedDisplayIds[index] = requestedDisplayId;
+      resolvedDisplayId = await _resolveDisplayId(requestedDisplayId);
+      if (resolvedDisplayId == null) {
+        throw CaptureTargetUnavailable(
+          'display ${describeDevice('display', requestedDisplayId)} '
+          'is not attached',
+        );
+      }
     }
     final defaults = await MiniScreen.getDefaultFormats(
       resolvedDisplayId ?? cfg.windowId!,
     );
     var (videoFormat, _) = defaults;
+    if (lockedSize != null &&
+        (videoFormat.width <= 0 || videoFormat.height <= 0)) {
+      // A rebuild knows this target had a size, so a 0x0 answer means the
+      // handle names nothing any more and every dimension derived from it
+      // would be a guess. Say that, instead of letting it surface four calls
+      // later as MINIAV_ERROR_SYSTEM_CALL_FAILED.
+      //
+      // Only on a rebuild: 0x0 is a legal REQUEST on first configure, where
+      // PipeWire uses it to mean "negotiate the native size".
+      throw CaptureTargetUnavailable(
+        'capture target ${resolvedDisplayId ?? cfg.windowId} reports a 0x0 '
+        'size — its handle no longer names anything',
+      );
+    }
     // Pick output preference: GPU only when:
     //   (a) a BackendContext with a live D3D11 device is present, AND
     //   (b) a D3D11VA-capable encoder exists for the requested codec.
@@ -1480,8 +1649,9 @@ class Recorder {
     // Captured by value for the re-acquire closure: `videoFormat` is a `var`
     // that the format-negotiation above reassigns, and a closure over it would
     // see later writes rather than the shape this track was built for.
-    final reacquireDisplayId = resolvedDisplayId;
+    final reacquireDisplayId = requestedDisplayId;
     final reacquireFormat = videoFormat;
+    final notAttached = _Counter();
 
     return VideoTrackRuntime(
       index: index,
@@ -1507,13 +1677,16 @@ class Recorder {
       addLostListenerFn: ctx.addLostListener,
       lossPolicy: cfg.lossPolicy,
       reacquireLimit: cfg.reacquireLimit,
+      canRebuildStage: true,
       // Re-acquire is offered for a DISPLAY and not for a window, because the
       // platform means different things by the two losses.
       //
       // A display's capture item closes for reasons that undo themselves —
       // Win+P, dock/undock, lock, an RDP transition, a mode change. The
-      // monitor is still a monitor; CreateForMonitor on the same HMONITOR
-      // gives a working item back the moment the topology settles.
+      // monitor is still a monitor. It does NOT still answer to the same
+      // handle, though, which is why each attempt re-resolves the target
+      // rather than reusing the id this track was built with; see
+      // [resolveDisplayTarget].
       //
       // A window's item closes when the window is DESTROYED. The HWND is dead
       // and will not be reissued, so retrying is asking a question that can
@@ -1522,14 +1695,17 @@ class Recorder {
       // decision to make with its user, not one to infer here.
       reacquireFn: reacquireDisplayId == null
           ? null
-          : () async {
-              // A RE-CONFIGURE, not a restart: it drops the dead capture item,
-              // session and frame pool and builds a fresh item from the same
-              // HMONITOR. After a loss the platform's stop is a no-op, so a
-              // bare restart would re-arm handlers on the item that died.
-              await ctx.configureDisplay(reacquireDisplayId, reacquireFormat);
-              return true;
-            },
+          // Which handle names this display NOW. The losses recovered here
+          // are exactly the ones that invalidate the old one.
+          : () => _reacquireDevice(
+                label: 'screen[$reacquireDisplayId]',
+                kind: 'display',
+                requestedId: reacquireDisplayId,
+                enumerate: MiniScreen.enumerateDisplays,
+                configure: (id) =>
+                    ctx.configureDisplay(id, reacquireFormat),
+                notAttached: notAttached,
+              ),
     );
   }
 
@@ -1599,8 +1775,18 @@ class Recorder {
           : MiniAVOutputPreference.cpu,
     );
 
+    final cameraId = await _resolveDeviceId(
+      'camera',
+      cfg.deviceId,
+      MiniCamera.enumerateDevices,
+    );
+    if (cameraId == null) {
+      throw CaptureTargetUnavailable(
+        'camera ${describeDevice('camera', cfg.deviceId)} is not attached',
+      );
+    }
     final ctx = await MiniCamera.createContext();
-    await ctx.configure(cfg.deviceId, format);
+    await ctx.configure(cameraId, format);
 
     // Pass the BackendContext (D3D11 zero-copy device) only on the GPU path —
     // the camera MF backend delivers gpuD3D11Handle buffers only under GPU
@@ -1643,7 +1829,7 @@ class Recorder {
         frameRateDenominator: format.frameRateDenominator,
         outputPreference: MiniAVOutputPreference.cpu,
       );
-      await ctx.configure(cfg.deviceId, format);
+      await ctx.configure(cameraId, format);
       encResult = await _openVideoEncoder(
         format,
         cfg.codec,
@@ -1664,6 +1850,12 @@ class Recorder {
                 '${encResult.encoder.backendName}',
     );
 
+    // Captured by value for the re-acquire closure: `format` is a var the
+    // GPU/CPU negotiation above reassigns, and a closure over it would
+    // re-configure into a shape this track was not built for.
+    final reacquireFormat = format;
+    final cameraNotAttached = _Counter();
+
     return VideoTrackRuntime(
       index: index,
       label: 'camera[${cfg.deviceId}]',
@@ -1679,6 +1871,22 @@ class Recorder {
       startFn: (cb) => ctx.startCapture(cb),
       stopFn: () => ctx.stopCapture(),
       destroyFn: () => ctx.destroy(),
+      addLostListenerFn: ctx.addLostListener,
+      lossPolicy: cfg.lossPolicy,
+      reacquireLimit: cfg.reacquireLimit,
+      // A camera IS re-acquirable, and until now nothing here said so: with
+      // no re-acquire path a loss went straight to ending the track. A USB
+      // device that is unplugged and pushed back in, or whose driver resets,
+      // comes back under the same id — Media Foundation ends the sample
+      // stream and the device is simply configured again.
+      reacquireFn: () => _reacquireDevice(
+        label: 'camera[${cfg.deviceId}]',
+        kind: 'camera',
+        requestedId: cfg.deviceId,
+        enumerate: MiniCamera.enumerateDevices,
+        configure: (id) => ctx.configure(id, reacquireFormat),
+        notAttached: cameraNotAttached,
+      ),
     );
   }
 
@@ -1836,16 +2044,30 @@ class Recorder {
     return (encoder: enc, codec: effectiveCodec);
   }
 
-  Future<_AudioTrackRuntime> _buildAudioTrack(
+  Future<AudioTrackRuntime> _buildAudioTrack(
     int index, {
     required String deviceId,
+    // Which enumeration answers for [deviceId]. Also the word used when
+    // telling someone their device is not there.
+    required String deviceKind,
     required AudioCodec codec,
     required int? bitrate,
     required int? sampleRate,
     required int? channels,
+    required CaptureLossPolicy lossPolicy,
+    required Duration? reacquireLimit,
+    required Future<List<MiniAVDeviceInfo>> Function() enumerate,
     required Future<Object> Function() factory,
-    required Future<void> Function(Object ctx, MiniAVAudioInfo fmt) configure,
-    required Future<MiniAVAudioInfo> Function() getDefault,
+    // Takes the id EXPLICITLY rather than closing over one: a re-acquire has
+    // to configure onto whatever id names the device now, which is not
+    // necessarily the id the caller asked for. See [resolveDeviceTarget].
+    required Future<void> Function(Object ctx, String id, MiniAVAudioInfo fmt)
+        configure,
+    required Future<MiniAVAudioInfo> Function(String id) getDefault,
+    required void Function() Function(MiniAVContextLostListener) Function(
+      Object ctx,
+    )
+    lostListener,
     required Future<void> Function(
       Object ctx,
       void Function(MiniAVBuffer, Object?) cb,
@@ -1855,7 +2077,13 @@ class Recorder {
     required Future<void> Function(Object ctx) destroy,
     required String label,
   }) async {
-    var format = await getDefault();
+    final startId = await _resolveDeviceId(deviceKind, deviceId, enumerate);
+    if (startId == null) {
+      throw CaptureTargetUnavailable(
+        '$deviceKind ${describeDevice(deviceKind, deviceId)} is not attached',
+      );
+    }
+    var format = await getDefault(startId);
     if (sampleRate != null || channels != null) {
       format = MiniAVAudioInfo(
         format: format.format,
@@ -1866,7 +2094,7 @@ class Recorder {
     }
 
     final ctx = await factory();
-    await configure(ctx, format);
+    await configure(ctx, startId, format);
 
     final encoderConfig = AudioEncoderConfig(
       codec: codec,
@@ -1886,7 +2114,13 @@ class Recorder {
       '${format.sampleRate}Hz/${format.channels}ch ($label)',
     );
 
-    return _AudioTrackRuntime(
+    // Captured by value: `format` is a var the negotiation above reassigns,
+    // and a closure over it would re-acquire into a shape this track was not
+    // built for.
+    final reacquireFormat = format;
+    final notAttached = _Counter();
+
+    return AudioTrackRuntime(
       index: index,
       label: label,
       encoder: encoder,
@@ -1899,6 +2133,17 @@ class Recorder {
       startFn: (cb) => start(ctx, cb),
       stopFn: () => stop(ctx),
       destroyFn: () => destroy(ctx),
+      lossPolicy: lossPolicy,
+      reacquireLimit: reacquireLimit,
+      addLostListenerFn: lostListener(ctx),
+      reacquireFn: () => _reacquireDevice(
+        label: label,
+        kind: deviceKind,
+        requestedId: deviceId,
+        enumerate: enumerate,
+        configure: (id) => configure(ctx, id, reacquireFormat),
+        notAttached: notAttached,
+      ),
     );
   }
 
@@ -1919,14 +2164,40 @@ class Recorder {
     );
 
     // 1. Mic context.
-    final micFmt = await MiniAudioInput.getDefaultFormat(cfg.micDeviceId);
+    final micId = await _resolveDeviceId(
+      'microphone',
+      cfg.micDeviceId,
+      MiniAudioInput.enumerateDevices,
+    );
+    if (micId == null) {
+      throw CaptureTargetUnavailable(
+        'microphone ${describeDevice('microphone', cfg.micDeviceId)} '
+        'is not attached',
+      );
+    }
+    final micFmt = await MiniAudioInput.getDefaultFormat(micId);
     final micCtx = await MiniAudioInput.createContext();
-    await micCtx.configure(cfg.micDeviceId, targetFormat);
+    await micCtx.configure(micId, targetFormat);
 
     // 2. Loopback context.
-    final loopFmt = await MiniLoopback.getDefaultFormat(cfg.loopbackDeviceId);
+    final loopId = await _resolveDeviceId(
+      'audio endpoint',
+      cfg.loopbackDeviceId,
+      MiniLoopback.enumerateDevices,
+    );
+    if (loopId == null) {
+      throw CaptureTargetUnavailable(
+        'audio endpoint '
+        '${describeDevice('audio endpoint', cfg.loopbackDeviceId)} '
+        'is not attached',
+      );
+    }
+    final loopFmt = await MiniLoopback.getDefaultFormat(loopId);
     final loopCtx = await MiniLoopback.createContext();
-    await loopCtx.configure(cfg.loopbackDeviceId, targetFormat);
+    await loopCtx.configure(loopId, targetFormat);
+
+    final micNotAttached = _Counter();
+    final loopNotAttached = _Counter();
 
     // 3. Single audio encoder.
     final encoderConfig = AudioEncoderConfig(
@@ -1958,7 +2229,7 @@ class Recorder {
             channels: targetChannels,
           );
 
-    return _MixedAudioTrackRuntime(
+    return MixedAudioTrackRuntime(
       index: index,
       label: 'mixed[mic=${cfg.micDeviceId},loop=${cfg.loopbackDeviceId}]',
       encoder: encoder,
@@ -1971,7 +2242,61 @@ class Recorder {
       micChain: chain(cfg.micEffects),
       loopChain: chain(cfg.loopbackEffects),
       masterChain: chain(cfg.masterEffects),
+      lossPolicy: cfg.lossPolicy,
+      reacquireLimit: cfg.reacquireLimit,
+      reacquireMicFn: () => _reacquireDevice(
+        label: 'mixed mic',
+        kind: 'microphone',
+        requestedId: cfg.micDeviceId,
+        enumerate: MiniAudioInput.enumerateDevices,
+        configure: (id) => micCtx.configure(id, targetFormat),
+        notAttached: micNotAttached,
+      ),
+      reacquireLoopFn: () => _reacquireDevice(
+        label: 'mixed loopback',
+        kind: 'audio endpoint',
+        requestedId: cfg.loopbackDeviceId,
+        enumerate: MiniLoopback.enumerateDevices,
+        configure: (id) => loopCtx.configure(id, targetFormat),
+        notAttached: loopNotAttached,
+      ),
     );
+  }
+
+  /// Re-configure one capture context onto whatever id names its device now,
+  /// or report that the device is not there.
+  ///
+  /// A RE-CONFIGURE, not a restart, for every device class. After a loss the
+  /// platform's stop is a no-op — WASAPI cleared is_running when its capture
+  /// thread exited, WGC's session is already gone — so a bare restart would
+  /// re-arm handlers on something that no longer exists. Configure is the call
+  /// that releases the dead objects and acquires them again.
+  Future<bool> _reacquireDevice({
+    required String label,
+    required String kind,
+    required String requestedId,
+    required Future<List<MiniAVDeviceInfo>> Function() enumerate,
+    required Future<void> Function(String id) configure,
+    required _Counter notAttached,
+  }) async {
+    final live = await _resolveDeviceId(kind, requestedId, enumerate);
+    if (live == null) {
+      notAttached.value++;
+      // Say so, and keep saying so. A recovery that is quietly waiting looks
+      // exactly like one that is quietly broken.
+      if (notAttached.value == 1 || notAttached.value % 12 == 0) {
+        _log(
+          '$label: $kind ${describeDevice(kind, requestedId)} is not '
+          'attached — waiting for it to come back. Nothing is being recorded '
+          'for this source meanwhile.',
+          RecorderLogLevel.warning,
+        );
+      }
+      return false;
+    }
+    notAttached.value = 0;
+    await configure(live);
+    return true;
   }
 
   /// Infer a [Container] from a file-path extension.
@@ -2227,6 +2552,17 @@ class Recorder {
     if (_rebuilding) return false;
     _rebuilding = true;
     try {
+      // Is the target even there? Ask first, because during an outage this
+      // runs every few seconds, and re-acquiring Dawn's device and warming
+      // the encoder SDK for a display that is unplugged is expensive work
+      // with nothing at the end of it.
+      final pinned = _pinnedDisplayIds[track.index];
+      if (pinned != null && await _resolveDisplayId(pinned) == null) {
+        throw CaptureTargetUnavailable(
+          'display ${describeDevice('display', pinned)} is not attached',
+        );
+      }
+
       // Re-read the D3D11 device Dawn is on NOW. Dawn recreates its own device
       // after a reset; the process-global handle still points at the removed
       // one, and an encoder opened against that would fail every frame while
@@ -2260,7 +2596,19 @@ class Recorder {
         'capture all replaced) — recording continues in the same file.',
         RecorderLogLevel.warning,
       );
+      _rebuildsWaiting = 0;
       return true;
+    } on CaptureTargetUnavailable catch (e) {
+      // Not a failure — the target is away, which is the whole reason this is
+      // running. Say it on the first attempt and then rarely, because an
+      // outage lasts minutes and an identical line every few seconds is how a
+      // log stops being read.
+      _rebuildsWaiting++;
+      if (_rebuildsWaiting == 1 || _rebuildsWaiting % 12 == 0) {
+        _log('${track.label} $e — still waiting for it to come back.',
+            RecorderLogLevel.warning);
+      }
+      return false;
     } catch (e, st) {
       _log('${track.label} stage rebuild failed: $e\n$st',
           RecorderLogLevel.error);
@@ -2271,6 +2619,110 @@ class Recorder {
   }
 
   bool _rebuilding = false;
+  int _rebuildsWaiting = 0;
+
+  /// Platform device names, keyed by device class and the id the caller first
+  /// asked for.
+  ///
+  /// Learned while the id is alive, because that is the only moment it can be
+  /// learned: once the id goes stale there is nothing left to ask. Keyed by
+  /// class as well as id so two classes cannot answer for each other.
+  final Map<String, String> _deviceNames = {};
+
+  String _nameKey(String kind, String id) => '$kind\u0000$id';
+
+  /// The name last seen for [id], for a message a person has to read.
+  String describeDevice(String kind, String id) =>
+      _deviceNames[_nameKey(kind, id)] ?? id;
+
+  /// The display each screen track is pinned to, by track index.
+  ///
+  /// A track built with no explicit display id picks the platform default
+  /// ONCE. "The default display" is a question with a different answer after
+  /// the topology changes, and re-asking it on a rebuild would let a recording
+  /// quietly continue on a different monitor -- the one thing
+  /// [CaptureLossPolicy] promises does not happen.
+  final Map<int, String> _pinnedDisplayIds = {};
+
+  /// [resolveDeviceTarget] against a fresh enumeration of [kind], remembering
+  /// the device's name while it is still there to be read.
+  Future<String?> _resolveDeviceId(
+    String kind,
+    String requestedId,
+    Future<List<MiniAVDeviceInfo>> Function() enumerate,
+  ) async {
+    final key = _nameKey(kind, requestedId);
+    final List<MiniAVDeviceInfo> devices;
+    try {
+      devices = await enumerate();
+    } catch (_) {
+      // Enumeration is a diagnostic here, not the operation. If it fails, hand
+      // back what was asked for: the configure attempt reports the real error.
+      return requestedId;
+    }
+    for (final d in devices) {
+      if (d.deviceId == requestedId && d.name.isNotEmpty) {
+        _deviceNames[key] = d.name;
+        break;
+      }
+    }
+    return resolveDeviceTarget(
+      requestedId: requestedId,
+      knownName: _deviceNames[key],
+      devices: devices,
+    );
+  }
+
+  /// The display equivalent, which is where this started and still the only
+  /// class whose ids are known to go stale on ordinary use.
+  Future<String?> _resolveDisplayId(String requestedId) =>
+      _resolveDeviceId('display', requestedId, MiniScreen.enumerateDisplays);
+
+  /// Why [track]'s display no longer looks like the one it is capturing, or
+  /// null when it still does.
+  ///
+  /// The one question that separates a still desktop from a dead capture. Both
+  /// deliver nothing; only one of them is attached to a display that has since
+  /// changed shape or gone away. Asked only when the capture is already
+  /// suspiciously quiet — see [CaptureWatchdog.probeSilenceUs] — so a healthy
+  /// recording never pays for it.
+  ///
+  /// Deliberately conservative: anything it cannot establish returns null and
+  /// leaves the decision to the silence window. A wrong "yes" here re-acquires
+  /// a perfectly good capture.
+  Future<String?> displayTargetDrifted(VideoTrackRuntime track) async {
+    final requested = _pinnedDisplayIds[track.index];
+    if (requested == null) return null; // a window or a camera; not this test
+    final name = describeDevice('display', requested);
+    final live = await _resolveDisplayId(requested);
+    if (live == null) {
+      return displayDriftReason(
+        display: name,
+        attached: false,
+        deliveredW: track.sourceWidth,
+        deliveredH: track.sourceHeight,
+        currentW: 0,
+        currentH: 0,
+      );
+    }
+    if (track.sourceWidth <= 0 || track.sourceHeight <= 0) return null;
+    final MiniAVVideoInfo now;
+    try {
+      final (video, _) = await MiniScreen.getDefaultFormats(live);
+      now = video;
+    } catch (_) {
+      // The platform declined to answer; that is not evidence of anything.
+      return null;
+    }
+    return displayDriftReason(
+      display: name,
+      attached: true,
+      deliveredW: track.sourceWidth,
+      deliveredH: track.sourceHeight,
+      currentW: now.width,
+      currentH: now.height,
+    );
+  }
 
   /// A track's encoder now emits [config] — its codec configuration record.
   ///
@@ -2317,8 +2769,7 @@ class Recorder {
   ///
   /// Empty before [start].
   List<RecorderCaptureStatus> get captureStatus => [
-        for (final t in _tracks)
-          if (t.captureStatus case final s?) s,
+        for (final t in _tracks) ...t.captureStatuses,
       ];
 
   /// True when every source that can report is capturing normally. Shorthand
@@ -2388,17 +2839,116 @@ abstract class TrackRuntime {
   FfmpegEncoderBridge? get encoderBridge;
   TrackChunk toChunk(EncodedPacket pkt);
 
-  /// One line describing anything that happened to this track's CAPTURE that
-  /// the output cannot show — a target that disappeared, an outage that was
-  /// re-acquired. Null when the capture ran start to finish.
+  // ---- Capture-target loss, for every kind of track ------------------------
+  //
+  // This machinery lived on the video runtime while video was the only path
+  // with a loss signal wired to it. None of it is about pictures: a
+  // subscription, a state machine, two counters. Mic, loopback and camera all
+  // report device loss through the same platform callback, and a recorder that
+  // hears it for one source and not the others is exactly as silent about the
+  // session as one that hears nothing.
+
+  /// Loss/re-acquire state, one per capture source this track owns.
+  ///
+  /// A list rather than a field because a mixed-audio track owns two devices
+  /// that fail independently — an HDMI render endpoint dies with the monitor
+  /// while the USB microphone beside it keeps working — and each has to come
+  /// back on its own.
+  final List<CaptureRecovery> recoveries = [];
+
+  /// Platform unsubscribes, keyed by the recovery they feed.
+  final Map<CaptureRecovery, void Function()> _lostUnsubs = {};
+
+  /// The one recovery of a track that has exactly one capture source. Null for
+  /// a track with none, and for one with several, where "the" recovery is not
+  /// a question with an answer.
+  CaptureRecovery? get soleRecovery =>
+      recoveries.length == 1 ? recoveries.first : null;
+
+  /// True while any of this track's targets is gone and has not given up.
+  bool get captureLost => recoveries.any((r) => r.lost);
+
+  /// True once this track is shutting down, so a loss reported during teardown
+  /// does not start a re-acquire nothing will ever cancel.
+  bool get captureStopping => false;
+
+  /// Live capture health, one entry per source that can lose a target.
+  List<RecorderCaptureStatus> get captureStatuses => [
+        for (final r in recoveries)
+          RecorderCaptureStatus(
+            label: r.label,
+            lost: r.lost,
+            ended: r.ended,
+            lossCount: r.lossCount,
+            recoveryCount: r.recoveryCount,
+            rebuildCount: r.hardRecoveryCount,
+            secondsMissing: r.totalLostUs / 1000000,
+          ),
+      ];
+
+  /// One line per source describing anything that happened to this track's
+  /// CAPTURE that the output cannot show — a target that disappeared, an
+  /// outage that was re-acquired. Empty when every capture ran start to
+  /// finish.
   ///
   /// [Recorder.captureIssues] collects these at stop, so a session that lost
   /// its display for forty minutes says so instead of reporting success and
   /// leaving a short file to be discovered later.
-  String? get captureLossSummary => null;
+  Iterable<String> get captureLossSummaries =>
+      recoveries.map((r) => r.summary).whereType<String>();
 
-  /// Live capture health, or null for a source that cannot lose a target.
-  RecorderCaptureStatus? get captureStatus => null;
+  /// Point a platform capture-lost callback at [recovery], and register it as
+  /// one of this track's recoveries.
+  ///
+  /// Called again after any rebuild that replaces the capture context, and
+  /// that is not optional: the subscription belongs to the context, and a
+  /// rebuild destroys the one it was made against. Leaving it would make a
+  /// SECOND loss invisible — the recorder would recover once and then go quiet
+  /// for the rest of the session, which is the exact failure this whole path
+  /// exists to prevent.
+  ///
+  /// [subscribe] is null for a source whose platform cannot report its own
+  /// death; the recovery is still registered, because a watchdog or an
+  /// explicit call may declare the loss instead.
+  void bindLostSubscription(
+    CaptureRecovery recovery,
+    void Function() Function(MiniAVContextLostListener)? subscribe, {
+    void Function()? onLost,
+  }) {
+    if (!recoveries.contains(recovery)) recoveries.add(recovery);
+    final previous = _lostUnsubs.remove(recovery);
+    if (previous != null) {
+      // The context this disposer belongs to may already be destroyed.
+      try {
+        previous();
+      } catch (_) {}
+    }
+    if (subscribe == null) return;
+    // The platform fires this from a capture thread and forbids synchronous
+    // teardown from inside it, so the listener does nothing but hand the work
+    // to the event loop.
+    _lostUnsubs[recovery] = subscribe((int reason) {
+      scheduleMicrotask(() {
+        if (captureStopping) return;
+        onLost?.call();
+        recovery.noteLost(reason);
+      });
+    });
+  }
+
+  /// Stop every re-acquire and drop every platform subscription. Idempotent,
+  /// because stop and dispose both reach it.
+  void cancelRecoveries() {
+    for (final r in recoveries) {
+      r.cancel();
+    }
+    for (final unsub in _lostUnsubs.values) {
+      try {
+        unsub();
+      } catch (_) {}
+    }
+    _lostUnsubs.clear();
+  }
 
   /// Re-open this track's AUDIO encoder pinned to the FFmpeg backend, keeping
   /// the capture context, and return `true` when one was swapped.
@@ -2528,6 +3078,13 @@ class EncoderImportCache {
 /// throttle) rather than when the serialized encoder happened to reach it —
 /// otherwise a brief encode stall would bunch several frames at near-identical
 /// timestamps.
+/// A mutable int, so a re-acquire closure and [Recorder._reacquireDevice] can
+/// agree on how many times in a row the device has been missing — which is
+/// what decides whether this attempt says anything.
+class _Counter {
+  int value = 0;
+}
+
 class _PendingVideoFrame {
   _PendingVideoFrame(this.buffer, this.captureUs);
   final MiniAVBuffer buffer;
@@ -2558,8 +3115,9 @@ class VideoTrackRuntime extends TrackRuntime {
     this.cfrOutput = false,
     this.reacquireFn,
     this.addLostListenerFn,
-    this.lossPolicy = VideoCaptureLossPolicy.reacquire,
+    this.lossPolicy = CaptureLossPolicy.reacquire,
     this.reacquireLimit,
+    this.canRebuildStage = false,
   });
 
   // ---- The STAGE: everything a GPU device reset destroys -----------------
@@ -2607,13 +3165,22 @@ class VideoTrackRuntime extends TrackRuntime {
   void Function() Function(MiniAVContextLostListener)? addLostListenerFn;
 
   /// What to do when the capture target disappears. See
-  /// [VideoCaptureLossPolicy] — including why nothing here ever substitutes a
+  /// [CaptureLossPolicy] — including why nothing here ever substitutes a
   /// different display for the one that went away.
-  final VideoCaptureLossPolicy lossPolicy;
+  final CaptureLossPolicy lossPolicy;
 
   /// How long to keep re-acquiring before ending the track; null = for as
   /// long as the recording runs.
   final Duration? reacquireLimit;
+
+  /// Whether [Recorder.rebuildVideoStage] will rebuild this track's whole GPU
+  /// stage — the graphics device, the processor, the encoder and the capture
+  /// context — rather than refuse it.
+  ///
+  /// True for the screen path only. A camera's stage is built the same way and
+  /// could follow; until it does, this says so out loud instead of being
+  /// inferred from something that merely correlated with it.
+  final bool canRebuildStage;
 
   /// Optional GPU screen processor (downscale + effects chain). Non-null when:
   /// (a) the zero-copy GPU path is live — [processorCpuReadback] is false, and
@@ -2775,15 +3342,11 @@ class VideoTrackRuntime extends TrackRuntime {
   // subscribed to the platform's capture-lost notification, and a duplicate
   // whose encode failed never retired its source (see [_encodeDuplicateDirect]).
 
-  /// Unsubscribe for [addLostListenerFn].
-  void Function()? _lostUnsub;
-
   CaptureWatchdog? _watchdog;
 
-  /// The re-acquire state machine. Null until [startCapture]; it needs the
-  /// recorder's master clock. See [CaptureRecovery] for why re-acquiring beats
-  /// reporting, and for what is deliberately never attempted.
-  CaptureRecovery? _recovery;
+  /// This track's single recovery — see [TrackRuntime.recoveries]. Null until
+  /// [startCapture]; it needs the recorder's master clock.
+  CaptureRecovery? get _recovery => soleRecovery;
 
   /// Capture buffers retired as duplicator sources — because the target died,
   /// or because re-encoding one failed. Their shared handles no longer
@@ -2802,34 +3365,36 @@ class VideoTrackRuntime extends TrackRuntime {
   int _captureStartedAtUs = -1;
   int _silentLosses = 0;
 
-  /// True while the target is gone and the track has not given up.
-  bool get captureLost => _recovery?.lost ?? false;
+  /// The dimensions the capture source is currently delivering, or 0 before
+  /// the first frame.
+  ///
+  /// Not [width]/[height], which are the ENCODER's and are pinned by what the
+  /// container already declared. This is what the platform is handing over,
+  /// and comparing it against what the display currently IS turns a silent
+  /// capture from a guess into a fact.
+  int sourceWidth = 0;
+  int sourceHeight = 0;
+
+  /// Master-clock µs of the last frame delivered by the CAPTURE SOURCE.
+  ///
+  /// Deliberately not [TrackRuntime.lastPacketUs], which the idle-frame
+  /// duplicator also advances: a frozen capture keeps that one fresh at the
+  /// full frame rate. This one only moves when the platform hands over a
+  /// frame it actually captured.
+  int lastSourceFrameUs = -1;
 
   @override
-  RecorderCaptureStatus? get captureStatus {
-    final r = _recovery;
-    if (r == null) return null;
-    return RecorderCaptureStatus(
-      label: label,
-      lost: r.lost,
-      ended: r.ended,
-      lossCount: r.lossCount,
-      recoveryCount: r.recoveryCount,
-      rebuildCount: r.hardRecoveryCount,
-      secondsMissing: r.totalLostUs / 1000000,
-    );
-  }
+  bool get captureStopping => _stopping;
 
   @override
-  String? get captureLossSummary {
-    final base = _recovery?.summary;
-    if (base == null) return null;
+  Iterable<String> get captureLossSummaries {
     // Which detector fired matters: a platform-reported loss is a known
     // event, while a watchdog loss is one nothing else would have caught.
-    return _silentLosses == 0
-        ? base
-        : '$base ($_silentLosses detected by the watchdog, not reported by '
-            'the platform)';
+    if (_silentLosses == 0) return super.captureLossSummaries;
+    return super.captureLossSummaries.map(
+          (s) => '$s ($_silentLosses detected by the watchdog, not reported '
+              'by the platform)',
+        );
   }
 
   // Encode-error rate limiting: log the first error immediately, then at
@@ -2946,7 +3511,7 @@ class VideoTrackRuntime extends TrackRuntime {
     _watchdogTimer?.cancel();
     _watchdogTimer = Timer.periodic(
       const Duration(seconds: 1),
-      (_) => checkWatchdog(rec.now()),
+      (_) => unawaited(tickWatchdog(rec)),
     );
   }
 
@@ -2964,6 +3529,61 @@ class VideoTrackRuntime extends TrackRuntime {
     _captureStartedAtUs = nowUs;
   }
 
+  /// The armed watchdog, so its widening state is observable.
+  CaptureWatchdog? get watchdog => _watchdog;
+
+  /// One watchdog tick, including the check that has to ask the platform a
+  /// question. Returns true when it declared the capture lost.
+  Future<bool> tickWatchdog(Recorder rec) async {
+    if (checkWatchdog(rec.now())) return true;
+
+    final wd = _watchdog;
+    final recovery = _recovery;
+    if (wd == null || recovery == null) return false;
+    if (_stopping || recovery.lost || recovery.ended) return false;
+
+    // Only ask when already suspicious. A capture delivering frames never
+    // reaches this line, so the probe costs a healthy recording nothing.
+    final nowUs = rec.now();
+    final since =
+        lastSourceFrameUs >= 0 ? lastSourceFrameUs : _captureStartedAtUs;
+    if (since < 0 || nowUs - since < CaptureWatchdog.probeSilenceUs) {
+      return false;
+    }
+    if (_probing) return false;
+    _probing = true;
+    final String? drifted;
+    try {
+      drifted = await rec.displayTargetDrifted(this);
+    } finally {
+      _probing = false;
+    }
+    if (drifted == null) return false;
+    // Re-check: the probe awaited, and the world may have moved under it.
+    if (_stopping || recovery.lost || recovery.ended) return false;
+    if (lastSourceFrameUs > since) return false; // frames came back meanwhile
+
+    _silentLosses++;
+    Recorder._log(
+      '$label: no frame for '
+      '${((rec.now() - since) / 1000000).toStringAsFixed(1)}s and $drifted — '
+      'the capture is stale, not idle. The platform never reported a loss, so '
+      'this is the watchdog calling it. Re-acquiring.',
+      RecorderLogLevel.warning,
+    );
+    _releaseDeadCaptureState();
+    _captureStartedAtUs = rec.now();
+    lastSourceFrameUs = -1;
+    lastPacketUs = -1;
+    encodeErrorsSincePacket = 0;
+    recovery.noteLost(watchdogLossReason, sinceUs: since);
+    return true;
+  }
+
+  /// A probe is in flight. It awaits the platform, and stacking them would put
+  /// several enumerations per second on a machine that is already struggling.
+  bool _probing = false;
+
   /// One watchdog tick. Returns true when it declared the capture lost.
   bool checkWatchdog(int nowUs) {
     final wd = _watchdog;
@@ -2971,29 +3591,68 @@ class VideoTrackRuntime extends TrackRuntime {
     if (wd == null || recovery == null) return false;
     // Recovery already owns the situation, or the recording is ending.
     if (_stopping || recovery.lost || recovery.ended) return false;
-    if (!wd.shouldDeclareLost(
+
+    final noOutput = wd.shouldDeclareLost(
       nowUs: nowUs,
       lastPacketUs: lastPacketUs,
       errorsSincePacket: encodeErrorsSincePacket,
       startedAtUs: _captureStartedAtUs,
-    )) {
+    );
+    // Two different silences. Output stopping means the pipeline died; the
+    // SOURCE stopping while output continues means the duplicator is painting
+    // over a capture that is already gone, which is the frozen-picture case
+    // and the one nothing used to catch.
+    final noFrames = !noOutput &&
+        wd.sourceWentSilent(
+          nowUs: nowUs,
+          lastSourceFrameUs: lastSourceFrameUs,
+          startedAtUs: _captureStartedAtUs,
+        );
+    if (!noOutput && !noFrames) {
+      // Frames are arriving, so any widening of the source window has served
+      // its purpose and the next real death should be caught quickly again.
+      wd.noteSourceAlive();
       return false;
     }
+
+    // When the capture actually went quiet, as opposed to when this noticed.
+    // Whichever test fired owns the clock: with the duplicator running,
+    // lastPacketUs is fresh at the very moment the picture is frozen, so
+    // reading it for a SOURCE-silence loss would time the outage at zero.
+    final quietSince = noFrames
+        ? (lastSourceFrameUs >= 0 ? lastSourceFrameUs : _captureStartedAtUs)
+        : (lastPacketUs >= 0 ? lastPacketUs : _captureStartedAtUs);
+
     _silentLosses++;
-    Recorder._log(
-      '$label produced no packet for '
-      '${(wd.silenceThresholdUs / 1000000).toStringAsFixed(1)}s '
-      '($encodeErrorsSincePacket encode error(s) since) — the platform never '
-      'reported a loss, so this is the watchdog calling it. Re-acquiring.',
-      RecorderLogLevel.warning,
-    );
+    if (noFrames) {
+      final waited = (wd.sourceSilenceThresholdUs / 1000000).toStringAsFixed(0);
+      Recorder._log(
+        '$label: the capture source delivered no frame for ${waited}s while '
+        'the idle-frame duplicator kept the output flowing — a frozen '
+        'picture, not a still one. The platform never reported a loss, so '
+        'this is the watchdog calling it. Re-acquiring.',
+        RecorderLogLevel.warning,
+      );
+      // In case the screen really was just static: see [widenSourceSilence].
+      wd.widenSourceSilence();
+    } else {
+      Recorder._log(
+        '$label produced no packet for '
+        '${(wd.silenceThresholdUs / 1000000).toStringAsFixed(1)}s '
+        '($encodeErrorsSincePacket encode error(s) since) — the platform '
+        'never reported a loss, so this is the watchdog calling it. '
+        'Re-acquiring.',
+        RecorderLogLevel.warning,
+      );
+    }
     _releaseDeadCaptureState();
-    // Restart the clock so a re-acquire that does not fix it re-fires on the
+    // Restart the clocks so a re-acquire that does not fix it re-fires on the
     // silence window rather than immediately.
     _captureStartedAtUs = nowUs;
+    lastSourceFrameUs = -1;
     lastPacketUs = -1;
     encodeErrorsSincePacket = 0;
-    recovery.noteLost(watchdogLossReason);
+    recovery.noteLost(watchdogLossReason, sinceUs: quietSince);
     return true;
   }
 
@@ -3011,6 +3670,12 @@ class VideoTrackRuntime extends TrackRuntime {
         return;
       }
       _statsFramesIn++;
+      lastSourceFrameUs = rec.now();
+      final delivered = buffer.data;
+      if (delivered is MiniAVVideoBuffer) {
+        sourceWidth = delivered.width;
+        sourceHeight = delivered.height;
+      }
       _maybeLogStats();
       // Wall-clock acceptance time. Used both for the pacer and, when the
       // frame is accepted, as its capture timestamp (see [_PendingVideoFrame]).
@@ -3177,16 +3842,23 @@ class VideoTrackRuntime extends TrackRuntime {
         severe ? RecorderLogLevel.error : RecorderLogLevel.warning,
       ),
       quiesce: () => _quiesceLostCapture(rec),
-      // The escalation. Only the screen path can rebuild today; for anything
-      // else this is null and the recovery stays on the cheap repair.
-      hardReacquire: reacquireFn == null
-          ? null
-          : () => rec.rebuildVideoStage(this),
+      // The escalation, offered only where there is something to escalate TO.
+      //
+      // [Recorder.rebuildVideoStage] handles the screen path and refuses every
+      // other, and escalation is ONE-WAY: three soft failures and the recovery
+      // never tries the cheap repair again. Offering it to a track the rebuild
+      // will refuse therefore does not merely waste attempts, it parks the
+      // source on a path that always answers false — a camera that came back
+      // after four attempts would never be picked up.
+      hardReacquire: canRebuildStage
+          ? () => rec.rebuildVideoStage(this)
+          : null,
       restart: () async {
         await startFn(_onFrame(rec));
         // A re-acquired capture has produced nothing yet; without this the
         // watchdog would judge it on the outage it just recovered from.
         _captureStartedAtUs = rec.now();
+        lastSourceFrameUs = -1;
         lastPacketUs = -1;
         encodeErrorsSincePacket = 0;
         // Re-read the encoder's configuration record. A capture-item loss
@@ -3215,38 +3887,15 @@ class VideoTrackRuntime extends TrackRuntime {
     bindLostListener(recovery);
   }
 
-  /// Point the platform's capture-lost callback at [recovery], and make it
-  /// the recovery this track uses.
-  ///
-  /// Called again after every [adoptStage], and that is not optional: the
-  /// subscription belongs to the capture context, and a rebuild destroys the
-  /// context it was made against. Leaving it would make a SECOND loss
-  /// invisible — the recorder would have recovered once and then gone quiet
-  /// for the rest of the session, which is the exact failure this whole path
-  /// exists to prevent.
-  void bindLostListener(CaptureRecovery recovery) {
-    _recovery = recovery;
-    final previous = _lostUnsub;
-    _lostUnsub = null;
-    if (previous != null) {
-      // The context this disposer belongs to may already be destroyed.
-      try {
-        previous();
-      } catch (_) {}
-    }
-    final subscribe = addLostListenerFn;
-    if (subscribe == null) return;
-    // The platform fires this from a capture thread and forbids synchronous
-    // teardown from inside it, so the listener does nothing but hand the work
-    // to the event loop.
-    _lostUnsub = subscribe((int reason) {
-      scheduleMicrotask(() {
-        if (_stopping) return;
-        _releaseDeadCaptureState();
-        recovery.noteLost(reason);
-      });
-    });
-  }
+  /// Re-point the platform's capture-lost callback at [recovery] after a
+  /// rebuild replaced the capture context. See [bindLostSubscription].
+  void bindLostListener(CaptureRecovery recovery) => bindLostSubscription(
+        recovery,
+        addLostListenerFn,
+        // Drop everything tied to the capture that just died BEFORE the
+        // recovery starts, so nothing downstream keeps using it.
+        onLost: _releaseDeadCaptureState,
+      );
 
   /// Drop everything tied to the capture that just died, so nothing downstream
   /// keeps using it. Runs synchronously the moment the loss is known — this is
@@ -3822,9 +4471,7 @@ class VideoTrackRuntime extends TrackRuntime {
   @override
   Future<void> stopCapture() async {
     _stopping = true;
-    _lostUnsub?.call();
-    _lostUnsub = null;
-    _recovery?.cancel();
+    cancelRecoveries();
     _watchdogTimer?.cancel();
     _watchdogTimer = null;
     _dupTimer?.cancel();
@@ -4215,8 +4862,8 @@ class VideoTrackRuntime extends TrackRuntime {
   }
 }
 
-class _AudioTrackRuntime extends TrackRuntime {
-  _AudioTrackRuntime({
+class AudioTrackRuntime extends TrackRuntime {
+  AudioTrackRuntime({
     required super.index,
     required super.label,
     required this.encoder,
@@ -4229,10 +4876,26 @@ class _AudioTrackRuntime extends TrackRuntime {
     required this.startFn,
     required this.stopFn,
     required this.destroyFn,
+    this.lossPolicy = CaptureLossPolicy.reacquire,
+    this.reacquireLimit,
+    this.addLostListenerFn,
+    this.reacquireFn,
   });
 
   /// Not final: [repinAudioEncoderToFfmpeg] swaps it during sink construction.
   AudioEncoder encoder;
+
+  /// What to do when the capture DEVICE goes away — see [CaptureLossPolicy].
+  final CaptureLossPolicy lossPolicy;
+  final Duration? reacquireLimit;
+
+  /// The platform's device-lost subscription, or null where the backend
+  /// cannot report its own death.
+  final void Function() Function(MiniAVContextLostListener)? addLostListenerFn;
+
+  /// Re-configure this track's capture context onto whatever id names its
+  /// device now. Null for a source with no re-acquire path.
+  final ReacquireFn? reacquireFn;
 
   /// The config [encoder] was opened with, kept so it can be re-opened on a
   /// different backend without re-deriving the capture format.
@@ -4338,8 +5001,63 @@ class _AudioTrackRuntime extends TrackRuntime {
   Future<void> _encodeChain = Future<void>.value();
 
   @override
+  bool get captureStopping => _stopping;
+
+  @override
   Future<void> startCapture(Recorder rec) async {
-    await startFn((MiniAVBuffer buffer, Object? _) {
+    _subscribeCaptureLost(rec);
+    await startFn(_onAudio(rec));
+  }
+
+  /// Wire the platform's device-lost callback to a re-acquire loop.
+  ///
+  /// No watchdog here, unlike the video path, and that is a decision rather
+  /// than an omission: a WASAPI loopback endpoint delivers NOTHING at all
+  /// while the render side is idle — not even silent buffers — so silence is
+  /// evidence of a quiet room, not of a dead device. The platform callback is
+  /// the only signal that means what it says.
+  void _subscribeCaptureLost(Recorder rec) {
+    final recovery = CaptureRecovery(
+      label: label,
+      policy: lossPolicy,
+      reacquireLimit: reacquireLimit,
+      nowUs: rec.now,
+      log: (String message, {bool severe = false}) => Recorder._log(
+        message,
+        severe ? RecorderLogLevel.error : RecorderLogLevel.warning,
+      ),
+      // Nothing here holds a GPU surface. What must not overlap a
+      // re-configure is an encode still reading the buffer that was in flight
+      // when the device died.
+      quiesce: drainInFlight,
+      restart: () async {
+        // The new device's capture timestamps are not a continuation of the
+        // old one's. Comparing across them would read as one enormous gap (or
+        // a negative one) and either fill minutes of silence or corrupt the
+        // epoch. Dropping the anchor makes the next buffer re-seed it, and the
+        // wall-clock drift correction — which is what covers a gap longer than
+        // the fill cap anyway — carries the outage.
+        _captureTsValid = false;
+        await startFn(_onAudio(rec));
+        lastPacketUs = -1;
+        encodeErrorsSincePacket = 0;
+      },
+      reacquire: reacquireFn,
+      // No escalation, because there is nothing left to escalate TO. The soft
+      // path here is already a full platform rebuild: WASAPI's configure
+      // releases the capture client, the audio client and the IMMDevice and
+      // re-acquires all three, and miniaudio's re-inits the device. The video
+      // equivalent only rebuilds the capture item, which is why that one needs
+      // a second, heavier tier.
+      hardReacquire: null,
+    );
+    bindLostSubscription(recovery, addLostListenerFn);
+  }
+
+  /// The capture callback as a value, so a re-acquire can re-register it on a
+  /// freshly configured context without duplicating any of it.
+  void Function(MiniAVBuffer, Object?) _onAudio(Recorder rec) {
+    return (MiniAVBuffer buffer, Object? _) {
       if (_stopping) {
         unawaited(MiniAV.releaseBuffer(buffer));
         return;
@@ -4450,7 +5168,7 @@ class _AudioTrackRuntime extends TrackRuntime {
       // above launches a gap fill of up to a second immediately before this
       // 10 ms chunk, so the small one can easily overtake the large one and
       // hand the muxer a decode timestamp that steps backwards by the whole
-      // gap. [_MixedAudioTrackRuntime] has always chained for this reason;
+      // gap. [MixedAudioTrackRuntime] has always chained for this reason;
       // this path was the one that did not.
       _encodeChain = _encodeChain.then<void>(
         (_) => _encodeAudio(rec, pcm, fmt, frameCount, ptsUs),
@@ -4460,7 +5178,7 @@ class _AudioTrackRuntime extends TrackRuntime {
       });
       _inFlight.add(fut);
       fut.whenComplete(() => _inFlight.remove(fut));
-    });
+    };
   }
 
   Future<void> _encodeAudio(
@@ -4545,6 +5263,7 @@ class _AudioTrackRuntime extends TrackRuntime {
   @override
   Future<void> stopCapture() async {
     _stopping = true;
+    cancelRecoveries();
     await stopFn();
   }
 
@@ -4625,8 +5344,8 @@ class _AudioTrackRuntime extends TrackRuntime {
 double _dbToLinear(double db) =>
     db == 0.0 ? 1.0 : math.pow(10.0, db / 20.0).toDouble();
 
-class _MixedAudioTrackRuntime extends TrackRuntime {
-  _MixedAudioTrackRuntime({
+class MixedAudioTrackRuntime extends TrackRuntime {
+  MixedAudioTrackRuntime({
     required super.index,
     required super.label,
     required this.encoder,
@@ -4639,7 +5358,21 @@ class _MixedAudioTrackRuntime extends TrackRuntime {
     this.micChain,
     this.loopChain,
     this.masterChain,
+    this.lossPolicy = CaptureLossPolicy.reacquire,
+    this.reacquireLimit,
+    this.reacquireMicFn,
+    this.reacquireLoopFn,
   });
+
+  /// What to do when either input's device goes away.
+  final CaptureLossPolicy lossPolicy;
+  final Duration? reacquireLimit;
+
+  /// Re-configure one input onto whatever id names its device now. Separate
+  /// functions because the two inputs are separate devices with separate
+  /// enumerations, and only one of them is usually gone.
+  final ReacquireFn? reacquireMicFn;
+  final ReacquireFn? reacquireLoopFn;
 
   /// Not final: [repinAudioEncoderToFfmpeg] swaps it during sink construction.
   AudioEncoder encoder;
@@ -4696,14 +5429,14 @@ class _MixedAudioTrackRuntime extends TrackRuntime {
   bool _audioEpochSet = false;
 
   // Crystal-drift correction — same semantics as
-  // _AudioTrackRuntime._driftThresholdUs / _driftSnapThresholdUs /
+  // AudioTrackRuntime._driftThresholdUs / _driftSnapThresholdUs /
   // _driftCorrectionUs.  See that field's comment for full rationale
   // (snap is a catastrophic-only fallback; capture gaps are silence-filled).
   static const int _driftThresholdUs = 10000; // 10 ms — nudge boundary
   static const int _driftSnapThresholdUs = 5000000; // 5 s — catastrophic only
   static const int _driftCorrectionUs = 20; // 20 µs nudge cap per callback
 
-  // Capture-gap silence fill — same rationale as _AudioTrackRuntime's fields
+  // Capture-gap silence fill — same rationale as AudioTrackRuntime's fields
   // of the same name. This mixer is driven solely by the loopback callback,
   // so when the render endpoint goes idle (WASAPI delivers nothing) the fed
   // sample count falls behind and everything after plays early. Gaps are
@@ -4756,15 +5489,67 @@ class _MixedAudioTrackRuntime extends TrackRuntime {
   }
 
   @override
+  bool get captureStopping => _stopping;
+
+  @override
   Future<void> startCapture(Recorder rec) async {
     _rec = rec;
     _wallClock = Stopwatch()..start();
     _lastMicSamplesMs = _wallClock!.elapsedMilliseconds;
+    _subscribeCaptureLost(rec);
+    await micCtx.startCapture(_onMic());
+    await loopCtx.startCapture(_onLoopback());
+  }
 
-    // Mic: convert to target f32 stereo, apply gain + effects, push to ring.
-    // Gain and effects run here (not at mix time) so the per-source DSP
-    // chain sees a contiguous post-gain mic stream.
-    await micCtx.startCapture((MiniAVBuffer buffer, Object? _) {
+  /// One re-acquire loop per input. See [TrackRuntime.recoveries] for why this
+  /// is a list rather than a field.
+  void _subscribeCaptureLost(Recorder rec) {
+    void log(String message, {bool severe = false}) => Recorder._log(
+          message,
+          severe ? RecorderLogLevel.error : RecorderLogLevel.warning,
+        );
+
+    final mic = CaptureRecovery(
+      label: '$label mic',
+      policy: lossPolicy,
+      reacquireLimit: reacquireLimit,
+      nowUs: rec.now,
+      log: log,
+      // The mic feeds a ring the loopback callback drains; nothing in flight
+      // is reading the buffer that died.
+      quiesce: () async {},
+      restart: () => micCtx.startCapture(_onMic()),
+      reacquire: reacquireMicFn,
+    );
+
+    final loop = CaptureRecovery(
+      label: '$label loopback',
+      policy: lossPolicy,
+      reacquireLimit: reacquireLimit,
+      nowUs: rec.now,
+      log: log,
+      quiesce: drainInFlight,
+      restart: () async {
+        // The new endpoint's capture timestamps do not continue the old
+        // one's, and this track detects gaps on exactly those. See the same
+        // reset in [AudioTrackRuntime].
+        _captureTsValid = false;
+        await loopCtx.startCapture(_onLoopback());
+        lastPacketUs = -1;
+        encodeErrorsSincePacket = 0;
+      },
+      reacquire: reacquireLoopFn,
+    );
+
+    bindLostSubscription(mic, micCtx.addLostListener);
+    bindLostSubscription(loop, loopCtx.addLostListener);
+  }
+
+  /// Mic: convert to target f32 stereo, apply gain + effects, push to ring.
+  /// Gain and effects run here (not at mix time) so the per-source DSP chain
+  /// sees a contiguous post-gain mic stream.
+  void Function(MiniAVBuffer, Object?) _onMic() {
+    return (MiniAVBuffer buffer, Object? _) {
       try {
         if (_stopping) return;
         final audio = buffer.data;
@@ -4802,12 +5587,14 @@ class _MixedAudioTrackRuntime extends TrackRuntime {
       } finally {
         unawaited(MiniAV.releaseBuffer(buffer));
       }
-    });
+    };
+  }
 
-    // Loopback: drives encoding. Each callback delivers ~10 ms of audio at
-    // 48 kHz f32 stereo (the WASAPI default). We mix mic in-place and feed
-    // the encoder once. No timers, no extra allocations.
-    await loopCtx.startCapture((MiniAVBuffer buffer, Object? _) {
+  /// Loopback: drives encoding. Each callback delivers ~10 ms of audio at
+  /// 48 kHz f32 stereo (the WASAPI default). We mix mic in-place and feed the
+  /// encoder once. No timers, no extra allocations.
+  void Function(MiniAVBuffer, Object?) _onLoopback() {
+    return (MiniAVBuffer buffer, Object? _) {
       try {
         if (_stopping) return;
         final audio = buffer.data;
@@ -4816,7 +5603,7 @@ class _MixedAudioTrackRuntime extends TrackRuntime {
       } finally {
         unawaited(MiniAV.releaseBuffer(buffer));
       }
-    });
+    };
   }
 
   /// Convert mic capture buffer to interleaved f32 stereo at 48 kHz. This
@@ -4985,7 +5772,7 @@ class _MixedAudioTrackRuntime extends TrackRuntime {
     pcm.buffer.asFloat32List(0, outSamples).setRange(0, outSamples, mix);
 
     // PTS is anchored to the master clock on the first chunk and then
-    // advanced by cumulative output sample count.  See _AudioTrackRuntime
+    // advanced by cumulative output sample count.  See AudioTrackRuntime
     // for why wall-clock PTS per callback produces crackly playback when
     // the isolate is briefly blocked.  The mixer's output rate is a
     // hardware-constant 48 kHz so the sample-count → µs conversion is
@@ -5141,6 +5928,7 @@ class _MixedAudioTrackRuntime extends TrackRuntime {
   @override
   Future<void> stopCapture() async {
     _stopping = true;
+    cancelRecoveries();
     try {
       await micCtx.stopCapture();
     } catch (_) {}
@@ -5175,7 +5963,7 @@ class _MixedAudioTrackRuntime extends TrackRuntime {
     codec: audioCodec,
     sampleRate: _outSampleRate,
     channels: _outChannels,
-    // See _AudioTrackRuntime.toTrackInfo: without this the muxer synthesises a
+    // See AudioTrackRuntime.toTrackInfo: without this the muxer synthesises a
     // header, and a synthesised OpusHead carries PreSkip = 0.
     extraData: encoder.extraData,
   );
@@ -5231,7 +6019,7 @@ class _MixerRing {
   int _totalSamples = 0;
 
   /// Frames currently buffered.
-  int get frames => _totalSamples ~/ _MixedAudioTrackRuntime._outChannels;
+  int get frames => _totalSamples ~/ MixedAudioTrackRuntime._outChannels;
 
   void add(Float32List samples) {
     if (samples.isEmpty) return;
@@ -5241,7 +6029,7 @@ class _MixerRing {
 
   /// Remove [frames] frames and return them as interleaved stereo f32.
   Float32List take(int frames) {
-    final wanted = frames * _MixedAudioTrackRuntime._outChannels;
+    final wanted = frames * MixedAudioTrackRuntime._outChannels;
     final out = Float32List(wanted);
     var written = 0;
     while (written < wanted) {

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.9
+
+- Raise the spawn constraint to ^0.1.1 — native transfer now actually transfers, and a web message the worker cannot deserialize is reported instead of vanishing.
+
 ## 0.5.8
 
 - Increment downstream deps

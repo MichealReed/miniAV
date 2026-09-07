@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.16
+
+- Raise the spawn constraint to ^0.1.1 — native transfer now actually transfers, and a web message the worker cannot deserialize is reported instead of vanishing.
+
 ## 0.5.15
 
 The container writer moves off the isolate that calls `stop()`, and the

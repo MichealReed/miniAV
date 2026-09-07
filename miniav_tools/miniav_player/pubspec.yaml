@@ -1,6 +1,6 @@
 name: miniav_player
 description: Network-first zero-copy A/V player built on miniav_tools codecs + minigpu_view presentation. Feed EncodedPackets from any transport; decode off-isolate, convert YUV on the GPU, present via a shared texture with zero readback.
-version: 0.2.6
+version: 0.2.7
 repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_tools/miniav_player
 environment:
   sdk: ^3.11.4
@@ -10,13 +10,13 @@ dependencies:
   flutter:
     sdk: flutter
   meta: ^1.16.0
-  miniav_tools: ^0.5.8
+  miniav_tools: ^0.5.9
   # Native codec backend (FFmpeg). Only compiled on native — the player's
   # conditional backend registration never imports it on web.
-  miniav_tools_ffmpeg: ^0.5.8
+  miniav_tools_ffmpeg: ^0.5.9
   # Web codec backend (WebCodecs). Only compiled on web.
-  miniav_tools_codecs: ^0.7.5
-  miniav_tools_platform_interface: ^0.5.7
+  miniav_tools_codecs: ^0.7.7
+  miniav_tools_platform_interface: ^0.5.8
   # GPU runtime for the YUV→RGBA convert + SharedOutputTexture present path.
   minigpu: ^1.8.1
   # Zero-copy Flutter presentation (D3D11 shared handle → Texture widget).

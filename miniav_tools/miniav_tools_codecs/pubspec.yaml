@@ -1,13 +1,13 @@
 name: miniav_tools_codecs
 description: First-party codecs for miniav_tools — GPU-compute (WGSL via minigpu), hardware (Media Foundation / vendor SDKs), and audio. FFmpeg is the software/container fallback.
-version: 0.7.6
+version: 0.7.7
 repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_tools/miniav_tools_codecs
 environment:
   sdk: ^3.11.4
 
 dependencies:
-  spawn: ^0.1.0
-  miniav_tools_platform_interface: ^0.5.7
+  spawn: ^0.1.1
+  miniav_tools_platform_interface: ^0.5.8
   miniav_platform_interface: ^0.7.4
   minigpu_platform_interface: ^1.8.1
   minigpu: ^1.8.1

@@ -758,8 +758,11 @@ Uint8List _slice(ByteData d, int start, int end) =>
 // =============================================================================
 
 class _MuxT {
-  _MuxT(this.info, this.isVideo, Uint8List config, {this.annexB = false})
-      : configs = [config];
+  /// [config] is null for a video track whose encoder has not published its
+  /// configuration record yet — see the deferred branch in [Mp4Muxer.open].
+  /// [configs] is then empty until [Mp4Muxer.setTrackConfig] supplies one.
+  _MuxT(this.info, this.isVideo, Uint8List? config, {this.annexB = false})
+      : configs = config == null ? <Uint8List>[] : [config];
   final TrackInfo info;
   final bool isVideo;
 
@@ -789,9 +792,12 @@ class _MuxT {
   final List<int> sampleConfig = [];
 
   /// H.264/HEVC only: the source emits Annex-B, so each packet needs rewriting
-  /// to length-prefixed NAL units on the way into `mdat`. Decided once from the
-  /// track's config record — never sniffed per packet (see [isAnnexB]).
-  final bool annexB;
+  /// to length-prefixed NAL units on the way into `mdat`. Decided ONCE — from
+  /// the track's config record where there is one at open, otherwise from the
+  /// first thing that arrives — and never re-decided per packet, because a
+  /// stream that changes framing halfway is a producer bug the container
+  /// cannot paper over (see [isAnnexB]).
+  bool annexB;
 
   /// In-memory mode only: packets held until `finish()` lays out `mdat`. Stays
   /// empty when streaming, where each payload goes to disk on arrival.
@@ -1008,6 +1014,10 @@ class Mp4Muxer implements PlatformMuxer {
   int _mdatLen = 0;
   int _lastStreamedTrack = -1;
 
+  /// Tracks whose Annex-B framing was decided from a packet because no
+  /// configuration record had arrived yet. One decision per track, ever.
+  final Set<int> _framingSettled = {};
+
   bool _headerWritten = false;
   bool _finished = false;
   bool _closed = false;
@@ -1064,6 +1074,16 @@ class Mp4Muxer implements PlatformMuxer {
     final t = _tracks[trackIndex];
     final record = _normalizeConfig(t, config);
 
+    if (t.configs.isEmpty) {
+      // The first record for a track that was opened without one. This also
+      // settles the sample framing: a producer that describes itself in
+      // Annex-B emits Annex-B.
+      t.annexB = t.isVideo && isAnnexB(Uint8List.fromList(config));
+      t.configs.add(record);
+      t.activeConfig = 0;
+      return Mp4ConfigChange.added;
+    }
+
     if (_sameBytes(t.configs[t.activeConfig], record)) {
       return Mp4ConfigChange.unchanged;
     }
@@ -1081,6 +1101,17 @@ class Mp4Muxer implements PlatformMuxer {
   /// The configuration records this track carries. Length > 1 means the
   /// encoder was reopened mid-recording with different parameter sets.
   int trackConfigCount(int trackIndex) => _tracks[trackIndex].configs.length;
+
+  /// Indices of tracks whose encoder never published a configuration record.
+  ///
+  /// Such a track's samples are all in `mdat` and its `stsd` entry is missing,
+  /// so it will not decode — but the rest of the file is sound, and refusing
+  /// to write `moov` over it would take the working tracks down too. Read this
+  /// after [finish] and say so; the media is recoverable, the silence is not.
+  List<int> get tracksMissingConfig => [
+        for (var i = 0; i < _tracks.length; i++)
+          if (_tracks[i].configs.isEmpty) i,
+      ];
 
   /// Accept the same conventions [open] does: an encoder handing back Annex-B
   /// parameter sets is normalised to a configuration record, so a caller does
@@ -1147,8 +1178,16 @@ class Mp4Muxer implements PlatformMuxer {
         }
         final cfg = t.extraData?.bytes;
         if (cfg == null || cfg.isEmpty) {
-          throw CodecInitException(
-              'mp4', '${t.codec} track needs its config record in extraData');
+          // DEFERRED, not refused. `moov` is built at finish() and `stsd`
+          // with it, so the record is not needed until then — and a hardware
+          // MFT is allowed to withhold its sequence header until it has
+          // produced output, which is after the recorder has already built
+          // its muxer. Refusing here sent those machines to FFmpeg for the
+          // whole recording. [setTrackConfig] fills it in; a track that never
+          // gets one is reported by [tracksMissingConfig] rather than taking
+          // the file down with it.
+          tracks.add(_MuxT(t, true, null, annexB: false));
+          continue;
         }
         // H.264/HEVC encoders hand us Annex-B parameter sets (the MF sequence
         // header, FFmpeg's `extradata`); MP4 needs an avcC/hvcC record and
@@ -1245,6 +1284,14 @@ class Mp4Muxer implements PlatformMuxer {
       t.lastDecodeUs = decodeUs;
     }
 
+    if (t.isVideo && t.configs.isEmpty && !_framingSettled.contains(i)) {
+      // A sample before any configuration record. The recorder supplies the
+      // record first, so this is a producer that did not — settle the framing
+      // from what actually arrived rather than dropping the packet, because
+      // the alternative is a file with no video at all.
+      t.annexB = isAnnexB(packet.data);
+      _framingSettled.add(i);
+    }
     t.dtsUs.add(packet.dtsUs);
     t.ptsUs.add(packet.ptsUs);
     t.nominalDurUs.add(packet.durationUs);

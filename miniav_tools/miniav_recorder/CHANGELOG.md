@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.15
+
+The container writer moves off the isolate that calls `stop()`, and the
+recorder says what it is doing while it finishes.
+
+- **The container writer runs on a worker, so `stop()` no longer freezes the caller.** Building an MP4 index is one synchronous pass over every sample in the recording — over half a million entries for two hours — and the isolate paying for it was the one drawing the UI. The writer itself is untouched: it runs on the worker through the same pinned backend, so a file cannot come out different depending on where it was assembled. If no worker can be started the recorder writes in process exactly as before and says so in the log, because a worker that will not start should cost a freeze, not the recording. A worker that dies mid-recording is reported once, when it happens, rather than as one error per dropped packet.
+
+- Only the first-party MP4/M4A/WAV writers move. A worker-hosted FFmpeg muxer is a separate problem: it takes codec parameters from a live `AVCodecContext` through a raw pointer into an encoder on another isolate, and it needs every stream's extradata before it will write a header. FFmpeg containers (MKV/WebM/TS) still finish in process.
+
+- New `Recorder.finalizeProgress`: a broadcast stream of `RecorderFinalizeProgress` reporting which phase `stop()` is on — stopping capture, draining, flushing, writing the index, closing, done — with elapsed time and, for the index phase, which file. Phases rather than a fraction: the expensive step is one call into a container writer that reports nothing while it runs, and a percentage over that would be a progress bar that lies.
+
+- The codec configuration record is handed to the container with the first packet, for encoders that only publish it after their first output. Without this an Intel Quick Sync machine could not use the first-party MP4 writer at all and fell back to FFmpeg for the whole recording — which then rewrote the entire multi-gigabyte file at stop to move `moov` to the front. Requires `miniav_tools_codecs` 0.7.6.
+
+- `stop()` reports where its time went — one line with a per-phase breakdown (stop capture / drain / flush / write index / dispose), warning when the whole shutdown ran long enough to drop frames. Every phase does synchronous FFI on whatever isolate called stop, and which one blocked was not knowable from outside. For scale: writing the container index is proportional to sample count, measured at ~240ms for 30 minutes and ~1s for 2 hours of 30fps video plus AAC.
+
+- A track build that throws part way through no longer orphans the native objects it had already created. Harmless as a one-off at start; a leak per attempt in the stage rebuild, which runs the same builder every few seconds for the whole length of an outage, and each orphan is a capture context holding a graphics device.
+
+- `Recorder.updateTrackConfig` now returns `Future<void>` rather than `void`, because the container it talks to may be on a worker. Calling it as a statement is unaffected.
+
+- The video encoder log line now includes the encoder's D3D11 device and whether it matches the capture's. It was being built with a comment explaining why it mattered and then never printed — a device mismatch presents as every GPU frame being refused with no clue as to why.
+
 ## 0.5.14
 
 - Watchdog fixes

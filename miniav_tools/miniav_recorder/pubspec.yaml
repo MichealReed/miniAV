@@ -1,6 +1,6 @@
 name: miniav_recorder
 description: High-level multi-source A/V recorder built on miniav + miniav_tools. Sync screen/camera/mic/loopback into MP4/MKV files or chunked streams.
-version: 0.5.14
+version: 0.5.15
 repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_tools/miniav_recorder
 environment:
   sdk: ^3.11.4
@@ -20,7 +20,11 @@ dependencies:
   # it, mixing setBufferAtSlot with dispatchFire silently binds wrong.
   minigpu: ^1.8.1
   # Canonical GPU/CPU colour converters (RGBA->YUV420) live here now.
-  miniav_tools_codecs: ^0.7.5
+  miniav_tools_codecs: ^0.7.6
+  # Hosts the container writer off the calling isolate: building an MP4
+  # index is one synchronous pass over every sample, and the isolate
+  # calling stop() is the one drawing the UI.
+  spawn: ^0.1.0
 dev_dependencies:
   lints: ^5.0.0
   test: ^1.31.0

@@ -275,6 +275,8 @@ void main() {
     });
   });
 
+  _buildDebrisTests();
+
   group('captureStatuses', () {
     test('an outage still open counts toward the time missing', () async {
       var clock = 0;
@@ -301,6 +303,74 @@ void main() {
       expect(_BareTrack().captureStatuses, isEmpty);
       expect(_BareTrack().captureLossSummaries, isEmpty);
       expect(_BareTrack().captureLost, isFalse);
+    });
+  });
+}
+
+/// A build that throws part way through must not orphan what it created.
+///
+/// One-off at start, where the recorder fails to start anyway. Not one-off in
+/// `rebuildVideoStage`, which runs the same builder every few seconds for the
+/// whole length of an outage — and in the field logs the failure lands exactly
+/// there, at `configureDisplay`, after the capture context already exists.
+void _buildDebrisTests() {
+  group('a half-built track cleans up after itself', () {
+    test('debris is destroyed when the build throws', () async {
+      final debris = <Future<void> Function()>[];
+      final destroyed = <String>[];
+      await expectLater(
+        buildGuarded<TrackRuntime>(debris, () async {
+          debris.add(() async => destroyed.add('context'));
+          throw StateError('Failed to configure display');
+        }),
+        throwsStateError,
+      );
+      expect(destroyed, ['context']);
+      expect(debris, isEmpty, reason: 'and the list does not grow');
+    });
+
+    test('debris is NOT destroyed when the build succeeds', () async {
+      // The runtime owns them at that point and disposes them itself.
+      final debris = <Future<void> Function()>[];
+      final destroyed = <String>[];
+      final track = _BareTrack();
+      final built = await buildGuarded<TrackRuntime>(debris, () async {
+        debris.add(() async => destroyed.add('context'));
+        return track;
+      });
+      expect(built, same(track));
+      expect(destroyed, isEmpty);
+      expect(debris, isEmpty);
+    });
+
+    test('everything created is destroyed, newest first', () async {
+      // An encoder opened against a context has to go before the context does.
+      final debris = <Future<void> Function()>[];
+      final destroyed = <String>[];
+      await expectLater(
+        buildGuarded<TrackRuntime>(debris, () async {
+          debris.add(() async => destroyed.add('context'));
+          debris.add(() async => destroyed.add('encoder'));
+          throw StateError('processor failed');
+        }),
+        throwsStateError,
+      );
+      expect(destroyed, ['encoder', 'context']);
+    });
+
+    test('a destroy that throws does not strand the rest', () async {
+      // After a device reset every teardown is EXPECTED to fail.
+      final debris = <Future<void> Function()>[];
+      final destroyed = <String>[];
+      await expectLater(
+        buildGuarded<TrackRuntime>(debris, () async {
+          debris.add(() async => destroyed.add('context'));
+          debris.add(() async => throw StateError('already gone'));
+          throw StateError('build failed');
+        }),
+        throwsStateError,
+      );
+      expect(destroyed, ['context']);
     });
   });
 }

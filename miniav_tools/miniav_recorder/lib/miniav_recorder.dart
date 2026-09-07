@@ -37,6 +37,7 @@ export 'src/recorder.dart'
         MixedAudioTrackRuntime,
         TrackRuntime,
         VideoTrackRuntime,
+        buildGuarded,
         displayDriftReason,
         releaseCaptureBuffer,
         resolveDeviceTarget;

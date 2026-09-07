@@ -16,7 +16,6 @@ import 'package:miniav_tools_codecs/miniav_tools_codecs.dart'
         ContainerFramingBackend,
         MfVideoEncoder,
         Mp4ConfigChange,
-        Mp4Muxer,
         registerFirstPartyBackends;
 import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
 import 'package:minigpu/minigpu.dart';
@@ -24,6 +23,11 @@ import 'package:minigpu/minigpu.dart';
 import 'adaptive_gpu_throttle.dart';
 import 'bounded_write_queue.dart';
 import 'capture_recovery.dart';
+import 'finalize_progress.dart';
+import 'mux_sink.dart';
+import '../workers/mux_worker.dart'
+    show muxPhaseClosing, muxPhaseWritingIndex;
+import 'worker_mux_sink.dart';
 import 'container_utils.dart';
 import 'frame_pacer.dart';
 import 'gpu_screen_processor.dart';
@@ -32,7 +36,45 @@ import 'recorder_sink.dart';
 import 'recorder_source.dart';
 import 'track_chunk.dart';
 
+export 'finalize_progress.dart';
 export 'recorder_log.dart' show RecorderLogLevel, RecorderLogSource;
+
+/// Run [build], destroying everything it registered in [debris] if it throws.
+///
+/// A half-finished build has already created native objects — a capture
+/// context, an encoder — and dropping the reference does not release them.
+/// One-off at start, where the recorder fails to start anyway; a leak PER
+/// ATTEMPT in [Recorder.rebuildVideoStage], which runs the same builder every
+/// few seconds for the whole length of an outage.
+///
+/// Newest first, because the later objects were built against the earlier
+/// ones: an encoder bound to a capture context has to go before the context
+/// does. A destroy that throws is expected — after a device reset every
+/// teardown fails — and must not strand the ones behind it.
+///
+/// [debris] is cleared either way: on success the returned runtime owns them
+/// and disposes them itself.
+Future<T> buildGuarded<T>(
+  List<Future<void> Function()> debris,
+  Future<T> Function() build,
+) async {
+  debris.clear();
+  try {
+    final built = await build();
+    debris.clear();
+    return built;
+  } catch (_) {
+    for (final destroy in debris.reversed) {
+      try {
+        await destroy();
+      } catch (_) {
+        // Already-dead objects are the normal case here.
+      }
+    }
+    debris.clear();
+    rethrow;
+  }
+}
 
 /// Why a display no longer looks like the one a quiet capture is attached to,
 /// or null when it still does.
@@ -387,7 +429,7 @@ class Recorder {
       // 1. Build each track (open encoder + record capture config).
       for (var i = 0; i < _sourceConfigs.length; i++) {
         final cfg = _sourceConfigs[i];
-        final track = await _buildTrack(i, cfg);
+        final track = await guardedBuild(() => _buildTrack(i, cfg));
         _tracks.add(track);
       }
 
@@ -436,6 +478,23 @@ class Recorder {
   }
 
   Future<void> _shutdown({required bool force}) async {
+    // Where the time goes. Every phase below does synchronous FFI — closing
+    // encoders, destroying capture contexts, building a sample index over
+    // hundreds of thousands of samples — on whatever isolate called stop,
+    // which in a Flutter app is the one drawing the UI. A shutdown that runs
+    // long is a visible freeze, and which phase did it is not guessable from
+    // the outside.
+    final phases = <String, int>{};
+    final sw = Stopwatch()..start();
+    _finalizeClock = sw;
+    _emitPhase(RecorderFinalizePhase.stoppingCapture);
+    var lastMs = 0;
+    void mark(String phase) {
+      final now = sw.elapsedMilliseconds;
+      phases[phase] = now - lastMs;
+      lastMs = now;
+    }
+
     // 1. Stop captures (so no more frames arrive).
     for (final t in _tracks) {
       try {
@@ -445,6 +504,8 @@ class Recorder {
       }
     }
     _masterClock.stop();
+    mark('stop capture');
+    _emitPhase(RecorderFinalizePhase.draining);
 
     // Collect capture-level problems BEFORE _tracks is cleared below. A file
     // that is short because its display went away is not distinguishable from
@@ -462,6 +523,8 @@ class Recorder {
     for (final t in _tracks) {
       await t.drainInFlight();
     }
+    mark('drain');
+    _emitPhase(RecorderFinalizePhase.flushing);
 
     // 3. Flush encoders + push trailing packets to every sink.
     for (final t in _tracks) {
@@ -470,6 +533,12 @@ class Recorder {
       } catch (e) {
         _log('flush(${t.label}): $e', RecorderLogLevel.error);
       }
+    }
+    mark('flush');
+    // The worker announces the index phase itself for the file it is writing.
+    // This covers the in-process fallback, where nothing else will.
+    if (_sinks.every((s) => s is! _FileSinkRuntime)) {
+      _emitPhase(RecorderFinalizePhase.writingIndex);
     }
 
     // 4. Finish + close every muxer.
@@ -480,6 +549,11 @@ class Recorder {
         _log('finish sink: $e', RecorderLogLevel.error);
       }
     }
+    // Writing the container index. Synchronous, and proportional to the SAMPLE
+    // COUNT rather than the file size — an hour of 30fps video plus AAC is
+    // roughly a quarter of a million entries across stts/stsz/stco/ctts.
+    mark('write index');
+    _emitPhase(RecorderFinalizePhase.closing);
 
     // 5. Close encoders + capture contexts.
     for (final t in _tracks) {
@@ -492,6 +566,7 @@ class Recorder {
         await s.dispose();
       } catch (_) {}
     }
+    mark('dispose');
     if (!force) {
       _tracks.clear();
       _sinks.clear();
@@ -504,6 +579,17 @@ class Recorder {
     //    (which would risk picking a different backend on the second run).
     //    Use [Recorder.disposeSharedGpu] for explicit teardown.
     _backendContext = null;
+
+    final total = sw.elapsedMilliseconds;
+    final breakdown =
+        phases.entries.map((e) => '${e.key} ${e.value}ms').join(', ');
+    _log(
+      'shutdown took ${total}ms ($breakdown)',
+      // A third of a second is roughly where a freeze stops being deniable.
+      total >= 333 ? RecorderLogLevel.warning : RecorderLogLevel.info,
+    );
+    _emitPhase(RecorderFinalizePhase.done);
+    _finalizeClock = null;
   }
 
   // -----------------------------------------------------------------------
@@ -1155,6 +1241,21 @@ class Recorder {
     );
   }
 
+  /// Native objects a track build has created but not yet handed to a runtime.
+  ///
+  /// A build that throws part way through used to orphan them. One-off at
+  /// start; a leak PER ATTEMPT in [rebuildVideoStage], which runs every few
+  /// seconds for the whole length of an outage — and each orphan is a capture
+  /// context holding a graphics device.
+  ///
+  /// Not re-entrant, and does not need to be: builds are sequential, guarded
+  /// by [_rebuilding] mid-session and by [_prepare] running before start.
+  final List<Future<void> Function()> buildDebris = [];
+
+  /// [buildGuarded] over this recorder's [buildDebris].
+  Future<TrackRuntime> guardedBuild(Future<TrackRuntime> Function() build) =>
+      buildGuarded(buildDebris, build);
+
   Future<TrackRuntime> _buildTrack(int index, RecorderSource cfg) async {
     switch (cfg) {
       case ScreenRecorderSource():
@@ -1377,6 +1478,7 @@ class Recorder {
     }
 
     final ctx = await MiniScreen.createContext();
+    buildDebris.add(ctx.destroy);
     if (resolvedDisplayId != null) {
       await ctx.configureDisplay(resolvedDisplayId, videoFormat);
     } else {
@@ -1786,6 +1888,7 @@ class Recorder {
       );
     }
     final ctx = await MiniCamera.createContext();
+    buildDebris.add(ctx.destroy);
     await ctx.configure(cameraId, format);
 
     // Pass the BackendContext (D3D11 zero-copy device) only on the GPU path —
@@ -2039,7 +2142,8 @@ class Recorder {
       'video encoder = ${enc.backendName} '
       '(${platform.runtimeType})${vendorTag ?? ''} for ${effectiveCodec.name} '
       '${format.width}x${format.height}'
-      '${quality != null ? ' quality=$quality (${effectiveRc.name} $effectiveCrf)' : ''}',
+      '${quality != null ? ' quality=$quality (${effectiveRc.name} $effectiveCrf)' : ''}'
+      '$deviceTag',
     );
     return (encoder: enc, codec: effectiveCodec);
   }
@@ -2094,6 +2198,7 @@ class Recorder {
     }
 
     final ctx = await factory();
+    buildDebris.add(() => destroy(ctx));
     await configure(ctx, startId, format);
 
     final encoderConfig = AudioEncoderConfig(
@@ -2414,6 +2519,29 @@ class Recorder {
         )) {
           Muxer? opened;
           try {
+            // On a worker where one can be had. Building the index is one
+            // synchronous pass over every sample in the recording, and the
+            // isolate calling stop() is the one drawing the UI.
+            final hosted = await WorkerMuxSink.tryOpen(
+              container: container,
+              path: sink.path,
+              tracks: tracks,
+              onPhase: (phase) => _notePhase(phase, sink.path),
+              onFatal: (error) => Recorder._log(
+                'the worker writing ${sink.path} ended before the recording '
+                'did${error == null ? '' : ': $error'}. Everything captured '
+                'from here on is lost and the file will have no index — its '
+                'media is still on disk and recoverable. Stop the recording.',
+                RecorderLogLevel.error,
+              ),
+            );
+            if (hosted != null) {
+              Recorder._log(
+                'muxer = ${hosted.backendName} for ${container.name} → '
+                '${sink.path} (on a worker; finish will not block the caller)',
+              );
+              return _FileSinkRuntime(muxer: hosted, path: sink.path);
+            }
             // PIN rather than negotiate: FFmpeg also muxes MP4, and this is a
             // routing decision, not a capability contest.
             opened = await MiniAVTools.createMuxer(
@@ -2425,9 +2553,14 @@ class Recorder {
             await opened.writeHeader();
             Recorder._log(
               'muxer = ${opened.backendName} for ${container.name} → '
-              '${sink.path}',
+              '${sink.path} (in process — no worker was available, so stop() '
+              'will block while the index is written)',
+              RecorderLogLevel.warning,
             );
-            return _FileSinkRuntime(muxer: opened, path: sink.path);
+            return _FileSinkRuntime(
+              muxer: InProcessMuxSink(opened),
+              path: sink.path,
+            );
           } catch (e) {
             // writeHeader() may have already opened the file. Release the
             // handle before FFmpeg tries to write the same path — on Windows a
@@ -2484,7 +2617,10 @@ class Recorder {
           FfmpegBackend.backendName,
         );
         await muxer.writeHeader();
-        return _FileSinkRuntime(muxer: muxer, path: sink.path);
+        return _FileSinkRuntime(
+          muxer: InProcessMuxSink(muxer),
+          path: sink.path,
+        );
 
       case StreamRecorderSink():
         return _StreamSinkRuntime(onChunk: sink.onChunk);
@@ -2501,6 +2637,18 @@ class Recorder {
     // [CaptureWatchdog]: a produced packet is the only proof a capture is
     // still alive that survives a static screen.
     track.notePacket(now());
+    // The container may still be waiting for this track's configuration
+    // record. A hardware H.264 MFT is allowed to withhold its sequence header
+    // until it has produced output, and the muxer was built before any frame
+    // was encoded — so for those encoders the record only exists now. It has
+    // to land BEFORE the sample it describes.
+    if (!track.configDelivered) {
+      final cfg = track.currentConfigRecord;
+      if (cfg != null && cfg.isNotEmpty) {
+        track.configDelivered = true;
+        await updateTrackConfig(track, cfg, firstRecord: true);
+      }
+    }
     final routed = packet.copyWith(trackIndex: track.index);
     for (final s in _sinks) {
       switch (s) {
@@ -2570,10 +2718,12 @@ class Recorder {
       // session already does at prepare — it has simply never run mid-session.
       await _maybeInitSharedGpu();
 
-      final fresh = await _buildScreenTrack(
-        track.index,
-        cfg,
-        lockedSize: (track.width, track.height),
+      final fresh = await guardedBuild(
+        () => _buildScreenTrack(
+          track.index,
+          cfg,
+          lockedSize: (track.width, track.height),
+        ),
       );
       if (fresh is! VideoTrackRuntime) return false;
 
@@ -2731,15 +2881,29 @@ class Recorder {
   /// parameter sets. When it does not, the container needs to know, because
   /// the record already committed to the file would otherwise be a claim
   /// about samples that were not encoded under it.
-  void updateTrackConfig(TrackRuntime track, Uint8List config) {
+  /// [firstRecord] marks the record a track was opened WITHOUT — the deferred
+  /// case, which is ordinary rather than a warning. A later `added` really is
+  /// the encoder changing its mind mid-recording.
+  Future<void> updateTrackConfig(
+    TrackRuntime track,
+    Uint8List config, {
+    bool firstRecord = false,
+  }) async {
     if (config.isEmpty) return;
     for (final s in _sinks) {
       if (s is! _FileSinkRuntime) continue;
-      final p = s.muxer.platform;
-      if (p is! Mp4Muxer) continue;
       try {
-        final change = p.setTrackConfig(track.index, config);
-        if (change == Mp4ConfigChange.added) {
+        final change = await s.muxer.setTrackConfig(track.index, config);
+        if (change == null) continue;
+        if (change == Mp4ConfigChange.added && firstRecord) {
+          _log(
+            '${track.label} published its codec configuration record with the '
+            'first frame — the container was opened without one and has it '
+            'now. Normal for a hardware encoder that only fills its sequence '
+            'header after the first output.',
+            RecorderLogLevel.info,
+          );
+        } else if (change == Mp4ConfigChange.added) {
           _log(
             '${track.label} encoder came back with DIFFERENT parameter sets — '
             'a second sample entry was written and later frames point at it. '
@@ -2756,6 +2920,44 @@ class Recorder {
 
   /// Master-clock pts, in microseconds, at the moment this is called.
   int now() => _masterClock.elapsedMicroseconds;
+
+  final StreamController<RecorderFinalizeProgress> _finalize =
+      StreamController<RecorderFinalizeProgress>.broadcast();
+  Stopwatch? _finalizeClock;
+
+  /// What [stop] is doing, while it does it.
+  ///
+  /// Broadcast, and it only carries events during a stop — subscribe once at
+  /// build time and leave it. Phases rather than a fraction: the expensive
+  /// step is one call into a container writer that reports nothing while it
+  /// runs, and a percentage over that would be a progress bar that lies.
+  ///
+  /// The writer runs on a worker where one could be started, so the isolate
+  /// reading this stream stays responsive while [RecorderFinalizePhase
+  /// .writingIndex] is in progress. Where no worker could be had it falls back
+  /// to writing in process, says so in the log, and this stream still reports
+  /// the phase — from an isolate that is blocked, so the event arrives before
+  /// the freeze rather than during it.
+  Stream<RecorderFinalizeProgress> get finalizeProgress => _finalize.stream;
+
+  void _emitPhase(RecorderFinalizePhase phase, {String? path}) {
+    if (_finalize.isClosed) return;
+    _finalize.add(RecorderFinalizeProgress(
+      phase: phase,
+      elapsed: _finalizeClock?.elapsed ?? Duration.zero,
+      path: path,
+    ));
+  }
+
+  /// A phase reported by a worker-hosted writer, named in its own vocabulary.
+  void _notePhase(String phase, String path) {
+    switch (phase) {
+      case muxPhaseWritingIndex:
+        _emitPhase(RecorderFinalizePhase.writingIndex, path: path);
+      case muxPhaseClosing:
+        _emitPhase(RecorderFinalizePhase.closing, path: path);
+    }
+  }
 
   final List<String> _captureIssues = [];
 
@@ -2821,6 +3023,21 @@ abstract class TrackRuntime {
     lastPacketUs = nowUs;
     encodeErrorsSincePacket = 0;
   }
+
+  /// Whether this track's codec configuration record has reached the
+  /// container. False until the first packet for an encoder that publishes it
+  /// late; already true at open for one that does not.
+  bool configDelivered = false;
+
+  /// The encoder's configuration record right now, or null if it has none yet.
+  Uint8List? get currentConfigRecord {
+    final bytes = encoderConfigRecord;
+    return bytes == null || bytes.isEmpty ? null : bytes;
+  }
+
+  /// Per-runtime access to whatever holds the encoder. Null where the track
+  /// has no codec-private data to publish.
+  Uint8List? get encoderConfigRecord => null;
 
   Future<void> startCapture(Recorder rec);
   Future<void> stopCapture();
@@ -3869,7 +4086,7 @@ class VideoTrackRuntime extends TrackRuntime {
         // the first frame under new parameter sets is written.
         final cfg = encoder.platform.extraData?.bytes;
         if (cfg != null && cfg.isNotEmpty) {
-          rec.updateTrackConfig(this, Uint8List.fromList(cfg));
+          await rec.updateTrackConfig(this, Uint8List.fromList(cfg));
         }
         // Re-arm the duplicator. The CFR grid needs nothing: claimPts caps
         // inline backfill at FramePacer.maxInlineBackfill and jumps the slot
@@ -4816,6 +5033,10 @@ class VideoTrackRuntime extends TrackRuntime {
       processor?.dispose();
     } catch (_) {}
   }
+
+  @override
+  @override
+  Uint8List? get encoderConfigRecord => encoder.platform.extraData?.bytes;
 
   @override
   TrackInfo toTrackInfo() => VideoTrackInfo(
@@ -6070,11 +6291,11 @@ class _FileSinkRuntime implements _SinkRuntime {
           RecorderLogLevel.error,
         ),
       );
-  /// The negotiated muxer facade, not a concrete FfmpegMuxer. The sink does
+  /// The container writer, which may be running on a worker. The sink does
   /// not care which backend writes the container -- it only needs
   /// writePacket/finish/close -- and typing it concretely was what forced the
   /// FFmpeg muxer on paths the first-party writer handles better.
-  final Muxer muxer;
+  final MuxSink muxer;
   final String path;
 
   // Decoupled mux-write queue: [enqueuePacket] chains each encoded packet onto
@@ -6094,8 +6315,7 @@ class _FileSinkRuntime implements _SinkRuntime {
   Future<void> finish() async {
     // Drain every queued packet to the muxer BEFORE writing the trailer.
     await _muxQueue.drain();
-    await muxer.finish();
-    _logTimingRepairs();
+    _report(await muxer.finish());
   }
 
   /// Say so when the container had to repair this recording's decode order.
@@ -6105,11 +6325,17 @@ class _FileSinkRuntime implements _SinkRuntime {
   /// bug is invisible from the output. Without this line the only symptom is a
   /// few frames of skew somewhere in a multi-gigabyte file, which nobody will
   /// ever trace back. With it, the session that did it says so at stop.
-  void _logTimingRepairs() {
-    final p = muxer.platform;
-    if (p is! Mp4Muxer) return;
-    for (final r in p.timingReports) {
-      if (r.isClean) continue;
+  void _report(MuxFinishReport report) {
+    for (final index in report.tracksMissingConfig) {
+      Recorder._log(
+        'track $index in $path was never given a codec configuration record — '
+        'its samples are all in the file but it has no sample entry, so it '
+        'will not decode. Every other track is sound; the media is '
+        'recoverable from mdat.',
+        RecorderLogLevel.error,
+      );
+    }
+    for (final r in report.timingRepairs) {
       Recorder._log(
         'mux timing repaired in $path — $r',
         RecorderLogLevel.warning,

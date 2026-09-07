@@ -1,5 +1,9 @@
 import 'dart:typed_data';
 
+/// Windows-only immutable, producer-complete D3D11 snapshot provenance.
+/// Matches MINIAV_D3D11_IMMUTABLE_READY_TAG in the native buffer header.
+const int kMiniAVD3D11ImmutableReadyTag = 0x57474331;
+
 /// Platform-agnostic types for MiniAV platform interface.
 /// These are pure Dart types, not FFI structs.
 
@@ -292,8 +296,22 @@ class MiniAVVideoBuffer {
   /// Per-plane DMA-BUF file descriptors (-1 if not applicable).
   final List<int> dmabufFds;
 
-  /// Per-plane DRM format modifiers (0 = LINEAR).
+  /// Per-plane DRM format modifiers on Linux (0 = LINEAR). Windows D3D11
+  /// plane 0 may carry [kMiniAVD3D11ImmutableReadyTag] instead.
   final List<int> drmFormatModifiers;
+
+  /// Whether this is a producer-complete immutable BGRA32 snapshot.
+  /// Only meaningful after the enclosing buffer's contentType has been checked
+  /// as gpuD3D11Handle. Untagged producers retain the conservative import path.
+  bool get d3d11ImmutableReady =>
+      pixelFormat == MiniAVPixelFormat.bgra32 &&
+      strideBytes.isNotEmpty &&
+      strideBytes.first == 0 &&
+      nativeHandles.isNotEmpty &&
+      nativeHandles.first is int &&
+      nativeHandles.first != 0 &&
+      drmFormatModifiers.isNotEmpty &&
+      drmFormatModifiers.first == kMiniAVD3D11ImmutableReadyTag;
 
   MiniAVVideoBuffer({
     required this.width,

@@ -36,9 +36,10 @@ typedef enum {
   //
   // OWNERSHIP: miniav owns the handle and CloseHandle()s it inside
   // MiniAV_ReleaseBuffer. The app must NOT close it. The app must finish
-  // importing it (OpenSharedResource1 / minigpu mgpuImportVideoFrame, both of
-  // which copy into a consumer-private texture before returning) BEFORE
-  // calling MiniAV_ReleaseBuffer; after release the handle is invalid.
+  // importing it BEFORE calling MiniAV_ReleaseBuffer; after release the handle
+  // is invalid. OpenSharedResource1 retains access to the SAME shared storage,
+  // not a private copy. Untagged resources require the consumer to preserve
+  // its snapshot before release. See MINIAV_D3D11_IMMUTABLE_READY_TAG below.
   MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE,
   MINIAV_BUFFER_CONTENT_TYPE_GPU_METAL_TEXTURE, // Video:
                                                 // data.video.native_gpu_texture_ptr
@@ -50,6 +51,14 @@ typedef enum {
                                                   // is AHardwareBuffer*
 } MiniAVBufferContentType;
 
+// Exact producer provenance, only for GPU_D3D11_HANDLE BGRA32 plane 0. A fresh,
+// immutable allocation contains a completed producer copy. Consumers may keep
+// an opened COM resource alive after MiniAV_ReleaseBuffer, without copying its
+// pixels. The NT handle itself remains owned by MiniAV and closes on release.
+// Stored in drm_format_modifier to preserve the existing C/Dart FFI layout;
+// that field remains a DRM modifier on Linux. Absence means no such guarantee.
+#define MINIAV_D3D11_IMMUTABLE_READY_TAG UINT64_C(0x57474331)
+
 typedef struct {
   // Per-plane data (works for both CPU and GPU)
   void *data_ptr;        // CPU: memory pointer, GPU: texture/handle pointer
@@ -60,7 +69,7 @@ typedef struct {
                          // subresource)
   uint32_t
       subresource_index; // GPU: D3D11 subresource, Vulkan image aspect, etc.
-  // Linux DMA-BUF extended info (zero/−1 on other platforms)
+  // Linux DMA-BUF extended info; Windows may carry the provenance tag above.
   int      dmabuf_fd;            // Per-plane DMA-BUF file descriptor (-1 if n/a)
   uint64_t drm_format_modifier;  // DRM format modifier (DRM_FORMAT_MOD_LINEAR=0)
 } MiniAVVideoPlane;

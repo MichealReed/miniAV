@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.6
+
+- The MP4 writer accepts a video track whose encoder has not published its configuration record yet. It builds `moov` at `finish()` and `stsd` with it, so the record is not needed until then - but `open` refused without one, and a recorder builds its muxer before a single frame has been encoded. A hardware H.264 MFT is allowed to withhold its sequence header until it has produced output (Intel Quick Sync does; NVIDIA does not), so on those machines the whole recording fell back to FFmpeg - whose file output carries `+faststart`, which rewrites the entire file at `av_write_trailer`. `setTrackConfig` now supplies the record and settles Annex-B framing with it; output is byte-identical to supplying it at open.
+
+- New `Mp4Muxer.tracksMissingConfig`: a track whose record never arrived is reported rather than thrown. Its samples are all in the file and its sample entry is missing, so it will not decode - and refusing to write `moov` over it would take every working track down with it.
+
 ## 0.7.5
 
 - Increment downstream deps

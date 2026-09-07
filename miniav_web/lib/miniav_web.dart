@@ -69,14 +69,25 @@ class MiniAVWebPlatform extends MiniAVPlatformInterface {
 
   @override
   Future<void> releaseBuffer(MiniAVBuffer buffer) async {
-    // Web does not require explicit buffer release
-    // This can be a no-op or implement custom logic if needed
+    releaseBufferSync(buffer);
   }
 
   @override
   void releaseBufferSync(MiniAVBuffer buffer) {
-    // Web does not require explicit buffer release — no-op (overrides the
-    // default delegation so the hot path allocates no Future on web either).
+    // 🔴 NO LONGER A NO-OP. A CPU buffer is plain Dart bytes and needs nothing,
+    // which is why this used to do nothing at all — but a
+    // [MiniAVBufferContentType.gpuWebVideoFrame] buffer carries a WebCodecs
+    // `VideoFrame`, and a VideoFrame that is not `close()`d pins a capture
+    // surface. The browser hands out only a few at a time, so a
+    // `MediaStreamTrackProcessor` whose frames leak STOPS PRODUCING once its
+    // queue fills — silently, with no error and no event. Leaving this a no-op
+    // would make the zero-copy camera path deliver about three frames and then
+    // freeze, which looks exactly like a broken camera.
+    if (buffer.contentType != MiniAVBufferContentType.gpuWebVideoFrame) return;
+    final vb = buffer.data;
+    if (vb is! MiniAVVideoBuffer || vb.nativeHandles.isEmpty) return;
+    final frame = vb.nativeHandles[0];
+    if (frame is web.VideoFrame) frame.close();
   }
 }
 

@@ -22,7 +22,19 @@ export 'modules/miniav_inject_interface.dart';
 // Conditional import for platform-specific implementation
 import 'platform_stub/miniav_platform_stub.dart'
     if (dart.library.ffi) 'package:miniav_ffi/miniav_ffi.dart'
-    if (dart.library.js) 'package:miniav_web/miniav_web.dart';
+    // 🔴 `dart.library.js_interop`, NOT `dart.library.js`.
+    //
+    // `dart:js` does not exist under dart2wasm — only `dart:js_interop` does —
+    // so `if (dart.library.js)` is FALSE there and this falls all the way
+    // through to the stub. The symptom is not a compile error: the app builds,
+    // starts, and throws `UnsupportedError: No platform implementation
+    // available.` out of a wasm frame with no Dart stack, which reads as a
+    // broken wasm build rather than as an unselected implementation.
+    //
+    // `js_interop` is provided by dart2js AND dart2wasm and by neither the VM
+    // nor AOT, so it selects exactly the same web implementation the old
+    // condition did, and one more target besides.
+    if (dart.library.js_interop) 'package:miniav_web/miniav_web.dart';
 
 // Abstract interface
 abstract class MiniAVPlatformInterface {

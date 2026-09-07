@@ -12,7 +12,8 @@ import 'recorder_source.dart';
 export 'audio_effect.dart';
 export 'screen_effect.dart';
 export 'screen_scale_policy.dart';
-export 'recorder_source.dart' show VideoIdleFramePolicy;
+export 'recorder_source.dart'
+    show CaptureLossPolicy, VideoCaptureLossPolicy, VideoIdleFramePolicy;
 
 class RecorderBuilder {
   final List<RecorderSource> _sources = [];
@@ -71,6 +72,8 @@ class RecorderBuilder {
     VideoIdleFramePolicy idleFramePolicy = VideoIdleFramePolicy.duplicate,
     bool adaptiveGpuThrottle = true,
     bool cfrOutput = false,
+    CaptureLossPolicy lossPolicy = CaptureLossPolicy.reacquire,
+    Duration? reacquireLimit,
   }) {
     _sources.add(
       ScreenRecorderSource(
@@ -89,6 +92,8 @@ class RecorderBuilder {
         idleFramePolicy: idleFramePolicy,
         adaptiveGpuThrottle: adaptiveGpuThrottle,
         cfrOutput: cfrOutput,
+        lossPolicy: lossPolicy,
+        reacquireLimit: reacquireLimit,
       ),
     );
   }
@@ -105,6 +110,8 @@ class RecorderBuilder {
     double? quality,
     Map<String, String> encoderOptions = const {},
     VideoIdleFramePolicy idleFramePolicy = VideoIdleFramePolicy.none,
+    CaptureLossPolicy lossPolicy = CaptureLossPolicy.reacquire,
+    Duration? reacquireLimit,
   }) {
     _sources.add(
       CameraRecorderSource(
@@ -118,6 +125,8 @@ class RecorderBuilder {
         quality: quality,
         encoderOptions: encoderOptions,
         idleFramePolicy: idleFramePolicy,
+        lossPolicy: lossPolicy,
+        reacquireLimit: reacquireLimit,
       ),
     );
   }
@@ -129,6 +138,8 @@ class RecorderBuilder {
     int? bitrateBps,
     int? sampleRate,
     int? channels,
+    CaptureLossPolicy lossPolicy = CaptureLossPolicy.reacquire,
+    Duration? reacquireLimit,
   }) {
     _sources.add(
       MicRecorderSource(
@@ -137,6 +148,8 @@ class RecorderBuilder {
         bitrateBps: bitrateBps,
         sampleRate: sampleRate,
         channels: channels,
+        lossPolicy: lossPolicy,
+        reacquireLimit: reacquireLimit,
       ),
     );
   }
@@ -148,6 +161,8 @@ class RecorderBuilder {
     int? bitrateBps,
     int? sampleRate,
     int? channels,
+    CaptureLossPolicy lossPolicy = CaptureLossPolicy.reacquire,
+    Duration? reacquireLimit,
   }) {
     _sources.add(
       LoopbackRecorderSource(
@@ -156,6 +171,8 @@ class RecorderBuilder {
         bitrateBps: bitrateBps,
         sampleRate: sampleRate,
         channels: channels,
+        lossPolicy: lossPolicy,
+        reacquireLimit: reacquireLimit,
       ),
     );
   }
@@ -195,6 +212,8 @@ class RecorderBuilder {
     List<AudioEffect> micEffects = const [],
     List<AudioEffect> loopbackEffects = const [],
     List<AudioEffect> masterEffects = const [],
+    CaptureLossPolicy lossPolicy = CaptureLossPolicy.reacquire,
+    Duration? reacquireLimit,
   }) {
     _sources.add(
       MixedAudioRecorderSource(
@@ -207,6 +226,8 @@ class RecorderBuilder {
         micEffects: micEffects,
         loopbackEffects: loopbackEffects,
         masterEffects: masterEffects,
+        lossPolicy: lossPolicy,
+        reacquireLimit: reacquireLimit,
       ),
     );
   }

@@ -14,7 +14,7 @@ dependencies:
   # Android's JVM half. Pulled in here so `attach` works on Android without the
   # app registering anything; a no-op plugin on every other platform.
   miniav_media_session_flutter: ^0.1.0
-  miniav_player: ^0.2.4
+  miniav_player: ^0.2.7
 
 dev_dependencies:
   flutter_test:

@@ -163,6 +163,19 @@ class ScreenRecorderSource extends RecorderSource {
   /// stay unfilled. Requires [idleFramePolicy] != none for idle-gap fill.
   final bool cfrOutput;
 
+  /// Draw the mouse cursor into the recording. Defaults to false, which is
+  /// the platform default on every backend.
+  ///
+  /// Honoured on Windows WGC (`IsCursorCaptureEnabled`, Windows 10 2004 /
+  /// 10.0.19041 and later), macOS ScreenCaptureKit and Linux PipeWire. Windows
+  /// DXGI cannot draw a cursor at all and captures without one; on web the
+  /// browser's own `getDisplayMedia` decides and this is a no-op.
+  ///
+  /// Where a platform cannot honour it, the recording continues WITHOUT the
+  /// cursor and says so in the log. A cursor is a thing you would like in the
+  /// picture; it is not worth failing a session over.
+  final bool captureCursor;
+
   /// What to do if the captured display or window goes away mid-recording.
   /// Defaults to [CaptureLossPolicy.reacquire].
   final CaptureLossPolicy lossPolicy;
@@ -192,6 +205,7 @@ class ScreenRecorderSource extends RecorderSource {
     this.idleFramePolicy = VideoIdleFramePolicy.duplicate,
     this.adaptiveGpuThrottle = true,
     this.cfrOutput = false,
+    this.captureCursor = false,
     this.lossPolicy = CaptureLossPolicy.reacquire,
     this.reacquireLimit,
   });

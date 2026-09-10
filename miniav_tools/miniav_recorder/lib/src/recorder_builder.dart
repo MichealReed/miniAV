@@ -72,6 +72,7 @@ class RecorderBuilder {
     VideoIdleFramePolicy idleFramePolicy = VideoIdleFramePolicy.duplicate,
     bool adaptiveGpuThrottle = true,
     bool cfrOutput = false,
+    bool captureCursor = false,
     CaptureLossPolicy lossPolicy = CaptureLossPolicy.reacquire,
     Duration? reacquireLimit,
   }) {
@@ -92,6 +93,7 @@ class RecorderBuilder {
         idleFramePolicy: idleFramePolicy,
         adaptiveGpuThrottle: adaptiveGpuThrottle,
         cfrOutput: cfrOutput,
+        captureCursor: captureCursor,
         lossPolicy: lossPolicy,
         reacquireLimit: reacquireLimit,
       ),

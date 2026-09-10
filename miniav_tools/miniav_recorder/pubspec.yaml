@@ -1,6 +1,6 @@
 name: miniav_recorder
 description: High-level multi-source A/V recorder built on miniav + miniav_tools. Sync screen/camera/mic/loopback into MP4/MKV files or chunked streams.
-version: 0.5.16
+version: 0.5.17
 repository: https://github.com/PracticalXR/miniAV/tree/master/miniav_tools/miniav_recorder
 environment:
   sdk: ^3.11.4

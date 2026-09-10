@@ -1479,6 +1479,36 @@ class Recorder {
 
     final ctx = await MiniScreen.createContext();
     buildDebris.add(ctx.destroy);
+    // BEFORE configure, and that is not a style choice: the backends read this
+    // when they build the capture session, and the platform REFUSES the call
+    // afterwards rather than quietly ignoring it.
+    //
+    // Only when asked. False is already every backend's default, so calling it
+    // to say "no" buys nothing and adds a way for a cosmetic setting to fail.
+    // One expression for the question AND the answer, so the guard and
+    // the argument cannot drift apart into asking for a cursor and then
+    // requesting its absence.
+    final wantCursor = cfg.captureCursor;
+    if (wantCursor) {
+      try {
+        await ctx.setCaptureCursor(wantCursor);
+        // Worth a line of its own. Whether a pointer in the picture was
+        // asked for is a question a recording raises later and nothing
+        // else answers - and because the platform refuses this call
+        // after configure, returning without a throw is also proof it
+        // landed in time.
+        Recorder._log('screen: cursor capture enabled.');
+      } catch (e) {
+        // DXGI cannot draw one, a pre-2004 Windows build has no such property,
+        // and a platform may not implement the call at all. None of that is
+        // worth ending a recording for — say it and carry on cursor-less.
+        Recorder._log(
+          'screen: this platform would not enable cursor capture ($e) — '
+          'recording without it.',
+          RecorderLogLevel.warning,
+        );
+      }
+    }
     if (resolvedDisplayId != null) {
       await ctx.configureDisplay(resolvedDisplayId, videoFormat);
     } else {

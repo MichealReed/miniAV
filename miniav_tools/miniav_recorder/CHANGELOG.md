@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.17
+
+- `addScreen(captureCursor: true)` draws the mouse cursor into the recording. miniAV has had the toggle since before this package existed and the recorder never called it, so every recording made here was cursor-less with no way to say otherwise - which for a usability recording removes the one thing you most want to see. Defaults to false, matching every backend, so existing recordings are unchanged.
+
+- Honoured on Windows WGC (`IsCursorCaptureEnabled`, Windows 10 2004 and later), macOS ScreenCaptureKit and Linux PipeWire. Windows DXGI cannot draw a cursor and captures without one; on web the browser decides. Where a platform declines, the recording continues cursor-less and says so once - a cursor is worth asking for, not worth failing a session over.
+
 ## 0.5.16
 
 - Raise the spawn constraint to ^0.1.1 — native transfer now actually transfers, and a web message the worker cannot deserialize is reported instead of vanishing.

@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.7.8-WIP
+
+## 0.7.7
+
+- Raise the spawn constraint to ^0.1.1 — native transfer now actually transfers, and a web message the worker cannot deserialize is reported instead of vanishing.
+
+## 0.7.6
+
+- The MP4 writer accepts a video track whose encoder has not published its configuration record yet. It builds `moov` at `finish()` and `stsd` with it, so the record is not needed until then - but `open` refused without one, and a recorder builds its muxer before a single frame has been encoded. A hardware H.264 MFT is allowed to withhold its sequence header until it has produced output (Intel Quick Sync does; NVIDIA does not), so on those machines the whole recording fell back to FFmpeg - whose file output carries `+faststart`, which rewrites the entire file at `av_write_trailer`. `setTrackConfig` now supplies the record and settles Annex-B framing with it; output is byte-identical to supplying it at open.
+
+- New `Mp4Muxer.tracksMissingConfig`: a track whose record never arrived is reported rather than thrown. Its samples are all in the file and its sample entry is missing, so it will not decode - and refusing to write `moov` over it would take every working track down with it.
+
+## 0.7.5
+
+- Increment downstream deps
+- Increment downstream deps
+- Increment downstream deps
+
+## 0.7.4
+
+- MP4: a decode timestamp that steps backwards is now REPAIRED rather than refused. finish() used to throw over media that was already fully written, leaving ftyp+mdat with no moov - a container no player opens - so one reordered packet early in a session destroyed the whole recording. Out-of-order packets are now counted as they arrive, naming the track and the sample so a bad session is knowable while it still runs, and clamped forward by the smallest amount that makes the sample table legal when the index is built; Mp4Muxer.timingReports reports both. Recordings with no reordering are byte-identical to before. finish() also no longer leaks the file handle when the index cannot be built.
+
+- MP4: a track's codec configuration record can now change part-way through a recording, via Mp4Muxer.setTrackConfig - for an encoder reopened after a graphics device reset, which issues its own parameter sets. Identical records are a no-op; different ones get a second stsd sample entry with the later chunks pointing at it, rather than samples being written under a record that does not describe them.
+
+- Media Foundation: a shared-handle import failure now tells an encoder on a different adapter (nothing ever imported) apart from a capture that died (frames imported, then stopped), instead of always blaming the adapter.
+
+- `AudioRingSink.open` now verifies `destination.maxChannelCount` can carry
+  the requested channel count and declines otherwise, so a surround request
+  on stereo-capped hardware falls back cleanly instead of being silently
+  down-mixed (or per-browser, dropped).
+
+- For channel counts above 2 the sink addresses the destination discretely
+  (`channelInterpretation: 'discrete'`, explicit channel counts on the node
+  chain) so a finished multichannel speaker feed is not run through the Web
+  Audio up/down-mix matrix.
+
+## 0.7.3
+
+- Fix wasm codec loading inside Web Workers: the loader now detects worker scope and uses importScripts with a glue URL resolved from the worker script location instead of assuming a DOM document. Wasm codecs previously fell back silently to WebCodecs in workers.
+
 ## 0.7.2
 
 - Web audio can now play entirely off the main thread: an AudioWorklet reads decoded PCM from shared memory that a worker fills, so a busy main thread no longer starves playback. Fixes two WebCodecs decoder faults: a packet handed to decode() was dropped whenever a frame was already buffered, which broke the reference chain for every frame after it, and both decoders passed the whole backing buffer instead of the packet's view of it. Decoders now wait on the output callback instead of polling a timer the browser clamps to 4ms, taking audio decode from 5.0ms to 0.1ms per packet. Worker-hosted demux and decode are available behind backendOptions['worker'] = 'true'. Also exposes the Media Foundation encoder's bound D3D11 device, and decodes AAC in the decodeAudioData fallback by synthesizing ADTS headers so browsers without WebCodecs audio can play it.

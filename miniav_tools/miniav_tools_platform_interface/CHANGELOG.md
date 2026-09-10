@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.9-WIP
+
+## 0.5.8
+
+- Raise the spawn constraint to ^0.1.1 — native transfer now actually transfers, and a web message the worker cannot deserialize is reported instead of vanishing.
+
+## 0.5.7
+
+- Increment downstream deps
+- Increment downstream deps
+- Increment downstream deps
+
+## 0.5.6
+
+- Export the audio-ring cursor primitives so a second ring with its own layout - miniAV's capture mirror, whose header is defined in C - can reuse the acquire-load ordering rather than duplicating it. Map gpuWebVideoFrame buffers to the webVideoFrame frame-source kind.
+
 ## 0.5.5
 
 - Add SharedAudioRing: a lock-free single-producer/single-consumer ring of interleaved f32 PCM in shared memory, so decoded audio reaches an audio thread without the main thread in between. Add the demux wire protocol shared by every worker-hosted demuxer.

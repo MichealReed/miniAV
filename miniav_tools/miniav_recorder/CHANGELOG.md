@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.5.17
+
+- `addScreen(captureCursor: true)` draws the mouse cursor into the recording. miniAV has had the toggle since before this package existed and the recorder never called it, so every recording made here was cursor-less with no way to say otherwise - which for a usability recording removes the one thing you most want to see. Defaults to false, matching every backend, so existing recordings are unchanged.
+
+- Honoured on Windows WGC (`IsCursorCaptureEnabled`, Windows 10 2004 and later), macOS ScreenCaptureKit and Linux PipeWire. Windows DXGI cannot draw a cursor and captures without one; on web the browser decides. Where a platform declines, the recording continues cursor-less and says so once - a cursor is worth asking for, not worth failing a session over.
+
+## 0.5.16
+
+- Raise the spawn constraint to ^0.1.1 — native transfer now actually transfers, and a web message the worker cannot deserialize is reported instead of vanishing.
+
+## 0.5.15
+
+The container writer moves off the isolate that calls `stop()`, and the
+recorder says what it is doing while it finishes.
+
+- **The container writer runs on a worker, so `stop()` no longer freezes the caller.** Building an MP4 index is one synchronous pass over every sample in the recording — over half a million entries for two hours — and the isolate paying for it was the one drawing the UI. The writer itself is untouched: it runs on the worker through the same pinned backend, so a file cannot come out different depending on where it was assembled. If no worker can be started the recorder writes in process exactly as before and says so in the log, because a worker that will not start should cost a freeze, not the recording. A worker that dies mid-recording is reported once, when it happens, rather than as one error per dropped packet.
+
+- Only the first-party MP4/M4A/WAV writers move. A worker-hosted FFmpeg muxer is a separate problem: it takes codec parameters from a live `AVCodecContext` through a raw pointer into an encoder on another isolate, and it needs every stream's extradata before it will write a header. FFmpeg containers (MKV/WebM/TS) still finish in process.
+
+- New `Recorder.finalizeProgress`: a broadcast stream of `RecorderFinalizeProgress` reporting which phase `stop()` is on — stopping capture, draining, flushing, writing the index, closing, done — with elapsed time and, for the index phase, which file. Phases rather than a fraction: the expensive step is one call into a container writer that reports nothing while it runs, and a percentage over that would be a progress bar that lies.
+
+- The codec configuration record is handed to the container with the first packet, for encoders that only publish it after their first output. Without this an Intel Quick Sync machine could not use the first-party MP4 writer at all and fell back to FFmpeg for the whole recording — which then rewrote the entire multi-gigabyte file at stop to move `moov` to the front. Requires `miniav_tools_codecs` 0.7.6.
+
+- `stop()` reports where its time went — one line with a per-phase breakdown (stop capture / drain / flush / write index / dispose), warning when the whole shutdown ran long enough to drop frames. Every phase does synchronous FFI on whatever isolate called stop, and which one blocked was not knowable from outside. For scale: writing the container index is proportional to sample count, measured at ~240ms for 30 minutes and ~1s for 2 hours of 30fps video plus AAC.
+
+- A track build that throws part way through no longer orphans the native objects it had already created. Harmless as a one-off at start; a leak per attempt in the stage rebuild, which runs the same builder every few seconds for the whole length of an outage, and each orphan is a capture context holding a graphics device.
+
+- `Recorder.updateTrackConfig` now returns `Future<void>` rather than `void`, because the container it talks to may be on a worker. Calling it as a statement is unaffected.
+
+- The video encoder log line now includes the encoder's D3D11 device and whether it matches the capture's. It was being built with a comment explaining why it mattered and then never printed — a device mismatch presents as every GPU frame being refused with no clue as to why.
+
+## 0.5.14
+
+- Watchdog fixes
+- **A frozen capture is now detected.** The silence watchdog read encoded packets, on the reasoning that a healthy static screen still emits a duplicate every frame interval, so packet silence is already pathological. True — and the converse is what broke it: the idle-frame duplicator goes on re-encoding its last frame when the capture underneath is dead, so the one detector meant to catch "capture stopped and nothing said so" was blind in the default configuration. Seen in the field on a display mode change (5120x1440 to 3840x1440): the platform never reported a loss, a few frames arrived at the new size, then nothing for the remaining fifty seconds while the packet counter climbed and the picture sat frozen. The watchdog now also watches frames from the SOURCE, which the duplicator cannot forge.
+
+- The watchdog now asks the platform instead of always waiting out the window. Three seconds of source silence - which a moving screen never reaches - triggers one question: is the display still attached, and is it still the size the capture is delivering? A display that has been re-routed or resized while the capture hands over nothing is a stale capture item, and saying so needs no guesswork. Cuts the frozen stretch from ten seconds to about three for a mode change or an unplug; the ten-second window remains the fallback for a stall the display itself does not show.
+
+- A watchdog outage is now timed from when the capture went quiet, not from when the watchdog concluded it. Both silences are decided after a window has elapsed and the recording was already frozen for all of it, so timing from the declaration counted only the recovery: three ten-second freezes were reported as "0.8s missing". That number is what an operator uses to decide whether a session is usable.
+
+- Source silence uses a much longer window than output silence (10s vs 3s), because the two mean different things: screen capture is event-driven, so a desktop where nothing moves legitimately delivers nothing for minutes. Each re-acquire that fails to bring frames back doubles the window, up to a minute, and a frame arriving earns the short window back — so a real death is caught in ten seconds while a genuinely still desktop settles at roughly one re-configure a minute, each covered by the duplicator and invisible in the file.
+
+- **Every capture source now hears its device die, reports it, and re-acquires it — not just the screen.** The loss machinery lived on the video runtime because video was the only path wired to it, and none of it is about pictures. Microphone, loopback, camera and both inputs of a mixed-audio track are on it now. The signal had been there the whole time: WASAPI calls its lost callback on `AUDCLNT_E_DEVICE_INVALIDATED`, Media Foundation ends the sample stream, and `addLostListener` carried both to Dart. Nothing subscribed. One Win+P took out a display and the HDMI audio endpoint that belonged to the same monitor; the video loss was reported and the audio simply stopped, four seconds absent from the file with "Recording stopped" reported as success.
+
+- A mixed-audio track tracks its two inputs separately, because they fail independently — a render endpoint dies with the monitor while the microphone beside it keeps working. This is the worst place to lose an input silently: the mix is driven by the loopback callback, so a dead endpoint stops the whole track, microphone included.
+
+- `Recorder.captureStatus` and `Recorder.captureIssues` now report one entry per capture SOURCE rather than per track, so a mixed track's microphone and endpoint appear under their own names. Both already returned lists; nothing at the call site changes.
+
+- New on `addCamera` / `addMic` / `addLoopback` / `addMixedAudio`: `lossPolicy` and `reacquireLimit`, matching `addScreen`. `VideoCaptureLossPolicy` is now `CaptureLossPolicy` — the old name is a typedef for it and keeps working.
+
+- Re-acquiring a lost display now looks for the display, not for the handle it used to have. A display device id is a live platform handle - on Windows literally an HMONITOR - and Windows destroys its monitor objects and issues new ones on every topology change, which is exactly the family of losses this recovers from. Every re-acquire was therefore asking for a monitor that had stopped existing: a Win+P test lost ten seconds of video to a display that was attached and capturable the whole time. Each attempt now re-resolves the target by the platform's display name, so a display that comes back under a new handle is picked up. A still-live id is always preferred, so platforms whose ids are already stable are unaffected.
+
+- A screen track built without an explicit display id no longer re-picks "the default display" when it rebuilds. After a topology change that can be a different monitor, and a recording that continued on one would have looked correct in every log line and in the file.
+
+- A capture target that is simply absent now reports as absent - once, and then rarely - instead of an error and a stack trace every few seconds for the length of the outage. New `CaptureTargetUnavailable`, which `start()` throws too, so an application that asked for a display that is not attached is told that instead of `MINIAV_ERROR_SYSTEM_CALL_FAILED`.
+
+- A stage rebuild checks its target is present before re-acquiring the graphics device and warming the encoder SDK, and refuses a target reporting a 0x0 size rather than deriving an encoder configuration from it.
+
+## 0.5.13
+
+- Increment downstream deps
+
+## 0.5.12
+
+- Screen capture now survives losing its target. A capture item closing - Win+P, dock/undock, lock, an RDP transition, a display mode change - is re-acquired in place: same file, same track, same encoder, with a frozen frame across the gap. Nothing previously subscribed to the platform's capture-lost notification at all, so a lost display went unnoticed and the recorder re-encoded a dead capture handle at the frame rate for the rest of the session, reporting success at stop.
+
+- A watchdog declares a loss when a source stops producing packets and the platform says nothing, which is the only cover for a graphics device reset. That case escalates to rebuilding the device, processor, encoder and capture context in place; a rebuild that would not match what the container already declares is refused rather than spliced.
+
+- New: VideoCaptureLossPolicy and reacquireLimit on addScreen (default: re-acquire for as long as the recording runs), Recorder.captureStatus and Recorder.captureHealthy for live health during a recording, and Recorder.captureIssues at stop - so a file that is short because its display went away is distinguishable from one that is short because someone stopped early. A window target is never re-acquired, since a destroyed HWND does not come back, and a different display is never substituted.
+
+- A duplicate frame whose encode fails now retires its source instead of re-encoding it forever, the audio track's encodes are chained so a gap fill cannot overtake live audio and hand the muxer a backwards timestamp, and container timing repairs are logged at stop.
+
 ## 0.5.11
 
 - Report the encoder's D3D11 device alongside the capture context's, so a device mismatch - which otherwise shows up as every GPU frame being refused with no explanation - is visible in the log.

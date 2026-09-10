@@ -13,6 +13,12 @@ class Muxer {
 
   Muxer(this._platform, this.backendName, {this.capability});
 
+  /// Underlying [PlatformMuxer]. Exposed for backend-specific diagnostics —
+  /// e.g. `Mp4Muxer.timingReports`, which says whether the index had to be
+  /// repaired because a producer fed packets out of decode order. Mirrors
+  /// [AudioEncoder.platform].
+  PlatformMuxer get platform => _platform;
+
   bool get isClosed => _closed;
 
   /// Write the container header. Must be called once before any packets.

@@ -1,5 +1,14 @@
 # miniav_platform_interface CHANGELOG
 
+## 0.7.4
+
+- Increment downstream deps
+## 0.7.3
+
+- New `MiniAVBufferContentType.gpuWebVideoFrame`: a WebCodecs `VideoFrame` carried in `nativeHandles[0]` rather than as an integer address, with no CPU planes - producing them would be exactly the readback the type exists to avoid. The frame MUST be released via `releaseBuffer`, which closes it: a `VideoFrame` pins a capture surface and a `MediaStreamTrackProcessor` whose frames are not closed simply stops producing once its queue fills, with no error and no event.
+
+- New `openCaptureMirror` / `closeCaptureMirror` on the audio-input interface, plus `MiniAVCaptureMirrorHandle` - where a capture mirror lives, in a form that can cross a thread. Null where the platform has no such thing, so this is a capability question and not an error.
+
 ## 0.7.2
 
 - released 08/13/26 - MR

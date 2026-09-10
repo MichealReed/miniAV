@@ -1,6 +1,7 @@
 // IMPORTANT: This file should be compiled as C++
 
 #include "screen_context_win_wgc.h"
+#include "wgc_frame_texture.h"
 #include "../../../include/miniav.h" // For MiniAV types, MiniAV_GetErrorString
 #include "../../common/miniav_com_win.h"
 #include "../../common/miniav_logging.h"
@@ -1834,9 +1835,10 @@ static MiniAVResultCode wgc_release_buffer(MiniAVScreenContext *ctx,
                        ref_count);
           }
           // OWNERSHIP: miniav closes the shared NT handle here. The app must
-          // have completed its import (OpenSharedResource1 / minigpu
-          // mgpuImportVideoFrame, which copies into a private texture before
-          // returning) before calling MiniAV_ReleaseBuffer. Leaving this to
+          // have completed its import before calling MiniAV_ReleaseBuffer.
+          // Tagged immutable snapshots can remain alive through the consumer's
+          // own COM reference; closing the handle does not revoke that import.
+          // Leaving this to
           // the app leaked one kernel handle per captured frame — every known
           // caller silently never closed it.
           if (frame_payload->gpu_shared_handle_to_close) {
@@ -2172,6 +2174,7 @@ static void wgc_on_frame_arrived(
       nullptr; // AddRef'd for payload
   HANDLE shared_handle_for_app = NULL;
   bool processed_as_gpu = false;
+  uint64_t gpu_import_tag = 0;
   HRESULT hr = S_OK;
   // Set when the live content size has drifted from the pool size; the pool is
   // recreated at the tail of this function (outside the frame's lifetime).
@@ -2289,6 +2292,7 @@ static void wgc_on_frame_arrived(
             // encoder). Without a fence the consumer may read garbage / black
             // because pending GPU work on texture_to_share_com has not yet
             // executed. See screen_context_win_dxgi.c for full rationale.
+            HRESULT producer_completion = S_FALSE;
             {
               D3D11_QUERY_DESC fence_desc{};
               fence_desc.Query = D3D11_QUERY_EVENT;
@@ -2305,8 +2309,9 @@ static void wgc_on_frame_arrived(
                 ULONGLONG poll_start = GetTickCount64();
                 bool fence_done = false;
                 for (;;) {
-                  if (wgc_ctx->d3d_context->GetData(copy_done.get(), nullptr, 0,
-                                                    0) != S_FALSE) {
+                  producer_completion = wgc_ctx->d3d_context->GetData(
+                      copy_done.get(), nullptr, 0, 0);
+                  if (producer_completion != S_FALSE) {
                     fence_done = true;
                     break;
                   }
@@ -2330,10 +2335,10 @@ static void wgc_on_frame_arrived(
               }
             }
 
+            gpu_import_tag = wgc_frame_import_tag(
+                needs_copy_for_sharing, producer_completion);
             texture_for_payload_ref_com =
-                texture_to_share_com; // This is the texture whose handle was
-                                      // shared
-            texture_for_payload_ref_com->AddRef(); // AddRef for payload
+                wgc_retain_frame_texture(texture_to_share_com);
             processed_as_gpu = true;
             // Counted now; every close below goes through
             // wgc_close_shared_handle() so the +1/-1 stay balanced.
@@ -2463,6 +2468,7 @@ static void wgc_on_frame_arrived(
           0; // GPU textures don't have stride
       buffer->data.video.planes[0].offset_bytes = 0;
       buffer->data.video.planes[0].subresource_index = 0;
+      buffer->data.video.planes[0].drm_format_modifier = gpu_import_tag;
       // calculate data size based on width, height, and pixel format
       buffer->data_size_bytes =
           ((size_t)buffer->data.video.info.width *

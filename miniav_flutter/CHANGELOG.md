@@ -1,3 +1,10 @@
+## 0.7.4
+
+- Increment downstream deps
+## 0.7.3
+
+- Version alignment with the miniAV 0.7.3 family release.
+
 ## 0.7.2
 
 - released 08/13/26 - MR

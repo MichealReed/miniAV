@@ -115,6 +115,17 @@ class AudioRingSink {
       }
       await context.audioWorklet.addModule(workletUrl).toDart;
 
+      // Verify the DESTINATION can actually carry the channel count — the
+      // same request-is-not-a-guarantee reasoning as the sample-rate check
+      // above. A worklet emitting 6 channels into a stereo-capped
+      // destination gets silently down-mixed (or worse, per-browser,
+      // dropped), so decline and let the caller fall back to stereo rather
+      // than play a mix whose centre may be gone.
+      if (channels > context.destination.maxChannelCount) {
+        await context.close().toDart;
+        return null;
+      }
+
       final node = web.AudioWorkletNode(
         context,
         _kProcessor,
@@ -127,6 +138,17 @@ class AudioRingSink {
       );
       final gain = web.GainNode(context);
       node.connect(gain);
+      if (channels > 2) {
+        // Surround: address the destination's channels DISCRETELY, in the
+        // worklet's emitted order. The default 'speakers' interpretation
+        // would run the Web Audio up/down-mix matrix over what is already a
+        // finished speaker feed.
+        context.destination.channelCount = channels;
+        context.destination.channelInterpretation = 'discrete';
+        gain.channelCount = channels;
+        gain.channelCountMode = 'explicit';
+        gain.channelInterpretation = 'discrete';
+      }
       gain.connect(context.destination);
 
       // Autoplay policy: a context created before a user gesture starts

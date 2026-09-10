@@ -737,6 +737,11 @@ if(MINIAV_PLATFORM_WINDOWS OR MINIAV_PLATFORM_MACOS OR MINIAV_PLATFORM_LINUX)
         target_include_directories(test_screen_capture PRIVATE ${TEST_INCLUDE_DIRS})
 
         if(MINIAV_PLATFORM_WINDOWS)
+            # CPU-only COM ownership and provenance checks. Positive control:
+            # test_wgc_texture_ownership --inject-extra-ref must fail.
+            add_executable(test_wgc_texture_ownership src/screen/test/test_wgc_texture_ownership.cpp)
+            target_link_libraries(test_wgc_texture_ownership PRIVATE windowsapp)
+
             # Start/stop/destroy race harness for the WGC backend's threadpool
             # callback drain. Positive control: MINIAV_WGC_STRESS_NO_DRAIN=1.
             add_executable(test_wgc_teardown_stress src/screen/test/test_wgc_teardown_stress.c)

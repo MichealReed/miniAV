@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.10-WIP
+
+## 0.5.9
+
+- Raise the spawn constraint to ^0.1.1 — native transfer now actually transfers, and a web message the worker cannot deserialize is reported instead of vanishing.
+
+## 0.5.8
+
+- Increment downstream deps
+- Increment downstream deps
+- Increment downstream deps
+
+## 0.5.7
+
+- Version alignment with the miniav_tools 0.5.7 family release.
+
 ## 0.5.6
 
 - Host the container demuxer on spawn, so it runs on an isolate natively and a Web Worker on web through one API.

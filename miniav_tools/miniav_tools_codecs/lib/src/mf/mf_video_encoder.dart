@@ -23,7 +23,8 @@ import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.
 import '../codecs_native.dart';
 import '../framing/annexb.dart';
 
-class MfVideoEncoder implements PlatformEncoder, Finalizable {
+class MfVideoEncoder
+    implements PlatformEncoder, FrameRepeatingEncoder, Finalizable {
   MfVideoEncoder._(this._handle, this._extra, this._codec) {
     // The owner is supposed to call close(), but an exception thrown out of
     // encode() (the miss counters below do exactly that) can skip it, and the
@@ -258,6 +259,7 @@ class MfVideoEncoder implements PlatformEncoder, Finalizable {
   /// re-importing the producer's surface makes a duplicate depend on a
   /// lifetime the producer controls, and it fires from a timer long after that
   /// surface may have been recycled.
+  @override
   Future<EncodedPacket?> repeatLastFrame(int timestampUs) async {
     _check();
     final force = _forceKeyframe ? 1 : 0;
@@ -359,10 +361,11 @@ class MfVideoEncoder implements PlatformEncoder, Finalizable {
       }
     }
 
-    // Zero-copy: a GPU capture buffer carries a shared NT handle in
-    // nativeHandles[0]. Feed the texture straight to the encoder — no readback,
-    // no memcpy. Falls through to the CPU path when the handle is absent or the
-    // encoder has no D3D device bound, so this is always safe to attempt.
+    // A GPU capture buffer carries a shared NT handle in nativeHandles[0]. The
+    // native side copies the frame into one of the encoder's own NV12 surfaces
+    // on the GPU (converting a BGRA screen frame) — no readback, no memcpy.
+    // Falls through to the CPU path when the handle is absent or the encoder
+    // has no D3D device bound, so this is always safe to attempt.
     if (frame is MiniAVBufferSource && supportsD3d11Input) {
       // The handle lives on the VIDEO payload, not the envelope; planes[0] is
       // a non-null but EMPTY list on the GPU path, so it is not a discriminator.
@@ -391,6 +394,9 @@ class MfVideoEncoder implements PlatformEncoder, Finalizable {
         // Reporting "could not open the capture texture" because the MFT was
         // momentarily full names a fault that did not happen and kills a
         // recording that was merely running behind. Drop the frame instead.
+        // r == 2 is a frame the native side already dropped: its copy had not
+        // finished in time, and the capture may reuse the texture once the
+        // frame is released.
         if (r > 0) return null;
         // r < 0. A GPU-resident buffer has NO CPU pixels — planes[] is empty —
         // so there is nothing to fall back to; `_nv12Bytes` below would throw
@@ -416,7 +422,31 @@ class MfVideoEncoder implements PlatformEncoder, Finalizable {
         // Naming the first when it is really the second sends whoever reads it
         // hunting a multi-GPU problem that does not exist — which is exactly
         // what happened in the field.
+        //
+        // Both are about OPENING the handle, so two failures that are not come
+        // first. The encoder's OWN device can be removed (a GPU fault, a driver
+        // reset), and then every handle fails to open; the native layer asks
+        // the device and says so. And a handle can open while the copy into
+        // the encoder's surface, or the submit, fails.
         if (frame.buffer.contentType != MiniAVBufferContentType.cpu) {
+          final reason = _reasonOrNone();
+          if (reason.contains('device was removed')) {
+            throw CodecRuntimeException(
+              'mf_encode',
+              "the encoder's own GPU device was lost after $_submitted "
+                  'frames, by a GPU fault or a driver reset, and nothing more '
+                  'encodes on it; the encoder has to be re-opened. '
+                  'NATIVE REASON: $reason',
+            );
+          }
+          if (!reason.startsWith('OpenSharedResource1')) {
+            throw CodecRuntimeException(
+              'mf_encode',
+              'could not encode the capture frame, after $_submitted frames '
+                  'had encoded. The frame is GPU-resident, so there are no CPU '
+                  'pixels to fall back to. NATIVE REASON: $reason',
+            );
+          }
           throw CodecRuntimeException(
             'mf_encode',
             _sharedHandleImported
@@ -859,9 +889,11 @@ class MfVideoEncoder implements PlatformEncoder, Finalizable {
   /// True once the MFT has a D3D11 device manager bound, which is what lets
   /// `mfencSendD3d11` open a capture's shared NT handle on our device.
   ///
-  /// Shares the `mfenc_submit_texture` tail with the texture path above, which
-  /// IS covered by a differential test — so the submit half is known good. The
-  /// handle-opening half is still only exercised with a synthetic handle.
+  /// The frame is copied into one of the encoder's own NV12 surfaces on the GPU
+  /// (a BGRA screen frame converted by the VideoProcessor) before the call
+  /// returns, so the MFT never holds the capture's texture, which the capture
+  /// reuses or frees once the frame is released. `mf_texture_zero_copy_test`
+  /// drives real NT handles, NV12 and BGRA, through it.
   @override
   bool get supportsD3d11SharedHandleInput => supportsD3d11Input;
 

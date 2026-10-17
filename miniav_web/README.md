@@ -278,6 +278,16 @@ final cancelGamepad = MiniInput.addGamepadChangeListener((n) { /* ... */ });
 
 MiniAV includes a unified input capture module for keyboard, mouse, and gamepad events.
 
+On web, gamepad-only capture polls the standard Gamepad API mapping at
+`gamepadPollHz` (default 60, bounded to 1–120 Hz). It emits changed canonical
+XInput-shaped samples, with up-positive stick Y and byte triggers. Unknown
+layouts are skipped; hidden/disconnected devices emit a neutral disconnect.
+`stopCapture` and `destroy` retire polling, including stop called from the first
+callback. `snapshotGamepad` reads the latest captured sample. Browser device
+exposure/activation still applies. Keyboard and pointer capture remain owned by
+Flutter/DOM; enabling only gamepads does not start motion sensors or request IMU
+permission. Physical browser/controller combinations need device testing.
+
 ### Basic Input Capture
 
 ```dart

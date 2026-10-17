@@ -135,7 +135,7 @@ class MiniavWasm {
     );
 
     // Avoid injecting the glue twice if another caller already did.
-    if (g.getProperty<JSAny?>('_miniavGlueInjected'.toJS).isUndefinedOrNull) {
+    if (g.getProperty<JSAny?>('_miniavGlueInjected'.toJS) == null) {
       g.setProperty('_miniavGlueInjected'.toJS, true.toJS);
       final script = web.HTMLScriptElement()
         ..src = _glueUrl

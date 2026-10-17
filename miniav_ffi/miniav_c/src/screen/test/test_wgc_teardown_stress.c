@@ -2,32 +2,31 @@
 // backend (src/screen/windows/screen_context_win_wgc.cpp).
 //
 // WHAT IT EXERCISES
-//   WGC delivers frames on WinRT threadpool threads, and wgc_on_frame_arrived
-//   blocks in its FPS pacing loop *after* releasing the context's critical
-//   section. Stopping/destroying the context from the main thread during that
-//   window used to close the handles the callback was waiting on and free the
-//   memory it was still reading. This harness slams that window: start
-//   capture, sleep a randomised sub-frame interval, stop and/or destroy,
-//   hundreds of times, at a deliberately LOW fps so the pacing loop is parked
-//   for hundreds of milliseconds per frame.
+//   WGC delivers frames on WinRT threadpool threads, and a pacing timer
+//   delivers held frames on another. Stopping/destroying the context from the
+//   main thread while one of those callbacks was still running used to free
+//   the memory it was reading, and a pacing wait that once ran outside the
+//   context's critical section made that window a frame interval wide. This
+//   harness slams it: start capture, sleep a randomised sub-frame interval,
+//   stop and/or destroy, hundreds of times, at a deliberately LOW fps so each
+//   frame stays held for hundreds of milliseconds.
 //
 // HOW IT DETECTS THE BUG
 //   The backend keeps a liveness canary in the context (WGC_CTX_MAGIC_*) and
 //   poisons it immediately before miniav_free(). Every threadpool entry point
-//   and the pacing loop check it and log a line tagged "WGC-UAF-CANARY".
+//   and the stress park check it and log a line tagged "WGC-UAF-CANARY".
 //   This harness counts those log lines and also reads the exported counter
 //   miniav_wgc_debug_ctx_uaf_hits(). Non-zero at exit == the race fired.
 //
 // POSITIVE CONTROL
-//   MINIAV_WGC_STRESS_NO_DRAIN=1    restore the pre-fix teardown (no drain,
-//                                   stop-event-blind pacing fallback)
-//   MINIAV_WGC_STRESS_PACE_SLEEP=1  force the pacing loop onto the no-waitable-
-//                                   timer fallback, where the pre-fix window
-//                                   was a full frame interval wide
+//   MINIAV_WGC_STRESS_NO_DRAIN=1    restore the pre-fix teardown (no drain)
+//   MINIAV_WGC_STRESS_PACE_SLEEP=1  park every frame callback for a frame
+//                                   interval outside the lock, blind to
+//                                   teardown, as the pre-fix pacing wait was
 //   Expected matrix (200 iterations, 2 fps):
 //     NO_DRAIN=1 PACE_SLEEP=1 -> FAIL (canary hits)   <- reproduces the bug
-//     NO_DRAIN=1              -> PASS (window is sub-microsecond on the
-//                                      waitable-timer path)
+//     NO_DRAIN=1              -> PASS (nothing waits outside the lock, so the
+//                                      window is microseconds wide)
 //                PACE_SLEEP=1 -> PASS (drain alone closes it)
 //     neither                 -> PASS
 //
@@ -95,8 +94,9 @@ int main(int argc, char **argv) {
          iterations, fps, max_sleep_ms,
          (no_drain && no_drain[0] == '1') ? "LEGACY/no-drain (positive control)"
                                           : "drained (fixed)",
-         (pace_sleep && pace_sleep[0] == '1') ? "no-timer fallback (forced)"
-                                              : "waitable timer");
+         (pace_sleep && pace_sleep[0] == '1')
+             ? "callbacks parked a frame interval (forced)"
+             : "held frames, timer-delivered");
   fflush(stdout);
 
   MiniAV_SetLogCallback(stress_log_callback, NULL);
@@ -156,8 +156,8 @@ int main(int argc, char **argv) {
     }
     ++started;
 
-    // Land the teardown at a random point, biased to fall INSIDE the pacing
-    // wait (which spans most of a frame interval at low fps).
+    // Land the teardown at a random point, biased to fall while a frame is
+    // held for its slot (most of a frame interval at low fps).
     unsigned sleep_ms = (unsigned)(rand() % (int)(max_sleep_ms + 1));
     if ((i & 3u) == 0u)
       sleep_ms = frame_ms / 2 + (unsigned)(rand() % 16); // dead centre

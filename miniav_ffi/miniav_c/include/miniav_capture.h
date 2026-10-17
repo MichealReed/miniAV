@@ -5,6 +5,7 @@
 
 #include "miniav_buffer.h"
 #include "miniav_types.h"
+#include "miniav_screen_windows_strict.h"
 #include <stdbool.h>
 #include <stdint.h>
 

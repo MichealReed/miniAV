@@ -68,7 +68,8 @@ class MiniAVWebScreenPlatform implements MiniScreenPlatformInterface {
 /// `MediaStreamTrackProcessor(maxBufferSize: 1)` handing `VideoFrame`s
 /// straight to the consumer, `requestVideoFrameCallback`-driven
 /// `VideoFrame(<video>)` where the processor is missing, and the canvas
-/// readback ONLY as the final fallback. The black-probe sleeps are gone
+/// readback only when those routes are missing or a live GPU import fails.
+/// The black-probe sleeps are gone
 /// entirely: the frame callbacks fire when a real frame exists, which is the
 /// edge the probing was busy-waiting for.
 class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
@@ -104,6 +105,87 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
   web.CanvasRenderingContext2D? _ctx;
 
   MiniAVVideoInfo? _format;
+  MiniAVAudioInfo? _audioFormat;
+  web.AudioContext? _audioContext;
+  web.MediaStreamAudioSourceNode? _audioSource;
+  web.AudioWorkletNode? _audioTap;
+  int _audioGeneration = 0;
+
+  // One outstanding transfer prevents a suspended/main-thread-busy consumer
+  // from accumulating seconds of stale sound. The destination is silent.
+  static const _audioWorklet = r'''
+class MiniAVScreenAudio extends AudioWorkletProcessor {
+  constructor() {
+    super(); this.pending = false; this.used = 0; this.channels = 0;
+    this.port.onmessage = () => { this.pending = false; };
+  }
+  process(inputs, outputs) {
+
+    const input = inputs[0];
+    if (!input || !input.length || input.length > 2) return true;
+    if (this.channels !== input.length) {
+      this.channels = input.length; this.used = 0;
+      this.samples = new Float32Array(960 * this.channels);
+    }
+    for (let frame = 0; frame < input[0].length; frame++) {
+      for (let ch = 0; ch < this.channels; ch++)
+        this.samples[this.used * this.channels + ch] = input[ch][frame];
+      if (++this.used === 960) {
+        if (!this.pending) {
+          const samples = this.samples;
+          this.port.postMessage({samples, channels: this.channels,
+            timestampUs: Math.round((currentFrame + frame + 1 - 960) * 1e6 / sampleRate)},
+            [samples.buffer]);
+          this.samples = new Float32Array(960 * this.channels);
+          this.pending = true;
+        }
+        this.used = 0;
+      }
+    }
+    for (const output of outputs) for (const channel of output) channel.fill(0);
+    return true;
+  }
+}
+registerProcessor('miniav-screen-audio', MiniAVScreenAudio);
+''';
+
+  @override
+  Future<bool> setCaptureFrameRate(int fps) async {
+    final tracks = _mediaStream?.getVideoTracks().toDart;
+    if (fps <= 0 || tracks == null || tracks.isEmpty) return false;
+    try {
+      await tracks.first
+          .applyConstraints(
+            web.MediaTrackConstraints(
+              frameRate: <String, Object>{'ideal': fps}.jsify()!,
+            ),
+          )
+          .toDart;
+      final f = _format;
+      if (f != null) {
+        _format = MiniAVVideoInfo(
+          width: f.width,
+          height: f.height,
+          pixelFormat: f.pixelFormat,
+          frameRateNumerator: fps,
+          frameRateDenominator: 1,
+          outputPreference: f.outputPreference,
+        );
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  void setContentHint(String hint) {
+    final tracks = _mediaStream?.getVideoTracks().toDart;
+    if (tracks == null || tracks.isEmpty) return;
+    try {
+      tracks.first.contentHint = hint;
+    } catch (_) {}
+  }
 
   // Capture
   bool _capturing = false;
@@ -111,6 +193,8 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
   int? _rafId;
   int? _rvfcId;
   web.ReadableStreamDefaultReader? _frameReader;
+  void Function(MiniAVBuffer buffer, Object? userData)? _onFrame;
+  Object? _onFrameUserData;
 
   // Debug
   static const bool _debug = false;
@@ -149,6 +233,19 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
       _mediaStream = await web.window.navigator.mediaDevices
           .getDisplayMedia(options)
           .toDart;
+      final audioTracks = _mediaStream!.getAudioTracks().toDart;
+      if (captureAudio && audioTracks.isNotEmpty) {
+        final reportedChannels = audioTracks.first.getSettings().channelCount;
+        final channels = reportedChannels <= 0 ? 2 : reportedChannels;
+        if (channels == 1 || channels == 2) {
+          _audioFormat = MiniAVAudioInfo(
+            format: MiniAVAudioFormat.f32,
+            sampleRate: 48000,
+            channels: channels,
+            numFrames: 960,
+          );
+        }
+      }
       if (_debug) {
         print(
           '[MiniAV][screen][configure] getDisplayMedia in '
@@ -163,7 +260,10 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
       if (vTracks.isNotEmpty) {
         vTracks.first.addEventListener(
           'ended',
-          ((web.Event _) => _fireLost(1)).toJS,
+          ((web.Event _) {
+            unawaited(stopCapture());
+            _fireLost(1);
+          }).toJS,
         );
       }
 
@@ -173,7 +273,9 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
         ..playsInline = true
         ..setAttribute('playsinline', 'true')
         // Keep a tiny visible footprint to avoid compositor discard.
-        ..style.position = 'absolute'
+                ..style
+                .position =
+            'absolute'
         ..style.left = '0'
         ..style.top = '0'
         ..style.width = '1px'
@@ -217,7 +319,7 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
         pixelFormat: MiniAVPixelFormat.rgba32,
         frameRateNumerator: format.frameRateNumerator,
         frameRateDenominator: format.frameRateDenominator,
-        outputPreference: MiniAVOutputPreference.gpu,
+        outputPreference: format.outputPreference,
       );
 
       if (_debug) {
@@ -248,7 +350,12 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
   Future<ScreenFormatDefaults> getConfiguredFormats() async {
     final f = _format;
     if (f == null) throw StateError('Screen context not configured');
-    return (f, null);
+    final hasLiveAudio =
+        _mediaStream?.getAudioTracks().toDart.any(
+          (track) => track.readyState == 'live',
+        ) ??
+        false;
+    return (f, hasLiveAudio ? _audioFormat : null);
   }
 
   @override
@@ -262,13 +369,27 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
 
     await stopCapture();
 
+    _onFrame = onFrame;
+    _onFrameUserData = userData;
     _capturing = true;
+    await _startAudioCapture();
+    if (!_capturing || _format == null || _video == null) return;
+
+    // A CPU preference may already be the caller's remembered GPU verdict.
+    // Honor it on this first run as well as after a live failure; otherwise
+    // the caller declines GPU VideoFrames and no picture is ever delivered.
+    if (_format!.outputPreference == MiniAVOutputPreference.cpu) {
+      _gpuMode = false;
+      _startCanvasLoop(onFrame, userData);
+      return;
+    }
 
     // Route 1: track processor (Chrome/Edge) — frames straight off the
     // track, nothing on the CPU. Route 2: rVFC + VideoFrame(<video>). Route
     // 3: the canvas readback, kept only for browsers with neither.
-    final hasProcessor =
-        (web.window as JSObject).has('MediaStreamTrackProcessor');
+    final hasProcessor = (web.window as JSObject).has(
+      'MediaStreamTrackProcessor',
+    );
     if (hasProcessor) {
       _gpuMode = true;
       unawaited(_pumpVideoFrames(onFrame, userData));
@@ -286,8 +407,58 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
   }
 
   @override
+  Future<bool> fallbackToCpuDelivery() async {
+    final onFrame = _onFrame;
+    final userData = _onFrameUserData;
+    if (!_capturing ||
+        onFrame == null ||
+        _mediaStream == null ||
+        _video == null ||
+        _format == null) {
+      return false;
+    }
+    if (!_gpuMode) return true;
+    // Cancel only the video pump; destroy/configureDisplay would
+    // stop the MediaStreamTrack and reopen getDisplayMedia. Keep the same
+    // browser-approved stream and its audio tracks throughout the switch.
+    _gpuMode = false;
+    await _stopVideoPump();
+    if (!_capturing ||
+        _mediaStream == null ||
+        _video == null ||
+        _format == null) {
+      return false;
+    }
+    final format = _format!;
+    _format = MiniAVVideoInfo(
+      width: format.width,
+      height: format.height,
+      pixelFormat: MiniAVPixelFormat.rgba32,
+      frameRateNumerator: format.frameRateNumerator,
+      frameRateDenominator: format.frameRateDenominator,
+      outputPreference: MiniAVOutputPreference.cpu,
+    );
+    _onFrame = onFrame;
+    _onFrameUserData = userData;
+    _capturing = true;
+    _gpuMode = false;
+    _startCanvasLoop(onFrame, userData);
+    return true;
+  }
+
+  @override
+  Object? get cpuDeliverySurface => !_gpuMode && _capturing ? _canvas : null;
+
+  @override
   Future<void> stopCapture() async {
     _capturing = false;
+    _onFrame = null;
+    _onFrameUserData = null;
+    await _stopAudioCapture();
+    await _stopVideoPump();
+  }
+
+  Future<void> _stopVideoPump() async {
     if (_rafId != null) {
       web.window.cancelAnimationFrame(_rafId!);
       _rafId = null;
@@ -326,7 +497,9 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
     try {
       final processor = web.MediaStreamTrackProcessor(
         web.MediaStreamTrackProcessorInit(
-            track: tracks.first, maxBufferSize: 1),
+          track: tracks.first,
+          maxBufferSize: 1,
+        ),
       );
       reader =
           processor.readable.getReader() as web.ReadableStreamDefaultReader;
@@ -334,14 +507,16 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
       // Feature-detected above, so this is a browser that has the
       // constructor and still refused. Not fatal and NOT silent.
       _gpuMode = false;
-      print('[MiniAV][screen] MediaStreamTrackProcessor failed ($e) — '
-          'falling back to the canvas readback path');
+      print(
+        '[MiniAV][screen] MediaStreamTrackProcessor failed ($e) — '
+        'falling back to the canvas readback path',
+      );
       _startCanvasLoop(onData, userData);
       return;
     }
     _frameReader = reader;
 
-    while (_capturing) {
+    while (_capturing && _gpuMode && identical(_frameReader, reader)) {
       final web.ReadableStreamReadResult result;
       try {
         result = await reader.read().toDart;
@@ -352,7 +527,7 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
       final frame = result.value as web.VideoFrame?;
       // Close it even on the way out — see the camera pump for the leak this
       // prevents ("A VideoFrame was garbage collected without being closed").
-      if (!_capturing) {
+      if (!_capturing || !_gpuMode || !identical(_frameReader, reader)) {
         frame?.close();
         break;
       }
@@ -360,9 +535,7 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
 
       final w = frame.displayWidth;
       final h = frame.displayHeight;
-      if (w > 0 &&
-          h > 0 &&
-          (w != _format!.width || h != _format!.height)) {
+      if (w > 0 && h > 0 && (w != _format!.width || h != _format!.height)) {
         _format = MiniAVVideoInfo(
           width: w,
           height: h,
@@ -397,7 +570,7 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
     try {
       await reader.cancel().toDart;
     } catch (_) {}
-    _frameReader = null;
+    if (identical(_frameReader, reader)) _frameReader = null;
   }
 
   /// Route 2: wrap each COMPOSITED frame in a `VideoFrame` — rVFC fires once
@@ -423,8 +596,10 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
         );
       } catch (e) {
         _gpuMode = false;
-        print('[MiniAV][screen] VideoFrame(<video>) failed ($e) — falling '
-            'back to the canvas readback path');
+        print(
+          '[MiniAV][screen] VideoFrame(<video>) failed ($e) — falling '
+          'back to the canvas readback path',
+        );
         _startCanvasLoop(onData, userData);
         return;
       }
@@ -482,14 +657,47 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
     _canvas ??= web.HTMLCanvasElement()
       ..width = _format!.width
       ..height = _format!.height;
-    _ctx ??= _canvas!.getContext(
-      '2d',
-      <String, dynamic>{'willReadFrequently': true}.jsify(),
-    ) as web.CanvasRenderingContext2D?;
+    _ctx ??=
+        _canvas!.getContext(
+              '2d',
+              <String, dynamic>{'willReadFrequently': true}.jsify(),
+            )
+            as web.CanvasRenderingContext2D?;
 
-    void frameCb(num _) {
+    var lastCaptureMs = double.negativeInfinity;
+    bool due(double nowMs) {
+      final numerator = _format!.frameRateNumerator;
+      final denominator = _format!.frameRateDenominator;
+      final intervalMs = numerator > 0 && denominator > 0
+          ? 1000 * denominator / numerator
+          : 0.0;
+      if (intervalMs <= 0 || nowMs - lastCaptureMs + 0.5 >= intervalMs) {
+        lastCaptureMs = nowMs;
+        return true;
+      }
+      return false;
+    }
+
+    // Read only when the video produces a new frame where rVFC exists. The
+    // elapsed-time gate also caps a 60/120 Hz source at the requested rate.
+    final el = _video! as JSObject;
+    if (el.has('requestVideoFrameCallback')) {
+      void videoFrameCb(JSNumber now, JSObject _) {
+        if (!_capturing || _gpuMode || _video == null) return;
+        final nowMs = now.toDartDouble;
+        if (due(nowMs)) _captureFrame(onData, userData);
+        if (_capturing && !_gpuMode && _video != null) {
+          _rvfcId = _video!.requestVideoFrameCallback(videoFrameCb.toJS);
+        }
+      }
+
+      _rvfcId = _video!.requestVideoFrameCallback(videoFrameCb.toJS);
+      return;
+    }
+
+    void frameCb(num nowMs) {
       if (!_capturing) return;
-      _captureFrame(onData, userData);
+      if (due(nowMs.toDouble())) _captureFrame(onData, userData);
       _rafId = web.window.requestAnimationFrame(frameCb.toJS);
     }
 
@@ -582,6 +790,132 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
   }
 
   // ---------------- Destroy ----------------
+  Future<void> _startAudioCapture() async {
+    final stream = _mediaStream;
+    if (_audioFormat == null || stream == null) return;
+    final tracks = stream
+        .getAudioTracks()
+        .toDart
+        .where((track) => track.readyState == 'live')
+        .toList();
+    if (tracks.isEmpty) {
+      _audioFormat = null;
+      return;
+    }
+    final generation = ++_audioGeneration;
+    String? url;
+    try {
+      final context = web.AudioContext(
+        web.AudioContextOptions(sampleRate: 48000),
+      );
+      _audioContext = context;
+      if (context.sampleRate != 48000) {
+        throw StateError('48 kHz audio unavailable');
+      }
+      url = web.URL.createObjectURL(
+        web.Blob(
+          [_audioWorklet.toJS].toJS,
+          web.BlobPropertyBag(type: 'application/javascript'),
+        ),
+      );
+      await context.audioWorklet
+          .addModule(url)
+          .toDart
+          .timeout(const Duration(seconds: 5));
+      if (!_capturing || generation != _audioGeneration) return;
+      final tap = web.AudioWorkletNode(
+        context,
+        'miniav-screen-audio',
+        web.AudioWorkletNodeOptions(numberOfInputs: 1, numberOfOutputs: 1),
+      );
+      _audioTap = tap;
+      tap.port.onmessage = Zone.current.bindUnaryCallback((
+        web.MessageEvent event,
+      ) {
+        try {
+          if (!_capturing ||
+              generation != _audioGeneration ||
+              context.state != 'running' ||
+              tracks.first.readyState != 'live' ||
+              tracks.first.muted) {
+            return;
+          }
+          final data = event.data as JSObject;
+          final samples = (data.getProperty<JSFloat32Array>(
+            'samples'.toJS,
+          )).toDart;
+          final channels = data
+              .getProperty<JSNumber>('channels'.toJS)
+              .toDartInt;
+          if (channels < 1 ||
+              channels > 2 ||
+              samples.length != 960 * channels) {
+            return;
+          }
+          final info = MiniAVAudioInfo(
+            format: MiniAVAudioFormat.f32,
+            sampleRate: 48000,
+            channels: channels,
+            numFrames: 960,
+          );
+          _audioFormat = info;
+          final bytes = Uint8List.view(
+            samples.buffer,
+            samples.offsetInBytes,
+            samples.lengthInBytes,
+          );
+          _onFrame?.call(
+            MiniAVBuffer(
+              type: MiniAVBufferType.audio,
+              contentType: MiniAVBufferContentType.cpu,
+              timestampUs: data
+                  .getProperty<JSNumber>('timestampUs'.toJS)
+                  .toDartInt,
+              data: MiniAVAudioBuffer(frameCount: 960, info: info, data: bytes),
+              dataSizeBytes: bytes.length,
+            ),
+            _onFrameUserData,
+          );
+        } finally {
+          if (generation == _audioGeneration) tap.port.postMessage(true.toJS);
+        }
+      }).toJS;
+      _audioSource = context.createMediaStreamSource(
+        web.MediaStream(tracks.toJS),
+      );
+      _audioSource!.connect(tap);
+      tap.connect(context.destination);
+      await context.resume().toDart.timeout(const Duration(seconds: 2));
+      if (!_capturing || generation != _audioGeneration) return;
+    } catch (error) {
+      // Audio is optional; failed authorization/capability must leave video live.
+      print('[MiniAV][screen] Shared audio unavailable: $error');
+      if (generation == _audioGeneration) await _stopAudioCapture();
+    } finally {
+      if (url != null) web.URL.revokeObjectURL(url);
+    }
+  }
+
+  Future<void> _stopAudioCapture() async {
+    ++_audioGeneration;
+    final tap = _audioTap;
+    _audioTap = null;
+    if (tap != null) {
+      tap.port.onmessage = null;
+      tap.port.close();
+      tap.disconnect();
+    }
+    _audioSource?.disconnect();
+    _audioSource = null;
+    final context = _audioContext;
+    _audioContext = null;
+    if (context != null && context.state != 'closed') {
+      try {
+        await context.close().toDart;
+      } catch (_) {}
+    }
+  }
+
   @override
   Future<void> destroy() async {
     await stopCapture();
@@ -595,6 +929,7 @@ class MiniAVWebScreenContext implements MiniScreenContextPlatformInterface {
     _canvas = null;
     _ctx = null;
     _format = null;
+    _audioFormat = null;
     if (_debug) print('[MiniAV][screen][destroy]');
   }
 }

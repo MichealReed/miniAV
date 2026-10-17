@@ -16,6 +16,7 @@ part 'modules/miniav_web_audio_input.dart';
 part 'modules/miniav_web_audio_output.dart';
 part 'modules/miniav_web_loopback.dart';
 part 'modules/miniav_web_input.dart';
+part 'modules/miniav_web_gamepad.dart';
 part 'modules/miniav_web_inject.dart';
 part './miniav_web_utils.dart';
 part './miniav_web_subscriptions.dart';

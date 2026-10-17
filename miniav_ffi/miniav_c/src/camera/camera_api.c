@@ -494,3 +494,15 @@ MiniAVResultCode MiniAV_Camera_SetContextLostCallback(
   ctx->lost_cb_user_data = user_data;
   return MINIAV_SUCCESS;
 }
+
+uint32_t MiniAV_VideoBuffer_GetColor(const MiniAVBuffer *buffer,
+                                     uint32_t *matrix, uint32_t *full_range) {
+#if defined(_WIN32) && defined(MINIAV_BACKEND_WIN_MF_CAMERA_ENABLED)
+  return miniav_mf_get_color(buffer, matrix, full_range);
+#else
+  MINIAV_UNUSED(buffer);
+  MINIAV_UNUSED(matrix);
+  MINIAV_UNUSED(full_range);
+  return 0;
+#endif
+}

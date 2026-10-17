@@ -91,6 +91,7 @@ typedef struct {
   IMFMediaEventGenerator *event_gen;
   int is_async;
   int is_hardware;
+  int strict_gpu; /* exact device, no forced reuse of codec-held staging slots */
   int need_input;  /* unconsumed METransformNeedInput count */
   int have_output; /* unconsumed METransformHaveOutput count */
   /* Drain state machine. THREE states, and conflating any two of them wedges
@@ -564,7 +565,7 @@ static int mfenc_list_hw_impl(int codec, char *out, int cap) {
 static void *mfenc_create_impl(int codec, int width, int height,
                                int bitrate_bps, int fps_num, int fps_den,
                                int gop, int want_hardware, int candidate,
-                               void *existing_device) {
+                               void *existing_device, int require_existing_device) {
   if (width <= 0 || height <= 0) return NULL;
   if (bitrate_bps <= 0) bitrate_bps = 4000000;
   if (fps_num <= 0) fps_num = 30;
@@ -577,6 +578,7 @@ static void *mfenc_create_impl(int codec, int width, int height,
     return NULL;
   }
   s->width = width;
+  s->strict_gpu = require_existing_device;
   s->height = height;
   s->frame_dur_100ns = (int64_t)10000000 * fps_den / fps_num;
 
@@ -687,6 +689,8 @@ static void *mfenc_create_impl(int codec, int width, int height,
         s->owns_device = 0;
       }
     }
+    /* Strict GPU callers must never allocate a replacement device. */
+    if (require_existing_device && !s->device) goto fail;
     if (!s->device && SUCCEEDED(D3D11CreateDevice(
                    NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags, kLevels,
                    ARRAYSIZE(kLevels), D3D11_SDK_VERSION, &s->device, NULL,
@@ -857,11 +861,11 @@ static void *mfenc_create_pub_impl(int codec, int width, int height,
    * failure is what left this on the software encoder. */
   for (int cand = 0; cand < 8; cand++) {
     void *s = mfenc_create_impl(codec, width, height, bitrate_bps, fps_num,
-                                fps_den, gop, 1, cand, existing_device);
+                                fps_den, gop, 1, cand, existing_device, 0);
     if (s) return s;
   }
   return mfenc_create_impl(codec, width, height, bitrate_bps, fps_num, fps_den,
-                           gop, 0, 0, existing_device);
+                           gop, 0, 0, existing_device, 0);
 }
 
 static int mfenc_get_extradata_impl(void *session, uint8_t *out, int cap) {
@@ -1299,6 +1303,11 @@ static int mfenc_import_slot(MfVidEnc *s, ID3D11Texture2D *foreign) {
         src = foreign;
         ID3D11Texture2D_AddRef(src); /* cache owns a reference either way */
       } else {
+        if (s->strict_gpu) {
+          snprintf(s->imp_err, sizeof(s->imp_err),
+                   "strict GPU route requires a texture on the creation device");
+          return -1;
+        }
         snprintf(s->imp_err, sizeof(s->imp_err),
                     "texture device=%p encoder device=%p (different)",
                     (void *)owner, (void *)s->device);
@@ -1454,6 +1463,9 @@ static int mfenc_pick_nv12(MfVidEnc *s) {
     s->nv12_busy_streak = 0;
     return i;
   }
+  /* Strict sessions report pressure until sample references are released;
+   * they never turn uncertain calibration into an overwrite/possible tear. */
+  if (s->strict_gpu) return -1;
   if (++s->nv12_busy_streak < 3) return -1;
   s->nv12_busy_streak = 0;
   /* Force-take, but never the slot holding the repeat source: overwriting it
@@ -1482,6 +1494,48 @@ static int mfenc_pick_nv12(MfVidEnc *s) {
  * same technique already ships in the FFmpeg shim's d3d11_vp_bgra_to_nv12.
  *
  * 0 = accepted, 1 = drain and retry, -1 = error. */
+/* How long a blt may take to complete before its frame is dropped. Past this
+ * the GPU is stalled rather than busy. */
+#define MFENC_BLT_WAIT_MS 100
+
+/* Wait, at most MFENC_BLT_WAIT_MS, for the work just queued on the session's
+ * context (a blt or copy into a staging slot) to finish on the GPU. S_OK when
+ * it has, S_FALSE when it had not by then, or the error a lost device reports.
+ *
+ * Steady-state cost is one blt's worth of GPU time (a fraction of a
+ * millisecond), so spin rather than sleep — a Sleep(1) costs a ~15.6 ms timer
+ * quantum, the trap that once made this encoder 3 s/frame. Past a short spin
+ * the GPU is genuinely backed up and burning a core no longer helps anyone,
+ * so yield to whatever else is ready; SwitchToThread returns immediately when
+ * nothing is, which degrades cleanly back to a spin. Past two 60 Hz frames
+ * the GPU is badly backed up and the wait sleeps instead. */
+static HRESULT mfenc_wait_gpu(MfVidEnc *s) {
+  mfenc_read_env();
+  if (!s->blt_fence || mfenc_no_fence) {
+    ID3D11DeviceContext_Flush(s->ctx);
+    return S_OK;
+  }
+  ID3D11DeviceContext_End(s->ctx, (ID3D11Asynchronous *)s->blt_fence);
+  ID3D11DeviceContext_Flush(s->ctx);
+  LARGE_INTEGER freq, t0, now;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&t0);
+  for (;;) {
+    HRESULT gd = ID3D11DeviceContext_GetData(
+        s->ctx, (ID3D11Asynchronous *)s->blt_fence, NULL, 0, 0);
+    if (gd != S_FALSE) return FAILED(gd) ? gd : S_OK;
+    QueryPerformanceCounter(&now);
+    double el = (double)(now.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
+    if (el > MFENC_BLT_WAIT_MS / 1000.0) return S_FALSE;
+    if (el > 0.033)
+      Sleep(1);
+    else if (el > 0.001)
+      SwitchToThread();
+    else
+      YieldProcessor();
+  }
+}
+
 /* Import a foreign-device RGBA/BGRA texture and VideoProcessor-blt it into the
  * session's NV12 staging texture. 0 on success. Split out of the send path so
  * the diagnostic below measures exactly this code. */
@@ -1501,9 +1555,25 @@ static int mfenc_blt_texture_to_nv12(MfVidEnc *s, ID3D11Texture2D *foreign) {
   if (km) {
     /* Bounded, never INFINITE. This runs on the encoder's worker thread with
      * the calling isolate blocked behind it, so a producer that never releases
-     * would hang the recording rather than drop a frame. */
+     * would hang the recording rather than drop a frame. Past the bound the
+     * frame is dropped: blitting without the lock read a texture the producer
+     * was still drawing. */
     HRESULT a = IDXGIKeyedMutex_AcquireSync(km, 0, 8);
-    if (a != S_OK) km = NULL; /* includes WAIT_TIMEOUT: skip the lock, not the frame */
+    if (a != S_OK) {
+      snprintf(s->imp_err, sizeof(s->imp_err),
+               "the producer still held the texture's keyed mutex after 8 ms "
+               "(AcquireSync=0x%08lX; a producer that hands frames over under "
+               "a key other than 0 never releases it); frame dropped",
+               (unsigned long)a);
+      /* An abandoned mutex is still handed over, and leaves the surface in an
+       * undefined state: give the key back, then release both, as DXGI says
+       * to; the next import of the texture reopens them. */
+      if (a == (HRESULT)WAIT_ABANDONED) {
+        IDXGIKeyedMutex_ReleaseSync(km, 0);
+        mfenc_drop_import(s, im);
+      }
+      return -1;
+    }
   }
 
   D3D11_VIDEO_PROCESSOR_STREAM st;
@@ -1521,38 +1591,30 @@ static int mfenc_blt_texture_to_nv12(MfVidEnc *s, ID3D11Texture2D *foreign) {
    * it as soon as this call returns. Reading a surface while its owner redraws
    * it is a tear.
    *
-   * Steady-state cost is one blt's worth of GPU time (a fraction of a
-   * millisecond), so spin rather than sleep — a Sleep(1) costs a ~15.6 ms timer
-   * quantum, the trap that once made this encoder 3 s/frame. Past a short spin
-   * the GPU is genuinely backed up and burning a core no longer helps anyone,
-   * so yield to whatever else is ready; SwitchToThread returns immediately when
-   * nothing is, which degrades cleanly back to a spin. */
-  if (SUCCEEDED(hr) && s->blt_fence && !mfenc_no_fence) {
-    ID3D11DeviceContext_End(s->ctx, (ID3D11Asynchronous *)s->blt_fence);
-    ID3D11DeviceContext_Flush(s->ctx);
-    LARGE_INTEGER freq, t0, now;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
-    for (;;) {
-      if (ID3D11DeviceContext_GetData(s->ctx, (ID3D11Asynchronous *)s->blt_fence,
-                                      NULL, 0, 0) != S_FALSE)
-        break;
-      QueryPerformanceCounter(&now);
-      double el = (double)(now.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
-      if (el > 0.033) break; /* two frames at 60 Hz; something else is wrong */
-      if (el > 0.001)
-        SwitchToThread();
-      else
-        YieldProcessor();
+   * A blt still unfinished after MFENC_BLT_WAIT_MS drops its frame rather than
+   * returning: the producer may redraw the source before the GPU reads it,
+   * which encodes a later picture under this frame's timestamp. */
+  BOOL blt_done = TRUE;
+  if (SUCCEEDED(hr)) {
+    hr = mfenc_wait_gpu(s); /* a failure is a lost device: the blt failed */
+    if (hr == S_FALSE) {
+      blt_done = FALSE;
+      hr = S_OK;
     }
-  } else if (SUCCEEDED(hr)) {
-    ID3D11DeviceContext_Flush(s->ctx);
   }
 
   if (km) IDXGIKeyedMutex_ReleaseSync(km, 0);
   if (FAILED(hr)) {
     snprintf(s->imp_err, sizeof(s->imp_err),
              "imported OK, but VideoProcessorBlt=0x%08lX", (unsigned long)hr);
+    return -1;
+  }
+  if (!blt_done) {
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "the GPU had not finished the VideoProcessorBlt after %d ms; "
+             "frame dropped, since its source may be redrawn before it is "
+             "read",
+             MFENC_BLT_WAIT_MS);
     return -1;
   }
   s->nv12_last = slot;
@@ -1566,6 +1628,10 @@ static int mfenc_send_d3d11_texture_impl(void *session, void *texture_ptr,
                                          int64_t pts_us, int force_keyframe) {
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s || !texture_ptr || !s->device) return -1;
+  if (s->strict_gpu && s->is_async && !s->stream_ended && !s->draining) {
+    mfenc_pump(s);
+    if (s->need_input <= 0) return 1; /* avoid conversion while input is blocked */
+  }
   if (mfenc_ensure_vp(s) != 0) {
     /* Distinguish "the VideoProcessor could not be built" from "the texture
      * could not be imported" -- otherwise an empty reason is ambiguous and the
@@ -1597,12 +1663,152 @@ static int mfenc_repeat_last_impl(void *session, int64_t pts_us,
   return mfenc_submit_texture(s, s->last_sub, pts_us, force_keyframe);
 }
 
+/* When the encoder's own device has been removed, says so in imp_err and
+ * returns 1. Every call on a removed device fails, and a failure blamed on its
+ * input sends the reader after the capture instead of the GPU. */
+static int mfenc_note_device_removed(MfVidEnc *s, const char *what,
+                                     HRESULT hr) {
+  HRESULT gone = ID3D11Device_GetDeviceRemovedReason(s->device);
+  if (SUCCEEDED(gone)) return 0;
+  snprintf(s->imp_err, sizeof(s->imp_err),
+           "%s=0x%08lX: the encoder's own D3D11 device was removed "
+           "(GetDeviceRemovedReason=0x%08lX), by a GPU fault or a driver "
+           "reset; nothing more encodes on it",
+           what, (unsigned long)hr, (unsigned long)gone);
+  return 1;
+}
+
+/* Copy a frame opened from a capture's shared handle into one of the
+ * session's own NV12 surfaces, and wait for the GPU to finish the copy, so the
+ * MFT only ever holds surfaces this session owns.
+ *
+ * The handle path used to give the MFT the producer's texture itself. The
+ * producer does not wait for the encoder: a camera's Frame Server takes its
+ * surface back for a later frame once the frame is released, and WGC frees
+ * its frames, so the asynchronous MFT could read another picture than the one
+ * it was given. On an RTX 3090 the NVIDIA H.264 MFT given a camera's Frame
+ * Server surface (NV12, MISC_SHARED | SHARED_NTHANDLE) faulted the GPU on the
+ * first frame, and the encoder's device was removed from then on. And the MFT
+ * takes NV12, so a screen's BGRA frame was never input it could take as is.
+ *
+ * A same-size NV12 frame is copied as it is; anything else goes through the
+ * VideoProcessor, as the texture path does (its colour state is set for RGB,
+ * so an NV12 frame of another size is converted as if it were full range).
+ * Returns the slot, -2 when every slot is still in flight, -3 when the frame
+ * was dropped (its producer still held it, or the copy had not finished in
+ * time), or -1 with the reason in imp_err. */
+static int mfenc_copy_shared_to_nv12(MfVidEnc *s, ID3D11Texture2D *src) {
+  int slot = mfenc_pick_nv12(s);
+  if (slot < 0) {
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "all %d NV12 staging surfaces are still held by the MFT "
+             "(back-pressure, drain and retry)",
+             MFENC_NV12_RING);
+    return -2;
+  }
+
+  /* As on the texture path: a bounded wait, and a frame whose producer still
+   * holds the lock is dropped rather than read mid-draw. */
+  IDXGIKeyedMutex *km = NULL;
+  if (FAILED(ID3D11Texture2D_QueryInterface(src, &IID_IDXGIKeyedMutex,
+                                            (void **)&km)))
+    km = NULL;
+  if (km) {
+    HRESULT a = IDXGIKeyedMutex_AcquireSync(km, 0, 8);
+    if (a != S_OK) {
+      if (a == (HRESULT)WAIT_TIMEOUT)
+        snprintf(s->imp_err, sizeof(s->imp_err),
+                 "the producer still held the capture texture's keyed mutex "
+                 "after 8 ms; frame dropped");
+      else
+        snprintf(s->imp_err, sizeof(s->imp_err),
+                 "AcquireSync on the capture texture's keyed mutex=0x%08lX",
+                 (unsigned long)a);
+      if (a == (HRESULT)WAIT_ABANDONED) IDXGIKeyedMutex_ReleaseSync(km, 0);
+      IDXGIKeyedMutex_Release(km);
+      return a == (HRESULT)WAIT_TIMEOUT ? -3 : -1;
+    }
+  }
+
+  D3D11_TEXTURE2D_DESC sd, dd;
+  ID3D11Texture2D_GetDesc(src, &sd);
+  ID3D11Texture2D_GetDesc(s->nv12_tex[slot], &dd);
+  HRESULT hr = S_OK;
+  if (sd.Format == DXGI_FORMAT_NV12 && sd.Width == dd.Width &&
+      sd.Height == dd.Height) {
+    ID3D11DeviceContext_CopySubresourceRegion(
+        s->ctx, (ID3D11Resource *)s->nv12_tex[slot], 0, 0, 0, 0,
+        (ID3D11Resource *)src, 0, NULL);
+  } else {
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd;
+    ZeroMemory(&ivd, sizeof(ivd));
+    ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    ID3D11VideoProcessorInputView *iv = NULL;
+    hr = ID3D11VideoDevice_CreateVideoProcessorInputView(
+        s->vdev, (ID3D11Resource *)src, s->vp_enum, &ivd, &iv);
+    if (SUCCEEDED(hr) && iv) {
+      D3D11_VIDEO_PROCESSOR_STREAM st;
+      ZeroMemory(&st, sizeof(st));
+      st.Enable = TRUE;
+      st.pInputSurface = iv;
+      hr = ID3D11VideoContext_VideoProcessorBlt(s->vctx, s->vp,
+                                                s->nv12_ov[slot], 0, 1, &st);
+      ID3D11VideoProcessorInputView_Release(iv);
+      if (FAILED(hr))
+        snprintf(s->imp_err, sizeof(s->imp_err),
+                 "VideoProcessorBlt(capture frame)=0x%08lX",
+                 (unsigned long)hr);
+    } else {
+      if (SUCCEEDED(hr)) hr = E_FAIL;
+      snprintf(s->imp_err, sizeof(s->imp_err),
+               "CreateVideoProcessorInputView(capture frame)=0x%08lX "
+               "(fmt=%u %ux%u misc=0x%X bind=0x%X)",
+               (unsigned long)hr, (unsigned)sd.Format, (unsigned)sd.Width,
+               (unsigned)sd.Height, (unsigned)sd.MiscFlags,
+               (unsigned)sd.BindFlags);
+    }
+  }
+  /* Finished, not just queued: the caller releases the capture buffer when
+   * this returns, and the producer may reuse the texture at once. */
+  if (SUCCEEDED(hr)) {
+    hr = mfenc_wait_gpu(s);
+    if (FAILED(hr)) {
+      if (!mfenc_note_device_removed(s, "copying the capture frame", hr))
+        snprintf(s->imp_err, sizeof(s->imp_err),
+                 "copying the capture frame failed on the GPU: 0x%08lX",
+                 (unsigned long)hr);
+    } else if (hr == S_FALSE)
+      snprintf(s->imp_err, sizeof(s->imp_err),
+               "the GPU had not finished copying the capture frame after %d "
+               "ms; frame dropped, since the capture may reuse its texture "
+               "before it is read",
+               MFENC_BLT_WAIT_MS);
+  }
+  if (km) {
+    IDXGIKeyedMutex_ReleaseSync(km, 0);
+    IDXGIKeyedMutex_Release(km);
+  }
+  if (hr == S_FALSE) return -3;
+  if (hr != S_OK) return -1;
+  s->nv12_last = slot;
+  return slot;
+}
+
 static int mfenc_send_d3d11_impl(void *session, void *shared_handle,
                                  int64_t pts_us, int force_keyframe) {
   MfVidEnc *s = (MfVidEnc *)session;
   if (!s || !shared_handle || !s->device) return -1;
 
   s->imp_err[0] = 0;
+  if (mfenc_ensure_vp(s) != 0) {
+    char why[128];
+    snprintf(why, sizeof(why), "%s", s->imp_err);
+    snprintf(s->imp_err, sizeof(s->imp_err),
+             "mfenc_ensure_vp failed: %s (a capture frame is copied into the "
+             "encoder's own NV12 surfaces, which it builds)",
+             why[0] ? why : "no reason recorded");
+    return -1;
+  }
   ID3D11Texture2D *tex = NULL;
   ID3D11Device1 *dev1 = NULL;
   HRESULT hq = ID3D11Device_QueryInterface(s->device, &IID_ID3D11Device1,
@@ -1618,16 +1824,21 @@ static int mfenc_send_d3d11_impl(void *session, void *shared_handle,
                                                  (void **)&tex);
   ID3D11Device1_Release(dev1);
   if (FAILED(hr) || !tex) {
-    snprintf(s->imp_err, sizeof(s->imp_err),
-             "OpenSharedResource1(capture handle)=0x%08lX -- most likely the "
-             "handle is on a different adapter than the encoder device",
-             (unsigned long)hr);
+    if (!mfenc_note_device_removed(s, "OpenSharedResource1(capture handle)",
+                                   hr))
+      snprintf(s->imp_err, sizeof(s->imp_err),
+               "OpenSharedResource1(capture handle)=0x%08lX -- most likely the "
+               "handle is on a different adapter than the encoder device",
+               (unsigned long)hr);
     return -1;
   }
 
-  int r = mfenc_submit_texture(s, tex, pts_us, force_keyframe);
+  int slot = mfenc_copy_shared_to_nv12(s, tex);
   ID3D11Texture2D_Release(tex);
-  return r;
+  if (slot == -2) return 1;
+  if (slot == -3) return 2; /* dropped: there is nothing to retry */
+  if (slot < 0) return -1;
+  return mfenc_submit_texture(s, s->nv12_tex[slot], pts_us, force_keyframe);
 }
 
 /* The ID3D11Device the MFT is bound to, for diagnostics. Whether this equals
@@ -1954,6 +2165,33 @@ MFENC_API void *miniav_shim_mfenc_create(int codec, int width, int height,
   return a.result;
 }
 
+/* Additive strict GPU ABI: hardware only, on the caller's exact device.
+ * The caller retains that device and its texture/cache ownership until destroy.
+ * No software encoder, OS capture or replacement D3D device is attempted. */
+static int job_create_gpu_on_device(void *vp) {
+  ArgCreate *a = (ArgCreate *)vp;
+  a->result = NULL;
+  if (!a->existing_device) return -1;
+  for (int cand = 0; cand < 8; cand++) {
+    a->result = mfenc_create_impl(a->codec, a->width, a->height,
+                                 a->bitrate_bps, a->fps_num, a->fps_den,
+                                 a->gop, 1, cand, a->existing_device, 1);
+    if (a->result) break;
+  }
+  return 0;
+}
+MFENC_API void *miniav_shim_mfenc_create_gpu_on_device(
+    int codec, int width, int height, int bitrate_bps, int fps_num,
+    int fps_den, int gop, void *existing_device) {
+  if (!existing_device || (codec != 0 && codec != 1) || width <= 0 ||
+      height <= 0 || bitrate_bps <= 0 || fps_num <= 0 || fps_den <= 0)
+    return NULL;
+  ArgCreate a = {codec, width, height, bitrate_bps, fps_num,
+                 fps_den, gop, existing_device, NULL};
+  if (mfenc_on_worker(job_create_gpu_on_device, &a, -1) != 0) return NULL;
+  return a.result;
+}
+
 typedef struct { void *s; uint8_t *out; int cap; } ArgExtra;
 static int job_extradata(void *vp) {
   ArgExtra *a = (ArgExtra *)vp;
@@ -2250,6 +2488,100 @@ MFENC_API void miniav_shim_mfenc_test_device_release(void *dev) {
 
 MFENC_API void miniav_shim_mfenc_test_texture_release(void *tex) {
   if (tex) ID3D11Texture2D_Release((ID3D11Texture2D *)tex);
+}
+
+/* ---- test-only: a frame shared the way capture shares one ----------------
+ *
+ * A texture on its own device with D3D11_RESOURCE_MISC_SHARED |
+ * SHARED_NTHANDLE and no keyed mutex: the shape of a camera's Frame Server
+ * NV12 surface and of a WGC frame. Capture hands each frame over as a new NT
+ * handle (miniav_shim_mfenc_test_nt_handle) and closes it on release.
+ * fmt: 0 = BGRA, 2 = NV12. pattern: 0 = flat grey, 1 = a gradient. Free with
+ * miniav_shim_mfenc_test_texture_release. */
+MFENC_API void *miniav_shim_mfenc_test_capture_texture(int width, int height,
+                                                       int pattern, int fmt) {
+  ID3D11Device *dev = NULL;
+  ID3D11DeviceContext *ctx = NULL;
+  if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                               D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
+                               D3D11_SDK_VERSION, &dev, NULL, &ctx)) ||
+      !dev)
+    return NULL;
+
+  const int nv12 = fmt == 2;
+  D3D11_TEXTURE2D_DESC td;
+  ZeroMemory(&td, sizeof(td));
+  td.Width = (UINT)width;
+  td.Height = (UINT)height;
+  td.MipLevels = 1;
+  td.ArraySize = 1;
+  td.Format = nv12 ? DXGI_FORMAT_NV12 : DXGI_FORMAT_B8G8R8A8_UNORM;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  td.MiscFlags =
+      D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+  /* NV12 initial data is the luma plane and then the interleaved chroma
+   * plane, at one pitch. */
+  const size_t pitch = nv12 ? (size_t)width : (size_t)width * 4;
+  const size_t rows = nv12 ? (size_t)height * 3 / 2 : (size_t)height;
+  uint8_t *pix = (uint8_t *)malloc(pitch * rows);
+  if (!pix) {
+    if (ctx) ID3D11DeviceContext_Release(ctx);
+    ID3D11Device_Release(dev);
+    return NULL;
+  }
+  for (size_t y = 0; y < rows; y++) {
+    uint8_t *row = pix + y * pitch;
+    for (int x = 0; x < width; x++) {
+      if (nv12) {
+        row[x] = !pattern ? 128
+                 : y < (size_t)height ? (uint8_t)((x + y) & 0xFF)
+                                      : (uint8_t)((x * 2 + y) & 0xFF);
+      } else {
+        UINT32 v = pattern ? (0xFF000000u | ((UINT32)(x & 0xFF) << 16) |
+                              ((UINT32)(y & 0xFF) << 8) |
+                              (UINT32)((x + y) & 0xFF))
+                           : 0xFF808080u;
+        memcpy(row + (size_t)x * 4, &v, 4);
+      }
+    }
+  }
+  D3D11_SUBRESOURCE_DATA srd;
+  ZeroMemory(&srd, sizeof(srd));
+  srd.pSysMem = pix;
+  srd.SysMemPitch = (UINT)pitch;
+
+  ID3D11Texture2D *tex = NULL;
+  HRESULT hr = ID3D11Device_CreateTexture2D(dev, &td, &srd, &tex);
+  free(pix);
+  if (ctx) {
+    ID3D11DeviceContext_Flush(ctx); /* visible to another device */
+    ID3D11DeviceContext_Release(ctx);
+  }
+  ID3D11Device_Release(dev); /* the texture holds its own ref */
+  return SUCCEEDED(hr) ? tex : NULL;
+}
+
+/* A new read-only NT handle for [tex], as capture makes one per frame. Close
+ * it with miniav_shim_mfenc_test_close_handle. */
+MFENC_API void *miniav_shim_mfenc_test_nt_handle(void *tex) {
+  IDXGIResource1 *res = NULL;
+  if (!tex || FAILED(ID3D11Texture2D_QueryInterface(
+                  (ID3D11Texture2D *)tex, &IID_IDXGIResource1,
+                  (void **)&res)) ||
+      !res)
+    return NULL;
+  HANDLE h = NULL;
+  HRESULT hr = IDXGIResource1_CreateSharedHandle(
+      res, NULL, DXGI_SHARED_RESOURCE_READ, NULL, &h);
+  IDXGIResource1_Release(res);
+  return SUCCEEDED(hr) ? (void *)h : NULL;
+}
+
+MFENC_API void miniav_shim_mfenc_test_close_handle(void *h) {
+  if (h) CloseHandle((HANDLE)h);
 }
 
 /* ---- diagnostic: did the VideoProcessor blt actually write? --------------

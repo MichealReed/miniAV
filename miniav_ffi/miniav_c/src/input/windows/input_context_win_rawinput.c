@@ -13,6 +13,41 @@
 
 #define MINIAV_INPUT_MAX_GAMEPADS 4
 
+// --- Event storage ---
+//
+// A callback is handed a POINTER to its event, and a receiver may read it after
+// the callback has returned: a language binding whose callback trampoline posts
+// the call to another thread (Dart's NativeCallable.listener is one) returns at
+// once and reads the event later, on its own thread. An event therefore must
+// not live in a local of the hook procedure or of the poll loop, where the next
+// event overwrites it. With two controllers reporting in one poll such a
+// receiver read the second report twice and never the first, so a disconnect
+// of the first controller was lost.
+//
+// Every event is copied into the next cell of a ring owned by the context: one
+// ring per controller slot, one for the keyboard, one for the mouse. A cell is
+// rewritten only after as many further events of its own ring as the ring has
+// cells, and the storage is freed only with the context. Hence:
+//   - A receiver that is fewer events of a ring behind than the ring has cells
+//     reads each event of that ring exactly as dispatched, once and in order.
+//   - A receiver that falls further behind reads newer events of the same ring
+//     in place of the ones it missed, and may read a cell while it is being
+//     rewritten. The newest events of a ring are never touched, so the LAST
+//     report of every controller slot, a disconnect included, always arrives
+//     intact.
+//   - Memory is fixed. Nothing is allocated per event and the receiver has
+//     nothing to release.
+// Each ring has a single writer: the hook thread writes keyboard and mouse
+// events, the poll thread writes controller reports.
+//
+// Sizes are in events. A controller slot reports at most once per poll, so 256
+// cells are over four seconds of a slot changing on every poll at the default
+// 60 Hz. Mouse moves arrive at the throttle rate, or at the device's own rate
+// when the throttle is off, so the mouse ring is the largest.
+#define MINIAV_INPUT_GAMEPAD_RING 256
+#define MINIAV_INPUT_KEYBOARD_RING 256
+#define MINIAV_INPUT_MOUSE_RING 1024
+
 typedef struct InputPlatformWin {
   // Hook thread
   HANDLE hook_thread;
@@ -46,6 +81,17 @@ typedef struct InputPlatformWin {
   // Previous gamepad state for change detection
   XINPUT_STATE prev_gamepad_state[MINIAV_INPUT_MAX_GAMEPADS];
   bool gamepad_was_connected[MINIAV_INPUT_MAX_GAMEPADS];
+
+  // Event storage (see "Event storage" above). The keyboard and mouse rings
+  // are written by the hook thread only, the gamepad rings by the poll thread
+  // only.
+  MiniAVKeyboardEvent keyboard_ring[MINIAV_INPUT_KEYBOARD_RING];
+  uint32_t keyboard_ring_next;
+  MiniAVMouseEvent mouse_ring[MINIAV_INPUT_MOUSE_RING];
+  uint32_t mouse_ring_next;
+  MiniAVGamepadEvent gamepad_ring[MINIAV_INPUT_MAX_GAMEPADS]
+                                 [MINIAV_INPUT_GAMEPAD_RING];
+  uint32_t gamepad_ring_next[MINIAV_INPUT_MAX_GAMEPADS];
 } InputPlatformWin;
 
 // --- Global callback routing ---
@@ -66,12 +112,20 @@ static MiniAVResultCode input_win_stop_capture(MiniAVInputContext *ctx);
 // exact same timeline as every other capture module.
 static uint64_t win_get_timestamp_us(void) { return miniav_get_time_us(); }
 
+// Returns the index of the ring cell to write next and advances the ring.
+static uint32_t input_win_ring_take(uint32_t *next, uint32_t cells) {
+  const uint32_t index = *next;
+  *next = (index + 1) % cells;
+  return index;
+}
+
 // --- Keyboard Hook Proc ---
 
 static LRESULT CALLBACK
 keyboard_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
   if (nCode == HC_ACTION && g_active_input_platform &&
       g_active_input_platform->keyboard_cb) {
+    InputPlatformWin *plat = g_active_input_platform;
     KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT *)lParam;
     MiniAVKeyboardEvent event;
     memset(&event, 0, sizeof(event));
@@ -85,8 +139,11 @@ keyboard_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
       event.action = MINIAV_KEY_ACTION_UP;
     }
 
-    MINIAV_SAFE_DISPATCH(g_active_input_platform->keyboard_cb(
-        &event, g_active_input_platform->user_data));
+    // Dispatch a stored copy, never the local: see "Event storage".
+    MiniAVKeyboardEvent *stored = &plat->keyboard_ring[input_win_ring_take(
+        &plat->keyboard_ring_next, MINIAV_INPUT_KEYBOARD_RING)];
+    *stored = event;
+    MINIAV_SAFE_DISPATCH(plat->keyboard_cb(stored, plat->user_data));
   }
   return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
@@ -181,7 +238,11 @@ static LRESULT CALLBACK mouse_hook_proc(int nCode, WPARAM wParam,
     return CallNextHookEx(NULL, nCode, wParam, lParam);
   }
 
-  MINIAV_SAFE_DISPATCH(plat->mouse_cb(&event, plat->user_data));
+  // Dispatch a stored copy, never the local: see "Event storage".
+  MiniAVMouseEvent *stored = &plat->mouse_ring[input_win_ring_take(
+      &plat->mouse_ring_next, MINIAV_INPUT_MOUSE_RING)];
+  *stored = event;
+  MINIAV_SAFE_DISPATCH(plat->mouse_cb(stored, plat->user_data));
   return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
@@ -296,7 +357,12 @@ static DWORD WINAPI gamepad_poll_thread_proc(LPVOID param) {
           event.right_trigger = state.Gamepad.bRightTrigger;
         }
 
-        MINIAV_SAFE_DISPATCH(plat->gamepad_cb(&event, plat->user_data));
+        // Dispatch a stored copy, never the local: see "Event storage".
+        MiniAVGamepadEvent *stored =
+            &plat->gamepad_ring[i][input_win_ring_take(
+                &plat->gamepad_ring_next[i], MINIAV_INPUT_GAMEPAD_RING)];
+        *stored = event;
+        MINIAV_SAFE_DISPATCH(plat->gamepad_cb(stored, plat->user_data));
         plat->prev_gamepad_state[i] = state;
         plat->gamepad_was_connected[i] = connected;
       }

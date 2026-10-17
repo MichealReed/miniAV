@@ -1,54 +1,62 @@
 # Changelog
 
-## 0.5.9-WIP
+## 0.6.0
+
+- New `FrameRepeatingEncoder`, for a video encoder that can re-submit the last
+  frame it accepted under a new timestamp. Re-submitting the producer's surface
+  could read the next picture, so the duplicate showed newer content than the
+  frame after it and playback jumped backwards. `repeatLastFrame` returns a
+  packet as `encode` does; an encoder whose packets do not carry their frame's
+  timestamp throws when it has nothing to repeat, so a caller pairing packets
+  with frames stays in step.
+- `FrameSource.miniavBuffer` takes an optional `timestampUs` that replaces the
+  buffer's own, so a buffer submitted twice carries its own time.
+- Requires miniav_platform_interface 0.8.0.
 
 ## 0.5.8
 
-- Raise the spawn constraint to ^0.1.1 — native transfer now actually transfers, and a web message the worker cannot deserialize is reported instead of vanishing.
+- Requires spawn ^0.1.1: native transfers actually transfer, and a web message
+  the worker cannot deserialize is reported instead of vanishing.
 
 ## 0.5.7
 
 - Increment downstream deps
-- Increment downstream deps
-- Increment downstream deps
 
 ## 0.5.6
 
-- Export the audio-ring cursor primitives so a second ring with its own layout - miniAV's capture mirror, whose header is defined in C - can reuse the acquire-load ordering rather than duplicating it. Map gpuWebVideoFrame buffers to the webVideoFrame frame-source kind.
+- Exports the audio-ring cursor primitives, so a ring with its own layout
+  (miniAV's capture mirror) can reuse their memory ordering. `gpuWebVideoFrame`
+  buffers map to the `webVideoFrame` frame source kind.
 
 ## 0.5.5
 
-- Add SharedAudioRing: a lock-free single-producer/single-consumer ring of interleaved f32 PCM in shared memory, so decoded audio reaches an audio thread without the main thread in between. Add the demux wire protocol shared by every worker-hosted demuxer.
+- New `SharedAudioRing`: a lock-free single-producer/single-consumer ring of
+  interleaved f32 PCM in shared memory, so decoded audio reaches an audio thread
+  without passing through the main thread. Adds the demux wire protocol shared
+  by worker-hosted demuxers.
 
 ## 0.5.4
 
-- Documentation only: the colour-contract doc comment no longer names a
-  private downstream project. No API or behaviour change.
+- Documentation fix only; no API or behaviour change.
 
 ## 0.5.3
 
-- `PlatformEncoder` gains two GPU-input capability getters, both defaulting to
-  `false`: `supportsD3d11SharedHandleInput` (a `FrameSource.miniavBuffer` whose
-  `nativeHandles[0]` is a D3D11 shared NT handle, opened on the encoder's own
-  device) and `supportsD3d11TextureInput` (a `D3D11TextureFrameSource` — a raw
-  texture pointer on the *processor's* device, so strictly stronger). They let
-  the recorder pick its zero-copy screen path by capability instead of by
-  concrete encoder type. **Implementers use `implements PlatformEncoder`, so
-  these must be declared explicitly** — the defaults do not carry.
-
-- Audio **decode** contract (the `supportsAudioDecode()` capability existed
-  with no factory): `PlatformAudioDecoder`, `DecodedAudio` (interleaved f32),
-  `AudioDecoderConfig`, and `MiniAVToolsBackend.createAudioDecoder`
-  (default `null` — non-breaking for existing backends).
-- **Demuxer stream support** (for miniav_player stream/file playback):
-  `DemuxerInput.byteStream(Stream<List<int>>)` (`StreamDemuxerInput`) for
-  live/progressive containers; `PlatformDemuxer.durationUs` (nullable) and
-  `PlatformDemuxer.isSeekable` (both default no-op → non-breaking). Packet
-  `trackIndex` on demuxer output indexes into `tracks`.
-- `DecodedFrame.webVideoFrame` (`Object?`, default `null`) — an
-  already-presentable browser `VideoFrame` handle for the web WebCodecs
-  decode path (presented directly, no readback). Native `implements
-  DecodedFrame` classes must return `null`.
+- `PlatformEncoder` gains `supportsD3d11SharedHandleInput` (a
+  `FrameSource.miniavBuffer` whose `nativeHandles[0]` is a D3D11 shared NT
+  handle) and `supportsD3d11TextureInput` (a `D3D11TextureFrameSource` on the
+  producer's own device), both `false` by default, so the recorder picks its
+  zero-copy path by capability. Classes that `implements PlatformEncoder` must
+  declare both.
+- Audio decoding: `PlatformAudioDecoder`, `DecodedAudio` (interleaved f32),
+  `AudioDecoderConfig` and `MiniAVToolsBackend.createAudioDecoder` (default
+  `null`, so existing backends are unaffected).
+- Demuxer streams: `DemuxerInput.byteStream(Stream<List<int>>)`
+  (`StreamDemuxerInput`) for live or progressive containers, plus
+  `PlatformDemuxer.durationUs` (nullable) and `isSeekable`, both with defaults.
+  A demuxed packet's `trackIndex` indexes into `tracks`.
+- `DecodedFrame.webVideoFrame` (`Object?`, default `null`): a browser
+  `VideoFrame` ready to present, from WebCodecs decoding on web. Native classes
+  that `implements DecodedFrame` must return `null`.
 
 ## 0.5.2
 
@@ -56,22 +64,18 @@
 
 ## 0.5.0
 
-- Version bump to keep the miniav_tools family in lockstep; no changes in this package.
+- Version bump to keep the miniav_tools family in lockstep; no changes in this
+  package.
 
 ## 0.4.10
 
-- Add `CpuExecutor` — a platform-agnostic seam for running CPU-bound work off
-  the main isolate. Native (`dart:io`) uses a long-lived background `Isolate`
-  reused across calls; web (`dart:js_interop`) runs inline (browser already
-  threads the codec/GPU paths). Resolved via conditional import so `dart:isolate`
-  never reaches web builds (verified with `dart compile js`). Intended for the
-  pure-Dart CPU hotspots that have no native thread to hide behind (software
-  pixel conversion fallback, AV1 entropy coder).
-- Add `FrameSource.yuv420p` — a pre-converted planar YUV420P (I420) frame source
-  (three tightly-packed u8 planes), so a GPU color-conversion step can feed an
-  encoder directly with no further conversion.
-- Add `PlatformEncoder.acceptsYuv420pPlanes` (default `false`) so the recorder
-  can detect encoders that consume YUV420P planes natively.
+- New `CpuExecutor` runs CPU-bound work off the main isolate: on a long-lived
+  background isolate natively, inline on web, without `dart:isolate` reaching
+  web builds.
+- New `FrameSource.yuv420p`: a planar YUV420P (I420) frame source, so a GPU
+  colour conversion can feed an encoder directly.
+- New `PlatformEncoder.acceptsYuv420pPlanes` (default `false`) for encoders that
+  take YUV420P planes natively.
 
 ## 0.4.9
 
@@ -203,11 +207,13 @@
 
 ## 0.2.8
 
-- add RecorderLogSource.minigpu: routes native minigpu/Dawn log lines through the unified Recorder log callback; Recorder.minigpuLevelFor public helper for tests; 12 new tests in log_level_test.dart
+- Add `RecorderLogSource.minigpu`, routing native minigpu/Dawn log lines through
+  the unified `Recorder` log callback, and the public `Recorder.minigpuLevelFor`
+  helper.
 
 ## 0.2.7
 
-- fix FormatException on non-UTF-8 bytes in MiniAV log callback: use Utf8Decoder(allowMalformed: true) instead of toDartString()
+- Fix a FormatException on non-UTF-8 bytes in the MiniAV log callback.
 - Increment minigpu to 1.4.4
 
 ## 0.2.5
@@ -216,7 +222,8 @@
 
 ## 0.2.3
 
-- add unified Recorder.setLogLevel and Recorder.setLogCallback routing all native logs (MiniAV + FFmpeg) through a single Dart callback
+- add unified Recorder.setLogLevel and Recorder.setLogCallback routing all
+  native logs (MiniAV + FFmpeg) through a single Dart callback
 
 ## 0.2.1
 

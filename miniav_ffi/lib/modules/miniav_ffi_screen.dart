@@ -162,6 +162,13 @@ class MiniFFIScreenPlatform implements MiniScreenPlatformInterface {
 }
 
 class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
+  // Native cadence changes require the capture owner to reconfigure its source.
+  @override
+  Future<bool> setCaptureFrameRate(int fps) async => false;
+
+  @override
+  void setContentHint(String hint) {}
+
   bindings.MiniAVScreenContextHandle? _context;
   ffi.NativeCallable<bindings.MiniAVBufferCallbackFunction>? _callbackHandle;
   FFIContextLostRegistry<bindings.MiniAVScreenContextHandle>? _lostRegistry;
@@ -373,6 +380,13 @@ class MiniFFIScreenContext implements MiniScreenContextPlatformInterface {
     _callbackHandle = null;
     _stopping = false;
   }
+
+  /// Native capture has its own format negotiation; no in-place CPU switch.
+  @override
+  Future<bool> fallbackToCpuDelivery() async => false;
+
+  @override
+  Object? get cpuDeliverySurface => null;
 
   @override
   Future<void> stopCapture() async {

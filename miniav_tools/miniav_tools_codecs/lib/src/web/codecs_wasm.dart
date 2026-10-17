@@ -45,8 +45,8 @@ class CodecsWasm {
   Future<void> _load() async {
     final g = globalContext;
     // Inject the glue script once; it installs the global `MiniavCodecs` factory.
-    if (g.getProperty<JSAny?>('MiniavCodecs'.toJS).isUndefinedOrNull) {
-      if (g.getProperty<JSAny?>('document'.toJS).isUndefinedOrNull) {
+    if (g.getProperty<JSAny?>('MiniavCodecs'.toJS) == null) {
+      if (g.getProperty<JSAny?>('document'.toJS) == null) {
         // Worker scope: no DOM, no <script> injection — but
         // `importScripts` exists and is synchronous. `_glueUrl` is
         // page-relative; a worker's relative URLs resolve against the WORKER
@@ -98,7 +98,7 @@ class CodecsWasm {
   /// worker script's URL (everything up to its own `/assets/`) in a worker.
   static String _assetDirUrl() {
     const rel = 'assets/packages/miniav_tools_codecs/web/';
-    if (!globalContext.getProperty<JSAny?>('document'.toJS).isUndefinedOrNull) {
+    if (globalContext.getProperty<JSAny?>('document'.toJS) != null) {
       return rel;
     }
     final loc = globalContext
@@ -106,8 +106,17 @@ class CodecsWasm {
         .getProperty<JSString>('href'.toJS)
         .toDart;
     final i = loc.lastIndexOf('/assets/');
-    if (i < 0) return rel;
-    return '${loc.substring(0, i + 1)}$rel';
+    if (i >= 0) return '${loc.substring(0, i + 1)}$rel';
+
+    // package:test serves package assets directly below `/packages/`, without
+    // Flutter's outer `/assets/` directory. A compiled worker still has to
+    // load the same package-owned codec payload from that origin.
+    final packages = loc.lastIndexOf('/packages/');
+    if (packages >= 0) {
+      return '${loc.substring(0, packages + 1)}packages/'
+          'miniav_tools_codecs/web/';
+    }
+    return rel;
   }
 
   /// [_glueUrl] resolved for a worker scope: against the app base recovered
@@ -122,8 +131,14 @@ class CodecsWasm {
         .getProperty<JSString>('href'.toJS)
         .toDart;
     final i = loc.lastIndexOf('/assets/');
-    if (i < 0) return _glueUrl;
-    return '${loc.substring(0, i + 1)}$_glueUrl';
+    if (i >= 0) return '${loc.substring(0, i + 1)}$_glueUrl';
+
+    final packages = loc.lastIndexOf('/packages/');
+    if (packages >= 0) {
+      return '${loc.substring(0, packages + 1)}packages/'
+          'miniav_tools_codecs/web/miniav_codecs.js';
+    }
+    return _glueUrl;
   }
 
   // --- raw module calls -----------------------------------------------------

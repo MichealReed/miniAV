@@ -48,6 +48,12 @@ String _formatStatsLine({
   int encUsMax = 0,
   int encSamples = 0,
   int adaptDivisor = 1,
+  int dupFrames = 0,
+  int capDtMin = -1,
+  int capDtMax = -1,
+  int lagMax = 0,
+  int outOfOrder = 0,
+  int encLost = 0,
 }) {
   final avgPkt = packetsOut > 0 ? (totalPktBytes / packetsOut).round() : 0;
   final pktRange = packetsOut > 0
@@ -65,13 +71,22 @@ String _formatStatsLine({
             '/${(encUsMax / 1000).toStringAsFixed(1)}ms'
       : '';
   final adaptStr = adaptDivisor > 1 ? ' adapt=÷$adaptDivisor' : '';
+  final dupStr = dupFrames > 0 ? ' dup=$dupFrames' : '';
+  final capStr = capDtMin >= 0
+      ? ' cap_dt=${(capDtMin / 1000).toStringAsFixed(1)}'
+            '..${(capDtMax / 1000).toStringAsFixed(1)}ms'
+            ' lag<=${(lagMax / 1000).toStringAsFixed(1)}ms'
+      : '';
+  final oooStr = outOfOrder > 0 ? ' ooo=$outOfOrder' : '';
+  final lostStr = encLost > 0 ? ' enc_lost=$encLost' : '';
   return '[recorder] $label video stats over '
       '${elapsedSecs.toStringAsFixed(1)}s: '
       'in=${framesIn} (${(framesIn / elapsedSecs).toStringAsFixed(1)} fps) '
       'thr_drop=${throttleDropped} busy_drop=${busyDropped} '
       'encoded=${packetsOut} '
       '(${(packetsOut / elapsedSecs).toStringAsFixed(1)} fps) '
-      'pkt=$pktRange$gpuStr$encStr$adaptStr$errStr';
+      'pkt=$pktRange$gpuStr$encStr$adaptStr$dupStr$capStr$oooStr$lostStr'
+      '$errStr';
 }
 
 void main() {
@@ -79,6 +94,53 @@ void main() {
   // Stats line format
   // -------------------------------------------------------------------------
   group('_VideoTrackRuntime stats line format', () {
+    test('capture timing: step range, worst lag, refusals, lost frames', () {
+      // A 60 Hz desktop thinned to 30 fps: captured one to three refreshes
+      // apart while arriving evenly.
+      final line = _formatStatsLine(
+        label: 'screen',
+        elapsedSecs: 2.0,
+        framesIn: 60,
+        throttleDropped: 0,
+        busyDropped: 0,
+        packetsOut: 58,
+        totalPktBytes: 580000,
+        minPktBytes: 8000,
+        maxPktBytes: 12000,
+        encodeErrors: 0,
+        lastError: null,
+        dupFrames: 2,
+        capDtMin: 16667,
+        capDtMax: 50001,
+        lagMax: 12345,
+        outOfOrder: 1,
+        encLost: 3,
+      );
+      expect(
+        line,
+        endsWith('dup=2 cap_dt=16.7..50.0ms lag<=12.3ms ooo=1 enc_lost=3'),
+      );
+    });
+
+    test('capture timing is absent without source timestamps', () {
+      final line = _formatStatsLine(
+        label: 'screen',
+        elapsedSecs: 2.0,
+        framesIn: 60,
+        throttleDropped: 0,
+        busyDropped: 0,
+        packetsOut: 60,
+        totalPktBytes: 600000,
+        minPktBytes: 8000,
+        maxPktBytes: 12000,
+        encodeErrors: 0,
+        lastError: null,
+      );
+      expect(line, isNot(contains('cap_dt=')));
+      expect(line, isNot(contains('ooo=')));
+      expect(line, isNot(contains('enc_lost=')));
+    });
+
     test('happy path: no errors, packets present', () {
       final line = _formatStatsLine(
         label: 'screen',

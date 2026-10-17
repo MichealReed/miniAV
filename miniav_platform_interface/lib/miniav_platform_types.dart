@@ -258,6 +258,74 @@ class MiniAVBuffer {
   Object? get nativeHandle => _nativeHandle;
 }
 
+/// A conservative changed rectangle in the captured BGRA frame coordinates.
+class MiniAVDamageRect {
+  final int x;
+  final int y;
+  final int width;
+  final int height;
+
+  const MiniAVDamageRect({
+    required this.x,
+    required this.y,
+    required this.width,
+    required this.height,
+  });
+}
+
+/// Optional producer-certified screen damage for one completed snapshot.
+///
+/// Partial rectangles are usable only after the same source epoch's immediately
+/// preceding generation was consumed. A gap, changed dimensions, [fullFrame],
+/// or absent metadata requires processing the entire frame. Generations count
+/// delivered frames only: changes in captures that were never delivered are
+/// carried into the next delivered frame's rectangles. These rectangles never
+/// certify an empty changed set.
+class MiniAVVideoDamage {
+  final int sourceEpoch;
+  final int generation;
+  final int width;
+  final int height;
+  final bool fullFrame;
+  final List<MiniAVDamageRect> rectangles;
+
+  MiniAVVideoDamage({
+    required this.sourceEpoch,
+    required this.generation,
+    required this.width,
+    required this.height,
+    required this.fullFrame,
+    required List<MiniAVDamageRect> rectangles,
+  }) : rectangles = List.unmodifiable(rectangles);
+}
+
+/// The matrix that turns a YUV frame's samples into RGB.
+enum MiniAVYuvMatrix { bt601, bt709, bt2020 }
+
+/// How to turn a YUV frame into RGB, as its producer reports it.
+class MiniAVVideoColor {
+  final MiniAVYuvMatrix matrix;
+
+  /// Full range (0..255) when true; limited (luma 16..235, chroma 16..240)
+  /// when false.
+  final bool fullRange;
+
+  const MiniAVVideoColor({required this.matrix, required this.fullRange});
+
+  @override
+  bool operator ==(Object other) =>
+      other is MiniAVVideoColor &&
+      other.matrix == matrix &&
+      other.fullRange == fullRange;
+
+  @override
+  int get hashCode => Object.hash(matrix, fullRange);
+
+  @override
+  String toString() =>
+      'MiniAVVideoColor(${matrix.name}, ${fullRange ? 'full' : 'limited'})';
+}
+
 /// Video payload of a [MiniAVBuffer].
 ///
 /// **Use [MiniAVBuffer.contentType] — not [planes] — to tell the CPU and GPU
@@ -269,11 +337,23 @@ class MiniAVVideoBuffer {
   final int height;
   final MiniAVPixelFormat pixelFormat;
 
+  /// Optional screen damage copied while the native buffer was alive.
+  final MiniAVVideoDamage? damage;
+
+  /// The YUV matrix and range of this frame, or null when the producer does
+  /// not say: RGB formats, screen capture, and for now every camera backend
+  /// except Windows Media Foundation.
+  final MiniAVVideoColor? color;
+
   /// Row stride in bytes per plane. **0 on the GPU paths** (no CPU rows).
   final List<int> strideBytes;
 
   /// CPU pixel data per plane — only meaningful when
   /// `MiniAVBuffer.contentType == MiniAVBufferContentType.cpu`.
+  ///
+  /// Each plane spans its stride times its rows: half the rows, rounded up,
+  /// for the chroma planes of 4:2:0 formats. An MJPEG frame is one plane of
+  /// [MiniAVBuffer.dataSizeBytes].
   ///
   /// On the GPU paths these entries are non-null but EMPTY (length 0); read
   /// [nativeHandles] instead.
@@ -322,6 +402,8 @@ class MiniAVVideoBuffer {
     this.nativeHandles = const [],
     this.dmabufFds = const [],
     this.drmFormatModifiers = const [],
+    this.damage,
+    this.color,
   });
 }
 

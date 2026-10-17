@@ -22,6 +22,8 @@ import 'package:minigpu/minigpu.dart';
 
 import 'adaptive_gpu_throttle.dart';
 import 'bounded_write_queue.dart';
+import 'capture_clock.dart';
+import 'capture_rate_watch.dart';
 import 'capture_recovery.dart';
 import 'finalize_progress.dart';
 import 'mux_sink.dart';
@@ -30,6 +32,7 @@ import '../workers/mux_worker.dart'
 import 'worker_mux_sink.dart';
 import 'container_utils.dart';
 import 'frame_pacer.dart';
+import 'packet_pts_ledger.dart';
 import 'gpu_screen_processor.dart';
 import 'recorder_log.dart';
 import 'recorder_sink.dart';
@@ -1846,26 +1849,47 @@ class Recorder {
     CameraRecorderSource cfg,
   ) async {
     var format = await MiniCamera.getDefaultFormat(cfg.deviceId);
-    if (cfg.width != null && cfg.height != null) {
-      // Pick the closest supported format if user requested specific dims.
+    double rateOf(MiniAVVideoInfo f) => f.frameRateDenominator == 0
+        ? 0
+        : f.frameRateNumerator / f.frameRateDenominator;
+    // How directly an encoder takes a format; null for one it cannot take.
+    // MJPEG frames are JPEG bytes, which only the Windows backend turns into
+    // raw frames (see below), so an MJPEG mode ranks last there and is out
+    // elsewhere.
+    int? rankOf(MiniAVPixelFormat pf) => switch (pf) {
+      MiniAVPixelFormat.nv12 => 0,
+      MiniAVPixelFormat.yuy2 => 1,
+      MiniAVPixelFormat.mjpeg => Platform.isWindows ? 3 : null,
+      _ => 2,
+    };
+    final wantSize = cfg.width != null && cfg.height != null;
+    MiniAVVideoInfo? best;
+    if (wantSize || cfg.fps != null) {
+      // The supported mode closest to the request. What the request leaves
+      // out comes from the default mode, so a size alone does not land on
+      // whichever rate the device happens to list first.
+      final targetWidth = wantSize ? cfg.width! : format.width;
+      final targetHeight = wantSize ? cfg.height! : format.height;
+      final targetFps = cfg.fps?.toDouble() ?? rateOf(format);
       final supported = await MiniCamera.getSupportedFormats(cfg.deviceId);
-      MiniAVVideoInfo? best;
       var bestScore = double.infinity;
+      var bestRank = 0;
       for (final f in supported) {
-        final dw = (f.width - cfg.width!).abs();
-        final dh = (f.height - cfg.height!).abs();
-        final df = cfg.fps != null
-            ? (f.frameRateNumerator / f.frameRateDenominator -
-                      cfg.fps!.toDouble())
-                  .abs()
-            : 0.0;
-        final score = dw + dh + df * 100;
-        if (score < bestScore) {
+        final rank = rankOf(f.pixelFormat);
+        if (rank == null) continue;
+        final score =
+            (f.width - targetWidth).abs() +
+            (f.height - targetHeight).abs() +
+            (rateOf(f) - targetFps).abs() * 100;
+        if (score < bestScore || (score == bestScore && rank < bestRank)) {
           bestScore = score;
+          bestRank = rank;
           best = f;
         }
       }
-      if (best != null) format = best;
+    }
+    if (best != null) {
+      format = best;
     } else if (cfg.fps != null) {
       format = MiniAVVideoInfo(
         width: format.width,
@@ -1873,6 +1897,18 @@ class Recorder {
         pixelFormat: format.pixelFormat,
         frameRateNumerator: cfg.fps!,
         frameRateDenominator: 1,
+        outputPreference: format.outputPreference,
+      );
+    }
+    if (format.pixelFormat == MiniAVPixelFormat.mjpeg && Platform.isWindows) {
+      // Asked for NV12 at a mode it offers only as MJPEG, the Windows backend
+      // decodes it.
+      format = MiniAVVideoInfo(
+        width: format.width,
+        height: format.height,
+        pixelFormat: MiniAVPixelFormat.nv12,
+        frameRateNumerator: format.frameRateNumerator,
+        frameRateDenominator: format.frameRateDenominator,
         outputPreference: format.outputPreference,
       );
     }
@@ -2001,6 +2037,7 @@ class Recorder {
       captureCtx: ctx,
       idleFramePolicy: cfg.idleFramePolicy,
       directD3d11Passthrough: directD3d11Passthrough,
+      rateWatch: CaptureRateWatch(nominalFps: rateOf(format)),
       startFn: (cb) => ctx.startCapture(cb),
       stopFn: () => ctx.stopCapture(),
       destroyFn: () => ctx.destroy(),
@@ -3365,6 +3402,7 @@ class VideoTrackRuntime extends TrackRuntime {
     this.lossPolicy = CaptureLossPolicy.reacquire,
     this.reacquireLimit,
     this.canRebuildStage = false,
+    this.rateWatch,
   });
 
   // ---- The STAGE: everything a GPU device reset destroys -----------------
@@ -3419,6 +3457,10 @@ class VideoTrackRuntime extends TrackRuntime {
   /// How long to keep re-acquiring before ending the track; null = for as
   /// long as the recording runs.
   final Duration? reacquireLimit;
+
+  /// Watches a source that delivers continuously (a camera) for running below
+  /// its configured rate; null for one that delivers on change (a screen).
+  final CaptureRateWatch? rateWatch;
 
   /// Whether [Recorder.rebuildVideoStage] will rebuild this track's whole GPU
   /// stage — the graphics device, the processor, the encoder and the capture
@@ -3549,7 +3591,22 @@ class VideoTrackRuntime extends TrackRuntime {
   bool _encoding = false;
   bool _stopping = false;
   bool _firstChunkSent = false;
+
+  /// PTS of the last frame SUBMITTED to the encoder (live or duplicate).
   int _lastVideoPtsUs = -1;
+
+  /// PTS of the last packet WRITTEN. Not [_lastVideoPtsUs]: an asynchronous
+  /// encoder holds two to four frames, so the two differ by that many.
+  int _lastWrittenPtsUs = -1;
+
+  /// Puts each frame's capture timestamp on the master clock and refuses
+  /// frames out of capture order. See [CaptureClock].
+  final CaptureClock _captureClock = CaptureClock();
+  bool _captureClockDistrustLogged = false;
+
+  /// Frames submitted to the encoder and still waiting for their packet. See
+  /// [PacketPtsLedger].
+  final PacketPtsLedger _ledger = PacketPtsLedger();
 
   // -------- Frame duplicator (zero-copy GPU path only) ------------------
   //
@@ -3673,6 +3730,17 @@ class VideoTrackRuntime extends TrackRuntime {
   // Duplicate frames emitted (idle fill + CFR backfill). Counted inside
   // _statsPacketsOut as well; shown separately as dup= when non-zero.
   int _statsDupFrames = 0;
+  // Capture-side timing from the source's own timestamps: the smallest and
+  // largest step between delivered frames (cap_dt=) and the worst delivery
+  // lag beyond the fastest one (lag<=). Uneven steps under even arrivals are
+  // what a capture thinned by back-pressure looks like.
+  int _statsCapDtMin = -1;
+  int _statsCapDtMax = -1;
+  int _statsLagMax = 0;
+  // Frames refused because they were captured before the previous one (ooo=).
+  int _statsOutOfOrder = 0;
+  // Ledger count already reported, so the stats line shows the window's own.
+  int _statsUnansweredLogged = 0;
   int _statsPacketsOut = 0;
   int _statsEncodeErrors = 0;
   int _statsMinPktBytes = 0x7fffffff;
@@ -3734,6 +3802,65 @@ class VideoTrackRuntime extends TrackRuntime {
       _statsEncUsSum += us;
       _statsEncSamples++;
       if (us > _statsEncUsMax) _statsEncUsMax = us;
+    }
+  }
+
+  /// The PTS to submit a frame due at [dueUs] under: strictly after the last
+  /// one submitted, even on sub-µs frame deltas.
+  int _nextSubmitPts(int dueUs) {
+    final ptsUs = dueUs <= _lastVideoPtsUs ? _lastVideoPtsUs + 1 : dueUs;
+    _lastVideoPtsUs = ptsUs;
+    return ptsUs;
+  }
+
+  /// Submits one frame stamped [ptsUs] and returns whatever packet the call
+  /// produced - from an asynchronous encoder, usually an EARLIER frame's.
+  /// [_write] pairs it with the frame it really encodes.
+  Future<EncodedPacket?> _submit(
+    int ptsUs,
+    Future<EncodedPacket?> Function() encode, {
+    bool timed = true,
+  }) async {
+    _ledger.submitted(ptsUs);
+    try {
+      return timed ? await _encStage(encode) : await encode();
+    } catch (_) {
+      _ledger.withdraw(ptsUs);
+      rethrow;
+    }
+  }
+
+  /// Writes [pkt], if there is one, under the PTS of the frame it encodes.
+  Future<void> _write(Recorder rec, EncodedPacket? pkt) async {
+    if (pkt == null) return;
+    _statsPacketsOut++;
+    _statsTotalPktBytes += pkt.data.length;
+    if (pkt.data.length < _statsMinPktBytes) {
+      _statsMinPktBytes = pkt.data.length;
+    }
+    if (pkt.data.length > _statsMaxPktBytes) {
+      _statsMaxPktBytes = pkt.data.length;
+    }
+    // Media Foundation's packets carry the time their frame was submitted
+    // with; FFmpeg's carry a submission index, so those pair by order.
+    var ptsUs =
+        _ledger.resolve(pkt.ptsUs, keyed: encoder.platform is MfVideoEncoder) ??
+        _lastWrittenPtsUs + 1;
+    if (ptsUs <= _lastWrittenPtsUs) ptsUs = _lastWrittenPtsUs + 1;
+    _lastWrittenPtsUs = ptsUs;
+    await rec.dispatchPacket(this, pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs));
+  }
+
+  /// A frame went out on a path that retains nothing for the duplicator, so
+  /// whatever IS retained now shows an older picture than the stream's last
+  /// frame. Duplicating it would put that older picture after the newer one:
+  /// the image jumping back. The next frame on a retaining path re-arms them.
+  void _dropDuplicatorSources() {
+    _lastSharedTex = null;
+    final stale = _lastDirectBuffer;
+    if (stale != null) {
+      _lastDirectBuffer = null;
+      releaseCaptureBuffer(stale);
     }
   }
 
@@ -3917,16 +4044,43 @@ class VideoTrackRuntime extends TrackRuntime {
         return;
       }
       _statsFramesIn++;
-      lastSourceFrameUs = rec.now();
+      final arrivalUs = rec.now();
+      lastSourceFrameUs = arrivalUs;
       final delivered = buffer.data;
       if (delivered is MiniAVVideoBuffer) {
         sourceWidth = delivered.width;
         sourceHeight = delivered.height;
       }
       _maybeLogStats();
-      // Wall-clock acceptance time. Used both for the pacer and, when the
-      // frame is accepted, as its capture timestamp (see [_PendingVideoFrame]).
-      final nowUs = rec.now();
+      // When the picture was CAPTURED, on the master clock - not when it got
+      // here, which trails capture by a latency that changes frame to frame.
+      // The pacer, the CFR slot and the PTS all key off it. See [CaptureClock].
+      final captureUs = _captureClock.stamp(buffer.timestampUs, arrivalUs);
+      final step = _captureClock.lastStepUs;
+      if (step >= 0) {
+        if (_statsCapDtMin < 0 || step < _statsCapDtMin) _statsCapDtMin = step;
+        if (step > _statsCapDtMax) _statsCapDtMax = step;
+      }
+      if (_captureClock.lastLagUs > _statsLagMax) {
+        _statsLagMax = _captureClock.lastLagUs;
+      }
+      if (_captureClock.distrusted && !_captureClockDistrustLogged) {
+        _captureClockDistrustLogged = true;
+        Recorder._log(
+          '$label capture timestamps do not keep time with the master clock; '
+          'stamping frames with their arrival time instead.',
+          RecorderLogLevel.warning,
+        );
+      }
+      if (captureUs == null) {
+        // Captured before a frame already accepted. Encoding it would put an
+        // older picture after a newer one: the image jumping back.
+        _statsOutOfOrder++;
+        releaseCaptureBuffer(buffer);
+        return;
+      }
+      final rateChange = rateWatch?.frame(captureUs);
+      if (rateChange != null) _logRateChange(rateChange);
       // Frame pacing (see [FramePacer]): in VFR mode the fps throttle engages
       // only when the source meaningfully outruns the target rate — a source
       // within ~15% of target (e.g. DXGI delivering ~31.4 fps against 30)
@@ -3939,7 +4093,7 @@ class VideoTrackRuntime extends TrackRuntime {
       // Audio sync is unaffected: both tracks use master-clock µs timestamps.
       final divisor = adaptiveGpuThrottle ? _gpuAdapt.divisor : 1;
       final wasThrottling = _pacer.throttleActive;
-      final drop = _pacer.shouldDropOnArrival(nowUs, divisor: divisor);
+      final drop = _pacer.shouldDropOnArrival(captureUs, divisor: divisor);
       if (_pacer.throttleActive != wasThrottling) {
         Recorder._log(
           _pacer.throttleActive
@@ -3962,7 +4116,7 @@ class VideoTrackRuntime extends TrackRuntime {
       // and let the serialized pump drain it. Only a SUSTAINED overrun (queue
       // already full) drops a frame, and then the OLDEST so the freshest frames
       // survive.
-      _frameQueue.add(_PendingVideoFrame(buffer, nowUs));
+      _frameQueue.add(_PendingVideoFrame(buffer, captureUs));
       if (_frameQueue.length > _maxQueueDepth) {
         final dropped = _frameQueue.removeAt(0);
         _statsBusyDropped++; // real back-pressure — encode can't keep up
@@ -4021,6 +4175,9 @@ class VideoTrackRuntime extends TrackRuntime {
       await destroyFn();
     } catch (_) {}
 
+    // The old encoder was closed without a flush: the frames it still held
+    // will never come back.
+    _ledger.abandon();
     encoder = fresh.encoder;
     processor = fresh.processor;
     captureCtx = fresh.captureCtx;
@@ -4311,35 +4468,23 @@ class VideoTrackRuntime extends TrackRuntime {
       // CFR: fill grid slots the capture missed with duplicates of the
       // PREVIOUS frame — must run before _lastSharedTex is updated below.
       await _emitBackfill(rec, claim.backfillPtsUs);
-      var ptsUs = claim.ptsUs;
-      if (ptsUs <= _lastVideoPtsUs) ptsUs = _lastVideoPtsUs + 1;
-      _lastVideoPtsUs = ptsUs;
+      final ptsUs = _nextSubmitPts(claim.ptsUs);
       final proc = processor!;
       final src = D3D11TextureFrameSource(
         texturePtr: ready.tex.d3d11TexturePtr,
         width: proc.outputWidth,
         height: proc.outputHeight,
         pixelFormat: MiniAVPixelFormat.rgba32,
+        timestampUs: ptsUs,
       );
-      final pkt = await _encStage(() => encoder.encode(src));
+      final pkt = await _submit(ptsUs, () => encoder.encode(src));
       // Retain as the duplicator source only AFTER the encode returns (see
       // _maybeDuplicateLast). The CFR idle filler treats a valid source as
       // proof it can fill the slot it is about to claim; a source whose encode
       // threw cannot fill one — repeatLastFrame has no last frame to repeat —
       // and the claimed slot would stay empty forever.
       _lastSharedTex = ready.tex;
-      if (pkt != null) {
-        _statsPacketsOut++;
-        _statsTotalPktBytes += pkt.data.length;
-        if (pkt.data.length < _statsMinPktBytes)
-          _statsMinPktBytes = pkt.data.length;
-        if (pkt.data.length > _statsMaxPktBytes)
-          _statsMaxPktBytes = pkt.data.length;
-        await rec.dispatchPacket(
-          this,
-          pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
-        );
-      }
+      await _write(rec, pkt);
     } catch (e, st) {
       _statsEncodeErrors++;
       encodeErrorsSincePacket++;
@@ -4353,6 +4498,28 @@ class VideoTrackRuntime extends TrackRuntime {
           RecorderLogLevel.error,
         );
       }
+    }
+  }
+
+  void _logRateChange(CaptureRateChange change) {
+    final watch = rateWatch!;
+    final nominal = watch.nominalFps.toStringAsFixed(
+      watch.nominalFps == watch.nominalFps.roundToDouble() ? 0 : 2,
+    );
+    final fps = watch.lastFps.toStringAsFixed(1);
+    if (change == CaptureRateChange.dropped) {
+      Recorder._log(
+        '$label is delivering $fps fps, not the $nominal it is set to. A '
+        'webcam does this in low light, exposing each frame for longer; the '
+        'recording repeats frames to fill the gaps, which shows as stutter. '
+        'More light on the scene restores the rate.',
+        RecorderLogLevel.warning,
+      );
+    } else {
+      Recorder._log(
+        '$label is back to $fps fps (set to $nominal).',
+        RecorderLogLevel.info,
+      );
     }
   }
 
@@ -4384,15 +4551,33 @@ class VideoTrackRuntime extends TrackRuntime {
         : '';
     final adaptStr = _gpuAdapt.divisor > 1 ? ' adapt=÷${_gpuAdapt.divisor}' : '';
     final dupStr = _statsDupFrames > 0 ? ' dup=${_statsDupFrames}' : '';
+    // Capture-side timing, from the source's own clock: the range of steps
+    // between frames it delivered, and the worst delivery lag. cap_dt that
+    // swings between one and three display refreshes means the capture is
+    // being thinned upstream of the recorder.
+    final capStr = _statsCapDtMin >= 0
+        ? ' cap_dt=${(_statsCapDtMin / 1000).toStringAsFixed(1)}'
+              '..${(_statsCapDtMax / 1000).toStringAsFixed(1)}ms'
+              ' lag<=${(_statsLagMax / 1000).toStringAsFixed(1)}ms'
+        : '';
+    final oooStr = _statsOutOfOrder > 0 ? ' ooo=$_statsOutOfOrder' : '';
+    final lost = _ledger.unanswered - _statsUnansweredLogged;
+    _statsUnansweredLogged = _ledger.unanswered;
+    final lostStr = lost > 0 ? ' enc_lost=$lost' : '';
     Recorder._log(
       '$label video stats over ${secs.toStringAsFixed(1)}s: '
       'in=${_statsFramesIn} (${(_statsFramesIn / secs).toStringAsFixed(1)} fps) '
       'thr_drop=${_statsThrottleDropped} busy_drop=${_statsBusyDropped} '
       'encoded=${_statsPacketsOut} '
       '(${(_statsPacketsOut / secs).toStringAsFixed(1)} fps) '
-      'pkt=$pktRange$gpuStr$encStr$adaptStr$dupStr$errStr',
+      'pkt=$pktRange$gpuStr$encStr$adaptStr$dupStr$capStr$oooStr$lostStr'
+      '$errStr',
     );
     _statsFramesIn = 0;
+    _statsCapDtMin = -1;
+    _statsCapDtMax = -1;
+    _statsLagMax = 0;
+    _statsOutOfOrder = 0;
     _statsThrottleDropped = 0;
     _statsBusyDropped = 0;
     _statsDupFrames = 0;
@@ -4428,9 +4613,9 @@ class VideoTrackRuntime extends TrackRuntime {
       // slot gets claimed and never filled. See [EncoderImportCache.noteFrame].
       if (_imports.noteFrame(buffer) >= 0) _lastSharedTex = null;
 
-      // PTS from the pacer: the capture-time timestamp recorded at enqueue in
-      // VFR mode (falling back to now() if the frame was encoded outside the
-      // queue), the claimed grid-slot time in CFR mode. This keeps PTS spacing
+      // PTS from the pacer: the frame's capture time (see [CaptureClock]) in
+      // VFR mode, falling back to now() if the frame was encoded outside the
+      // queue; the claimed grid-slot time in CFR mode. This keeps PTS spacing
       // stable even when the serialized encoder briefly stalls and then
       // drains several queued frames back-to-back.
       final claim = _pacer.claimPts(captureUs ?? rec.now());
@@ -4444,10 +4629,7 @@ class VideoTrackRuntime extends TrackRuntime {
       // PREVIOUS frame — must run before the branches below update the
       // retained duplicator sources (_lastDirectBuffer / _lastSharedTex).
       await _emitBackfill(rec, claim.backfillPtsUs);
-      var ptsUs = claim.ptsUs;
-      // Guarantee strict monotonic increase even on sub-µs frame deltas.
-      if (ptsUs <= _lastVideoPtsUs) ptsUs = _lastVideoPtsUs + 1;
-      _lastVideoPtsUs = ptsUs;
+      final ptsUs = _nextSubmitPts(claim.ptsUs);
 
       // --- Direct D3D11 passthrough (source-agnostic; no processor needed) ---
       // A GPU-handle frame that is already encoder-sized and whose encoder
@@ -4469,8 +4651,8 @@ class VideoTrackRuntime extends TrackRuntime {
         if (vb is MiniAVVideoBuffer &&
             vb.width == width &&
             vb.height == height) {
-          final src = FrameSource.miniavBuffer(buffer);
-          final pkt = await _encStage(() => encoder.encode(src));
+          final src = FrameSource.miniavBuffer(buffer, timestampUs: ptsUs);
+          final pkt = await _submit(ptsUs, () => encoder.encode(src));
           // Retain this frame as the duplicator's source and release the
           // previously retained one. The NT handle + capture-side texture stay
           // valid until the buffer is released.
@@ -4479,18 +4661,7 @@ class VideoTrackRuntime extends TrackRuntime {
           retainBuffer = true;
           _lastSharedTex = null; // direct frame supersedes any old texture
           if (prev != null) releaseCaptureBuffer(prev);
-          if (pkt != null) {
-            _statsPacketsOut++;
-            _statsTotalPktBytes += pkt.data.length;
-            if (pkt.data.length < _statsMinPktBytes)
-              _statsMinPktBytes = pkt.data.length;
-            if (pkt.data.length > _statsMaxPktBytes)
-              _statsMaxPktBytes = pkt.data.length;
-            await rec.dispatchPacket(
-              this,
-              pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
-            );
-          }
+          await _write(rec, pkt);
           return;
         }
         // Size mismatch → fall through to the processor rescale (screen); with
@@ -4511,7 +4682,8 @@ class VideoTrackRuntime extends TrackRuntime {
             // which we cannot import here (would create a circular dep).
             // Use dynamic dispatch — safe because processorGpuBuffer is only
             // ever set to true when encoder.platform.supportsGpuBufferInput=true.
-            final pkt = await _encStage(
+            final pkt = await _submit(
+              ptsUs,
               // ignore: avoid_dynamic_calls
               () async =>
                   await (encoder.platform as dynamic).encodeFromGpuBuffer(
@@ -4522,18 +4694,8 @@ class VideoTrackRuntime extends TrackRuntime {
                       )
                       as EncodedPacket?,
             );
-            if (pkt != null) {
-              _statsPacketsOut++;
-              _statsTotalPktBytes += pkt.data.length;
-              if (pkt.data.length < _statsMinPktBytes)
-                _statsMinPktBytes = pkt.data.length;
-              if (pkt.data.length > _statsMaxPktBytes)
-                _statsMaxPktBytes = pkt.data.length;
-              await rec.dispatchPacket(
-                this,
-                pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
-              );
-            }
+            _dropDuplicatorSources();
+            await _write(rec, pkt);
             return;
           }
           // processToGpuBuffer returned null — fall through to CPU path.
@@ -4569,8 +4731,9 @@ class VideoTrackRuntime extends TrackRuntime {
               width: proc.outputWidth,
               height: proc.outputHeight,
               pixelFormat: MiniAVPixelFormat.rgba32,
+              timestampUs: ptsUs,
             );
-            final pkt = await _encStage(() => encoder.encode(src));
+            final pkt = await _submit(ptsUs, () => encoder.encode(src));
             // Remember for the frame duplicator: when capture goes idle on a
             // static screen, the duplicator re-encodes this same texture at
             // the target frame rate so playback stays smooth.  The processor
@@ -4582,18 +4745,7 @@ class VideoTrackRuntime extends TrackRuntime {
             // texture the encoder rejected would leave that slot permanently
             // empty (repeatLastFrame has nothing to repeat).
             _lastSharedTex = sharedTex;
-            if (pkt != null) {
-              _statsPacketsOut++;
-              _statsTotalPktBytes += pkt.data.length;
-              if (pkt.data.length < _statsMinPktBytes)
-                _statsMinPktBytes = pkt.data.length;
-              if (pkt.data.length > _statsMaxPktBytes)
-                _statsMaxPktBytes = pkt.data.length;
-              await rec.dispatchPacket(
-                this,
-                pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
-              );
-            }
+            await _write(rec, pkt);
             return;
           }
           // GPU processor returned null (resource init failed, handle invalid,
@@ -4630,20 +4782,11 @@ class VideoTrackRuntime extends TrackRuntime {
                 vPlane: yuv.v,
                 width: yuv.width,
                 height: yuv.height,
+                timestampUs: ptsUs,
               );
-              final pkt = await _encStage(() => encoder.encode(src));
-              if (pkt != null) {
-                _statsPacketsOut++;
-                _statsTotalPktBytes += pkt.data.length;
-                if (pkt.data.length < _statsMinPktBytes)
-                  _statsMinPktBytes = pkt.data.length;
-                if (pkt.data.length > _statsMaxPktBytes)
-                  _statsMaxPktBytes = pkt.data.length;
-                await rec.dispatchPacket(
-                  this,
-                  pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
-                );
-              }
+              final pkt = await _submit(ptsUs, () => encoder.encode(src));
+              _dropDuplicatorSources();
+              await _write(rec, pkt);
               return;
             }
             // GPU YUV conversion failed — fall through to the RGBA read-back.
@@ -4657,20 +4800,11 @@ class VideoTrackRuntime extends TrackRuntime {
               pixelFormat: MiniAVPixelFormat.rgba32,
               width: proc.outputWidth,
               height: proc.outputHeight,
+              timestampUs: ptsUs,
             );
-            final pkt = await _encStage(() => encoder.encode(src));
-            if (pkt != null) {
-              _statsPacketsOut++;
-              _statsTotalPktBytes += pkt.data.length;
-              if (pkt.data.length < _statsMinPktBytes)
-                _statsMinPktBytes = pkt.data.length;
-              if (pkt.data.length > _statsMaxPktBytes)
-                _statsMaxPktBytes = pkt.data.length;
-              await rec.dispatchPacket(
-                this,
-                pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
-              );
-            }
+            final pkt = await _submit(ptsUs, () => encoder.encode(src));
+            _dropDuplicatorSources();
+            await _write(rec, pkt);
             return;
           }
           // processToBytes returned null — GPU import/dispatch failed (e.g.
@@ -4685,20 +4819,10 @@ class VideoTrackRuntime extends TrackRuntime {
       // Handles CPU buffers, D3D11 buffers when no GPU processor is
       // configured (processor == null), and the processToBytes() failure
       // fall-through above.
-      final src = FrameSource.miniavBuffer(buffer);
-      final pkt = await _encStage(() => encoder.encode(src));
-      if (pkt != null) {
-        _statsPacketsOut++;
-        _statsTotalPktBytes += pkt.data.length;
-        if (pkt.data.length < _statsMinPktBytes)
-          _statsMinPktBytes = pkt.data.length;
-        if (pkt.data.length > _statsMaxPktBytes)
-          _statsMaxPktBytes = pkt.data.length;
-        await rec.dispatchPacket(
-          this,
-          pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
-        );
-      }
+      final src = FrameSource.miniavBuffer(buffer, timestampUs: ptsUs);
+      final pkt = await _submit(ptsUs, () => encoder.encode(src));
+      _dropDuplicatorSources();
+      await _write(rec, pkt);
     } catch (e, st) {
       _statsEncodeErrors++;
       encodeErrorsSincePacket++;
@@ -4740,12 +4864,20 @@ class VideoTrackRuntime extends TrackRuntime {
 
   @override
   Future<void> flushAndDispatch(Recorder rec) async {
+    // The encoder's last few frames come back here. They keep the times
+    // they were captured at; stamping them with the time of the flush moved
+    // the end of every recording's video to the moment it stopped.
     final pkts = await encoder.flush();
     for (final p in pkts) {
-      var ptsUs = rec.now();
-      if (ptsUs <= _lastVideoPtsUs) ptsUs = _lastVideoPtsUs + 1;
-      _lastVideoPtsUs = ptsUs;
-      await rec.dispatchPacket(this, p.copyWith(ptsUs: ptsUs, dtsUs: ptsUs));
+      await _write(rec, p);
+    }
+    final lost = _ledger.abandon();
+    if (lost > 0) {
+      Recorder._log(
+        '$label encoder returned no packet for $lost submitted frame(s) '
+        '(${_ledger.unanswered} over the recording).',
+        RecorderLogLevel.info,
+      );
     }
   }
 
@@ -4766,6 +4898,14 @@ class VideoTrackRuntime extends TrackRuntime {
       }
       final tex = _lastSharedTex;
       if (tex != null && tex.isValid) {
+        // Pipelined, stage 1 runs while this backfill encodes, and with a
+        // two-deep output ring the texture it writes next is THIS one, the
+        // previous frame's. Re-reading it can pick up the NEXT picture and put
+        // it ahead of the live frame. Only an encoder that repeats its own
+        // copy fills the slot safely; otherwise the previous frame holds.
+        if (pipelinedZeroCopy && encoder.platform is! FrameRepeatingEncoder) {
+          break;
+        }
         await _encodeDuplicate(rec, tex, pts);
         continue;
       }
@@ -4841,7 +4981,13 @@ class VideoTrackRuntime extends TrackRuntime {
           nowUs - _lastVideoPtsUs < (intervalUs * 3) ~/ 2) {
         return;
       }
-      fillPtsUs = nowUs;
+      // One interval after the last frame, not "now". Live frames carry their
+      // CAPTURE time, which trails arrival, so a duplicate stamped with the
+      // timer's time can land after a live frame still on its way, and that
+      // frame would be clamped in behind its own duplicate. After a long gap
+      // the stamp moves up to one interval before now rather than falling
+      // further behind.
+      fillPtsUs = math.max(_lastVideoPtsUs + intervalUs, nowUs - intervalUs);
     }
     if (idleFramePolicy == VideoIdleFramePolicy.duplicate) {
       // Direct-passthrough mode retains the last live capture buffer instead
@@ -4890,12 +5036,10 @@ class VideoTrackRuntime extends TrackRuntime {
   Future<void> _encodeDuplicate(
     Recorder rec,
     SharedOutputTexture tex,
-    int nowUs,
+    int fillPtsUs,
   ) async {
     try {
-      var ptsUs = nowUs;
-      if (ptsUs <= _lastVideoPtsUs) ptsUs = _lastVideoPtsUs + 1;
-      _lastVideoPtsUs = ptsUs;
+      final ptsUs = _nextSubmitPts(fillPtsUs);
       // Prefer asking the encoder to repeat its last frame. A duplicate is the
       // same picture with a new timestamp, and expressing that by re-importing
       // the producer's texture makes it depend on a surface lifetime we do not
@@ -4903,32 +5047,29 @@ class VideoTrackRuntime extends TrackRuntime {
       // when that surface is most likely to have been recycled. It also fails
       // outright when there is no GPU processor writing the texture at all
       // (direct passthrough, gpuWork=false), which is a configuration where the
-      // duplicate has no business importing anything.
+      // duplicate has no business importing anything. The pipelined CFR
+      // backfill is the sharpest case: the producer is writing the next
+      // picture into that texture while the duplicate reads it.
       final platform = encoder.platform;
-      EncodedPacket? pkt;
-      if (platform is MfVideoEncoder) {
-        pkt = await platform.repeatLastFrame(ptsUs);
+      final EncodedPacket? pkt;
+      if (platform is FrameRepeatingEncoder) {
+        pkt = await _submit(
+          ptsUs,
+          () => platform.repeatLastFrame(ptsUs),
+          timed: false,
+        );
       } else {
-        pkt = await encoder.encode(D3D11TextureFrameSource(
+        final src = D3D11TextureFrameSource(
           texturePtr: tex.d3d11TexturePtr,
           width: tex.width,
           height: tex.height,
           pixelFormat: MiniAVPixelFormat.rgba32,
-        ));
-      }
-      if (pkt != null) {
-        _statsPacketsOut++;
-        _statsDupFrames++;
-        _statsTotalPktBytes += pkt.data.length;
-        if (pkt.data.length < _statsMinPktBytes)
-          _statsMinPktBytes = pkt.data.length;
-        if (pkt.data.length > _statsMaxPktBytes)
-          _statsMaxPktBytes = pkt.data.length;
-        await rec.dispatchPacket(
-          this,
-          pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
+          timestampUs: ptsUs,
         );
+        pkt = await _submit(ptsUs, () => encoder.encode(src), timed: false);
       }
+      _statsDupFrames++;
+      await _write(rec, pkt);
     } catch (e, st) {
       _statsEncodeErrors++;
       encodeErrorsSincePacket++;
@@ -4950,27 +5091,27 @@ class VideoTrackRuntime extends TrackRuntime {
   Future<void> _encodeDuplicateDirect(
     Recorder rec,
     MiniAVBuffer buf,
-    int nowUs,
+    int fillPtsUs,
   ) async {
     try {
-      var ptsUs = nowUs;
-      if (ptsUs <= _lastVideoPtsUs) ptsUs = _lastVideoPtsUs + 1;
-      _lastVideoPtsUs = ptsUs;
-      final src = FrameSource.miniavBuffer(buf);
-      final pkt = await encoder.encode(src);
-      if (pkt != null) {
-        _statsPacketsOut++;
-        _statsDupFrames++;
-        _statsTotalPktBytes += pkt.data.length;
-        if (pkt.data.length < _statsMinPktBytes)
-          _statsMinPktBytes = pkt.data.length;
-        if (pkt.data.length > _statsMaxPktBytes)
-          _statsMaxPktBytes = pkt.data.length;
-        await rec.dispatchPacket(
-          this,
-          pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
+      final ptsUs = _nextSubmitPts(fillPtsUs);
+      // Same picture, new time: an encoder that kept its own copy repeats it
+      // (see [_encodeDuplicate]); any other gets the retained buffer again,
+      // under the duplicate's own timestamp rather than the original's.
+      final platform = encoder.platform;
+      final EncodedPacket? pkt;
+      if (platform is FrameRepeatingEncoder) {
+        pkt = await _submit(
+          ptsUs,
+          () => platform.repeatLastFrame(ptsUs),
+          timed: false,
         );
+      } else {
+        final src = FrameSource.miniavBuffer(buf, timestampUs: ptsUs);
+        pkt = await _submit(ptsUs, () => encoder.encode(src), timed: false);
       }
+      _statsDupFrames++;
+      await _write(rec, pkt);
     } catch (e, st) {
       _statsEncodeErrors++;
       encodeErrorsSincePacket++;
@@ -5002,31 +5143,19 @@ class VideoTrackRuntime extends TrackRuntime {
     }
   }
 
-  Future<void> _encodeBlack(Recorder rec, int nowUs) async {
+  Future<void> _encodeBlack(Recorder rec, int fillPtsUs) async {
     try {
-      var ptsUs = nowUs;
-      if (ptsUs <= _lastVideoPtsUs) ptsUs = _lastVideoPtsUs + 1;
-      _lastVideoPtsUs = ptsUs;
+      final ptsUs = _nextSubmitPts(fillPtsUs);
       final src = FrameSource.cpu(
         bytes: _blackFrameData,
         pixelFormat: MiniAVPixelFormat.rgba32,
         width: width,
         height: height,
+        timestampUs: ptsUs,
       );
-      final pkt = await encoder.encode(src);
-      if (pkt != null) {
-        _statsPacketsOut++;
-        _statsDupFrames++;
-        _statsTotalPktBytes += pkt.data.length;
-        if (pkt.data.length < _statsMinPktBytes)
-          _statsMinPktBytes = pkt.data.length;
-        if (pkt.data.length > _statsMaxPktBytes)
-          _statsMaxPktBytes = pkt.data.length;
-        await rec.dispatchPacket(
-          this,
-          pkt.copyWith(ptsUs: ptsUs, dtsUs: ptsUs),
-        );
-      }
+      final pkt = await _submit(ptsUs, () => encoder.encode(src), timed: false);
+      _statsDupFrames++;
+      await _write(rec, pkt);
     } catch (e, st) {
       _statsEncodeErrors++;
       encodeErrorsSincePacket++;

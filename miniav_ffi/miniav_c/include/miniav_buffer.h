@@ -2,6 +2,7 @@
 #define MINIAV_BUFFER_H
 
 #include "miniav_types.h" // Includes the format enums now
+#include "export.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -108,12 +109,18 @@ typedef struct {
   // metal_shared_event is always NULL. Do not treat a NULL fence as "the GPU
   // is idle".
   //
-  // What the Windows backends do instead: before handing out the shared NT
-  // handle they insert a D3D11_QUERY_EVENT, Flush(), and CPU busy-poll it for
-  // at most ~16 ms. On timeout they log a rate-limited warning and hand the
-  // frame over ANYWAY — i.e. under GPU contention a consumer can receive a
-  // texture whose producer-side copy has not finished (torn/black frame).
-  // Consumers that need a hard guarantee must do their own synchronisation.
+  // What the Windows backends do instead: the producer waits for its own
+  // copy before the shared NT handle goes out. Windows Graphics Capture
+  // (window and display capture) and the Media Foundation camera signal an
+  // ID3D11Fence after the copy (an event query where the runtime has no
+  // fences) and wait at most 100 ms for it. A copy not complete by then is
+  // never shared: WGC drops the frame, and the camera delivers it as a CPU
+  // frame instead. DXGI Desktop Duplication still CPU busy-polls a
+  // D3D11_QUERY_EVENT for at most ~16 ms and on timeout logs a rate-limited
+  // warning and hands the frame over ANYWAY — i.e. under GPU contention a
+  // consumer of that backend can receive a texture whose producer-side copy
+  // has not finished (torn/black frame), and must do its own synchronisation
+  // if it needs a hard guarantee.
   // See NATIVE_AUDIT.md "P2 — Real fences instead of the poll".
   struct {
     int   sync_fd;             // Linux/Android: sync_file fd (-1 if none)
@@ -122,6 +129,36 @@ typedef struct {
     uint64_t metal_fence_value;// macOS/iOS: signaled value on metal_shared_event
   } native_fence;
 } MiniAVBuffer;
+
+// Optional screen-damage copy, with no changes to the public buffer layout.
+// The buffer must remain alive, with no concurrent release, throughout this call.
+// Returns 0 for uncertified/unsupported buffers. Otherwise returns the required
+// uint64_t word count; writes only if words != NULL and capacity is sufficient.
+// Words: source epoch, generation, width, height, full-frame (0/1), rectangle
+// count, then x/y/width/height per rectangle. A non-full changed set is never
+// empty. Generations number the frames DELIVERED in one epoch. Partial damage is
+// relative ONLY to the frame delivered just before (generation - 1) and already
+// includes changes from acquisitions that were never delivered. Missing metadata
+// or a generation gap requires full-frame work.
+MINIAV_API uint32_t MiniAV_VideoBuffer_CopyDamage(
+    const MiniAVBuffer *buffer, uint64_t *words, uint32_t capacity);
+
+typedef enum {
+  MINIAV_YUV_MATRIX_UNKNOWN = 0,
+  MINIAV_YUV_MATRIX_BT601 = 1,
+  MINIAV_YUV_MATRIX_BT709 = 2,
+  MINIAV_YUV_MATRIX_BT2020 = 3,
+} MiniAVYuvMatrix;
+
+// Optional colour of a YUV video buffer, with no changes to the public buffer
+// layout. Same lifetime rule as MiniAV_VideoBuffer_CopyDamage. Returns 0 when
+// the producer does not say (RGB formats, screen capture, backends that do not
+// report it yet) and writes nothing. Otherwise returns 1 and writes the
+// MiniAVYuvMatrix to *matrix and 1 (full, 0..255) or 0 (limited: luma 16..235,
+// chroma 16..240) to *full_range; either pointer may be NULL.
+MINIAV_API uint32_t MiniAV_VideoBuffer_GetColor(const MiniAVBuffer *buffer,
+                                                uint32_t *matrix,
+                                                uint32_t *full_range);
 
 typedef struct MiniAVNativeBufferInternalPayload {
   MiniAVNativeHandleType handle_type;

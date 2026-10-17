@@ -2,7 +2,7 @@
 /// added in ABI v12 to unblock QSV and MediaFoundation encoder init on Windows.
 ///
 /// Validates:
-///   1. [FfmpegShim.kExpectedAbiVersion] is 21 (v14 added the decoder
+///   1. [FfmpegShim.kExpectedAbiVersion] is 22 (v14 added the decoder
 ///      helpers: codec_set_extradata + frame audio field readers; v15 added
 ///      the demux byte pipe + open helpers + stream/par getters; v16 added
 ///      the mf_decoder.c hardware H.264/HEVC → D3D11 NV12 decode session;
@@ -14,7 +14,9 @@
 ///      `VideoTrackInfo.rotationDegrees`; v20 added
 ///      stream_set_rotation_degrees, its write side for the muxer; v21
 ///      added init_dart_api + set_log_port, moving av_log delivery off a
-///      process-global NativeCallable and onto a Dart native port).
+///      process-global NativeCallable and onto a Dart native port; v22 made
+///      d3d11_copy_resource report a dropped frame, and vp_bgra_to_nv12 return
+///      -8 / -9 for one, once their GPU waits became bounded).
 ///   2. On Windows with a loaded shim: [ensureMta] returns 0 (S_OK) or -1
 ///      (RPC_E_CHANGED_MODE — STA thread); never throws.
 ///   3. Calling [ensureMta] twice on the same thread is safe (idempotent in
@@ -31,8 +33,8 @@ import 'package:test/test.dart';
 
 void main() {
   group('FfmpegShim.ensureMta', () {
-    test('kExpectedAbiVersion is 21', () {
-      expect(FfmpegShim.kExpectedAbiVersion, equals(21));
+    test('kExpectedAbiVersion is 22', () {
+      expect(FfmpegShim.kExpectedAbiVersion, equals(22));
     });
 
     test('returns 0 on non-Windows (no-op)', () {

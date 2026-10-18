@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.2-WIP
+
+- Byte-stream demuxing (`DemuxerInput.byteStream`) frees its byte pipe only
+  once the worker isolate has exited. `close()` freed it as soon as the worker
+  was closed, possibly while the worker was still inside a read, and an open
+  that timed out on a stalled stream leaked it whenever the worker had not
+  answered within 2 seconds. `close()` now waits up to 2 seconds for the exit,
+  and a pipe whose worker never exits is leaked rather than freed under it.
+
 ## 0.6.1
 
 - Requires spawn ^0.1.2.

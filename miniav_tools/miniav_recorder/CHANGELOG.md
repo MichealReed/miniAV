@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.2
+
+- Version bump for the miniav_tools 0.6.2 family. No functional change in
+  this package.
+
 ## 0.6.1
 
 - Requires spawn ^0.1.2.

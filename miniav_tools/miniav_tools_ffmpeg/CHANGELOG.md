@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.2-WIP
+## 0.6.2
 
 - Byte-stream demuxing (`DemuxerInput.byteStream`) frees its byte pipe only
   once the worker isolate has exited. `close()` freed it as soon as the worker

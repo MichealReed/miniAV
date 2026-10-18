@@ -1,5 +1,9 @@
 import 'dart:typed_data';
 
+/// Windows-only immutable, producer-complete D3D11 snapshot provenance.
+/// Matches MINIAV_D3D11_IMMUTABLE_READY_TAG in the native buffer header.
+const int kMiniAVD3D11ImmutableReadyTag = 0x57474331;
+
 /// Platform-agnostic types for MiniAV platform interface.
 /// These are pure Dart types, not FFI structs.
 
@@ -70,6 +74,20 @@ enum MiniAVBufferContentType {
 
   /// Android: `nativeHandles[0]` is an `AHardwareBuffer*`.
   gpuAHardwareBuffer,
+
+  /// Web zero-copy: `nativeHandles[0]` is a WebCodecs **`VideoFrame`** — a JS
+  /// object, not an address, which is why it rides in `nativeHandles`
+  /// (`List<Object?>`) rather than as an integer like every other GPU variant.
+  /// `planes` is empty and `strideBytes` is empty: there are no CPU bytes, and
+  /// producing them is exactly the readback this content type exists to avoid.
+  ///
+  /// 🔴 **THE FRAME MUST BE CLOSED, AND `releaseBuffer` IS WHAT CLOSES IT.**
+  /// A `VideoFrame` pins a decoder/capture surface; the browser hands out only
+  /// a few at a time and a `MediaStreamTrackProcessor` whose frames are not
+  /// closed simply STOPS PRODUCING after its queue fills — no error, no event,
+  /// just silence. Treat this exactly like the Windows shared handle: consume
+  /// it, then release the buffer, and never keep it past the current turn.
+  gpuWebVideoFrame,
 }
 
 enum MiniAVLogLevel { none, trace, debug, info, warn, error }
@@ -109,6 +127,36 @@ typedef MiniAVDeviceChangeListener =
 /// Listener type for per-context device-lost events. The integer is a
 /// `MiniAVResultCode`-compatible reason code.
 typedef MiniAVContextLostListener = void Function(int reason);
+
+/// Where a capture MIRROR lives, in a form that can cross a thread.
+///
+/// See `MiniAudioInputContextPlatformInterface.openCaptureMirror`. The reader
+/// is `CaptureMirror` in `miniav_tools_platform_interface`, and the ring's
+/// layout is `MiniAV_Audio_SetCaptureMirror`'s in `miniav_c`.
+class MiniAVCaptureMirrorHandle {
+  const MiniAVCaptureMirrorHandle({
+    required this.memory,
+    required this.baseOffset,
+    required this.capacityFrames,
+    required this.channels,
+    required this.sampleRate,
+  });
+
+  /// The memory the ring is inside.
+  ///
+  /// 🔴 On web this is a `SharedArrayBuffer` — **SHARED BY CLONE, never
+  /// transferred**: putting one in a transfer list is a `DataCloneError`, and
+  /// sharing is the entire point. Typed as `Object` so this interface stays
+  /// free of `dart:js_interop`.
+  final Object memory;
+
+  /// Byte offset of the ring header within [memory].
+  final int baseOffset;
+
+  final int capacityFrames;
+  final int channels;
+  final int sampleRate;
+}
 
 class MiniAVVideoInfo {
   final int width;
@@ -210,6 +258,74 @@ class MiniAVBuffer {
   Object? get nativeHandle => _nativeHandle;
 }
 
+/// A conservative changed rectangle in the captured BGRA frame coordinates.
+class MiniAVDamageRect {
+  final int x;
+  final int y;
+  final int width;
+  final int height;
+
+  const MiniAVDamageRect({
+    required this.x,
+    required this.y,
+    required this.width,
+    required this.height,
+  });
+}
+
+/// Optional producer-certified screen damage for one completed snapshot.
+///
+/// Partial rectangles are usable only after the same source epoch's immediately
+/// preceding generation was consumed. A gap, changed dimensions, [fullFrame],
+/// or absent metadata requires processing the entire frame. Generations count
+/// delivered frames only: changes in captures that were never delivered are
+/// carried into the next delivered frame's rectangles. These rectangles never
+/// certify an empty changed set.
+class MiniAVVideoDamage {
+  final int sourceEpoch;
+  final int generation;
+  final int width;
+  final int height;
+  final bool fullFrame;
+  final List<MiniAVDamageRect> rectangles;
+
+  MiniAVVideoDamage({
+    required this.sourceEpoch,
+    required this.generation,
+    required this.width,
+    required this.height,
+    required this.fullFrame,
+    required List<MiniAVDamageRect> rectangles,
+  }) : rectangles = List.unmodifiable(rectangles);
+}
+
+/// The matrix that turns a YUV frame's samples into RGB.
+enum MiniAVYuvMatrix { bt601, bt709, bt2020 }
+
+/// How to turn a YUV frame into RGB, as its producer reports it.
+class MiniAVVideoColor {
+  final MiniAVYuvMatrix matrix;
+
+  /// Full range (0..255) when true; limited (luma 16..235, chroma 16..240)
+  /// when false.
+  final bool fullRange;
+
+  const MiniAVVideoColor({required this.matrix, required this.fullRange});
+
+  @override
+  bool operator ==(Object other) =>
+      other is MiniAVVideoColor &&
+      other.matrix == matrix &&
+      other.fullRange == fullRange;
+
+  @override
+  int get hashCode => Object.hash(matrix, fullRange);
+
+  @override
+  String toString() =>
+      'MiniAVVideoColor(${matrix.name}, ${fullRange ? 'full' : 'limited'})';
+}
+
 /// Video payload of a [MiniAVBuffer].
 ///
 /// **Use [MiniAVBuffer.contentType] — not [planes] — to tell the CPU and GPU
@@ -221,11 +337,23 @@ class MiniAVVideoBuffer {
   final int height;
   final MiniAVPixelFormat pixelFormat;
 
+  /// Optional screen damage copied while the native buffer was alive.
+  final MiniAVVideoDamage? damage;
+
+  /// The YUV matrix and range of this frame, or null when the producer does
+  /// not say: RGB formats, screen capture, and for now every camera backend
+  /// except Windows Media Foundation.
+  final MiniAVVideoColor? color;
+
   /// Row stride in bytes per plane. **0 on the GPU paths** (no CPU rows).
   final List<int> strideBytes;
 
   /// CPU pixel data per plane — only meaningful when
   /// `MiniAVBuffer.contentType == MiniAVBufferContentType.cpu`.
+  ///
+  /// Each plane spans its stride times its rows: half the rows, rounded up,
+  /// for the chroma planes of 4:2:0 formats. An MJPEG frame is one plane of
+  /// [MiniAVBuffer.dataSizeBytes].
   ///
   /// On the GPU paths these entries are non-null but EMPTY (length 0); read
   /// [nativeHandles] instead.
@@ -248,8 +376,22 @@ class MiniAVVideoBuffer {
   /// Per-plane DMA-BUF file descriptors (-1 if not applicable).
   final List<int> dmabufFds;
 
-  /// Per-plane DRM format modifiers (0 = LINEAR).
+  /// Per-plane DRM format modifiers on Linux (0 = LINEAR). Windows D3D11
+  /// plane 0 may carry [kMiniAVD3D11ImmutableReadyTag] instead.
   final List<int> drmFormatModifiers;
+
+  /// Whether this is a producer-complete immutable BGRA32 snapshot.
+  /// Only meaningful after the enclosing buffer's contentType has been checked
+  /// as gpuD3D11Handle. Untagged producers retain the conservative import path.
+  bool get d3d11ImmutableReady =>
+      pixelFormat == MiniAVPixelFormat.bgra32 &&
+      strideBytes.isNotEmpty &&
+      strideBytes.first == 0 &&
+      nativeHandles.isNotEmpty &&
+      nativeHandles.first is int &&
+      nativeHandles.first != 0 &&
+      drmFormatModifiers.isNotEmpty &&
+      drmFormatModifiers.first == kMiniAVD3D11ImmutableReadyTag;
 
   MiniAVVideoBuffer({
     required this.width,
@@ -260,6 +402,8 @@ class MiniAVVideoBuffer {
     this.nativeHandles = const [],
     this.dmabufFds = const [],
     this.drmFormatModifiers = const [],
+    this.damage,
+    this.color,
   });
 }
 

@@ -130,8 +130,13 @@ void main() {
       expect(findAll(mp4, 'ctts'), isEmpty);
     });
 
-    test('genuinely non-monotonic DTS is rejected, not silently mangled',
+    test('genuinely non-monotonic DTS is repaired and reported, not mangled',
         () async {
+      // This used to throw. It cannot: finish() runs over media that is
+      // already written in full, so refusing to build the index turns a
+      // recoverable file into ftyp+mdat with no moov — which no player opens.
+      // The requirement the throw was protecting is still enforced below: a
+      // negative delta must never reach the unsigned stts field.
       final m = Mp4Muxer.open(MuxerConfig(
         container: Container.mp4,
         output: MuxerOutput.bytes(),
@@ -142,7 +147,26 @@ void main() {
         await m.writePacket(
             EncodedPacket(data: _payload(t), ptsUs: t, dtsUs: t));
       }
-      await expectLater(m.finish(), throwsA(isA<CodecRuntimeException>()));
+      await m.finish();
+      final mp4 = Uint8List.fromList(m.getBytes()!);
+
+      // Not silent: the muxer says what it had to do, and to which track.
+      final r = m.timingReports.single;
+      expect(r.isClean, isFalse);
+      expect(r.outOfOrderPackets, 1);
+      expect(r.firstOutOfOrderSample, 2);
+      expect(r.repairedSamples, 1);
+
+      // Not mangled: every stts delta is a real duration, never a masked
+      // negative — the same assertion the reordering test above makes.
+      final stts = findAll(mp4, 'stts').single;
+      final d = ByteData.view(mp4.buffer);
+      final entries = d.getUint32(stts.payloadStart + 4, Endian.big);
+      for (var e = 0; e < entries; e++) {
+        final delta = d.getUint32(stts.payloadStart + 12 + e * 8, Endian.big);
+        expect(delta, lessThan(10000000),
+            reason: 'stts entry $e is $delta us — a negative delta got through');
+      }
       await m.close();
     });
   });

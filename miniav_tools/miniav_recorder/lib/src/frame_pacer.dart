@@ -197,13 +197,18 @@ class FramePacer {
 
   /// Idle-filler claim (CFR only): returns the PTS of the next unfilled grid
   /// slot iff its moment has passed far enough that no live frame can claim it
-  /// anymore (live frames claim their NEAREST slot, i.e. within ±half an
-  /// interval of the slot time), else null. VFR mode always returns null —
-  /// the caller keeps its wall-clock idle-fill behaviour there.
+  /// anymore, else null. VFR mode always returns null — the caller keeps its
+  /// wall-clock idle-fill behaviour there.
+  ///
+  /// A live frame claims its NEAREST slot, so its capture time is within half
+  /// an interval of the slot's. It is stamped with that capture time, though,
+  /// and gets here a delivery latency later, so the filler waits a further
+  /// half interval: a frame still on its way when the filler took its slot
+  /// would be dropped for a duplicate of the frame before it.
   int? claimIdleSlot(int nowUs) {
     if (!cfr || _baseUs < 0 || intervalUs <= 0) return null;
     final duePts = _slotPts(_nextSlot);
-    if (nowUs - duePts < (intervalUs + 1) ~/ 2) return null;
+    if (nowUs - duePts < intervalUs) return null;
     _nextSlot++;
     return duePts;
   }

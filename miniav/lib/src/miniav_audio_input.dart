@@ -65,4 +65,16 @@ class MiniAudioInputContext {
   /// unsubscribe.
   void Function() addLostListener(MiniAVContextLostListener listener) =>
       _context.addLostListener(listener);
+
+  /// Hand captured audio to another thread instead of to [startCapture]'s
+  /// callback. Null where the platform has no such thing — the caller's
+  /// fallback is the callback path, so this is a capability question, not an
+  /// error. See `MiniAudioInputContextPlatformInterface.openCaptureMirror`.
+  Future<MiniAVCaptureMirrorHandle?> openCaptureMirror({
+    int capacityFrames = 0,
+  }) =>
+      _context.openCaptureMirror(capacityFrames: capacityFrames);
+
+  /// Detach the mirror and resume the ordinary delivery path.
+  Future<void> closeCaptureMirror() => _context.closeCaptureMirror();
 }

@@ -11,6 +11,37 @@ extension _JSImageCaptureExt on _JSImageCapture {
   external JSPromise grabFrame();
 }
 
+/// Whether this browser can stream camera frames as WebCodecs `VideoFrame`s
+/// directly off the track. The best route: frame-accurate, with a drop-stale
+/// queue. Chrome has it; Firefox and Safari do not (as of writing).
+bool get _trackProcessorSupported =>
+    web.window.has('MediaStreamTrackProcessor');
+
+/// Whether this browser can construct a `VideoFrame` from an arbitrary image
+/// source — which includes the `<video>` element we already have.
+///
+/// 🔴 THIS IS WHAT MAKES THE GPU PATH NEARLY UNIVERSAL. The obvious fallback —
+/// importing the `HTMLVideoElement` straight into `importExternalTexture` — is
+/// a TRAP: an external texture built from a video element EXPIRES AT THE END OF
+/// THE CURRENT TASK, and the landing path awaits real GPU work, so the texture
+/// can die mid-use. Nothing can "hold the task open"; a task ends when the
+/// stack unwinds and the microtask checkpoint drains.
+///
+/// `new VideoFrame(videoElement, {timestamp})` sidesteps it completely: the
+/// result is an ordinary VideoFrame with explicit open/close lifetime, exactly
+/// like the track-processor path, so it composes with an async encoder.
+///
+/// And the coverage is effectively total, because WebGPU shipped LATER than
+/// WebCodecs in every engine (Chrome 113 vs 94, Safari 26 vs 16.4, Firefox 141
+/// vs 130). A browser that can use the GPU path at all can construct a
+/// VideoFrame — so the canvas readback below is a floor for correctness, not a
+/// path anyone with WebGPU is expected to land on.
+bool get _videoFrameCtorSupported => web.window.has('VideoFrame');
+
+/// Either zero-copy route.
+bool get _zeroCopySupported =>
+    _trackProcessorSupported || _videoFrameCtorSupported;
+
 /// Web implementation of [MiniCameraPlatformInterface]
 class MiniAVWebCameraPlatform implements MiniCameraPlatformInterface {
   @override
@@ -45,6 +76,15 @@ class MiniAVWebCameraPlatform implements MiniCameraPlatformInterface {
 
   @override
   Future<List<MiniAVVideoInfo>> getSupportedFormats(String deviceId) async {
+    // 🔴 ADVERTISE GPU WHEN THE BROWSER HAS IT. Every entry here hard-coded
+    // `cpu`, which is what a caller reads to decide whether a zero-copy path
+    // exists — so the honest answer used to be "there is none", and the SDK's
+    // capture ladder correctly built a single CPU rung even on a browser that
+    // could do better. `configure` re-checks and downgrades if the ask fails,
+    // so advertising this is a claim the code below actually honours.
+    final pref = _zeroCopySupported
+        ? MiniAVOutputPreference.gpu
+        : MiniAVOutputPreference.cpu;
     return [
       MiniAVVideoInfo(
         width: 640,
@@ -52,7 +92,7 @@ class MiniAVWebCameraPlatform implements MiniCameraPlatformInterface {
         pixelFormat: MiniAVPixelFormat.rgba32,
         frameRateNumerator: 30,
         frameRateDenominator: 1,
-        outputPreference: MiniAVOutputPreference.cpu,
+        outputPreference: pref,
       ),
       MiniAVVideoInfo(
         width: 1280,
@@ -60,7 +100,7 @@ class MiniAVWebCameraPlatform implements MiniCameraPlatformInterface {
         pixelFormat: MiniAVPixelFormat.rgba32,
         frameRateNumerator: 30,
         frameRateDenominator: 1,
-        outputPreference: MiniAVOutputPreference.cpu,
+        outputPreference: pref,
       ),
       MiniAVVideoInfo(
         width: 1920,
@@ -68,7 +108,7 @@ class MiniAVWebCameraPlatform implements MiniCameraPlatformInterface {
         pixelFormat: MiniAVPixelFormat.rgba32,
         frameRateNumerator: 30,
         frameRateDenominator: 1,
-        outputPreference: MiniAVOutputPreference.cpu,
+        outputPreference: pref,
       ),
     ];
   }
@@ -124,6 +164,19 @@ class MiniAVWebCameraContext implements MiniCameraContextPlatformInterface {
   int? _rafId;
   Timer? _fallbackTimer; // optional fallback
   MiniAVVideoInfo? _currentFormat;
+
+  /// ZERO-COPY MODE: deliver WebCodecs `VideoFrame`s straight from the track
+  /// instead of drawing to a canvas and reading the pixels back.
+  ///
+  /// 🔴 The canvas path costs a FULL-FRAME `getImageData` per frame — 3.7 MB at
+  /// 720p, ~110 MB/s at 30 fps, synchronously on the main thread, and the
+  /// browser itself complains about it (`willReadFrequently`). It exists
+  /// because it works everywhere; it is not the path to want when the consumer
+  /// is a GPU encoder that will only upload the pixels again.
+  bool _gpuMode = false;
+  web.ReadableStreamDefaultReader? _frameReader;
+  int? _rvfcId;
+
 
   // First-frame / warm-up
   bool _firstRealFrame = false;
@@ -210,13 +263,22 @@ class MiniAVWebCameraContext implements MiniCameraContextPlatformInterface {
         ..height = vh;
       _context = _canvas!.getContext('2d') as web.CanvasRenderingContext2D?;
 
+      // The GPU path is taken only if the CALLER asked for it and this
+      // browser has the API. Report back what was actually resolved, never
+      // what was requested — a caller that reads `gpu` here and gets canvas
+      // buffers would import garbage.
+      _gpuMode = format.outputPreference == MiniAVOutputPreference.gpu &&
+          _zeroCopySupported;
+
       _currentFormat = MiniAVVideoInfo(
         width: vw,
         height: vh,
         pixelFormat: MiniAVPixelFormat.rgba32,
         frameRateNumerator: format.frameRateNumerator,
         frameRateDenominator: format.frameRateDenominator,
-        outputPreference: MiniAVOutputPreference.cpu,
+        outputPreference: _gpuMode
+            ? MiniAVOutputPreference.gpu
+            : MiniAVOutputPreference.cpu,
       );
 
       _firstRealFrame = false;
@@ -228,8 +290,11 @@ class MiniAVWebCameraContext implements MiniCameraContextPlatformInterface {
         );
       }
 
-      // Prime attempts (draw a few times)
-      await _primeFirstFrame();
+      // Prime attempts (draw a few times) — CPU delivery only. The zero-copy
+      // pump reads frames off the TRACK and never looks at this canvas, so
+      // the prime would be eight synchronous `getImageData` readbacks (and
+      // ~300 ms of waits) spent on a picture nothing consumes.
+      if (!(_gpuMode && _trackProcessorSupported)) await _primeFirstFrame();
     } catch (e) {
       if (_debug) print('[MiniAV][camera][configure] ERROR: $e');
       throw Exception('Failed to configure camera: $e');
@@ -392,7 +457,235 @@ class MiniAVWebCameraContext implements MiniCameraContextPlatformInterface {
       );
     }
 
+    if (_gpuMode) {
+      if (_trackProcessorSupported) {
+        unawaited(_pumpVideoFrames(onData, userData));
+      } else {
+        _startVideoElementFrames(onData, userData);
+      }
+      return;
+    }
+
     // If still black after prime, allow capture loop to find first real frame.
+    void frameCb(num _) {
+      if (!_capturing) return;
+      _captureFrame(onData, userData);
+      _rafId = web.window.requestAnimationFrame(frameCb.toJS);
+    }
+
+    _rafId = web.window.requestAnimationFrame(frameCb.toJS);
+  }
+
+  /// ZERO-COPY CAPTURE: read `VideoFrame`s off the track and hand each one
+  /// straight to the consumer. No canvas, no `getImageData`, no pixels on the
+  /// CPU at all.
+  ///
+  /// 🔴 ONE FRAME IS IN FLIGHT AT A TIME, on purpose. `maxBufferSize: 1` tells
+  /// the browser to drop stale frames rather than queue them, which is the
+  /// behaviour a live encoder wants — a backlog here would show up as latency
+  /// that never recovers. The consumer must release each buffer (which closes
+  /// the frame) or the reader stops producing; see
+  /// [MiniAVBufferContentType.gpuWebVideoFrame].
+  Future<void> _pumpVideoFrames(
+    void Function(MiniAVBuffer buffer, Object? userData) onData,
+    Object? userData,
+  ) async {
+    final tracks = _mediaStream!.getVideoTracks().toDart;
+    if (tracks.isEmpty) {
+      _gpuMode = false;
+      return;
+    }
+    final web.ReadableStreamDefaultReader reader;
+    try {
+      final processor = web.MediaStreamTrackProcessor(
+        web.MediaStreamTrackProcessorInit(track: tracks.first, maxBufferSize: 1),
+      );
+      reader =
+          processor.readable.getReader() as web.ReadableStreamDefaultReader;
+    } catch (e) {
+      // Feature-detected above, so this is a browser that has the constructor
+      // and still refused. Not fatal and NOT silent: fall back to the canvas
+      // path rather than delivering nothing.
+      _gpuMode = false;
+      print('[MiniAV][camera] MediaStreamTrackProcessor failed ($e) — '
+          'falling back to the canvas readback path');
+      _startCanvasLoop(onData, userData);
+      return;
+    }
+    _frameReader = reader;
+
+    while (_capturing) {
+      final web.ReadableStreamReadResult result;
+      try {
+        result = await reader.read().toDart;
+      } catch (_) {
+        break; // reader cancelled by stopCapture, or the track ended
+      }
+      if (result.done) break;
+      final frame = result.value as web.VideoFrame?;
+      // 🔴 CLOSE IT EVEN ON THE WAY OUT. `read()` can return a frame in the
+      // same turn `stopCapture` clears `_capturing`, and breaking here without
+      // closing leaks exactly one frame per stop — which the browser reports
+      // as "A VideoFrame was garbage collected without being closed". The
+      // reader cancel below drops what is still QUEUED; this one is already
+      // ours.
+      if (!_capturing) {
+        frame?.close();
+        break;
+      }
+      if (frame == null) continue;
+
+      final w = frame.displayWidth;
+      final h = frame.displayHeight;
+      if (w > 0 && h > 0 && (w != _currentFormat!.width || h != _currentFormat!.height)) {
+        _currentFormat = MiniAVVideoInfo(
+          width: w,
+          height: h,
+          pixelFormat: _currentFormat!.pixelFormat,
+          frameRateNumerator: _currentFormat!.frameRateNumerator,
+          frameRateDenominator: _currentFormat!.frameRateDenominator,
+          outputPreference: MiniAVOutputPreference.gpu,
+        );
+      }
+
+      _frameCount++;
+      final videoBuffer = MiniAVVideoBuffer(
+        width: w,
+        height: h,
+        // The GPUExternalTexture the importer builds is opaque and handles YUV
+        // internally, so the frame's own layout never surfaces. rgba32 is what
+        // the consumer effectively sees.
+        pixelFormat: MiniAVPixelFormat.rgba32,
+        planes: const [],
+        strideBytes: const [],
+        nativeHandles: [frame],
+      );
+      onData(
+        MiniAVBuffer(
+          type: MiniAVBufferType.video,
+          contentType: MiniAVBufferContentType.gpuWebVideoFrame,
+          timestampUs: frame.timestamp.toInt(),
+          data: videoBuffer,
+          dataSizeBytes: 0,
+        ),
+        userData,
+      );
+    }
+
+    // Whoever is left holding a frame closes it; anything still queued in the
+    // reader is dropped with the cancel below.
+    try {
+      await reader.cancel().toDart;
+    } catch (_) {}
+    _frameReader = null;
+  }
+
+  /// ZERO-COPY CAPTURE, ROUTE 2: wrap each displayed video frame in a
+  /// `VideoFrame` and hand that over. No `MediaStreamTrackProcessor`, no
+  /// canvas, no pixel readback.
+  ///
+  /// Driven by `requestVideoFrameCallback` where it exists — it fires once per
+  /// COMPOSITED FRAME, so there is no guessing and no duplicate wrapping of a
+  /// frame the camera has not replaced yet. rAF is the floor when it does not:
+  /// it can wrap the same frame twice on a display faster than the camera,
+  /// which costs a redundant encode but is never wrong.
+  ///
+  /// 🔴 `timestamp` IS REQUIRED. `new VideoFrame(image, init)` throws a
+  /// TypeError without it for any source that is not already a VideoFrame —
+  /// an `<video>` element included.
+  void _startVideoElementFrames(
+    void Function(MiniAVBuffer buffer, Object? userData) onData,
+    Object? userData,
+  ) {
+    final el = _videoElement;
+    if (el == null) {
+      _gpuMode = false;
+      return;
+    }
+    final hasRvfc = (el as JSObject).has('requestVideoFrameCallback');
+
+    void emit(num nowMs) {
+      if (!_capturing || _videoElement == null) return;
+      if (_videoElement!.readyState < 2) return;
+      final w = _videoElement!.videoWidth;
+      final h = _videoElement!.videoHeight;
+      if (w <= 0 || h <= 0) return;
+
+      final web.VideoFrame frame;
+      try {
+        frame = web.VideoFrame(
+          _videoElement! as JSObject,
+          web.VideoFrameInit(timestamp: (nowMs * 1000).round()),
+        );
+      } catch (e) {
+        // The constructor exists but refused this source. Not fatal and not
+        // silent: drop to the canvas path rather than delivering nothing.
+        _gpuMode = false;
+        print('[MiniAV][camera] VideoFrame(<video>) failed ($e) — falling '
+            'back to the canvas readback path');
+        _startCanvasLoop(onData, userData);
+        return;
+      }
+
+      if (w != _currentFormat!.width || h != _currentFormat!.height) {
+        _currentFormat = MiniAVVideoInfo(
+          width: w,
+          height: h,
+          pixelFormat: _currentFormat!.pixelFormat,
+          frameRateNumerator: _currentFormat!.frameRateNumerator,
+          frameRateDenominator: _currentFormat!.frameRateDenominator,
+          outputPreference: MiniAVOutputPreference.gpu,
+        );
+      }
+
+      _frameCount++;
+      onData(
+        MiniAVBuffer(
+          type: MiniAVBufferType.video,
+          contentType: MiniAVBufferContentType.gpuWebVideoFrame,
+          timestampUs: frame.timestamp.toInt(),
+          data: MiniAVVideoBuffer(
+            width: w,
+            height: h,
+            pixelFormat: MiniAVPixelFormat.rgba32,
+            planes: const [],
+            strideBytes: const [],
+            nativeHandles: [frame],
+          ),
+          dataSizeBytes: 0,
+        ),
+        userData,
+      );
+    }
+
+    if (hasRvfc) {
+      void rvfc(JSNumber now, JSObject meta) {
+        if (!_capturing) return;
+        emit(now.toDartDouble);
+        if (_capturing && _gpuMode && _videoElement != null) {
+          _rvfcId = _videoElement!.requestVideoFrameCallback(rvfc.toJS);
+        }
+      }
+
+      _rvfcId = el.requestVideoFrameCallback(rvfc.toJS);
+      return;
+    }
+
+    void raf(num now) {
+      if (!_capturing) return;
+      emit(now);
+      if (_capturing && _gpuMode) {
+        _rafId = web.window.requestAnimationFrame(raf.toJS);
+      }
+    }
+
+    _rafId = web.window.requestAnimationFrame(raf.toJS);
+  }
+
+  void _startCanvasLoop(
+    void Function(MiniAVBuffer buffer, Object? userData) onData,
+    Object? userData,
+  ) {
     void frameCb(num _) {
       if (!_capturing) return;
       _captureFrame(onData, userData);
@@ -566,6 +859,19 @@ class MiniAVWebCameraContext implements MiniCameraContextPlatformInterface {
       web.window.cancelAnimationFrame(_rafId!);
       _rafId = null;
     }
+    if (_rvfcId != null) {
+      _videoElement?.cancelVideoFrameCallback(_rvfcId!);
+      _rvfcId = null;
+    }
+    // Unblocks the pump's pending `read()` so it can exit and cancel; without
+    // this the loop sits on a future that only the next frame would complete.
+    final reader = _frameReader;
+    _frameReader = null;
+    if (reader != null) {
+      try {
+        await reader.cancel().toDart;
+      } catch (_) {}
+    }
     _fallbackTimer?.cancel();
     _fallbackTimer = null;
   }
@@ -583,6 +889,7 @@ class MiniAVWebCameraContext implements MiniCameraContextPlatformInterface {
     _canvas = null;
     _context = null;
     _currentFormat = null;
+    _gpuMode = false;
     _firstRealFrame = false;
     _attemptedImageCapture = false;
     if (_debug) print('[MiniAV][camera][destroy]');

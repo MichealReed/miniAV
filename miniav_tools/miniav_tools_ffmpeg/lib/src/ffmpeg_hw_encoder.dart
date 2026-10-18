@@ -492,6 +492,10 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   int _nextPts = 0;
   CodecExtraData? _extraData;
   bool _forceKeyframe = false;
+
+  /// Packets taken from the encoder while making room for a frame, returned
+  /// by the following calls in order.
+  final List<EncodedPacket> _out = [];
   bool _loggedRescale = false;
 
   HwEncoderVendor get vendor => _spec.vendor;
@@ -873,14 +877,26 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
     f.pictType = _forceKeyframe ? 1 /* AV_PICTURE_TYPE_I */ : 0;
     _forceKeyframe = false;
 
-    final sendRet = _ff.avcodecSendFrame(_codecCtx, _frame);
-    if (sendRet < 0 && sendRet != kAvErrorEAgain) {
+    // Never drop the frame: EAGAIN means the encoder wants its output read
+    // first, so the waiting packets are taken into [_out] and the frame is
+    // sent again. Swallowing EAGAIN lost the frame without a word, and every
+    // later packet then belonged to a different frame than the caller thought.
+    var sendRet = _ff.avcodecSendFrame(_codecCtx, _frame);
+    if (sendRet == kAvErrorEAgain) {
+      while (true) {
+        final pkt = _drainOne();
+        if (pkt == null) break;
+        _out.add(pkt);
+      }
+      sendRet = _ff.avcodecSendFrame(_codecCtx, _frame);
+    }
+    if (sendRet < 0) {
       throw CodecRuntimeException(
         'ffmpeg-hw',
         'avcodec_send_frame: ${_ff.strError(sendRet)} ($sendRet)',
       );
     }
-    return _drainOne();
+    return _takePacket();
   }
 
   void _copyPackedRgb(AVFrame f, _PreparedRgba src) {
@@ -948,7 +964,8 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
         'avcodec_send_frame(NULL): ${_ff.strError(ret)}',
       );
     }
-    final out = <EncodedPacket>[];
+    final out = <EncodedPacket>[..._out];
+    _out.clear();
     while (true) {
       final pkt = _drainOne();
       if (pkt == null) break;
@@ -975,6 +992,7 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    _out.clear();
     // Release GPU compute rescale resources.
     _gpuScaleShader?.destroy();
     _gpuScaleShader = null;
@@ -1024,6 +1042,14 @@ class FfmpegHwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
       _ff.avcodecParametersFree(pp);
       calloc.free(pp);
     }
+  }
+
+  /// The oldest packet taken so far, after reading at most one more from the
+  /// encoder: one frame in, one packet out per call.
+  EncodedPacket? _takePacket() {
+    final pkt = _drainOne();
+    if (pkt != null) _out.add(pkt);
+    return _out.isEmpty ? null : _out.removeAt(0);
   }
 
   EncodedPacket? _drainOne() {

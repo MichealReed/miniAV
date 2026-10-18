@@ -34,4 +34,12 @@ export 'package:miniav_platform_interface/miniav_platform_types.dart'
         MiniAVNativeFence;
 export 'src/audio_ring/shared_audio_ring.dart'
     show SharedAudioRing, kControlSlots, kDataOffsetBytes;
+// The cursor primitives, for a SECOND ring with a layout of its own: miniAV's
+// capture mirror, whose header is defined in C. Exported rather than
+// duplicated because the ORDERING argument (an acquire load, so the samples a
+// cursor advertises are actually visible) is the part worth having in one
+// place — see `ring_sync_web.dart`.
+export 'src/audio_ring/ring_sync_stub.dart'
+    if (dart.library.js_interop) 'src/audio_ring/ring_sync_web.dart'
+    show loadCursorU32, hasAtomics, isSharedBuffer, bufferFromShareable;
 export 'src/demux_protocol.dart';

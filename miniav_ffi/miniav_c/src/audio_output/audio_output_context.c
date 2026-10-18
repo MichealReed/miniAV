@@ -154,9 +154,12 @@ MiniAV_AudioOutput_GetDefaultFormat(const char *device_id,
   if (!format_out)
     return MINIAV_ERROR_INVALID_ARG;
   memset(format_out, 0, sizeof(MiniAVAudioInfo));
-  MINIAV_UNUSED(device_id);
 
-  // Query the default playback device's native format when possible.
+  // Query the NAMED device's native format when a device_id is given (it is
+  // the device name — the same portable-id convention Configure resolves),
+  // else the system default. This used to ignore device_id outright while
+  // the interface promised "for a device" — the caller asking about their
+  // surround receiver got the laptop speakers' answer.
   ma_context ma_ctx;
   // miniaudio's WASAPI backend runs CoInitializeEx on the thread that inits a
   // ma_context and CoUninitialize on whichever thread uninits it — under Dart
@@ -164,8 +167,33 @@ MiniAV_AudioOutput_GetDefaultFormat(const char *device_id,
   // makes that mismatch survivable instead of tearing the apartment down.
   MINIAV_COM_ENSURE_MTA();
   if (ma_context_init(NULL, 0, NULL, &ma_ctx) == MA_SUCCESS) {
+    ma_device_id resolved_id;
+    ma_bool32 have_id = MA_FALSE;
+    if (device_id && device_id[0] != '\0') {
+      ma_device_info *playback_infos;
+      ma_uint32 playback_count;
+      if (ma_context_get_devices(&ma_ctx, &playback_infos, &playback_count,
+                                 NULL, NULL) == MA_SUCCESS) {
+        for (ma_uint32 i = 0; i < playback_count; ++i) {
+          if (strcmp(playback_infos[i].name, device_id) == 0) {
+            resolved_id = playback_infos[i].id;
+            have_id = MA_TRUE;
+            break;
+          }
+        }
+      }
+      if (!have_id) {
+        // Same policy as Configure: an unmatched name falls back to the
+        // default, loudly enough to notice in a log.
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "AudioOutput: GetDefaultFormat device '%s' not found — "
+                   "answering for the system default.",
+                   device_id);
+      }
+    }
     ma_device_info info;
-    if (ma_context_get_device_info(&ma_ctx, ma_device_type_playback, NULL,
+    if (ma_context_get_device_info(&ma_ctx, ma_device_type_playback,
+                                   have_id ? &resolved_id : NULL,
                                    &info) == MA_SUCCESS &&
         info.nativeDataFormatCount > 0) {
       ma_format mf = info.nativeDataFormats[0].format;
@@ -242,6 +270,10 @@ MiniAVResultCode MiniAV_AudioOutput_Configure(
   ma_device_id playback_id;
   ma_bool32 have_playback_id = MA_FALSE;
   if (device_id && device_id[0] != '\0') {
+    // Did we get a TRUSTWORTHY device list? "Enumerated fine, no such name"
+    // and "could not enumerate at all" look identical from have_playback_id
+    // alone, and they deserve opposite answers — see the refusal below.
+    ma_bool32 enumerated = MA_FALSE;
     ma_context tmp_ctx;
     // miniaudio's WASAPI backend runs CoInitializeEx on the thread that inits a
     // ma_context and CoUninitialize on whichever thread uninits it — under Dart
@@ -253,6 +285,7 @@ MiniAVResultCode MiniAV_AudioOutput_Configure(
       ma_uint32 playback_count = 0;
       if (ma_context_get_devices(&tmp_ctx, &playback_infos, &playback_count, NULL,
                                  NULL) == MA_SUCCESS) {
+        enumerated = MA_TRUE;
         for (ma_uint32 i = 0; i < playback_count; ++i) {
           if (strcmp(playback_infos[i].name, device_id) == 0) {
             playback_id = playback_infos[i].id;
@@ -266,10 +299,30 @@ MiniAVResultCode MiniAV_AudioOutput_Configure(
     if (have_playback_id) {
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "AudioOutput: selected playback device '%s'.", device_id);
+    } else if (enumerated) {
+      // A NAMED DEVICE THAT DOES NOT EXIST IS AN ERROR, NOT A SUGGESTION.
+      //
+      // This used to open the system default and return success, which is a
+      // lie the caller cannot detect: they asked for headphones, they got the
+      // speakers, and every layer above reported the route as working. It was
+      // reported as "my audio monitor won't change to my headset, it stays
+      // through my speakers" — two output streams silently opened on the same
+      // endpoint. A caller that genuinely wants the default has always been
+      // able to say so by passing an empty device_id, and one that wants a
+      // fallback can retry with it; neither is possible if we decide here.
+      //
+      // Only when the enumeration itself SUCCEEDED: a transient COM failure
+      // must not be reported as "no such device" (it keeps the old fallback
+      // below, since we cannot prove absence without a list).
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "AudioOutput: playback device '%s' not found. Refusing rather "
+                 "than silently opening the system default.",
+                 device_id);
+      return MINIAV_ERROR_DEVICE_NOT_FOUND;
     } else {
       miniav_log(MINIAV_LOG_LEVEL_WARN,
-                 "AudioOutput: playback device '%s' not found — using system "
-                 "default.",
+                 "AudioOutput: could not enumerate playback devices while "
+                 "resolving '%s' — using system default.",
                  device_id);
     }
   }

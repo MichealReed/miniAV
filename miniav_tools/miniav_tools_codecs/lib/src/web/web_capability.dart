@@ -38,6 +38,18 @@ external JSAny? get _navigatorGpu;
 abstract final class WebCapability {
   WebCapability._();
 
+  /// dart2wasm internalizes JavaScript `undefined` as Dart `null`, so calling
+  /// `JSAny.isUndefined` there throws by design. dart2js can still expose an
+  /// explicit JS-undefined value, which is why the guarded check remains.
+  static bool _present(JSAny? value) {
+    if (value == null) return false;
+    try {
+      return !value.isUndefined;
+    } on UnimplementedError {
+      return true;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Synchronous feature flags
   // ---------------------------------------------------------------------------
@@ -46,32 +58,27 @@ abstract final class WebCapability {
   ///
   /// Supported: Chrome 94+, Safari 16.4+, Firefox 130+.
   static bool get hasVideoEncoder {
-    final v = _videoEncoderCtor;
-    return v != null && !v.isUndefined;
+    return _present(_videoEncoderCtor);
   }
 
   /// True when the WebCodecs [VideoDecoder] API is present.
   static bool get hasVideoDecoder {
-    final v = _videoDecoderCtor;
-    return v != null && !v.isUndefined;
+    return _present(_videoDecoderCtor);
   }
 
   /// True when the WebCodecs [AudioEncoder] API is present.
   static bool get hasAudioEncoder {
-    final v = _audioEncoderCtor;
-    return v != null && !v.isUndefined;
+    return _present(_audioEncoderCtor);
   }
 
   /// True when the WebCodecs [AudioDecoder] API is present.
   static bool get hasAudioDecoder {
-    final v = _audioDecoderCtor;
-    return v != null && !v.isUndefined;
+    return _present(_audioDecoderCtor);
   }
 
   /// True when the [MediaRecorder] API is present (universal baseline fallback).
   static bool get hasMediaRecorder {
-    final v = _mediaRecorderCtor;
-    return v != null && !v.isUndefined;
+    return _present(_mediaRecorderCtor);
   }
 
   /// True when WebGPU (`navigator.gpu`) is available.
@@ -79,14 +86,12 @@ abstract final class WebCapability {
   /// Requires Chrome 113+, Edge 113+ (or earlier with `--enable-unsafe-webgpu`).
   /// Firefox and Safari do not yet ship WebGPU unconditionally.
   static bool get hasWebGPU {
-    final v = _navigatorGpu;
-    return v != null && !v.isUndefined;
+    return _present(_navigatorGpu);
   }
 
   /// True when `OffscreenCanvas` is available (needed for CPU→VideoFrame conversion).
   static bool get hasOffscreenCanvas {
-    final v = _offscreenCanvasCtor;
-    return v != null && !v.isUndefined;
+    return _present(_offscreenCanvasCtor);
   }
 
   // ---------------------------------------------------------------------------

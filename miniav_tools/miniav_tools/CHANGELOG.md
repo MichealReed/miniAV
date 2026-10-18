@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.1
+
+- Version bump for the miniav_tools 0.6.1 family. No functional change in
+  this package.
+
+## 0.6.0
+
+- Requires miniav_platform_interface 0.8.0 and
+  miniav_tools_platform_interface 0.6.0. No other changes.
+
+## 0.5.9
+
+- Requires spawn ^0.1.1: native transfers actually transfer, and a web message
+  the worker cannot deserialize is reported instead of vanishing.
+
+## 0.5.8
+
+- Increment downstream deps
+
+## 0.5.7
+
+- New `Muxer.platform`, like `AudioEncoder.platform`, for backend-specific
+  diagnostics such as `Mp4Muxer.timingReports`.
+
 ## 0.5.6
 
 - Version bump so the dependency on miniav_tools_platform_interface can move
@@ -7,29 +31,22 @@
 
 ## 0.5.5
 
-- Declare `miniav_platform_interface` as a direct dependency. It was imported
-  directly (`AudioEncoder` uses `miniav_platform_types`) but resolved only
-  through `miniav_tools_platform_interface`'s own dependency — working by luck,
-  and breaking the moment that transitive edge changes. `dart pub publish`
-  flags this as an error.
+- Declares `miniav_platform_interface` as a direct dependency; it was imported
+  directly but resolved only through another package's dependency.
 
 ## 0.5.4
 
-- **Internal pins are now caret ranges, not exact versions.** Exact pins made
-  every patch cascade: publishing `miniav_tools_platform_interface` 0.5.3 made
-  the already-published `miniav_tools` 0.5.3 and `miniav_tools_ffmpeg` 0.5.3
-  unsatisfiable next to it, because they pinned 0.5.2 exactly and nothing in the
-  set could move independently. `dart pub publish` warns about this. `release.py
-  sync` now normalises to caret so it cannot recur.
-- Republished: 0.5.3 shipped pinning `miniav_tools_platform_interface: 0.5.2`,
-  which cannot resolve alongside any package needing 0.5.3.
+- Internal dependencies are caret ranges instead of exact pins, which made each
+  patch release unsatisfiable next to already-published packages.
+- Republished: 0.5.3 pinned `miniav_tools_platform_interface: 0.5.2` exactly and
+  could not resolve next to packages needing 0.5.3.
 
 ## 0.5.3
 
-- `MiniAVTools.createAudioDecoder` + `AudioDecoder` facade wrapper
-  (routes by `supportsAudioDecode`, mirrors `createAudioEncoder`).
-- `Demuxer` facade exposes `durationUs` / `isSeekable`; `seek` documents that
-  it throws on non-seekable (live) inputs.
+- `MiniAVTools.createAudioDecoder` and an `AudioDecoder` facade, routed by
+  `supportsAudioDecode` like `createAudioEncoder`.
+- The `Demuxer` facade exposes `durationUs` and `isSeekable`; `seek` throws on
+  non-seekable (live) inputs.
 
 ## 0.5.2
 
@@ -37,7 +54,8 @@
 
 ## 0.5.0
 
-- Version bump to keep the miniav_tools family in lockstep; no changes in this package.
+- Version bump to keep the miniav_tools family in lockstep; no changes in this
+  package.
 
 ## 0.4.10
 
@@ -173,9 +191,11 @@
 
 ## 0.2.7
 
-- fix FormatException on non-UTF-8 bytes in MiniAV log callback: use Utf8Decoder(allowMalformed: true) instead of toDartString()
+- Fix a FormatException on non-UTF-8 bytes in the MiniAV log callback.
 - Increment minigpu to 1.4.4
-- add RecorderLogSource.minigpu: routes native minigpu/Dawn log lines through the unified Recorder log callback; Recorder.minigpuLevelFor public helper for tests; 12 new tests in log_level_test.dart
+- Add `RecorderLogSource.minigpu`, routing native minigpu/Dawn log lines through
+  the unified `Recorder` log callback, and the public `Recorder.minigpuLevelFor`
+  helper.
 
 ## 0.2.5
 
@@ -183,7 +203,8 @@
 
 ## 0.2.3
 
-- add unified Recorder.setLogLevel and Recorder.setLogCallback routing all native logs (MiniAV + FFmpeg) through a single Dart callback
+- add unified Recorder.setLogLevel and Recorder.setLogCallback routing all
+  native logs (MiniAV + FFmpeg) through a single Dart callback
 
 ## 0.2.1
 

@@ -20,6 +20,13 @@ void storeCursor(Int32List control, int index, int value) =>
 /// Whether cursor access is genuinely atomic here.
 bool get hasAtomics => false;
 
+/// Reads a `uint32` cursor.
+///
+/// Separate from [loadCursor] because the ring miniAV's capture MIRROR uses
+/// declares its cursors `uint32` in C, and a `Uint32List` is what reads them
+/// back without a sign fold at 2^31.
+int loadCursorU32(Uint32List control, int index) => control[index];
+
 /// Allocates the ring's backing store.
 ///
 /// Off-web there is no `SharedArrayBuffer`, so this is an ordinary buffer.

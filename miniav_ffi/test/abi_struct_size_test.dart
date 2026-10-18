@@ -16,6 +16,7 @@ import 'dart:ffi' as ffi;
 
 import 'package:ffi/ffi.dart';
 import 'package:miniav_ffi/miniav_ffi_bindings.dart' as bindings;
+import 'package:miniav_ffi/miniav_ffi_windows_strict_screen.dart' as strict;
 import 'package:test/test.dart';
 
 /// Dart's sizeOf for every struct named in the C ABI table.
@@ -45,6 +46,7 @@ final Map<String, int> dartStructSizes = {
   'MiniAVBuffer.data': ffi.sizeOf<bindings.UnnamedUnion2>(),
   'MiniAVBuffer.data.video': ffi.sizeOf<bindings.UnnamedStruct1>(),
   'MiniAVBuffer.data.audio': ffi.sizeOf<bindings.UnnamedStruct2>(),
+  ...strict.miniavWindowsStrictRecordSizes,
 };
 
 int cSizeOf(String name) {

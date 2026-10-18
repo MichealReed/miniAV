@@ -86,6 +86,18 @@ class MiniScreenContext {
     Object? userData,
   }) => _context.startCapture(onFrame, userData: userData);
 
+  /// Retain the current source while switching to CPU frame delivery where
+  /// supported. In particular, browsers must not reopen the screen picker.
+  Future<bool> fallbackToCpuDelivery() => _context.fallbackToCpuDelivery();
+
+  /// Change cadence on the selected source without another browser picker.
+  Future<bool> setCaptureFrameRate(int fps) => _context.setCaptureFrameRate(fps);
+
+  void setContentHint(String hint) => _context.setContentHint(hint);
+
+  /// Backend-owned surface updated by CPU delivery, if one is available.
+  Object? get cpuDeliverySurface => _context.cpuDeliverySurface;
+
   /// Stop screen capture
   Future<void> stopCapture() => _context.stopCapture();
 

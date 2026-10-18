@@ -47,6 +47,18 @@ extern MiniAVResultCode
 miniav_screen_context_platform_init_macos_cg(MiniAVScreenContext *ctx);
 #endif
 
+uint32_t MiniAV_VideoBuffer_CopyDamage(const MiniAVBuffer *buffer,
+                                     uint64_t *words, uint32_t capacity) {
+#if defined(_WIN32) && defined(MINIAV_BACKEND_WIN_DXGI_ENABLED)
+  return miniav_dxgi_copy_damage(buffer, words, capacity);
+#else
+  MINIAV_UNUSED(buffer);
+  MINIAV_UNUSED(words);
+  MINIAV_UNUSED(capacity);
+  return 0;
+#endif
+}
+
 // --- Backend Table ---
 // Order matters here for default preference.
 // For Windows, WGC is listed first to make it the default.
@@ -176,6 +188,20 @@ MiniAVResultCode MiniAV_Screen_DestroyContext(MiniAVScreenContext *ctx) {
   if (!ctx) {
     return MINIAV_ERROR_INVALID_ARG;
   }
+
+#if defined(_WIN32) && defined(MINIAV_BACKEND_WIN_WGC_ENABLED)
+  if (ctx->strict_control_owner) {
+    return MiniAV_Screen_Windows_ReleaseFundedControlV1(ctx);
+  }
+  if (miniav_wgc_context_is_strict(ctx)) {
+    // Public Destroy is exclusive: the owner must first stop, observe actual
+    // retirement and drain its calls. Any failure retains BOTH raw contexts.
+    const MiniAVResultCode result = ctx->ops->destroy_platform(ctx);
+    if (result != MINIAV_SUCCESS) return result;
+    miniav_free(ctx);
+    return MINIAV_SUCCESS;
+  }
+#endif
 
   miniav_log(MINIAV_LOG_LEVEL_INFO, "Destroying screen context...");
   if (ctx->is_running) {
@@ -342,6 +368,12 @@ MiniAVResultCode MiniAV_Screen_ConfigureDisplay(MiniAVScreenContext *ctx,
       !format) {
     return MINIAV_ERROR_INVALID_ARG;
   }
+#if defined(_WIN32) && defined(MINIAV_BACKEND_WIN_WGC_ENABLED)
+  if (ctx->ops == &g_screen_ops_win_wgc) {
+    MiniAVResultCode claim = miniav_wgc_generic_configuration(ctx);
+    if (claim != MINIAV_SUCCESS) return claim;
+  }
+#endif
   if (ctx->is_running) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "Cannot configure display while capture is running.");
@@ -374,6 +406,12 @@ MiniAVResultCode MiniAV_Screen_ConfigureWindow(MiniAVScreenContext *ctx,
       !format) {
     return MINIAV_ERROR_INVALID_ARG;
   }
+#if defined(_WIN32) && defined(MINIAV_BACKEND_WIN_WGC_ENABLED)
+  if (ctx->ops == &g_screen_ops_win_wgc) {
+    MiniAVResultCode claim = miniav_wgc_generic_configuration(ctx);
+    if (claim != MINIAV_SUCCESS) return claim;
+  }
+#endif
   if (ctx->is_running) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "Cannot configure window while capture is running.");
@@ -405,6 +443,12 @@ MiniAVResultCode MiniAV_Screen_ConfigureRegion(MiniAVScreenContext *ctx,
       !format || width <= 0 || height <= 0) {
     return MINIAV_ERROR_INVALID_ARG;
   }
+#if defined(_WIN32) && defined(MINIAV_BACKEND_WIN_WGC_ENABLED)
+  if (ctx->ops == &g_screen_ops_win_wgc) {
+    MiniAVResultCode claim = miniav_wgc_generic_configuration(ctx);
+    if (claim != MINIAV_SUCCESS) return claim;
+  }
+#endif
   if (ctx->is_running) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "Cannot configure region while capture is running.");
@@ -441,6 +485,11 @@ MiniAV_Screen_GetConfiguredFormats(MiniAVScreenContext *ctx,
     memset(audio_format_out, 0, sizeof(MiniAVAudioInfo));
   }
 
+#if defined(_WIN32) && defined(MINIAV_BACKEND_WIN_WGC_ENABLED)
+  if (ctx->ops == &g_screen_ops_win_wgc)
+    return miniav_wgc_configured_formats(ctx, video_format_out, audio_format_out);
+#endif
+
   if (ctx->ops && ctx->ops->get_configured_video_formats) {
     return ctx->ops->get_configured_video_formats(ctx, video_format_out,
                                                   audio_format_out);
@@ -473,6 +522,14 @@ MiniAVResultCode MiniAV_Screen_StartCapture(MiniAVScreenContext *ctx,
   if (!ctx || !ctx->ops || !ctx->ops->start_capture || !callback) {
     return MINIAV_ERROR_INVALID_ARG;
   }
+#if defined(_WIN32) && defined(MINIAV_BACKEND_WIN_WGC_ENABLED)
+  if (ctx->ops == &g_screen_ops_win_wgc) {
+    bool handled = false;
+    MiniAVResultCode result = miniav_wgc_route_start(ctx, callback, user_data,
+                                                  &handled);
+    if (handled || result != MINIAV_SUCCESS) return result;
+  }
+#endif
   if (ctx->is_running) {
     miniav_log(MINIAV_LOG_LEVEL_WARN, "Screen capture already running.");
     return MINIAV_ERROR_ALREADY_RUNNING;
@@ -502,6 +559,13 @@ MiniAVResultCode MiniAV_Screen_StopCapture(MiniAVScreenContext *ctx) {
   if (!ctx || !ctx->ops || !ctx->ops->stop_capture) {
     return MINIAV_ERROR_INVALID_ARG;
   }
+#if defined(_WIN32) && defined(MINIAV_BACKEND_WIN_WGC_ENABLED)
+  if (ctx->ops == &g_screen_ops_win_wgc) {
+    bool handled = false;
+    MiniAVResultCode result = miniav_wgc_route_stop(ctx, &handled);
+    if (handled || result != MINIAV_SUCCESS) return result;
+  }
+#endif
   if (!ctx->is_running) {
     miniav_log(MINIAV_LOG_LEVEL_WARN,
                "Screen capture not running or already stopped.");
@@ -561,6 +625,10 @@ MiniAVResultCode MiniAV_Screen_SetContextLostCallback(
     void *user_data) {
   MiniAVScreenContext *ctx = (MiniAVScreenContext *)context_handle;
   if (!ctx) return MINIAV_ERROR_INVALID_ARG;
+#if defined(_WIN32) && defined(MINIAV_BACKEND_WIN_WGC_ENABLED)
+  if (ctx->ops == &g_screen_ops_win_wgc)
+    return miniav_wgc_set_lost(ctx, callback, user_data);
+#endif
   ctx->lost_cb = callback;
   ctx->lost_cb_user_data = user_data;
   return MINIAV_SUCCESS;
@@ -606,6 +674,10 @@ MiniAVResultCode MiniAV_Screen_SetCaptureCursor(
   if (!ctx) {
     return MINIAV_ERROR_INVALID_ARG;
   }
+#if defined(_WIN32) && defined(MINIAV_BACKEND_WIN_WGC_ENABLED)
+  if (ctx->ops == &g_screen_ops_win_wgc)
+    return miniav_wgc_set_cursor(ctx, enabled);
+#endif
   if (ctx->is_configured) {
     // Backends read capture_cursor when they build the session at configure
     // time; toggling afterward would not take effect uniformly.

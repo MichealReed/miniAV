@@ -5,6 +5,7 @@
 
 #include "miniav_buffer.h"
 #include "miniav_types.h"
+#include "miniav_screen_windows_strict.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -260,6 +261,15 @@ MINIAV_API int MiniAV_Audio_ReadFrames(MiniAVAudioContextHandle context,
                                        uint32_t max_frames);
 MINIAV_API uint32_t
 MiniAV_Audio_GetAvailableFrames(MiniAVAudioContextHandle context);
+
+// Give the capture callback a caller-owned SPSC mirror ring it ALSO writes
+// into, so a consumer on another thread (a web worker sharing the wasm linear
+// memory) can drain captured audio without calling into wasm. See the
+// definition in audio_context.c for the header layout and the memory the
+// caller must provide. base = NULL detaches.
+MINIAV_API MiniAVResultCode
+MiniAV_Audio_SetCaptureMirror(MiniAVAudioContextHandle context, void *base,
+                              uint32_t capacity_frames);
 
 // Subscribe for audio capture device add/remove notifications.
 MINIAV_API MiniAVResultCode MiniAV_Audio_SetDeviceChangeCallback(

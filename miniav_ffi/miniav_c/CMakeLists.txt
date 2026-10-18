@@ -423,7 +423,8 @@ endif()
 if(MINIAV_ENABLE_SCREEN)
     message(STATUS "Screen module enabled")
     list(APPEND ALL_DEFINITIONS "MINIAV_MODULE_SCREEN_ENABLED")
-    list(APPEND ALL_SOURCES "src/screen/screen_api.c")
+    list(APPEND ALL_SOURCES "src/screen/screen_api.c"
+                            "src/screen/screen_strict_api.c")
     list(APPEND ALL_PRIVATE_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src/screen")
 
     if(MINIAV_PLATFORM_WINDOWS)
@@ -431,7 +432,9 @@ if(MINIAV_ENABLE_SCREEN)
         
         if(MINIAV_BACKEND_WIN_WGC)
             message(STATUS "Windows: Enabling WGC for screen capture")
-            list(APPEND ALL_SOURCES "src/screen/windows/screen_context_win_wgc.cpp")
+            list(APPEND ALL_SOURCES "src/screen/windows/screen_context_win_wgc.cpp"
+                                    "src/screen/windows/screen_context_win_wgc_strict.cpp"
+                                    "src/screen/windows/wgc_control_storage.cpp")
             list(APPEND ALL_HEADERS "src/screen/windows/screen_context_win_wgc.h")
             list(APPEND ALL_LINK_LIBS d3d11 dxgi)
             list(APPEND ALL_DEFINITIONS "MINIAV_BACKEND_WIN_WGC_ENABLED")
@@ -737,6 +740,29 @@ if(MINIAV_PLATFORM_WINDOWS OR MINIAV_PLATFORM_MACOS OR MINIAV_PLATFORM_LINUX)
         target_include_directories(test_screen_capture PRIVATE ${TEST_INCLUDE_DIRS})
 
         if(MINIAV_PLATFORM_WINDOWS)
+            # CPU-only COM ownership and provenance checks. Positive control:
+            # test_wgc_texture_ownership --inject-extra-ref must fail.
+            add_executable(test_wgc_texture_ownership src/screen/test/test_wgc_texture_ownership.cpp)
+            target_link_libraries(test_wgc_texture_ownership PRIVATE windowsapp)
+
+            # Desktop Duplication damage chain fed made-up acquisitions: no
+            # D3D, no display.
+            add_executable(test_dxgi_damage src/screen/test/test_dxgi_damage.c)
+
+            if(MINIAV_BACKEND_WIN_WGC)
+                add_executable(test_wgc_fixed_geometry src/screen/test/test_wgc_fixed_geometry.cpp)
+                target_include_directories(test_wgc_fixed_geometry PRIVATE ${TEST_INCLUDE_DIRS})
+                # Unstarted production provider only: no window/Start/pixels.
+                add_executable(test_wgc_strict_unstarted src/screen/test/test_wgc_strict_unstarted.cpp)
+                target_link_libraries(test_wgc_strict_unstarted PRIVATE miniav_c)
+                target_include_directories(test_wgc_strict_unstarted PRIVATE ${TEST_INCLUDE_DIRS})
+                # Running provider against a real window in a child process:
+                # frames, buffer bound, resize, close, exit and deadline.
+                add_executable(test_wgc_strict_running src/screen/test/test_wgc_strict_running.cpp)
+                target_link_libraries(test_wgc_strict_running PRIVATE miniav_c user32 gdi32 d3d11 dxgi)
+                target_include_directories(test_wgc_strict_running PRIVATE ${TEST_INCLUDE_DIRS})
+            endif()
+
             # Start/stop/destroy race harness for the WGC backend's threadpool
             # callback drain. Positive control: MINIAV_WGC_STRESS_NO_DRAIN=1.
             add_executable(test_wgc_teardown_stress src/screen/test/test_wgc_teardown_stress.c)

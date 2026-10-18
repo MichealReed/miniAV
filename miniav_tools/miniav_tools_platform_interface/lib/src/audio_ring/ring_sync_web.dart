@@ -34,6 +34,15 @@ void storeCursor(Int32List control, int index, int value) =>
 /// Whether cursor access is genuinely atomic here.
 bool get hasAtomics => true;
 
+/// Reads a `uint32` cursor with acquire ordering.
+///
+/// Separate from [loadCursor] because miniAV's capture MIRROR declares its
+/// cursors `uint32` in C. `Atomics` operates on any integer TypedArray, so the
+/// only difference is which view the value comes back through — and reading a
+/// count past 2^31 through an `Int32List` would fold it negative.
+int loadCursorU32(Uint32List control, int index) =>
+    _atomicsLoad(control.toJS, index);
+
 /// True when this page can actually allocate a `SharedArrayBuffer`.
 ///
 /// Asked by CONSTRUCTING one rather than by reading `crossOriginIsolated`.

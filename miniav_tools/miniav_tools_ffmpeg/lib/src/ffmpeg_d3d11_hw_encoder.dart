@@ -581,7 +581,8 @@ Future<bool> ffmpegD3d11EncoderCompatibleWith(
 
 /// True zero-copy D3D11VA hardware encoder. See library doc-comment for
 /// pipeline details.
-class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
+class FfmpegD3d11HwEncoder
+    implements PlatformEncoder, FrameRepeatingEncoder, FfmpegEncoderBridge {
   FfmpegD3d11HwEncoder._(
     this._ff,
     this._shim,
@@ -641,6 +642,16 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   int _nextPts = 0;
   CodecExtraData? _extraData;
   bool _forceKeyframe = false;
+
+  /// A reference to the last frame the encoder accepted, for
+  /// [repeatLastFrame]. It holds the pool surface the input was copied into,
+  /// so that surface is not handed out again while a repeat may still name
+  /// it, and nothing else ever writes it. Null until the first frame.
+  Pointer<AVFrame> _lastSent = nullptr;
+
+  /// Packets taken from the encoder while making room for a frame, returned
+  /// by the following calls in order.
+  final List<EncodedPacket> _out = [];
 
   D3d11HwVendor get vendor => _spec.vendor;
   String get encoderName => _spec.encoderName;
@@ -1560,6 +1571,10 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
           dstSubresource: dstSlice,
           dstNv12Tex: dstTex,
         );
+        if (vpRet == FfmpegShim.kVpSourceBusy ||
+            vpRet == FfmpegShim.kVpBltIncomplete) {
+          return await _repeatForDroppedFrame(frame.timestampUs);
+        }
         if (vpRet < 0) {
           throw CodecRuntimeException(
             'ffmpeg-d3d11',
@@ -1568,7 +1583,7 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
           );
         }
       } else {
-        _shim.d3d11CopyResource(
+        final copied = _shim.d3d11CopyResource(
           _d3dDevice,
           _d3dContext,
           dstTex,
@@ -1576,6 +1591,9 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
           srcTex,
           subresource,
         );
+        if (copied != 0) {
+          return await _repeatForDroppedFrame(frame.timestampUs);
+        }
       }
 
       // For QSV: the encoder needs a QSV-format frame (mfxFrameSurface1
@@ -1614,18 +1632,9 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
       frameToSend.ref
         ..width = _cfg.width
         ..height = _cfg.height
-        ..format = _d3dPixFmt
-        ..pts = _nextPts++
-        ..pictType = _forceKeyframe ? 1 /* AV_PICTURE_TYPE_I */ : 0;
-      _forceKeyframe = false;
-
-      final sendRet = _ff.avcodecSendFrame(_codecCtx, frameToSend);
-      if (sendRet < 0 && sendRet != kAvErrorEAgain) {
-        throw CodecRuntimeException(
-          'ffmpeg-d3d11',
-          'avcodec_send_frame: ${_ff.strError(sendRet)} ($sendRet)',
-        );
-      }
+        ..format = _d3dPixFmt;
+      _send(frameToSend);
+      _retainLastSent(frameToSend);
     } finally {
       if (qsvFrame != nullptr) {
         _ff.avFrameUnref(qsvFrame);
@@ -1644,12 +1653,126 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
       }
     }
 
-    return _drainOne();
+    return _takePacket();
+  }
+
+  /// Stands in for a frame whose copy into the pool the shim dropped: the
+  /// copy was not finished in time, so the surface holds no defined picture.
+  /// The last accepted frame is sent again in its place, which keeps one
+  /// submission per [encode] call, the order a caller pairs packets with
+  /// frames by. With nothing sent yet there is no stand-in, so it throws.
+  Future<EncodedPacket?> _repeatForDroppedFrame(int timestampUs) {
+    if (_lastSent == nullptr) {
+      throw const CodecRuntimeException(
+        'ffmpeg-d3d11',
+        'The first frame was not finished on the GPU in time and was '
+            'dropped; there is no earlier frame to send in its place.',
+      );
+    }
+    return repeatLastFrame(timestampUs);
+  }
+
+  /// Re-encodes the last accepted frame under a new timestamp. The pool
+  /// surface it was copied into is still held by [_lastSent], so this neither
+  /// reads the producer's texture again nor copies anything: a duplicate
+  /// cannot pick up a picture the producer wrote after the original.
+  ///
+  /// This encoder numbers its packets by submission, not by [timestampUs], so
+  /// a caller pairs them with frames by order. That is why having nothing to
+  /// repeat is a [StateError] rather than a silent null.
+  @override
+  Future<EncodedPacket?> repeatLastFrame(int timestampUs) async {
+    _checkOpen();
+    if (_lastSent == nullptr) {
+      throw StateError('FfmpegD3d11HwEncoder: no frame to repeat yet');
+    }
+    final f = _ff.avFrameAlloc();
+    if (f == address(0)) {
+      throw const CodecRuntimeException(
+        'ffmpeg-d3d11',
+        'av_frame_alloc returned NULL',
+      );
+    }
+    try {
+      final r = _ff.avFrameRef(f, _lastSent);
+      if (r < 0) {
+        throw CodecRuntimeException(
+          'ffmpeg-d3d11',
+          'av_frame_ref: ${_ff.strError(r)} ($r)',
+        );
+      }
+      _send(f);
+    } finally {
+      _ff.avFrameUnref(f);
+      final fp = calloc<Pointer<AVFrame>>()..value = f;
+      _ff.avFrameFree(fp);
+      calloc.free(fp);
+    }
+    return _takePacket();
+  }
+
+  /// Stamps [frame] with the next submission index and hands it to the
+  /// encoder. Never drops it: EAGAIN means the encoder wants its output read
+  /// first, so the waiting packets are taken into [_out] and the frame is sent
+  /// again. Swallowing EAGAIN instead lost the frame without a word, and every
+  /// later packet then belonged to a different frame than the caller thought.
+  void _send(Pointer<AVFrame> frame) {
+    frame.ref
+      ..pts = _nextPts
+      ..pictType = _forceKeyframe ? 1 /* AV_PICTURE_TYPE_I */ : 0;
+    var sendRet = _ff.avcodecSendFrame(_codecCtx, frame);
+    if (sendRet == kAvErrorEAgain) {
+      while (true) {
+        final pkt = _drainOne();
+        if (pkt == null) break;
+        _out.add(pkt);
+      }
+      sendRet = _ff.avcodecSendFrame(_codecCtx, frame);
+    }
+    if (sendRet < 0) {
+      throw CodecRuntimeException(
+        'ffmpeg-d3d11',
+        'avcodec_send_frame: ${_ff.strError(sendRet)} ($sendRet)',
+      );
+    }
+    _nextPts++;
+    _forceKeyframe = false;
+  }
+
+  void _retainLastSent(Pointer<AVFrame> frame) {
+    if (_lastSent == nullptr) {
+      final f = _ff.avFrameAlloc();
+      if (f == address(0)) return;
+      _lastSent = f;
+    } else {
+      _ff.avFrameUnref(_lastSent);
+    }
+    if (_ff.avFrameRef(_lastSent, frame) < 0) _freeLastSent();
+  }
+
+  void _freeLastSent() {
+    if (_lastSent == nullptr) return;
+    _ff.avFrameUnref(_lastSent);
+    final fp = calloc<Pointer<AVFrame>>()..value = _lastSent;
+    _ff.avFrameFree(fp);
+    calloc.free(fp);
+    _lastSent = nullptr;
+  }
+
+  /// The oldest packet taken so far, after reading at most one more from the
+  /// encoder: one frame in, one packet out per call.
+  EncodedPacket? _takePacket() {
+    final pkt = _drainOne();
+    if (pkt != null) _out.add(pkt);
+    return _out.isEmpty ? null : _out.removeAt(0);
   }
 
   @override
   Future<List<EncodedPacket>> flush() async {
     _checkOpen();
+    // End of stream: nothing is repeated after this, so the pool gets the
+    // surface back.
+    _freeLastSent();
     final ret = _ff.avcodecSendFrame(_codecCtx, nullptr);
     if (ret < 0 && ret != kAvErrorEof) {
       throw CodecRuntimeException(
@@ -1657,7 +1780,8 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
         'avcodec_send_frame(NULL): ${_ff.strError(ret)}',
       );
     }
-    final out = <EncodedPacket>[];
+    final out = <EncodedPacket>[..._out];
+    _out.clear();
     while (true) {
       final pkt = _drainOne();
       if (pkt == null) break;
@@ -1783,6 +1907,8 @@ class FfmpegD3d11HwEncoder implements PlatformEncoder, FfmpegEncoderBridge {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    _freeLastSent();
+    _out.clear();
     final pp = calloc<Pointer<AVPacket>>()..value = _packet;
     final cp = calloc<Pointer<AVCodecContext>>()..value = _codecCtx;
     try {

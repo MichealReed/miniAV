@@ -467,6 +467,96 @@ void main() {
     final out = await enc.flush();
     expect(out, isNotEmpty, reason: 'mixed texture + NV12 input failed');
   });
+
+  // The capture-handle path: a frame handed over as a shared NT handle, the
+  // way a camera or a screen capture hands one over. The encoder copies it into
+  // its own NV12 surface before the call returns. It used to give the MFT the
+  // capture's own texture, which the capture reuses once the frame is
+  // released, and a camera's Frame Server surface given to the NVIDIA MFT that
+  // way faulted the GPU on the first frame.
+  for (final (fmt, pixelFormat, label) in [
+    (2, MiniAVPixelFormat.nv12, 'NV12 (a camera)'),
+    (0, MiniAVPixelFormat.bgra32, 'BGRA (a screen)'),
+  ]) {
+    test('$label frames from a capture handle encode the picture', () async {
+      // Encoded bytes for 20 frames of one picture, or null without a D3D11
+      // device. A gradient has to cost far more than flat grey, or the copy
+      // wrote nothing and the encoder coded whatever its surface held.
+      Future<int?> encodedBytes(int pattern) async {
+        final enc = await MfVideoEncoder.open(
+          const EncoderConfig(
+            codec: VideoCodec.h264,
+            width: _w,
+            height: _h,
+            bitrateBps: 4000000,
+            frameRateNumerator: 30,
+            frameRateDenominator: 1,
+            gopLength: 30,
+          ),
+        );
+        expect(enc, isNotNull, reason: 'MF H.264 encoder failed to open');
+        addTearDown(() => enc!.close());
+        if (!enc!.supportsD3d11SharedHandleInput) return null;
+
+        final tex = mfencTestCaptureTexture(_w, _h, pattern, fmt);
+        expect(tex, isNot(nullptr), reason: 'could not create the source');
+        addTearDown(() => mfencTestTextureRelease(tex));
+
+        final packets = <EncodedPacket>[];
+        for (var i = 0; i < 20; i++) {
+          // A handle per frame, closed once the frame is encoded, as a capture
+          // closes it when the buffer is released.
+          final handle = mfencTestNtHandle(tex);
+          expect(handle, isNot(nullptr), reason: 'CreateSharedHandle failed');
+          try {
+            final p = await enc.encode(
+              MiniAVBufferSource(
+                MiniAVBuffer(
+                  type: MiniAVBufferType.video,
+                  contentType: MiniAVBufferContentType.gpuD3D11Handle,
+                  timestampUs: i * 33333,
+                  data: MiniAVVideoBuffer(
+                    width: _w,
+                    height: _h,
+                    pixelFormat: pixelFormat,
+                    strideBytes: const [0],
+                    planes: [Uint8List(0)],
+                    nativeHandles: [handle.address],
+                  ),
+                  dataSizeBytes: 0,
+                ),
+              ),
+            );
+            if (p != null) packets.add(p);
+          } finally {
+            mfencTestCloseHandle(handle);
+          }
+        }
+        packets.addAll(await enc.flush());
+        expect(
+          packets,
+          isNotEmpty,
+          reason: 'nothing encoded. NATIVE REASON: ${enc.lastImportError}',
+        );
+        expect(packets.any((p) => p.isKeyframe), isTrue, reason: 'no keyframe');
+        return packets.fold<int>(0, (a, p) => a + p.data.length);
+      }
+
+      final gradient = await encodedBytes(1);
+      if (gradient == null) {
+        markTestSkipped('no D3D11 device bound (software MFT)');
+        return;
+      }
+      final flat = (await encodedBytes(0))!;
+      expect(
+        gradient,
+        greaterThan(flat * 3),
+        reason:
+            'gradient=$gradient B vs flat-grey=$flat B — too close; the copy '
+            'into the encoder surface is not transferring the picture',
+      );
+    });
+  }
 }
 
 Uint8List _nv12(int w, int h) {

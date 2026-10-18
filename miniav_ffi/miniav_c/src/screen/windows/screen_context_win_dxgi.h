@@ -14,6 +14,9 @@ extern "C" {
 // and by miniav_camera_context_platform_init_windows to assign to context instance.
 extern const ScreenContextInternalOps g_screen_ops_win_dxgi;
 
+uint32_t miniav_dxgi_copy_damage(const MiniAVBuffer *buffer, uint64_t *words,
+                                uint32_t capacity);
+
 // Platform initialization function
 MiniAVResultCode miniav_screen_context_platform_init_windows_dxgi(MiniAVScreenContext *ctx);
 

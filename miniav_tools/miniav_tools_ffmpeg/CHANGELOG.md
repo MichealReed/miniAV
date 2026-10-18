@@ -1,221 +1,155 @@
 # Changelog
 
+## 0.6.0
+
+- D3D11 encoder: no unbounded waits, and no frame encoded from an unfinished
+  copy. A producer that never released its texture's keyed mutex hung the encode
+  call and the isolate waiting on it, and a frame was encoded whether or not its
+  copy had finished. Each wait is now bounded at 100 ms. A frame that misses one
+  is dropped and the encoder re-sends its last accepted frame in its place, so
+  every `encode` call still submits exactly one frame; before any frame has been
+  accepted, `encode` throws `CodecRuntimeException`.
+  - Shim ABI 22: `FfmpegShim.d3d11CopyResource` returns 0 (copied), 1 (dropped)
+    or -1 (bad argument), and the BGRA→NV12 conversion returns
+    `FfmpegShim.kVpSourceBusy` or `FfmpegShim.kVpBltIncomplete` for a dropped
+    frame.
+- `FfmpegD3d11HwEncoder` implements `FrameRepeatingEncoder`: `repeatLastFrame`
+  re-sends the encoder's own copy of the last accepted frame under a new
+  timestamp, instead of reading the producer's texture again when it may already
+  hold the next picture.
+- Video encoders (software, hardware, NVENC and D3D11) no longer lose a frame
+  when `avcodec_send_frame` returns `EAGAIN`. The frame was never encoded, so a
+  caller pairing packets with frames in order matched every later packet to the
+  wrong frame.
+- New `Ffmpeg.avFrameRef` binding (`av_frame_ref`).
+- Requires miniav_platform_interface 0.8.0 and
+  miniav_tools_platform_interface 0.6.0.
+
+## 0.5.9
+
+- Requires spawn ^0.1.1: native transfers actually transfer, and a web message
+  the worker cannot deserialize is reported instead of vanishing.
+
+## 0.5.8
+
+- Increment downstream deps
+
+## 0.5.7
+
+- Version alignment with the miniav_tools 0.5.7 family release.
+
 ## 0.5.6
 
-- Host the container demuxer on spawn, so it runs on an isolate natively and a Web Worker on web through one API.
+- Host the container demuxer on spawn, so it runs on an isolate natively and a
+  Web Worker on web through one API.
 
 ## 0.5.5
 
-- **`IsolateDemuxer` is now hosted by `package:spawn`.** The handshake, the
-  pending-request map, id correlation, the `[op, id, ...]` reply protocol and
-  the bounded-close-then-kill teardown were all hand-rolled here and are now
-  the worker library's job. Behaviour is unchanged - the full demuxer
-  roundtrip suite passes untouched, including the starved-live-worker shutdown
-  and the stalled-mid-probe open timeout.
-
-  One thing deliberately did NOT move: closing the byte pipe BEFORE closing the
-  worker. Killing an isolate does not preempt a blocking native call, so only
-  the code that owns the pipe can free a starved `av_read_frame`. No worker
-  library can do that for us.
-
-  New `src/demux_protocol.dart` gives `TrackInfo` and `EncodedPacket` a byte
-  encoding, because `spawn` carries portable values or `WireMessage`s rather
-  than deep-copying arbitrary objects. That is more work than an isolate send,
-  and it is what makes the protocol legible to a non-Dart host later.
-
-  Adds a dependency on `spawn`.
-
-- **Native `av_log` forwarding moved from a `NativeCallable` to a Dart native
-  port** (shim ABI 20 -> 21, new exports `miniav_shim_init_dart_api` /
-  `miniav_shim_set_log_port`; `tool/shim_c/dart_dl/` vendors the BSD-licensed
-  Dart SDK dynamic-linking API). `av_log_set_callback` is a PROCESS-GLOBAL
-  registry: a `NativeCallable` installed there is owned by ONE isolate, and
-  when that isolate exits the VM deletes the trampoline while FFmpeg keeps the
-  pointer — the next log line from a codec thread aborted the whole process
-  (`runtime_entry.cc: Callback invoked after it has been deleted`, typically
-  under `avcodec_open2`). A whole-suite `dart test` hit it every run, because
-  every test FILE is a separate isolate in ONE VM process; `dart test` now
-  completes. `setFfmpegLogCallback` gained an optional `level:` argument and
-  registers a `ReceivePort` per isolate. Semantics unchanged and still
-  documented: PROCESS-GLOBAL, LAST WRITER WINS — with several isolates
-  registered only the most recent receives lines. Trap: the message is carried
-  as raw bytes, not a `Dart_CObject` string, because FFmpeg emits Latin-1
-  filenames on Windows and `Dart_CObject_kString` requires valid UTF-8. The
-  v8/v9 function-pointer exports remain for non-Dart embedders; Dart no longer
-  binds them.
-- `FfmpegDemuxer` now fills `VideoTrackInfo.rotationDegrees` from the
-  container's display matrix (shim ABI 18 -> 20, new exports
-  `miniav_shim_stream_rotation_degrees` / `_set_rotation_degrees`). It
-  previously reported 0 for every container, so a 90-degree phone MP4/MKV/WebM
-  played back sideways. Value is degrees CLOCKWISE in {0, 90, 180, 270};
-  decoded frames stay in coded orientation, so `width`/`height` remain the
-  coded dimensions and the consumer applies the turn. Only a plain quadrant
-  turn is reported: flips, scales and arbitrary transforms read as 0, matching
-  `miniav_tools_codecs`' MP4 demuxer, so the two never disagree about the same
-  file. Trap: `av_display_rotation_get` cannot be used for this — it derives
-  the angle from `atan2`, so a mirrored (pure horizontal flip) clip comes back
-  as 180 and would render upside down. Second trap: FFmpeg 7 removed
-  `AVStream.side_data` / `av_stream_get_side_data`, so stream side data lives
-  in `codecpar->coded_side_data`.
-- `FfmpegMuxer` now WRITES `VideoTrackInfo.rotationDegrees` as a container
-  display matrix, so a rotation read by the demuxer survives a remux instead
-  of being silently dropped (it plays sideways otherwise). Set before
-  `avformat_write_header`, after codecpar is populated —
-  `avcodec_parameters_from_context` overwrites the side data. A rotation that
-  is not a multiple of 90, or a missing shim, throws rather than writing an
-  upright file.
-- `hook/build.dart` registers `tool/shim_c/**` as build dependencies. Without
-  them an edited `shim.c` kept serving the previously built DLL, and a stale
-  ABI makes `FfmpegShim.tryLoad()` return null — which takes the whole backend
-  down (every open throws "shim not loadable"), not just the new export.
+- `IsolateDemuxer` runs on `package:spawn` (a new dependency) instead of
+  hand-written isolate code; behaviour is unchanged.
+- FFmpeg log forwarding uses a Dart native port instead of a `NativeCallable`
+  (shim ABI 21, new exports `miniav_shim_init_dart_api` /
+  `miniav_shim_set_log_port`; the shim vendors the Dart SDK's BSD-licensed
+  dynamic-linking API). FFmpeg's log callback is process-wide, so a log line
+  after the registering isolate exited aborted the process.
+  `setFfmpegLogCallback` gains an optional `level:`; the last isolate to
+  register receives the lines.
+- `FfmpegDemuxer` fills `VideoTrackInfo.rotationDegrees` from the container's
+  display matrix (shim ABI 20); it reported 0, so portrait phone videos played
+  sideways. Only clockwise quarter turns are reported, as in the first-party MP4
+  demuxer; decoded frames keep their coded orientation for the consumer to turn.
+- `FfmpegMuxer` writes `VideoTrackInfo.rotationDegrees` as a display matrix, so
+  rotation survives a remux; a rotation that is not a multiple of 90 throws.
+- `hook/build.dart` registers the shim sources, so an edited shim rebuilds; a
+  stale shim's old ABI disabled the whole backend.
 
 ## 0.5.4
 
-- **Internal pins are now caret ranges, not exact versions.** Exact pins made
-  every patch cascade: publishing `miniav_tools_platform_interface` 0.5.3 made
-  the already-published `miniav_tools` 0.5.3 and `miniav_tools_ffmpeg` 0.5.3
-  unsatisfiable next to it, because they pinned 0.5.2 exactly and nothing in the
-  set could move independently. `dart pub publish` warns about this. `release.py
-  sync` now normalises to caret so it cannot recur.
-- Republished: 0.5.3 shipped pinning `miniav_tools_platform_interface: 0.5.2`,
-  which cannot resolve alongside any package needing 0.5.3.
+- Internal dependencies are caret ranges instead of exact pins, which made each
+  patch release unsatisfiable next to already-published packages.
+- Republished: 0.5.3 pinned `miniav_tools_platform_interface: 0.5.2` exactly and
+  could not resolve next to packages needing 0.5.3.
 
 ## 0.5.3
 
-- Declare the new `PlatformEncoder` GPU-input capabilities.
-  `FfmpegD3d11HwEncoder` reports both `supportsD3d11SharedHandleInput` and
-  `supportsD3d11TextureInput`; the CPU-fed encoders report neither. Behaviour is
-  unchanged — this replaces the recorder's `platform is FfmpegD3d11HwEncoder`
-  check with the same answer, expressed as a capability other encoders can give.
-
-- **Demuxer + live-stream muxing for miniav_player stream/file playback**
-  (shim ABI 14 -> 15):
-  - `FfmpegDemuxer` (was a throwing scaffold) + `IsolateDemuxer` — file / bytes
-    / live byte-stream → `EncodedPacket`s with pts/dts/duration rescaled to
-    microseconds (inverse of the muxer's rescale). `createDemuxer` returns the
-    isolate host by default (`av_read_frame` blocks on live input and must be
-    off the UI isolate); `backendOptions {'sw_isolate': '0'}` = in-isolate
-    (file/bytes only). `durationUs` / `isSeekable` / keyframe `seek`.
-  - Shim **blocking byte pipe** (`miniav_shim_bytepipe_*`) — feeds libavformat
-    from a live `Stream<List<int>>` with pause/resume backpressure; closing the
-    pipe unblocks a natively-stuck `av_read_frame` (the only way — `Isolate.kill`
-    can't preempt synchronous FFI).
-  - Seekable in-memory IO: `miniav_shim_open_input_bytes` (read+seek AVIO over a
-    C-owned copy, so moov-at-end MP4 probes) and `..._memsink_*` (seekable output
-    for `BytesMuxerOutput` so +faststart works). `FfmpegMuxer` now supports
-    `BytesMuxerOutput` (seekable memsink) and `CallbackMuxerOutput` (streaming
-    byte-pipe, streamable containers).
-  - `Container.fmp4` now sets real fragmentation movflags
-    (`+frag_keyframe+empty_moov+default_base_moof` + optional `frag_duration`) —
-    init segment up-front, live-streamable.
-  - Open-timeout robustness: a live stream stalling mid-probe surfaces a
-    `CodecInitException` (default 15 s, `backendOptions {'open_timeout_ms'}`)
-    instead of hanging `open()` forever.
-- **Decode side for the miniav_player work** (shim ABI 13 -> 14):
-  - `FfmpegAudioDecoder` — AAC/Opus/MP3/Vorbis/FLAC -> interleaved f32
-    (planar formats interleaved during the mandatory AVFrame copy-out;
-    stream rate/channels read per-frame via new shim getters
-    `miniav_shim_frame_sample_rate` / `_nb_channels`).
-  - `miniav_shim_codec_set_extradata`: `DecoderConfig.extraData` /
-    `AudioDecoderConfig.extraData` now actually reach the codec context
-    (avcC / hvcC / AAC ASC / OpusHead) instead of being ignored.
-  - `IsolateVideoDecoder` / `IsolateAudioDecoder` — worker-isolate decoder
-    hosts mirroring `IsolateSoftwareEncoder`'s TransferableTypedData
-    protocol; `createDecoder`/`createAudioDecoder` return them by default
-    (`backendOptions {'sw_isolate': '0'}` keeps the in-isolate path).
-  - Fixed `FfmpegSoftwareDecoder` pts: decoded `frame.pts` is already in
-    microseconds (packets are fed us with no time_base), so the old
-    `* (1e6/30)` scaling corrupted timestamps; now passthrough with a
-    delta-extrapolating AV_NOPTS fallback.
+- Declares the `PlatformEncoder` GPU-input capabilities: `FfmpegD3d11HwEncoder`
+  reports `supportsD3d11SharedHandleInput` and `supportsD3d11TextureInput`, and
+  CPU-fed encoders report neither. Behaviour is unchanged.
+- Demuxing and live-stream muxing for playback (shim ABI 15):
+  - `FfmpegDemuxer` reads files, bytes and live byte streams into
+    `EncodedPacket`s with microsecond timestamps, with `durationUs`,
+    `isSeekable` and keyframe `seek`. `createDemuxer` returns an
+    `IsolateDemuxer` by default because reading a live stream blocks;
+    `backendOptions {'sw_isolate': '0'}` runs in-isolate (files and bytes only).
+  - A live `Stream<List<int>>` is fed through a blocking byte pipe with
+    backpressure; closing it unblocks a stalled read.
+  - In-memory input is seekable, so an MP4 with `moov` at the end opens from
+    bytes. `FfmpegMuxer` supports `BytesMuxerOutput` (seekable, so faststart
+    works) and `CallbackMuxerOutput` (streamable containers).
+  - `Container.fmp4` writes real fragmented MP4 (init segment up front,
+    live-streamable), with an optional `frag_duration`.
+  - A live stream that stalls while opening raises `CodecInitException` after 15
+    s (`backendOptions {'open_timeout_ms'}`) instead of hanging `open()`.
+- Decoding for playback (shim ABI 14):
+  - `FfmpegAudioDecoder`: AAC, Opus, MP3, Vorbis and FLAC to interleaved f32.
+  - `DecoderConfig.extraData` and `AudioDecoderConfig.extraData` reach the
+    codec; they were ignored.
+  - `IsolateVideoDecoder` / `IsolateAudioDecoder` decode on a worker isolate and
+    are returned by default (`backendOptions {'sw_isolate': '0'}` keeps the
+    in-isolate path).
+  - `FfmpegSoftwareDecoder` timestamps were scaled wrongly and are now passed
+    through.
 
 ## 0.5.2
 
-- Isolate-hosted **CPU-fed hardware** encoder (fixes the recording freeze on
-  the software/CPU-fed path). `IsolateSoftwareEncoder.open` gained
-  `hwVendorOrder` / `requireHardware`: the worker now tries each CPU-fed
-  hardware vendor (looping `FfmpegHwEncoder.openWith`) before the software
-  encoder, all on the worker isolate. Two things this unblocks:
-  - **QSV / MediaFoundation now initialise.** Their COM objects require the
-    MTA apartment; Flutter's UI isolate is STA (`miniav_shim_ensure_mta` →
-    `RPC_E_CHANGED_MODE`), so on the UI isolate they failed at
-    `avcodec_open2`. The worker runs on a fresh OS thread that enters MTA, so
-    e.g. `h264_mf` and `h264_qsv` finally open. (Verified on an AMD iGPU box:
-    the worker opens `h264_mf` where AMF fails its NV12 pool and NVENC has no
-    device.)
-  - **No UI freeze.** The blocking `avcodec_open2` probes and the per-frame
-    encode both run off the calling (UI) isolate; frames cross as
-    `TransferableTypedData` (~1 ms at 720p). Previously the Stage-A hardware
-    open ran synchronously on the UI isolate.
-  `FfmpegBackend.createEncoder` now routes the post-zero-copy path through this
-  isolate encoder (removing the UI-isolate Stage-A open) and derives the
-  vendor order from the capture adapter via the new `hwVendorOrderForDevice`
-  (AMD→MF-before-AMF to dodge AMF's silent-black on AMD, Intel→QSV, NVIDIA→
-  NVENC). `IsolateSoftwareEncoder` reports its actual encoder's
-  `acceptsYuv420pPlanes` and an `activeEncoderDescription`. The `sw_isolate:'0'`
-  escape hatch keeps the legacy in-isolate path.
+- CPU-fed hardware encoders run on a worker isolate, fixing a recording freeze
+  on the CPU path. `IsolateSoftwareEncoder.open` gains `hwVendorOrder` /
+  `requireHardware` and tries each hardware vendor before software.
+  - QSV and Media Foundation open: they need an MTA COM apartment, which
+    Flutter's UI isolate is not.
+  - Opening and encoding no longer block the UI isolate; frames cross as
+    `TransferableTypedData` (~1 ms at 720p).
+  - `FfmpegBackend.createEncoder` uses it after the zero-copy path, with the
+    vendor order taken from the capture adapter (new `hwVendorOrderForDevice`;
+    on AMD, Media Foundation before AMF, which can encode black).
+    `IsolateSoftwareEncoder` reports its real encoder's `acceptsYuv420pPlanes`
+    and an `activeEncoderDescription`; `sw_isolate: '0'` keeps the in-isolate
+    path.
 
 ## 0.5.1
 
-- D3D11 HW-encoder vendor order now follows the injected device's adapter.
-  `FfmpegD3d11HwEncoder.open` with an injected `ID3D11Device` (the recorder's
-  zero-copy path) previously always tried the global default order
-  (NVENC → AMF → QSV → MF), so on an AMD/Intel device it wasted an NVENC
-  `avcodec_open2` — "OpenEncodeSessionEx failed: no encode device" — before
-  falling through to the native vendor. It now derives the order from the
-  device's DXGI vendor (AMD→AMF, Intel→QSV, NVIDIA→NVENC, + MediaFoundation
-  fallback), so the native encoder is tried first and no cross-vendor attempt
-  is made. The adapter-aware helper already backed the probe/warm-up paths;
-  this wires it into `open()` too. `vendorOrder` is now optional; passing it
-  explicitly still overrides.
+- `FfmpegD3d11HwEncoder.open` with an injected `ID3D11Device` tries the device's
+  own vendor first (AMD → AMF, Intel → QSV, NVIDIA → NVENC, then Media
+  Foundation) instead of always starting with NVENC. `vendorOrder` is optional;
+  passing it still overrides.
 
 ## 0.5.0
 
-- Software encoding no longer freezes the app: `createEncoder`'s software
-  fallback now returns `IsolateSoftwareEncoder`, which hosts the exact same
-  `FfmpegSoftwareEncoder` on a long-lived worker isolate. The synchronous libav
-  encode (tens of ms/frame at 720p+) runs off the calling (UI) isolate; frames
-  cross as `TransferableTypedData` (~1 ms), packets come back the same way, and
-  codec extradata (SPS/PPS) is captured at open. Opt out with
-  `backendOptions: {'sw_isolate': '0'}` (returns the classic in-isolate
-  encoder, e.g. for tests that wire its `FfmpegEncoderBridge` directly).
-- AMF (AMD) D3D11 zero-copy: BGRA input to `h264_amf`/`hevc_amf` is broken on
-  real AMD hardware — AMD iGPUs reject BGRA frames at `avcodec_send_frame`
-  ("Unknown error"), and some driver combos accept them but silently encode
-  black. AMF now always uses the NV12 + D3D11 VideoProcessor pool (AMF's
-  native input format; same fixed-function path QSV/MF use).
-- NV12 hwframes-pool creation is now adaptive: bind-flag sets are tried from
-  richest (Intel's SR|RT|DECODER|VIDEO_ENCODER) down to minimal (SR|RT),
-  re-allocating the frames context per attempt — AMD rejects
-  DECODER|RENDER_TARGET combinations with E_INVALIDARG. If no set works
-  (some adapters cannot create NV12 texture arrays with RENDER_TARGET at
-  all), the vendor is reported cleanly unavailable and encoding falls back to
-  the next vendor / CPU — correct output instead of black video.
+- Software encoding no longer freezes the app: the software fallback is
+  `IsolateSoftwareEncoder`, which runs `FfmpegSoftwareEncoder` on a worker
+  isolate. `backendOptions: {'sw_isolate': '0'}` returns the in-isolate encoder.
+- AMF (AMD) D3D11 zero-copy always converts to NV12 first: BGRA input was
+  rejected, or silently encoded black, on real AMD hardware.
+- The NV12 frame pool tries progressively simpler bind flags (AMD rejects some
+  combinations). If none works, the vendor is reported unavailable and encoding
+  falls back to the next vendor or the CPU, instead of producing black video.
 
 ## 0.4.10
 
-- Software encoder (`FfmpegSoftwareEncoder`) now accepts pre-converted planar
-  YUV420P frames (`FrameSource.yuv420p`) directly — the planes are copied
-  straight into the `AVFrame` with no internal RGBA→YUV conversion. Advertised
-  via `acceptsYuv420pPlanes => true`. Lets the recorder convert RGBA→YUV420P on
-  the GPU and skip the per-pixel Dart conversion on the software-encode path.
-  The HW encoders (`d3d11`, generic `hw`/NV12, `nvenc`) keep their existing
-  RGBA/NV12 input (`acceptsYuv420pPlanes => false`).
+- `FfmpegSoftwareEncoder` accepts planar YUV420P frames (`FrameSource.yuv420p`,
+  `acceptsYuv420pPlanes`) without converting them, so the recorder can convert
+  on the GPU. Hardware encoders keep their RGBA/NV12 input.
 
 ## 0.4.9
 
-- **Licensing: switch to the BtbN LGPL FFmpeg build** (`kFfmpegLicense`). The
-  previous GPL build (`-gpl-shared`) links libx264/libx265 and makes the whole
-  binary GPLv2+, imposing copyleft on downstream products. The LGPL build keeps
-  `libav*` under LGPL-2.1 (safe for proprietary dynamic linking). The cache dir
-  is namespaced per-licence (`latest-lgpl`) so the change forces a fresh
-  download instead of reusing a cached GPL install.
-- Consequences of LGPL (no libx264/libx265): software H.264 now comes from
-  `libopenh264` (BSD) and Windows MediaFoundation `h264_mf`; the MF spec no
-  longer forces `hw_encoding=1`, so its software MFT works as a true CPU
-  fallback. There is no software HEVC — `createEncoder` falls back to a
-  downscaled (≤4096px) H.264 stream when a >4096px or HEVC request has no
-  hardware encoder. AV1 (SVT-AV1) and VP9 (libvpx) remain available at any
-  resolution.
+- Licensing: the auto-downloaded FFmpeg is the BtbN LGPL build
+  (`kFfmpegLicense`) instead of GPL, so it is safe for proprietary dynamic
+  linking. The cache directory is per licence, which forces a fresh download.
+- **Behaviour change:** without libx264/libx265, software H.264 comes from
+  `libopenh264` and Windows Media Foundation (`h264_mf`, now usable as a CPU
+  fallback). There is no software HEVC: a HEVC or over-4096 px request with no
+  hardware encoder falls back to H.264 at no more than 4096 px. AV1 (SVT-AV1)
+  and VP9 (libvpx) remain.
 
 ## 0.4.8
 
@@ -223,23 +157,17 @@
 
 ## 0.4.7
 
-- Remove the inert auto-register top-level final and fix the docs: importing
-  the package never actually registered the backend (Dart top-level finals
-  are lazy and nothing read it). Call `registerFfmpegBackend()` explicitly
-  (idempotent); `miniav_recorder` does it in `warmup()` and `start()`.
+- Importing the package never registered the backend: call
+  `registerFfmpegBackend()` explicitly (idempotent). `miniav_recorder` does so
+  in `warmup()` and `start()`.
 
 ## 0.4.6
 
-- Replace all direct `stderr.writeln` diagnostics with a levelled log hook:
-  `setFfmpegToolsLogCallback` / `setFfmpegToolsLogLevel` (uses
-  `MiniAVLogLevel`). Default sink is `print` — `dart:io` stdio writes crash
-  console-less Windows GUI apps with an uncatchable async
-  `FileSystemException` (errno 6), which also masked the real error when the
-  FFmpeg auto-download failed.
-- README: document FFmpeg warmup (`ensureFFmpegLoaded`,
-  `MiniAVTools.warmup()`, `FfmpegDownloader.ensureFfmpeg`), correct the cache
-  paths (`%LOCALAPPDATA%\miniav_tools\ffmpeg` etc. — not
-  `~/.miniav_tools_ffmpeg`), and describe the new logging hook.
+- Diagnostics go through a levelled log hook, `setFfmpegToolsLogCallback` /
+  `setFfmpegToolsLogLevel` (default sink `print`), instead of `stderr`, which
+  crashed Windows GUI apps without a console.
+- README documents FFmpeg warmup (`ensureFFmpegLoaded`, `MiniAVTools.warmup()`,
+  `FfmpegDownloader.ensureFfmpeg`), the real cache paths and the log hook.
 
 ## 0.4.5
 
@@ -355,29 +283,36 @@
 
 ## 0.2.8
 
-- add RecorderLogSource.minigpu: routes native minigpu/Dawn log lines through the unified Recorder log callback; Recorder.minigpuLevelFor public helper for tests; 12 new tests in log_level_test.dart
+- Add `RecorderLogSource.minigpu`, routing native minigpu/Dawn log lines through
+  the unified `Recorder` log callback, and the public `Recorder.minigpuLevelFor`
+  helper.
 
 ## 0.2.7
 
-- fix FormatException on non-UTF-8 bytes in MiniAV log callback: use Utf8Decoder(allowMalformed: true) instead of toDartString()
+- Fix a FormatException on non-UTF-8 bytes in the MiniAV log callback.
 - Increment minigpu to 1.4.4
 
 ## 0.2.6
 
-- fix: add missing `dart:convert` import for `Utf8Decoder` (compilation error introduced in 0.2.5).
+- Fix a compilation error introduced in 0.2.5.
 
 ## 0.2.5
 
-- fix: `FfmpegShim.setFfmpegLogCallback` now uses `Utf8Decoder(allowMalformed: true)` when decoding native C strings, so FFmpeg log messages containing non-UTF-8 bytes (Latin-1 filenames, Windows-1252 error strings, etc.) no longer throw `FormatException: Unexpected extension byte`.
+- `FfmpegShim.setFfmpegLogCallback` no longer throws `FormatException` on FFmpeg
+  log messages that are not valid UTF-8.
 
 ## 0.2.4
 
-- fix: `FfmpegShim.tryLoad()` no longer poisons its cache when called before FFmpeg has been loaded. The shim DLL imports avcodec/avutil; if those aren't loaded yet on Windows, the shim load fails and previously the failure was cached forever — breaking the audio encoder when `Recorder.setLogLevel`/`setLogCallback` was called early. tryLoad now skips silently (without caching) until FFmpeg is loaded.
+- `FfmpegShim.tryLoad()` no longer caches a failure when called before FFmpeg is
+  loaded, which broke the audio encoder when
+  `Recorder.setLogLevel`/`setLogCallback` was called early.
 
 ## 0.2.3
 
-- FFmpeg log forwarding shim bridge (miniav_shim_set_ffmpeg_log_callback, miniav_shim_set_ffmpeg_log_level); FfmpegShim.setFfmpegLogLevel, setFfmpegLogCallback; ABI bumped to 8; export FfmpegShim from barrel
-- add unified Recorder.setLogLevel and Recorder.setLogCallback routing all native logs (MiniAV + FFmpeg) through a single Dart callback
+- FFmpeg log forwarding: `FfmpegShim.setFfmpegLogLevel` and
+  `setFfmpegLogCallback` (shim ABI 8); `FfmpegShim` is exported.
+- add unified Recorder.setLogLevel and Recorder.setLogCallback routing all
+  native logs (MiniAV + FFmpeg) through a single Dart callback
 
 ## 0.2.1
 
@@ -425,23 +360,18 @@
 
 ## 0.1.0
 
-- Initial release. FFmpeg-backed encoder, decoder, muxer and demuxer
-  registered against `miniav_tools_platform_interface`.
+- Initial release. FFmpeg-backed encoder, decoder, muxer and demuxer registered
+  against `miniav_tools_platform_interface`.
 - Software encode for H.264 / HEVC / VP9 / VP8 / AV1 / MJPEG / ProRes via
   libavcodec.
-- Stage A hardware encode (CPU frame in, encoded packet out) using
-  NVENC / AMF / QSV / VideoToolbox / MediaFoundation / V4L2 M2M.
-- Stage B zero-copy D3D11 encode on Windows: takes an `ID3D11Texture2D` NT
-  shared handle directly without any PCIe transfer or colour conversion.
-  - `FfmpegD3d11HwEncoder.openWith(cfg, vendor, existingD3d11Device, sourceTextureFormat)`
-    lets callers inject their own `ID3D11Device*` so the encoder runs on the
-    same DXGI adapter as an external GPU API (Dawn / WebGPU). Required for
-    cross-API NT-handle sharing — different adapters fail with `E_INVALIDARG`.
-  - `sourceTextureFormat` selects `bgra` (default; matches DXGI screen
-    capture and minigpu `SharedOutputTexture`) or `rgba`. The hwframes pool
-    is allocated with this `sw_format` so `CopySubresourceRegion` from the
-    caller's texture stays in the same DXGI type group.
-- MP4 / Matroska / MPEG-TS muxer with byte-buffer, file and streaming
-  callback outputs. Container-level fragmenting for low-latency streaming.
-- Auto-download of FFmpeg shared libraries (BtbN GPL builds) on first run;
-  set `MINIAV_TOOLS_FFMPEG_NO_AUTODOWNLOAD=1` to opt out.
+- Stage A hardware encode (CPU frame in, encoded packet out) using NVENC / AMF /
+  QSV / VideoToolbox / MediaFoundation / V4L2 M2M.
+- Stage B zero-copy D3D11 encode on Windows from an `ID3D11Texture2D` NT shared
+  handle, with no PCIe transfer or colour conversion.
+  `FfmpegD3d11HwEncoder.openWith(cfg, vendor, existingD3d11Device,
+  sourceTextureFormat)` takes the caller's `ID3D11Device*` (sharing needs the
+  same adapter) and a `bgra` (default) or `rgba` source format.
+- MP4 / Matroska / MPEG-TS muxer with byte-buffer, file and streaming callback
+  outputs, and fragmenting for low-latency streaming.
+- Auto-download of FFmpeg shared libraries (BtbN GPL builds) on first run; set
+  `MINIAV_TOOLS_FFMPEG_NO_AUTODOWNLOAD=1` to opt out.

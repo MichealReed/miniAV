@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:miniav_platform_interface/miniav_platform_types.dart';
 import 'package:test/test.dart';
 import 'package:miniav_platform_interface/miniav_platform_interface.dart'
@@ -109,11 +110,14 @@ void main() {
       final context = await camera.createContext();
       final frameReceivedCompleter = Completer<void>();
       int frameCount = 0;
+      MiniAVVideoBuffer? firstVideo;
 
       await context.configure(firstDevice.deviceId, formatToTest);
 
       await context.startCapture((buffer, userData) {
         frameCount++;
+        final data = buffer.data;
+        if (data is MiniAVVideoBuffer) firstVideo ??= data;
         print(
           '[Test Callback] Frame received! Count: $frameCount, Type: ${buffer.runtimeType}, Size: ${buffer.dataSizeBytes}',
         );
@@ -138,6 +142,21 @@ void main() {
         reason: 'Expected at least one frame to be received.',
       );
       print('Capture test successful: Received $frameCount frames.');
+
+      // Media Foundation reports the colour of every YUV frame, and of nothing
+      // else. (Only the colour is read here: the planes died with the buffer.)
+      final video = firstVideo;
+      if (Platform.isWindows && video != null) {
+        print('Frame colour: ${video.pixelFormat.name} ${video.color}');
+        const yuv = {
+          MiniAVPixelFormat.nv12,
+          MiniAVPixelFormat.yuy2,
+          MiniAVPixelFormat.i420,
+          MiniAVPixelFormat.yv12,
+        };
+        expect(video.color != null, yuv.contains(video.pixelFormat),
+            reason: 'colour of a ${video.pixelFormat.name} frame');
+      }
 
       await context.stopCapture();
       print('Camera capture stopped.');

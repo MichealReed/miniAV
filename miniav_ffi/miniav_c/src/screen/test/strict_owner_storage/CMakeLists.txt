@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.20)
+project(miniav_strict_owner_storage_cpu LANGUAGES C CXX)
+if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  message(FATAL_ERROR "The qualified CPU witness requires Windows x64 MSVC")
+endif()
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+foreach(target IN ITEMS miniav_strict_owner_storage_cpu miniav_strict_owner_storage_unsupported_cpu)
+  add_executable(${target} owner_storage_cpu.cpp ../../windows/wgc_control_storage.cpp
+    ../../screen_strict_api.c header_layout.c)
+  target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+    MINIAV_BUILD_DLL MINIAV_BACKEND_WIN_WGC_ENABLED)
+  target_include_directories(${target} PRIVATE ../../../.. ../../../../include)
+  target_compile_options(${target} PRIVATE /EHsc /W4)
+  target_link_libraries(${target} PRIVATE windowsapp d3d11 dxgi dwmapi bcrypt)
+endforeach()
+target_compile_definitions(miniav_strict_owner_storage_unsupported_cpu PRIVATE
+  MINIAV_OWNER_STORAGE_FORCE_UNSUPPORTED)

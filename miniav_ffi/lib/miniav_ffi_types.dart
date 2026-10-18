@@ -2,6 +2,8 @@ import 'dart:convert';
 
 import 'package:miniav_platform_interface/miniav_platform_types.dart';
 import 'miniav_ffi_bindings.dart' as bindings;
+import 'miniav_ffi_color.dart';
+import 'miniav_ffi_damage.dart';
 import 'dart:ffi' as ffi;
 
 import 'dart:typed_data';
@@ -92,6 +94,36 @@ class VideoFormatInfo {
       'VideoFormatInfo(width: $width, height: $height, pixelFormat: ${pixelFormat.name}, frameRate: $frameRateNumerator/$frameRateDenominator, preference: ${outputPreference.name})';
 }
 
+/// Bytes in the CPU view of video plane [plane]: its stride times its rows.
+/// The chroma planes of 4:2:0 formats have half the rows, rounded up, and an
+/// MJPEG frame is one plane of [dataSizeBytes]. GPU frames carry no CPU bytes,
+/// whatever their plane pointers hold (a DMA-BUF file descriptor, a texture).
+int _cpuPlaneBytes(
+  bindings.MiniAVBufferContentType contentType,
+  bindings.MiniAVPixelFormat pixelFormat,
+  int plane,
+  int strideBytes,
+  int height,
+  int dataSizeBytes,
+) {
+  if (contentType !=
+      bindings.MiniAVBufferContentType.MINIAV_BUFFER_CONTENT_TYPE_CPU) {
+    return 0;
+  }
+  switch (pixelFormat) {
+    case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_MJPEG:
+      return plane == 0 ? dataSizeBytes : 0;
+    case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_I420:
+    case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_YV12:
+    case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_NV12:
+    case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_NV21:
+    case bindings.MiniAVPixelFormat.MINIAV_PIXEL_FORMAT_YUV420_10BIT:
+      return strideBytes * (plane == 0 ? height : (height + 1) ~/ 2);
+    default:
+      return strideBytes * height;
+  }
+}
+
 extension MiniAVBufferFFI on MiniAVBuffer {
   /// Converts a bindings.MiniAVBuffer Pointer to a platform MiniAVBuffer.
   static MiniAVBuffer fromPointer(ffi.Pointer<bindings.MiniAVBuffer> ptr) {
@@ -130,11 +162,16 @@ extension MiniAVBufferFFI on MiniAVBuffer {
       final planes = List<Uint8List?>.generate(numPlanes, (i) {
         final planePtr = video.planes[i].data_ptr;
         if (planePtr == ffi.nullptr) return null;
-        // final width = video.info.width;
-        final height = video.info.height;
-        final sizeGuess = strideBytes[i] * height;
+        final length = _cpuPlaneBytes(
+          contentType,
+          pixelFormat,
+          i,
+          strideBytes[i],
+          video.info.height,
+          dataSizeBytes,
+        );
         try {
-          return planePtr.cast<ffi.Uint8>().asTypedList(sizeGuess);
+          return planePtr.cast<ffi.Uint8>().asTypedList(length);
         } catch (_) {
           return null;
         }
@@ -155,6 +192,8 @@ extension MiniAVBufferFFI on MiniAVBuffer {
         nativeHandles: nativeHandles,
         dmabufFds: dmabufFds,
         drmFormatModifiers: drmFormatModifiers,
+        damage: copyVideoDamage(ptr),
+        color: copyVideoColor(ptr),
       );
     } else if (type == bindings.MiniAVBufferType.MINIAV_BUFFER_TYPE_AUDIO) {
       final audio = native.data.audio;

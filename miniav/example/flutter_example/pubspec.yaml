@@ -32,6 +32,8 @@ dependencies:
     sdk: flutter
   miniav:
     path: ../../
+  minigpu:
+    path: ../../../../minigpu/minigpu
   minigpu_view:
     path: ../../../../minigpu/minigpu_view
 

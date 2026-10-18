@@ -1,5 +1,7 @@
 # miniav_ffi CHANGELOG
 
+## 0.8.1-WIP
+
 ## 0.8.0
 
 - New, optional strict capture of one approved application's window on Windows

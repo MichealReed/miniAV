@@ -1,5 +1,7 @@
 # miniav_platform_interface CHANGELOG
 
+## 0.8.1-WIP
+
 ## 0.8.0
 
 - Screen frames can say which parts changed: `MiniAVVideoBuffer.damage`

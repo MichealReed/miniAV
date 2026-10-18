@@ -1,5 +1,7 @@
 # Changelog
 
+## 0.3.1-WIP
+
 ## 0.3.0
 
 - Requires miniav 0.8.0 and the 0.6.0 miniav_tools packages

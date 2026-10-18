@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1
+
+- Requires spawn ^0.1.2.
+
 ## 0.6.0
 
 - Video frames are timed by when they were captured, not when they reached the

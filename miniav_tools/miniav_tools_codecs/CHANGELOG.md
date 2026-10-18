@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.1
+
+- The bundled web worker payloads (codec, demux and audio playback) are
+  rebuilt with spawn 0.1.2 and this release's sources; they had not been
+  rebuilt since August. Each is about 32 kB larger.
+- Requires spawn ^0.1.2.
+
 ## 0.8.0
 
 - Opening the web audio sink can be cancelled while its worklet module loads,

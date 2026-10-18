@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1
+
+- Version bump for the miniav_tools 0.6.1 family. No functional change in
+  this package.
+
 ## 0.6.0
 
 - Requires miniav_platform_interface 0.8.0 and

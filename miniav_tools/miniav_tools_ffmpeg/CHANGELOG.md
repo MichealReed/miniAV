@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1
+
+- Requires spawn ^0.1.2.
+
 ## 0.6.0
 
 - D3D11 encoder: no unbounded waits, and no frame encoded from an unfinished

@@ -96,6 +96,14 @@ Uint8List mp3Frame(Mp3FrameSpec spec) {
   return f;
 }
 
+/// A Layer III frame a real decoder accepts: [spec]'s header over an all-zero
+/// payload. [mp3Frame]'s ramp is only STRUCTURALLY valid — read as side info
+/// it is noise, and a decoder rejects it (Chrome: "granule big_values > 288").
+/// Zero side info gives main_data_begin 0 and every granule part2_3_length 0
+/// and big_values 0, so the frame decodes to exact silence.
+Uint8List mp3SilentFrame(Mp3FrameSpec spec) =>
+    mp3Frame(spec)..fillRange(4, spec.frameLength, 0);
+
 /// A Xing/Info (or VBRI) metadata frame: a normal frame whose payload carries
 /// the tag at the version/channel-dependent offset.
 Uint8List mp3VbrFrame(

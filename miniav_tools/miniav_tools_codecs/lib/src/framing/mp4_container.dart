@@ -776,7 +776,8 @@ class _MuxT {
   /// control) and this stays length 1. When they are not, ISO-BMFF's answer
   /// is a second sample entry in `stsd` with the later chunks pointing at it
   /// via `stsc`'s `sample_description_index` — which is exactly what this
-  /// carries.
+  /// carries. The other case is a stream whose own parameter sets contradict
+  /// the record it was opened with — see [Mp4Muxer._followInBandParamSets].
   ///
   /// The alternative, writing samples encoded against new parameter sets
   /// under the old record, produces a file that decodes wrong or not at all
@@ -790,6 +791,24 @@ class _MuxT {
   /// derived from this, so a config change forces a chunk boundary in both
   /// the streaming and in-memory layouts.
   final List<int> sampleConfig = [];
+
+  /// The [configs] entries at least one sample was written under.
+  final Set<int> sampledConfigs = {};
+
+  /// The [configs] entries the file carries as `stsd` sample entries, in the
+  /// order they were added: every one some sample was written under, or the
+  /// one in force for a track that has no samples.
+  ///
+  /// A record replaced before any sample was written under it is not carried.
+  /// That is the usual shape of a wrong open-time record: corrected by the
+  /// first keyframe, it describes nothing in the file. And an entry nothing
+  /// points at is worse than useless, because a reader that looks only at the
+  /// first sample entry decodes every sample against it.
+  List<int> get writtenConfigs {
+    if (configs.isEmpty) return const [];
+    if (sampledConfigs.isEmpty) return [activeConfig];
+    return sampledConfigs.toList()..sort();
+  }
 
   /// H.264/HEVC only: the source emits Annex-B, so each packet needs rewriting
   /// to length-prefixed NAL units on the way into `mdat`. Decided ONCE — from
@@ -943,9 +962,10 @@ enum Mp4ConfigChange {
   /// Matches a record this track already carries; samples point back at it.
   restored,
 
-  /// New. A second `stsd` sample entry now exists and later chunks point at
-  /// it. Conformant, but readers that use only the first sample entry will
-  /// render everything after this point incorrectly.
+  /// New. Later chunks point at a sample entry of its own — a second one
+  /// once samples were written under another record. Conformant, but readers
+  /// that use only the first sample entry will render everything after this
+  /// point incorrectly.
   added,
 }
 
@@ -1055,12 +1075,17 @@ class Mp4Muxer implements PlatformMuxer {
   ///    for a reopened encoder with the same settings, and a complete no-op.
   ///  * `restored` — matches a record this track already carries, so samples
   ///    go back to pointing at it. No new sample entry.
-  ///  * `added` — genuinely new. A second `stsd` entry is written and every
-  ///    subsequent chunk points at it. Conformant, and correctly played by
-  ///    readers that honour `sample_description_index` — but readers that use
-  ///    only the first sample entry will render everything after this point
-  ///    wrong, so a caller that cannot accept that should start a new file
-  ///    here instead.
+  ///  * `added` — genuinely new. Every subsequent chunk points at an `stsd`
+  ///    entry of its own: a second one if samples were already written under
+  ///    the previous record. Conformant, and correctly played by readers that
+  ///    honour `sample_description_index` — but readers that use only the
+  ///    first sample entry will render everything after this point wrong, so
+  ///    a caller that cannot accept that should start a new file here instead.
+  ///
+  /// A record no sample is written under is not written at all. An H.264 or
+  /// HEVC sample that carries its own parameter sets has the final say: when
+  /// the record in force does not hold them, the track switches to one that
+  /// does before the sample is booked.
   Mp4ConfigChange setTrackConfig(int trackIndex, Uint8List config) {
     _checkOpen();
     _checkNotFinished('setTrackConfig');
@@ -1098,9 +1123,13 @@ class Mp4Muxer implements PlatformMuxer {
     return Mp4ConfigChange.added;
   }
 
-  /// The configuration records this track carries. Length > 1 means the
-  /// encoder was reopened mid-recording with different parameter sets.
-  int trackConfigCount(int trackIndex) => _tracks[trackIndex].configs.length;
+  /// The `stsd` sample entries this track carries if it is finished now: one
+  /// per configuration record samples were written under, or the record in
+  /// force before the first sample. More than one means the parameter sets
+  /// changed part-way — the encoder was reopened with different ones, or the
+  /// stream's own parameter sets switched records.
+  int trackConfigCount(int trackIndex) =>
+      _tracks[trackIndex].writtenConfigs.length;
 
   /// Indices of tracks whose encoder never published a configuration record.
   ///
@@ -1262,7 +1291,6 @@ class Mp4Muxer implements PlatformMuxer {
       throw CodecRuntimeException('mp4', 'trackIndex $i out of range');
     }
     final t = _tracks[i];
-    t.sampleConfig.add(t.activeConfig);
 
     // The decode clock a track will actually be indexed on is chosen at
     // finish (see [_timing]): `dtsUs` when the producer ever sets it, `ptsUs`
@@ -1292,6 +1320,11 @@ class Mp4Muxer implements PlatformMuxer {
       t.annexB = isAnnexB(packet.data);
       _framingSettled.add(i);
     }
+    // Before the sample is booked under a record: the parameter sets it
+    // carries may not be the ones the track was told about.
+    if (t.annexB) _followInBandParamSets(t, packet.data);
+    t.sampleConfig.add(t.activeConfig);
+    t.sampledConfigs.add(t.activeConfig);
     t.dtsUs.add(packet.dtsUs);
     t.ptsUs.add(packet.ptsUs);
     t.nominalDurUs.add(packet.durationUs);
@@ -1320,6 +1353,52 @@ class Mp4Muxer implements PlatformMuxer {
     t.sizes.add(bytes.length);
     await sink.add(bytes);
     _mdatLen += bytes.length;
+  }
+
+  /// Side with the stream when a sample's own parameter sets contradict the
+  /// track's record.
+  ///
+  /// A producer's published parameter sets are a claim about its stream; the
+  /// ones in front of a keyframe are the stream. AMD's H.264 Media Foundation
+  /// encoder is a measured case where the two differ: its sequence header
+  /// signals pic_order_cnt_type 0, and every SPS it emits signals type 2.
+  /// [_MuxT.reframe] strips the in-band copies, so samples booked under the
+  /// published record have every slice header parsed against the wrong SPS,
+  /// and nothing left in the file can say so.
+  ///
+  /// So a sample carrying a parameter set the record in force does not hold
+  /// switches the track to a record that holds them all: one it already
+  /// carries, or a new one built from them plus any parameter-set type the
+  /// sample did not repeat. The usual case — a wrong open-time record
+  /// corrected by the first keyframe — still ends as ONE sample entry, because
+  /// a record no sample was booked under is not written
+  /// ([_MuxT.writtenConfigs]). A track opened without a record gets its first
+  /// one here.
+  void _followInBandParamSets(_MuxT t, Uint8List data) {
+    final codec = (t.info as VideoTrackInfo).codec;
+    if (codec != VideoCodec.h264 && codec != VideoCodec.hevc) return;
+    final hevc = codec == VideoCodec.hevc;
+    final fresh = leadingParamSets(data, hevc: hevc);
+    if (fresh.isEmpty) return;
+    bool holds(Uint8List record) =>
+        carriesParamSets(configParamSets(record, hevc: hevc), fresh);
+    if (t.configs.isNotEmpty && holds(t.configs[t.activeConfig])) return;
+    for (var c = 0; c < t.configs.length; c++) {
+      if (holds(t.configs[c])) {
+        t.activeConfig = c;
+        return;
+      }
+    }
+    final held = t.configs.isEmpty
+        ? const <Uint8List>[]
+        : configParamSets(t.configs[t.activeConfig], hevc: hevc);
+    final merged = mergeParamSets(fresh, held, hevc: hevc);
+    final record = hevc ? buildHvcC(merged) : buildAvcC(merged);
+    // No usable SPS among them: there is nothing better to describe the
+    // sample with than what the track already has.
+    if (record == null) return;
+    t.configs.add(record);
+    t.activeConfig = t.configs.length - 1;
   }
 
   @override
@@ -1831,11 +1910,15 @@ class Mp4Muxer implements PlatformMuxer {
       if (o > _u32Max) needCo64 = true;
     }
     final stss = t.isVideo ? _stss(t) : null;
+    // Entries only for the records samples were written under, so a chunk's
+    // sample_description_index is its record's position in that list.
+    final written = t.writtenConfigs;
+    final entryOf = {for (var e = 0; e < written.length; e++) written[e]: e};
     final body = <int>[
-      ..._stsd(t),
+      ..._stsd(t, written),
       ..._stts(tm.durations),
       if (tm.ctts != null) ..._ctts(tm.ctts!),
-      ..._stsc(t.chunkCounts, t.chunkConfig),
+      ..._stsc(t.chunkCounts, [for (final c in t.chunkConfig) entryOf[c] ?? 0]),
       ..._stsz(t.sizes),
       ...(needCo64 ? _co64(t.chunkOffsets) : _stco(t.chunkOffsets)),
       if (stss != null) ...stss,
@@ -1851,10 +1934,13 @@ class Mp4Muxer implements PlatformMuxer {
   /// plays the whole file correctly; one that reads only the first entry
   /// renders the tail wrong, which is why [Mp4Muxer.setTrackConfig] reports
   /// that it happened rather than doing it quietly.
-  Uint8List _stsd(_MuxT t) {
+  ///
+  /// [written] is [_MuxT.writtenConfigs]: a record no sample was written
+  /// under gets no entry.
+  Uint8List _stsd(_MuxT t, List<int> written) {
     final b = BytesBuilder(copy: false);
-    _u32c(b, t.configs.length, 'stsd entry count');
-    for (var i = 0; i < t.configs.length; i++) {
+    _u32c(b, written.length, 'stsd entry count');
+    for (final i in written) {
       b.add(t.isVideo ? _videoEntry(t, i) : _audioEntry(t, i));
     }
     return fullBox('stsd', 0, 0, b.toBytes());
@@ -1998,13 +2084,13 @@ class Mp4Muxer implements PlatformMuxer {
   }
 
   /// sample-to-chunk, run-length encoded over [chunkCounts] (one entry per
-  /// chunk, in order).
-  Uint8List _stsc(List<int> chunkCounts, List<int> chunkConfig) {
+  /// chunk, in order). [chunkEntry] is each chunk's 0-based `stsd` entry.
+  Uint8List _stsc(List<int> chunkCounts, List<int> chunkEntry) {
     // [first_chunk, samples_per_chunk, sample_description_index]
     final entries = <List<int>>[];
     for (var c = 0; c < chunkCounts.length; c++) {
       // 1-based, and 1 for every track that never changed configuration.
-      final desc = (c < chunkConfig.length ? chunkConfig[c] : 0) + 1;
+      final desc = (c < chunkEntry.length ? chunkEntry[c] : 0) + 1;
       // A run continues only while BOTH the sample count and the description
       // index hold. Collapsing on the count alone would silently carry the
       // first config across a chunk that was encoded under a different one.

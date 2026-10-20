@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.2-WIP
+
+- MP4 muxer: an H.264 or HEVC sample that carries parameter sets its track's
+  configuration record does not hold switches the track to a record that does.
+  The samples used to be described by the record alone, with their own
+  parameter sets stripped. AMD's H.264 Media Foundation encoder publishes a
+  sequence header whose SPS differs from the one in its stream (picture order
+  count type and colour description), so no frame of its MP4 recordings
+  decoded correctly.
+- **Behaviour change:** a configuration record no sample was written under is
+  no longer written as an `stsd` sample entry, and `trackConfigCount` counts
+  the entries written. A record replaced before the first sample used to stay
+  in the file as the first entry, which readers that use only the first entry
+  apply to every sample.
+- MP4 muxer: a track opened without a configuration record takes one from the
+  first sample that carries parameter sets, instead of being written without
+  one.
+- Media Foundation encoder: `extraData` follows the parameter sets the stream
+  carries. It starts as the encoder's published sequence header and is
+  replaced when a packet carries different ones.
+
 ## 0.8.1
 
 - The bundled web worker payloads (codec, demux and audio playback) are

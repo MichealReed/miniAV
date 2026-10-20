@@ -6,11 +6,11 @@
 /// reaches the encoder — D3D11 zero-copy texture input remains a follow-up, as
 /// does an MTA-isolate host (today `open` returns `null` on an STA thread →
 /// FFmpeg).
-/// [extraData] is the Annex-B parameter-set blob (the MF sequence header, or
-/// the sets harvested from the first keyframe when the MFT does not publish
-/// one). `Mp4Muxer` converts it to an avcC/hvcC record and rewrites the samples
-/// to length-prefixed NALs, so Annex-B is the right thing to hand back here —
-/// see `framing/annexb.dart`.
+/// [extraData] is the Annex-B parameter-set blob: the MF sequence header until
+/// the first keyframe, then the parameter sets the stream actually carries
+/// wherever the two differ (see `_followParamSets`). `Mp4Muxer` converts it to
+/// an avcC/hvcC record and rewrites the samples to length-prefixed NALs, so
+/// Annex-B is the right thing to hand back here — see `framing/annexb.dart`.
 library;
 
 import 'dart:ffi';
@@ -597,7 +597,7 @@ class MfVideoEncoder
       if (f.size <= 0 || f.data == nullptr) break;
       final data = Uint8List.fromList(f.data.asTypedList(f.size));
       mfencFree(f.data.cast());
-      if (_extra == null && f.isKeyframe == 1) _harvestParamSets(data);
+      _followParamSets(data);
       _produced++;
       _pending.add(EncodedPacket(
         data: data,
@@ -608,27 +608,32 @@ class MfVideoEncoder
     }
   }
 
-  /// Recover the parameter sets from a keyframe when the MFT published no
-  /// `MF_MT_MPEG_SEQUENCE_HEADER`. Some hardware MFTs only fill that attribute
-  /// after the first output — and the muxer refuses a video track with no
-  /// config record, so a null [extraData] would fail the whole recording.
-  /// The sets are repeated in-band on every IDR, so the first keyframe has them.
-  void _harvestParamSets(Uint8List keyframe) {
-    if (!isAnnexB(keyframe)) return;
+  /// Make [extraData] the parameter sets the stream actually carries.
+  ///
+  /// `MF_MT_MPEG_SEQUENCE_HEADER` is read once, at open, and it is a claim
+  /// about the stream rather than the stream. AMD's H.264 MFT publishes one
+  /// whose SPS signals pic_order_cnt_type 0 and an unspecified colour
+  /// description, while every SPS it emits signals type 2 and BT.709 — and it
+  /// never updates the header. A container that describes the track from that
+  /// header and strips the in-band copies, as MP4 does, makes every slice
+  /// header parse against the wrong SPS. Intel's Quick Sync MFT publishes no
+  /// header until its first output: the same problem with nothing to keep.
+  ///
+  /// So the parameter sets in front of a packet are authoritative. When one is
+  /// not already in [_extra] they replace it, keeping any parameter-set type
+  /// the packet did not repeat. When they agree, as NVIDIA's MFT's do, nothing
+  /// changes.
+  void _followParamSets(Uint8List packet) {
     final hevc = _codec == VideoCodec.hevc;
-    final sets = BytesBuilder(copy: false);
-    for (final nal in splitAnnexB(keyframe)) {
-      if (nal.isEmpty) continue;
-      final type = hevc ? (nal[0] >> 1) & 0x3F : nal[0] & 0x1F;
-      final isParamSet = hevc
-          ? (type == 32 || type == 33 || type == 34) // VPS / SPS / PPS
-          : (type == 7 || type == 8); // SPS / PPS
-      if (!isParamSet) continue;
-      sets.add(const [0, 0, 0, 1]);
-      sets.add(nal);
-    }
-    final bytes = sets.toBytes();
-    if (bytes.isNotEmpty) _extra = CodecExtraData.video(_codec, bytes);
+    final fresh = leadingParamSets(packet, hevc: hevc);
+    if (fresh.isEmpty) return;
+    final extra = _extra;
+    final held = extra == null
+        ? const <Uint8List>[]
+        : configParamSets(extra.bytes, hevc: hevc);
+    if (carriesParamSets(held, fresh)) return;
+    _extra =
+        CodecExtraData.video(_codec, mergeParamSets(fresh, held, hevc: hevc));
   }
 
   /// Extract tightly-packed NV12 bytes from [frame].

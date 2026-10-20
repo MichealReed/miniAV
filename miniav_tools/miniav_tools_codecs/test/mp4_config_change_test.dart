@@ -177,6 +177,25 @@ void main() {
           reason: 'same samples_per_chunk, different config — three runs');
       expect(rows.map((e) => e[0]).toList(), [1, 2, 3]);
     });
+
+    test('a record replaced before any sample was written is not written',
+        () async {
+      // It describes no sample. Writing it anyway puts it first, and the first
+      // entry is the one readers that ignore sample_description_index use for
+      // every sample in the track.
+      final m = _open();
+      await m.writeHeader();
+      expect(m.setTrackConfig(0, _avcC(0x28)), Mp4ConfigChange.added);
+      await _write(m, 10);
+      await m.finish();
+
+      final mp4 = Uint8List.fromList(m.getBytes()!);
+      expect(_stsdEntryCount(mp4), 1);
+      expect(m.trackConfigCount(0), 1);
+      expect(_stsc(mp4).every((e) => e[2] == 1), isTrue);
+      final track = Mp4Demuxer.open(mp4).tracks.single as VideoTrackInfo;
+      expect(track.extraData!.bytes, _avcC(0x28));
+    });
   });
 
   group('the STREAMING path splits chunks too', () {
@@ -231,6 +250,26 @@ void main() {
       final mp4 = await streamed((_) {});
       expect(_stsdEntryCount(mp4), 1);
       expect(_stsc(mp4).every((e) => e[2] == 1), isTrue);
+    });
+
+    test('a record replaced before the first sample is not written', () async {
+      final path = '${dir.path}/out.mp4';
+      final m = Mp4Muxer.open(MuxerConfig(
+        container: Container.mp4,
+        output: MuxerOutput.file(path),
+        tracks: [_track(0x1f)],
+      ));
+      await m.writeHeader();
+      m.setTrackConfig(0, _avcC(0x28));
+      await _write(m, 10);
+      await m.finish();
+
+      final mp4 = File(path).readAsBytesSync();
+      expect(_stsdEntryCount(mp4), 1);
+      expect(_stsc(mp4).every((e) => e[2] == 1), isTrue,
+          reason: 'the chunks point at the surviving entry, renumbered');
+      final track = Mp4Demuxer.open(mp4).tracks.single as VideoTrackInfo;
+      expect(track.extraData!.bytes, _avcC(0x28));
     });
   });
 

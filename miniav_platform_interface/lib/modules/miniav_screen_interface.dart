@@ -64,6 +64,21 @@ abstract class MiniScreenContextPlatformInterface {
     Object? userData,
   });
 
+  /// Switch a live capture to CPU frames without reacquiring its source.
+  /// Unsupported backends leave the active capture untouched.
+  Future<bool> fallbackToCpuDelivery() async => false;
+
+  /// Adjust the already selected source without opening another picker.
+  /// Unsupported backends leave the source untouched and return false.
+  Future<bool> setCaptureFrameRate(int fps) async => false;
+
+  /// Resource preference for the selected video track, where supported.
+  void setContentHint(String hint) {}
+
+  /// The live CPU-delivery surface, when the backend can expose one without
+  /// copying it. Hosts may present it; ownership remains with this context.
+  Object? get cpuDeliverySurface => null;
+
   /// Stop screen capture.
   Future<void> stopCapture();
 

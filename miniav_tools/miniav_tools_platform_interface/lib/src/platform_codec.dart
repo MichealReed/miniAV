@@ -70,6 +70,28 @@ abstract class PlatformEncoder {
   bool get supportsD3d11TextureInput => false;
 }
 
+/// A video encoder that can re-submit the last frame it accepted under a new
+/// timestamp, without the caller handing over the picture again.
+///
+/// An idle or constant-frame-rate duplicate is the same picture with a later
+/// timestamp. Expressing that by re-submitting the producer's surface makes the
+/// duplicate depend on a surface the producer may already be rewriting with
+/// the NEXT picture — a duplicate that shows newer content than the frame
+/// encoded after it, which plays back as the picture jumping backwards. An
+/// encoder that kept its own copy of its last input has no such dependency.
+abstract interface class FrameRepeatingEncoder implements PlatformEncoder {
+  /// Re-encodes the last frame this encoder accepted, stamped [timestampUs].
+  ///
+  /// Returns a packet if one happened to be ready, exactly like
+  /// [PlatformEncoder.encode]: the packet may belong to an earlier frame.
+  ///
+  /// An encoder whose packets carry the timestamp each frame was submitted
+  /// with may return null without submitting anything when it has nothing to
+  /// repeat. One whose packets do not must throw instead, so that a caller
+  /// pairing packets with frames by submission order stays in step.
+  Future<EncodedPacket?> repeatLastFrame(int timestampUs);
+}
+
 /// Abstract audio encoder. Backends return a concrete subclass from
 /// [MiniAVToolsBackend.createAudioEncoder].
 ///

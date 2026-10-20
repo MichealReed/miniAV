@@ -44,6 +44,14 @@ void main(List<String> args) async {
       _ => Generator.defaultGenerator,
     };
 
+    // hooks_runner re-runs this hook only when the hook script itself or a
+    // REGISTERED dependency is newer than the cached output. CMakeBuilder
+    // registers none of its sources, so without this an edited encoder or
+    // decoder keeps serving the previously built library - here and in every
+    // package that depends on this one - and the edit looks like it changed
+    // nothing.
+    output.dependencies.addAll(_sourceFiles(_sourceDir));
+
     final builder = CMakeBuilder.create(
       name: _assetName,
       sourceDir: _sourceDir.absolute.uri,
@@ -61,4 +69,21 @@ void main(List<String> args) async {
       logger.info('registered asset: ${asset.file}');
     }
   });
+}
+
+/// Every native source under [dir] that the CMake build compiles, as absolute
+/// URIs for `output.dependencies`. Build trees (`build*/`, which include the
+/// wasm and web builds' output) are skipped: registering generated files
+/// would rebuild this library whenever they change.
+Iterable<Uri> _sourceFiles(Directory dir) sync* {
+  const extensions = {'.c', '.cc', '.cpp', '.h', '.hpp', '.txt', '.cmake'};
+  final buildTree = RegExp(r'/build[^/]*/');
+  for (final entity in dir.listSync(recursive: true, followLinks: false)) {
+    if (entity is! File) continue;
+    final path = entity.path.replaceAll(r'\', '/');
+    if (buildTree.hasMatch(path)) continue;
+    final dot = path.lastIndexOf('.');
+    if (dot < 0 || !extensions.contains(path.substring(dot))) continue;
+    yield entity.absolute.uri;
+  }
 }

@@ -1,43 +1,56 @@
 # miniav CHANGELOG
 
+## 0.8.1-WIP
+
+## 0.8.0
+
+- `MiniScreenContext` exposes `setCaptureFrameRate`, `setContentHint`,
+  `fallbackToCpuDelivery` and `cpuDeliverySurface`. The web backend
+  implements them; native backends report them as unsupported.
+- Screen frames from Windows Desktop Duplication carry `damage`: the
+  rectangles that changed since the previous frame.
+- Windows camera frames carry `color`, the YUV matrix and range of the
+  picture, so a viewer can convert them to the right RGB. Other platforms
+  report `null` for now.
+
+## 0.7.4
+
+- Increment downstream deps
+
+## 0.7.3
+
+- New `openCaptureMirror` / `closeCaptureMirror` on the audio-input facade hand
+  captured audio to another thread instead of `startCapture`'s callback; closing
+  the mirror resumes normal delivery. They return null where unsupported.
+
 ## 0.7.2
 
 - released 08/13/26 - MR
+
 ## 0.7.1
 
-- Picks up miniav_ffi 0.7.1: destroying a Windows camera context no longer
-  frees the Media Foundation source-reader callback while MF still holds it,
-  and COM/MF initialisation is now process-lifetime rather than driven from
-  individual FFI calls (the Dart VM runs an isolate's calls on threads borrowed
-  from a pool, so per-call CoInitializeEx/CoUninitialize could not be balanced).
-  No API change in this package.
+- Picks up miniav_ffi 0.7.1: destroying a Windows camera context no longer frees
+  the Media Foundation callback while MF still holds it, and COM/MF
+  initialisation is process-wide instead of per call. No API change in this
+  package.
 
 ## 0.7.0
 
 ### GPU buffer handoff contract (Windows)
 
-- **FIXED (leak): the shared NT handle on the GPU path is now closed by
-  miniav.** Previously `MiniAV.releaseBuffer` only *logged* that the app was
-  responsible for closing it and no caller ever did — one leaked kernel handle
-  per captured GPU frame (60/s at 60 fps). miniav now owns the handle and
-  closes it in the release path.
-  - **Contract:** finish importing the handle (`OpenSharedResource1`, minigpu
-    `importVideoFrame`, …) *before* calling `releaseBuffer` / `releaseBufferSync`,
-    and do **not** `CloseHandle` it yourself. Release **every** buffer, including
-    ones you skip — the handle is only closed on release.
-- **DOCS FIX:** the README GPU example said the handle lives in `planes[0]`. It
-  does not: it is in **`nativeHandles[0]`** (a plain Dart `int`). On the GPU path
-  `planes[0]` is a non-null but **empty** `Uint8List` with stride 0, so
-  `planes[0] != null` is *not* a CPU/GPU discriminator — use `buffer.contentType`.
-- **`MiniAVNativeFence` is documented as unimplemented.** No backend populates
-  it: `d3d11FencePtr`/`metalSharedEventPtr`/`metalFenceValue` are always `0`,
-  `syncFd` always `-1`. The Windows backends instead insert a
-  `D3D11_QUERY_EVENT`, `Flush()`, and busy-poll for ≤16 ms — **on timeout they
-  hand the frame over anyway**, so a consumer can receive a texture whose
-  producer-side copy has not finished.
-
-- `MiniScreen.setIOSAppGroup(String)` — register the App Group shared with
-  the iOS Broadcast Upload Extension before configuring the
+- **Behaviour change:** miniav closes the shared NT handle of a GPU frame when
+  the buffer is released; it leaked one kernel handle per captured GPU frame.
+  Finish importing the handle (`OpenSharedResource1`, minigpu
+  `importVideoFrame`, …) before `releaseBuffer` / `releaseBufferSync`, do not
+  `CloseHandle` it yourself, and release every buffer, including ones you skip.
+- README fix: the GPU handle is in `nativeHandles[0]`, not `planes[0]`. On the
+  GPU path `planes[0]` is an empty `Uint8List`, so use `buffer.contentType` to
+  tell CPU frames from GPU frames.
+- `MiniAVNativeFence` is documented as unimplemented: no backend fills it. The
+  Windows backends wait up to 16 ms for the GPU copy and then hand the frame
+  over anyway, so a texture may not be finished.
+- `MiniScreen.setIOSAppGroup(String)` registers the App Group shared with the
+  iOS Broadcast Upload Extension; call it before configuring the
   `system_screen_broadcast` display.
 
 ## 0.6.0
@@ -48,10 +61,8 @@
 
 ## 0.5.9
 
-- add `MiniAV.releaseBufferSync()`: synchronous, fire-and-forget variant of
-  `releaseBuffer()` for hot paths (e.g. a per-frame capture callback) that must
-  avoid a per-call `Future`/microtask allocation. Delegates to the platform's
-  synchronous release where available.
+- Add `MiniAV.releaseBufferSync()`, a synchronous variant of `releaseBuffer()`
+  for hot paths such as a per-frame capture callback.
 
 ## 0.5.8
 
@@ -63,8 +74,9 @@
 
 ## 0.5.6
 
-- fix FormatException on non-UTF-8 bytes in MiniAV log callback: use Utf8Decoder(allowMalformed: true) instead of toDartString()
-- add setLogCallback and installStderrLogger to route native MiniAV C library logs to a Dart callback
+- Fix a FormatException on non-UTF-8 bytes in the MiniAV log callback.
+- add setLogCallback and installStderrLogger to route native MiniAV C library
+  logs to a Dart callback
 
 ## 0.5.5
 

@@ -261,8 +261,11 @@ void main() {
         markTestSkipped('AudioDecoder API not available in this browser');
         return;
       }
+      // Silent frames, not mp3Stream's ramp: a real decoder rejects the ramp's
+      // side info, so it can only exercise framing.
       const spec = Mp3FrameSpec();
-      final bytes = concatBytes([mp3Stream(repeatSpec(spec, 8))]);
+      final bytes =
+          concatBytes([for (var i = 0; i < 8; i++) mp3SilentFrame(spec)]);
       final dm = await ContainerFramingBackend().createDemuxer(
         DemuxerConfig(input: DemuxerInput.bytes(bytes)),
       );
@@ -280,28 +283,27 @@ void main() {
       expect(dec, isNotNull, reason: 'no backend could decode mp3 on web');
 
       var packets = 0;
-      var frames = 0;
+      final decoded = <DecodedAudio>[];
       for (var p = await dm.readPacket(); p != null; p = await dm.readPacket()) {
         packets++;
-        for (final d in await dec!.decode(p)) {
-          frames += d.frameCount;
-        }
+        decoded.addAll(await dec!.decode(p));
       }
-      for (final d in await dec!.flush()) {
-        frames += d.frameCount;
-      }
+      decoded.addAll(await dec!.flush());
       await dec.close();
       await dm.close();
 
-      // What this fixture can honestly prove: the whole demux → configure →
-      // decode → flush chain RUNS in a browser without throwing, which is
-      // exactly what regressed (configure threw a TypeError and no packet was
-      // ever fed). It canNOT prove PCM correctness — the frames are synthetic,
-      // valid headers over silent payload, so a real decoder may legitimately
-      // emit nothing. Byte-accurate output needs a real .mp3 asset served to
-      // the browser; see the VM-side decode tests for that coverage.
+      // The whole demux → configure → decode → flush chain must RUN (what
+      // regressed: configure threw a TypeError and no packet was ever fed) and
+      // must yield PCM. Silent frames prove the samples are the stream's, not
+      // that the decoder is accurate — the VM-side decode tests cover that.
       expect(packets, 8, reason: 'every demuxed packet must reach the decoder');
-      expect(frames, greaterThanOrEqualTo(0));
+      final frames = decoded.fold<int>(0, (n, d) => n + d.frameCount);
+      expect(frames, greaterThan(0), reason: 'a real decoder emits PCM here');
+      for (final d in decoded) {
+        expect(d.samples.length, d.frameCount * d.channels);
+        expect(d.samples.every((s) => s.abs() < 1e-4), isTrue,
+            reason: 'silent mp3 frames must decode to silence');
+      }
     }, tags: ['browser']);
   });
 

@@ -196,6 +196,35 @@ void main() {
       expect(buf.nativeHandles[0], same(fakeHandle));
     });
 
+    test('immutable D3D11 import requires exact producer provenance', () {
+      MiniAVVideoBuffer buffer({
+        MiniAVPixelFormat format = MiniAVPixelFormat.bgra32,
+        int stride = 0,
+        Object? handle = 123,
+        List<int> tags = const [kMiniAVD3D11ImmutableReadyTag],
+      }) => MiniAVVideoBuffer(
+        width: 3840,
+        height: 2160,
+        pixelFormat: format,
+        strideBytes: [stride],
+        planes: const [null],
+        nativeHandles: [handle],
+        drmFormatModifiers: tags,
+      );
+      expect(buffer().d3d11ImmutableReady, isTrue);
+      expect(buffer(tags: const []).d3d11ImmutableReady, isFalse);
+      expect(buffer(tags: const [0]).d3d11ImmutableReady, isFalse);
+      expect(buffer(tags: const [0x57474332]).d3d11ImmutableReady, isFalse);
+      expect(
+        buffer(format: MiniAVPixelFormat.nv12).d3d11ImmutableReady,
+        isFalse,
+      );
+      expect(buffer(stride: 15360).d3d11ImmutableReady, isFalse);
+      expect(buffer(handle: null).d3d11ImmutableReady, isFalse);
+      expect(buffer(handle: 0).d3d11ImmutableReady, isFalse);
+      expect(buffer(handle: Object()).d3d11ImmutableReady, isFalse);
+    });
+
     // Regression: the README used to tell integrators the GPU handle lives in
     // `planes[0]`. It does not — it is in `nativeHandles[0]`, and `planes[0]`
     // as produced by the FFI shim is a non-null but EMPTY Uint8List (stride 0),

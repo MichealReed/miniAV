@@ -5,7 +5,7 @@ part of '../miniav_web.dart';
 /// Keyboard/mouse capture on the web is intentionally not implemented here —
 /// apps listen through Flutter/DOM directly (see `INPUT_LAYER_PLAN.md` §3). The
 /// web platform contributes two things through this seam:
-///   * gamepad enumeration + hotplug (Gamepad API), and
+///   * standard gamepad state, enumeration and hotplug (Gamepad API), and
 ///   * **motion / IMU** via [MiniAVWebInputContext], emitting the same canonical
 ///     [MiniAVMotionEvent] the native backends produce so the client parallax
 ///     path is byte-shape-identical across native and web.
@@ -95,8 +95,9 @@ Future<bool> _requestPermissionOnCtor(String ctorName) async {
     if (ctor == null) return true; // constructor absent → no sensor at all
     final obj = ctor as JSObject;
     if (!obj.has('requestPermission')) return true; // non-iOS: no gate
-    final promise =
-        obj.callMethod<JSPromise<JSString>>('requestPermission'.toJS);
+    final promise = obj.callMethod<JSPromise<JSString>>(
+      'requestPermission'.toJS,
+    );
     final state = (await promise.toDart).toDart;
     return state == 'granted';
   } catch (_) {
@@ -105,11 +106,9 @@ Future<bool> _requestPermissionOnCtor(String ctorName) async {
   }
 }
 
-/// Web input context. P0 scope = **motion (IMU) via Path-B** (DeviceOrientation
-/// + DeviceMotion), which is the first-class path on iOS Safari — all iOS
-/// browsers are WebKit and will never ship the Generic Sensor API, so Path-B is
-/// not a fallback there. (P1 layers the Generic Sensor "Path-A" upgrade for
-/// Chromium/Android and gamepad-state polling onto the same context.)
+/// Web input context for selected standard gamepads and motion sensors.
+/// Motion uses DeviceOrientation + DeviceMotion; gamepad capture polls only
+/// while started and emits neutral disconnects when the page becomes hidden.
 ///
 /// Emits the canonical [MiniAVMotionEvent]: gyro in rad/s, accel in m/s²
 /// (gravity-included, reaction-force sign as the browser reports), a fused
@@ -119,6 +118,8 @@ Future<bool> _requestPermissionOnCtor(String ctorName) async {
 /// landscape.
 class MiniAVWebInputContext implements MiniInputContextPlatformInterface {
   MiniAVInputConfig? _config;
+  final _gamepad = _WebGamepadCapture();
+  bool _destroyed = false;
 
   void Function(MiniAVMotionEvent event, Object? userData)? _onMotion;
   Object? _userData;
@@ -142,9 +143,12 @@ class MiniAVWebInputContext implements MiniInputContextPlatformInterface {
 
   @override
   Future<void> configure(MiniAVInputConfig config) async {
+    if (_destroyed) throw StateError('Input context was destroyed');
     _config = config;
     // Web sensors are hard-capped at ~60 Hz; never spin faster.
-    final hz = config.motionRateHz <= 0 ? 60 : math.min(config.motionRateHz, 60);
+    final hz = config.motionRateHz <= 0
+        ? 60
+        : math.min(config.motionRateHz, 60);
     _intervalUs = 1000000 ~/ hz;
   }
 
@@ -156,14 +160,25 @@ class MiniAVWebInputContext implements MiniInputContextPlatformInterface {
     void Function(MiniAVMotionEvent event, Object? userData)? onMotion,
     Object? userData,
   }) async {
-    // Keyboard/mouse/gamepad on web are handled elsewhere (Flutter/DOM for
-    // pointer+key; Gamepad API polling is P1). This context owns motion.
+    if (_destroyed) throw StateError('Input context was destroyed');
+    // Keyboard and pointer remain Flutter/DOM-owned. Only explicitly selected
+    // gamepad and motion feeds start here; gamepad capture never requests IMU.
+    _stopMotion();
+    _gamepad.stop();
     _onMotion = onMotion;
     _userData = userData;
 
     final types = _config?.inputTypes ?? MiniAVInputType.motion.value;
     final wantsMotion = (types & MiniAVInputType.motion.value) != 0;
     if (wantsMotion) _startMotion();
+    if ((types & MiniAVInputType.gamepad.value) != 0) {
+      try {
+        _gamepad.start(_config?.gamepadPollHz ?? 60, onGamepad, userData);
+      } catch (_) {
+        _stopMotion();
+        rethrow;
+      }
+    }
   }
 
   void _startMotion() {
@@ -220,8 +235,9 @@ class MiniAVWebInputContext implements MiniInputContextPlatformInterface {
   void _maybeEmit() {
     final now = _WebUtils._getCurrentTimestampUs();
     final display = _displayRotation();
-    final screenQuat = (_config?.motionMode ?? MiniAVMotionMode.fusedScreenStable)
-            == MiniAVMotionMode.rawDeviceFrame
+    final screenQuat =
+        (_config?.motionMode ?? MiniAVMotionMode.fusedScreenStable) ==
+            MiniAVMotionMode.rawDeviceFrame
         ? _orientation
         : _remapToScreen(_orientation, _screenAngleDeg());
 
@@ -306,13 +322,20 @@ class MiniAVWebInputContext implements MiniInputContextPlatformInterface {
   MiniAVMotionEvent? latestMotion() => _latest;
 
   @override
-  MiniAVGamepadEvent? snapshotGamepad(int index) => null; // P1
+  MiniAVGamepadEvent? snapshotGamepad(int index) => _gamepad.snapshot(index);
 
   @override
   Future<bool> requestMotionPermission() => _requestWebMotionPermission();
 
   @override
   Future<void> stopCapture() async {
+    _gamepad.stop();
+    _stopMotion();
+    _onMotion = null;
+    _userData = null;
+  }
+
+  void _stopMotion() {
     if (!_capturing) return;
     _capturing = false;
     if (_orientJs != null) {
@@ -327,6 +350,7 @@ class MiniAVWebInputContext implements MiniInputContextPlatformInterface {
 
   @override
   Future<void> destroy() async {
+    _destroyed = true;
     await stopCapture();
     _onMotion = null;
     _userData = null;

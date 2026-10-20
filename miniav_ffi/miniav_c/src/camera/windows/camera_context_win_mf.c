@@ -18,6 +18,7 @@
 
 // DirectX includes for shared textures
 #include <d3d11.h>
+#include <d3d11_4.h> // ID3D11Fence, ID3D11Multithread
 #include <dxgi1_2.h> // For IDXGIResource1 and CreateSharedHandle
 
 #pragma comment(lib, "mf")
@@ -104,6 +105,14 @@ typedef struct MFPlatformContext {
   ID3D11DeviceContext *d3d_device_context; // Immediate context
   UINT dxgi_manager_reset_token;
 
+  // Completion fence for the pre-share wait (see mf_wait_submitted_work).
+  // Created on first use, released wherever the device is.
+  ID3D11Fence *copy_fence;
+  ID3D11DeviceContext4 *copy_fence_ctx;
+  HANDLE copy_fence_event;
+  UINT64 copy_fence_value;
+  BOOL copy_fence_unavailable;
+
   // Rebases MF's 100 ns REFERENCE_TIME sample clock onto the shared
   // miniav_get_time_us() epoch (reset at start_capture).
   MiniAVTimebase timebase;
@@ -115,15 +124,144 @@ typedef struct MFPlatformContext {
   // any successfully delivered sample and at start_capture.
   int consecutive_read_failures;
 
+  // MF_NOTE_* bits: conditions that hold for every frame of a configuration,
+  // logged on the first frame only. Cleared by mf_configure.
+  UINT32 logged_notes;
+
+  // Colour of the configured output (MiniAVYuvMatrix; UNKNOWN when it is not
+  // YUV), set by mf_configure and copied into every frame.
+  UINT32 yuv_matrix;
+  UINT32 yuv_full_range;
+
 } MFPlatformContext;
 
 // Consecutive non-terminal OnReadSample failures before we treat the stream
 // as lost (covers device-lost HRESULTs outside the fixed terminal set).
 #define MF_MAX_CONSECUTIVE_READ_FAILURES 30
 
+// How long a GPU frame waits for the GPU before it is shared. Past this the
+// GPU is stalled and the frame takes the CPU path instead.
+#define MF_GPU_WAIT_MS 100
+
+#define MF_NOTE_COPIED_TO_SHAREABLE 0x1u
+#define MF_NOTE_NOT_DXGI 0x2u
+#define MF_NOTE_CPU_FALLBACK 0x4u
+
+// TRUE the first time [note] is seen in this configuration.
+static BOOL mf_first_note(MFPlatformContext *mf_ctx, UINT32 note) {
+  if (mf_ctx->logged_notes & note)
+    return FALSE;
+  mf_ctx->logged_notes |= note;
+  return TRUE;
+}
+
+static void mf_release_copy_fence(MFPlatformContext *mf_ctx) {
+  if (mf_ctx->copy_fence) {
+    ID3D11Fence_Release(mf_ctx->copy_fence);
+    mf_ctx->copy_fence = NULL;
+  }
+  if (mf_ctx->copy_fence_ctx) {
+    ID3D11DeviceContext4_Release(mf_ctx->copy_fence_ctx);
+    mf_ctx->copy_fence_ctx = NULL;
+  }
+  if (mf_ctx->copy_fence_event) {
+    CloseHandle(mf_ctx->copy_fence_event);
+    mf_ctx->copy_fence_event = NULL;
+  }
+  mf_ctx->copy_fence_value = 0;
+  mf_ctx->copy_fence_unavailable = FALSE;
+}
+
+// Waits, at most MF_GPU_WAIT_MS, for everything submitted to the immediate
+// context so far to complete. Flush alone only submits it: a consumer on
+// another device can open a shared handle and read the texture before the
+// GPU has written it. An ID3D11Fence wakes on completion without spinning; an
+// event query stands in where the runtime has no fences. FALSE on timeout or
+// a lost device.
+static BOOL mf_wait_submitted_work(MFPlatformContext *mf_ctx) {
+  ID3D11DeviceContext *ctx = mf_ctx->d3d_device_context;
+  if (!mf_ctx->copy_fence && !mf_ctx->copy_fence_unavailable) {
+    ID3D11Device5 *dev5 = NULL;
+    HRESULT hr = ID3D11Device_QueryInterface(
+        mf_ctx->d3d_device, &IID_ID3D11Device5, (void **)&dev5);
+    if (SUCCEEDED(hr)) {
+      hr = ID3D11Device5_CreateFence(dev5, 0, D3D11_FENCE_FLAG_NONE,
+                                     &IID_ID3D11Fence,
+                                     (void **)&mf_ctx->copy_fence);
+      ID3D11Device5_Release(dev5);
+    }
+    if (SUCCEEDED(hr))
+      hr = ID3D11DeviceContext_QueryInterface(
+          ctx, &IID_ID3D11DeviceContext4, (void **)&mf_ctx->copy_fence_ctx);
+    if (SUCCEEDED(hr)) {
+      mf_ctx->copy_fence_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+      if (!mf_ctx->copy_fence_event)
+        hr = E_FAIL;
+    }
+    if (FAILED(hr)) {
+      mf_release_copy_fence(mf_ctx);
+      mf_ctx->copy_fence_unavailable = TRUE;
+    }
+  }
+
+  const uint64_t start_us = miniav_get_time_us();
+  const uint64_t deadline_us = start_us + MF_GPU_WAIT_MS * 1000ull;
+  if (mf_ctx->copy_fence) {
+    const UINT64 value = ++mf_ctx->copy_fence_value;
+    if (FAILED(ID3D11DeviceContext4_Signal(mf_ctx->copy_fence_ctx,
+                                           mf_ctx->copy_fence, value)))
+      return FALSE;
+    ID3D11DeviceContext_Flush(ctx);
+    for (;;) {
+      const UINT64 done = ID3D11Fence_GetCompletedValue(mf_ctx->copy_fence);
+      if (done == UINT64_MAX)
+        return FALSE; // device removed
+      if (done >= value)
+        return TRUE;
+      const uint64_t now_us = miniav_get_time_us();
+      if (now_us >= deadline_us ||
+          FAILED(ID3D11Fence_SetEventOnCompletion(
+              mf_ctx->copy_fence, value, mf_ctx->copy_fence_event)))
+        return FALSE;
+      // Auto-reset event: a wake left over from an earlier frame only loops.
+      WaitForSingleObject(mf_ctx->copy_fence_event,
+                          (DWORD)((deadline_us - now_us + 999) / 1000));
+    }
+  }
+
+  D3D11_QUERY_DESC qd;
+  qd.Query = D3D11_QUERY_EVENT;
+  qd.MiscFlags = 0;
+  ID3D11Query *query = NULL;
+  if (FAILED(ID3D11Device_CreateQuery(mf_ctx->d3d_device, &qd, &query)))
+    return FALSE;
+  ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)query);
+  ID3D11DeviceContext_Flush(ctx);
+  BOOL done = FALSE;
+  for (;;) {
+    const HRESULT gd =
+        ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)query, NULL, 0, 0);
+    if (gd == S_OK) {
+      done = TRUE;
+      break;
+    }
+    const uint64_t now_us = miniav_get_time_us();
+    if (gd != S_FALSE || now_us >= deadline_us)
+      break;
+    if (now_us - start_us < 1000)
+      YieldProcessor();
+    else
+      Sleep(1);
+  }
+  ID3D11Query_Release(query);
+  return done;
+}
+
 typedef struct MFFrameReleasePayload {
   IMFSample *sample; // Always present
   MiniAVOutputPreference original_output_preference;
+  UINT32 yuv_matrix; // For MiniAV_VideoBuffer_GetColor
+  UINT32 yuv_full_range;
   union {
     struct {                        // For CPU
       IMFMediaBuffer *media_buffer; // To properly unlock
@@ -136,6 +274,93 @@ typedef struct MFFrameReleasePayload {
     } gpu;
   };
 } MFFrameReleasePayload;
+
+static BOOL mf_is_yuv(MiniAVPixelFormat pf) {
+  switch (pf) {
+  case MINIAV_PIXEL_FORMAT_I420:
+  case MINIAV_PIXEL_FORMAT_YV12:
+  case MINIAV_PIXEL_FORMAT_NV12:
+  case MINIAV_PIXEL_FORMAT_NV21:
+  case MINIAV_PIXEL_FORMAT_YUY2:
+  case MINIAV_PIXEL_FORMAT_UYVY:
+  case MINIAV_PIXEL_FORMAT_YUV420_10BIT:
+  case MINIAV_PIXEL_FORMAT_YUV422_10BIT:
+  case MINIAV_PIXEL_FORMAT_YUV444_10BIT:
+    return TRUE;
+  default:
+    return FALSE;
+  }
+}
+
+// The colour of the configured output. Media Foundation states it on the
+// media type when the driver or the decoder does. Otherwise it is BT.601 (the
+// UVC default, and JPEG's), at full range for MJPEG this reader decodes
+// (JFIF) and limited range for an uncompressed mode.
+static void mf_set_color(MFPlatformContext *mf_ctx, MiniAVPixelFormat pf,
+                         UINT32 mf_matrix, UINT32 mf_range,
+                         BOOL decoded_mjpeg) {
+  mf_ctx->yuv_matrix = MINIAV_YUV_MATRIX_UNKNOWN;
+  mf_ctx->yuv_full_range = 0;
+  if (!mf_is_yuv(pf))
+    return;
+  BOOL matrix_stated = TRUE;
+  switch (mf_matrix) {
+  case MFVideoTransferMatrix_BT709:
+  case MFVideoTransferMatrix_SMPTE240M: // within a few percent of BT.709
+    mf_ctx->yuv_matrix = MINIAV_YUV_MATRIX_BT709;
+    break;
+  case MFVideoTransferMatrix_BT2020_10:
+  case MFVideoTransferMatrix_BT2020_12:
+    mf_ctx->yuv_matrix = MINIAV_YUV_MATRIX_BT2020;
+    break;
+  case MFVideoTransferMatrix_BT601:
+    mf_ctx->yuv_matrix = MINIAV_YUV_MATRIX_BT601;
+    break;
+  default:
+    mf_ctx->yuv_matrix = MINIAV_YUV_MATRIX_BT601;
+    matrix_stated = FALSE;
+    break;
+  }
+  BOOL range_stated = mf_range == MFNominalRange_0_255 ||
+                      mf_range == MFNominalRange_16_235;
+  mf_ctx->yuv_full_range = range_stated
+                               ? (mf_range == MFNominalRange_0_255 ? 1 : 0)
+                               : (decoded_mjpeg ? 1 : 0);
+  miniav_log(MINIAV_LOG_LEVEL_INFO,
+             "MF: Frames are %s (%s), %s range (%s).",
+             mf_ctx->yuv_matrix == MINIAV_YUV_MATRIX_BT709    ? "BT.709"
+             : mf_ctx->yuv_matrix == MINIAV_YUV_MATRIX_BT2020 ? "BT.2020"
+                                                              : "BT.601",
+             matrix_stated ? "stated" : "assumed",
+             mf_ctx->yuv_full_range ? "full" : "limited",
+             range_stated ? "stated" : "assumed");
+}
+
+uint32_t miniav_mf_get_color(const MiniAVBuffer *buffer, uint32_t *matrix,
+                             uint32_t *full_range) {
+  if (!buffer || buffer->type != MINIAV_BUFFER_TYPE_VIDEO ||
+      !buffer->internal_handle)
+    return 0;
+  const MiniAVNativeBufferInternalPayload *payload =
+      (const MiniAVNativeBufferInternalPayload *)buffer->internal_handle;
+  if (payload->handle_type != MINIAV_NATIVE_HANDLE_TYPE_VIDEO_CAMERA ||
+      !payload->context_owner || !payload->native_singular_resource_ptr ||
+      payload->parent_miniav_buffer_ptr != buffer)
+    return 0;
+  const MiniAVCameraContext *ctx =
+      (const MiniAVCameraContext *)payload->context_owner;
+  if (ctx->ops != &g_camera_ops_win_mf)
+    return 0;
+  const MFFrameReleasePayload *frame =
+      (const MFFrameReleasePayload *)payload->native_singular_resource_ptr;
+  if (frame->yuv_matrix == MINIAV_YUV_MATRIX_UNKNOWN)
+    return 0;
+  if (matrix)
+    *matrix = frame->yuv_matrix;
+  if (full_range)
+    *full_range = frame->yuv_full_range;
+  return 1;
+}
 
 // --- IMFSourceReaderCallback Implementation ---
 static HRESULT STDMETHODCALLTYPE MFPlatform_QueryInterface(
@@ -277,6 +502,12 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                                          (void **)&dxgi_buffer);
       if (SUCCEEDED(hr)) {
         ID3D11Texture2D *d3d11_texture = NULL;
+        // The frame can be one slice of a texture array (a decoder's output
+        // pool is one); this is the slice.
+        UINT subresource_index = 0;
+        if (FAILED(IMFDXGIBuffer_GetSubresourceIndex(dxgi_buffer,
+                                                     &subresource_index)))
+          subresource_index = 0;
         hr = IMFDXGIBuffer_GetResource(dxgi_buffer, &IID_ID3D11Texture2D,
                                        (void **)&d3d11_texture);
         if (SUCCEEDED(hr)) {
@@ -291,13 +522,30 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
           ID3D11Texture2D *texture_to_share = d3d11_texture;
           bool texture_needs_release = false;
 
-          if (!(tex_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED)) {
-            miniav_log(MINIAV_LOG_LEVEL_WARN,
-                       "MF: Texture from IMFDXGIBuffer is NOT shareable. "
-                       "Attempting to copy to a shareable texture.");
+          // The consumer reads the whole shared resource as one picture, so
+          // only a single shareable texture is shared as it is. A slice of an
+          // array, which used to be shared whole (the consumer then read
+          // slice 0, another frame) or copied whole, is copied out on its own.
+          if (!(tex_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED) ||
+              tex_desc.ArraySize > 1 || tex_desc.MipLevels > 1) {
+            if (mf_first_note(mf_ctx, MF_NOTE_COPIED_TO_SHAREABLE)) {
+              miniav_log(MINIAV_LOG_LEVEL_INFO,
+                         "MF: Camera frames arrive in %s; each is copied into "
+                         "a shareable texture.",
+                         tex_desc.ArraySize > 1
+                             ? "a texture array"
+                             : "textures that cannot be shared");
+            }
 
             ID3D11Texture2D *shareable_texture = NULL;
             D3D11_TEXTURE2D_DESC shareable_tex_desc = tex_desc;
+            shareable_tex_desc.ArraySize = 1;
+            shareable_tex_desc.MipLevels = 1;
+            // A decoder-output binding is not needed by the copy, and is not
+            // valid on a shared resource.
+            shareable_tex_desc.BindFlags &= ~(UINT)D3D11_BIND_DECODER;
+            if (shareable_tex_desc.BindFlags == 0)
+              shareable_tex_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             shareable_tex_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED |
                                            D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
             shareable_tex_desc.CPUAccessFlags = 0;
@@ -307,16 +555,10 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                                               &shareable_tex_desc, NULL,
                                               &shareable_texture);
             if (SUCCEEDED(hr)) {
-              ID3D11DeviceContext_CopyResource(
+              ID3D11DeviceContext_CopySubresourceRegion(
                   mf_ctx->d3d_device_context,
-                  (ID3D11Resource *)shareable_texture,
-                  (ID3D11Resource *)d3d11_texture);
-              // Commit the copy before the shared handle is exposed to a
-              // consumer on another device — without this the consumer can
-              // open the handle and read the texture before the copy has
-              // executed (the same producer-side race the screen-capture
-              // path guards with its pre-share fence).
-              ID3D11DeviceContext_Flush(mf_ctx->d3d_device_context);
+                  (ID3D11Resource *)shareable_texture, 0, 0, 0, 0,
+                  (ID3D11Resource *)d3d11_texture, subresource_index, NULL);
               texture_to_share = shareable_texture;
               texture_needs_release = true;
               miniav_log(MINIAV_LOG_LEVEL_DEBUG,
@@ -326,6 +568,22 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                          "MF: Failed to create shareable GPU texture copy: "
                          "0x%X. Will fallback to CPU.",
                          hr);
+            }
+          }
+
+          // Share only finished work: our copy above, or the frame MF wrote
+          // on this device. A consumer on another device does not wait for
+          // either before reading.
+          if (SUCCEEDED(hr) && !mf_wait_submitted_work(mf_ctx)) {
+            static ULONGLONG s_last_wait_warn_ms = 0;
+            const ULONGLONG now_ms = GetTickCount64();
+            hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            if (now_ms - s_last_wait_warn_ms > 2000) {
+              s_last_wait_warn_ms = now_ms;
+              miniav_log(MINIAV_LOG_LEVEL_WARN,
+                         "MF: GPU had not finished the frame after %d ms; not "
+                         "sharing an unfinished texture. Will fallback to CPU.",
+                         MF_GPU_WAIT_MS);
             }
           }
 
@@ -397,10 +655,10 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
                      hr);
         }
         IMFDXGIBuffer_Release(dxgi_buffer);
-      } else {
-        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "MF: Failed to query IMFDXGIBuffer: 0x%X. Not a DXGI "
-                   "buffer. Will fallback to CPU.",
+      } else if (mf_first_note(mf_ctx, MF_NOTE_NOT_DXGI)) {
+        miniav_log(MINIAV_LOG_LEVEL_INFO,
+                   "MF: The camera delivers frames in system memory, not "
+                   "D3D11 textures (0x%X); they take the CPU path.",
                    hr);
       }
       IMFMediaBuffer_Release(media_buffer);
@@ -417,8 +675,11 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   if (!processed_as_gpu_texture) {
     buffer_ptr->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
     if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_GPU) {
-      miniav_log(MINIAV_LOG_LEVEL_INFO, "MF: GPU preference: Falling back to "
-                                        "CPU path for sample processing.");
+      if (mf_first_note(mf_ctx, MF_NOTE_CPU_FALLBACK)) {
+        miniav_log(MINIAV_LOG_LEVEL_INFO,
+                   "MF: GPU output preferred, but frames are taking the CPU "
+                   "path (logged for the first such frame only).");
+      }
     } else if (desired_output_pref == MINIAV_OUTPUT_PREFERENCE_CPU) {
       miniav_log(MINIAV_LOG_LEVEL_DEBUG,
                  "MF: CPU preference: Processing sample on CPU path.");
@@ -621,6 +882,8 @@ static HRESULT STDMETHODCALLTYPE MFPlatform_OnReadSample(
   frame_payload->original_output_preference = processed_as_gpu_texture
                                                   ? MINIAV_OUTPUT_PREFERENCE_GPU
                                                   : MINIAV_OUTPUT_PREFERENCE_CPU;
+  frame_payload->yuv_matrix = mf_ctx->yuv_matrix;
+  frame_payload->yuv_full_range = mf_ctx->yuv_full_range;
 
   if (processed_as_gpu_texture) {
     frame_payload->gpu.shared_texture_handle =
@@ -943,6 +1206,7 @@ static MiniAVResultCode mf_destroy_platform(MiniAVCameraContext *ctx) {
     }
 
     // Release DirectX objects
+    mf_release_copy_fence(mf_ctx);
     if (mf_ctx->d3d_device_context) {
       ID3D11DeviceContext_Release(mf_ctx->d3d_device_context);
       mf_ctx->d3d_device_context = NULL;
@@ -1442,6 +1706,113 @@ error_exit:
   return SUCCEEDED(hr) ? MINIAV_SUCCESS : MINIAV_ERROR_SYSTEM_CALL_FAILED;
 }
 
+// TRUE when [source] offers [format]'s size and rate only as MJPEG while an
+// uncompressed format was asked for, so the reader has to decode (see the
+// type match in mf_configure). Read from the source before the reader is
+// created, because the reader settings a decode needs make an MJPEG stream
+// delivered as it is fail (MF_E_INVALIDMEDIATYPE on its first sample).
+static BOOL mf_mode_needs_mjpeg_decode(IMFMediaSource *source,
+                                       const MiniAVVideoInfo *format) {
+  if (format->pixel_format == MINIAV_PIXEL_FORMAT_MJPEG ||
+      format->frame_rate_denominator == 0)
+    return FALSE;
+  IMFPresentationDescriptor *pd = NULL;
+  if (FAILED(IMFMediaSource_CreatePresentationDescriptor(source, &pd)))
+    return FALSE;
+  BOOL has_exact = FALSE, has_mjpeg = FALSE, seen_video = FALSE;
+  DWORD stream_count = 0;
+  IMFPresentationDescriptor_GetStreamDescriptorCount(pd, &stream_count);
+  // The reader's first video stream is the first stream of video type.
+  for (DWORD s = 0; s < stream_count && !seen_video; s++) {
+    BOOL selected = FALSE;
+    IMFStreamDescriptor *sd = NULL;
+    IMFMediaTypeHandler *handler = NULL;
+    GUID major;
+    if (FAILED(IMFPresentationDescriptor_GetStreamDescriptorByIndex(
+            pd, s, &selected, &sd)))
+      continue;
+    if (SUCCEEDED(IMFStreamDescriptor_GetMediaTypeHandler(sd, &handler)) &&
+        SUCCEEDED(IMFMediaTypeHandler_GetMajorType(handler, &major)) &&
+        IsEqualGUID(&major, &MFMediaType_Video)) {
+      seen_video = TRUE;
+      DWORD type_count = 0;
+      IMFMediaTypeHandler_GetMediaTypeCount(handler, &type_count);
+      for (DWORD t = 0; t < type_count; t++) {
+        IMFMediaType *mt = NULL;
+        if (FAILED(IMFMediaTypeHandler_GetMediaTypeByIndex(handler, t, &mt)))
+          continue;
+        GUID subtype;
+        UINT64 size = 0, rate = 0;
+        if (SUCCEEDED(IMFMediaType_GetGUID(mt, &MF_MT_SUBTYPE, &subtype)) &&
+            SUCCEEDED(IMFMediaType_GetUINT64(mt, &MF_MT_FRAME_SIZE, &size)) &&
+            SUCCEEDED(IMFMediaType_GetUINT64(mt, &MF_MT_FRAME_RATE, &rate)) &&
+            (UINT32)(size >> 32) == format->width &&
+            (UINT32)size == format->height && (UINT32)rate != 0 &&
+            (uint64_t)(UINT32)(rate >> 32) * format->frame_rate_denominator ==
+                (uint64_t)format->frame_rate_numerator * (UINT32)rate) {
+          const MiniAVPixelFormat pf = MfSubTypeToMiniAVPixelFormat(&subtype);
+          if (pf == format->pixel_format)
+            has_exact = TRUE;
+          else if (pf == MINIAV_PIXEL_FORMAT_MJPEG)
+            has_mjpeg = TRUE;
+        }
+        IMFMediaType_Release(mt);
+      }
+    }
+    if (handler)
+      IMFMediaTypeHandler_Release(handler);
+    IMFStreamDescriptor_Release(sd);
+  }
+  IMFPresentationDescriptor_Release(pd);
+  return has_mjpeg && !has_exact;
+}
+
+// Turns off frame-rate conversion in the video processor the reader inserted
+// for a decode. It is on by default, and repeated frames under made-up,
+// evenly spaced timestamps whenever the camera ran slower than its nominal
+// rate: a Logitech C922 sending 24 frames a second in low light came out as
+// 30, the repeats arriving in bursts, hiding the camera's real timing from
+// the consumer.
+static void mf_disable_frame_rate_conversion(IMFSourceReader *reader) {
+  IMFSourceReaderEx *reader_ex = NULL;
+  if (FAILED(IMFSourceReader_QueryInterface(reader, &IID_IMFSourceReaderEx,
+                                            (void **)&reader_ex)))
+    return;
+  for (DWORD i = 0;; i++) {
+    GUID category;
+    IMFTransform *transform = NULL;
+    if (FAILED(IMFSourceReaderEx_GetTransformForStream(
+            reader_ex, (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, i,
+            &category, &transform)))
+      break;
+    if (IsEqualGUID(&category, &MFT_CATEGORY_VIDEO_PROCESSOR)) {
+      IMFAttributes *attributes = NULL;
+      if (SUCCEEDED(IMFTransform_GetAttributes(transform, &attributes))) {
+        IMFAttributes_SetUINT32(attributes, &MF_XVP_DISABLE_FRC, TRUE);
+        IMFAttributes_Release(attributes);
+      }
+    }
+    IMFTransform_Release(transform);
+  }
+  IMFSourceReaderEx_Release(reader_ex);
+}
+
+// How a pixel format ranks for the default mode: the formats encoders and
+// renderers take directly first, then other uncompressed ones, and MJPEG
+// last, since an MJPEG mode delivers JPEG bytes rather than pixels.
+static int mf_default_format_rank(MiniAVPixelFormat pixel_format) {
+  switch (pixel_format) {
+  case MINIAV_PIXEL_FORMAT_NV12:
+    return 0;
+  case MINIAV_PIXEL_FORMAT_YUY2:
+    return 1;
+  case MINIAV_PIXEL_FORMAT_MJPEG:
+    return 3;
+  default:
+    return 2;
+  }
+}
+
 static MiniAVResultCode mf_get_default_format(const char *device_id_utf8,
                                               MiniAVVideoInfo *format_out) {
   miniav_log(MINIAV_LOG_LEVEL_DEBUG, "MF: Getting default format for device %s",
@@ -1472,30 +1843,52 @@ static MiniAVResultCode mf_get_default_format(const char *device_id_utf8,
     return MINIAV_SUCCESS;
   }
 
-  // Find a good default format (prefer 720p30 or 1080p30, fallback to first)
-  MiniAVVideoInfo *selected = &formats[0]; // Default to first
-
+  // The default is 720p at about 30 fps, else 1080p at about 30, else the
+  // size nearest 720p at about 30, else (no mode near 30 fps) the rate
+  // nearest 30 at the size nearest 720p. "About 30" is within half a frame
+  // per second, so a camera listing only 30000/1001 qualifies; an exact 30
+  // still wins a tie. Within a tier an uncompressed mode beats MJPEG. The
+  // first exact 720p30 used to win whatever its format, so a camera listing
+  // MJPEG first handed consumers JPEG bytes. (Windows' camera Frame Server
+  // lists a decoded NV12 twin of each MJPEG mode, so a raw mode is normally
+  // there to take.)
+  MiniAVVideoInfo *selected = NULL;
+  uint64_t best_key[5] = {0};
   for (uint32_t i = 0; i < count; i++) {
-    // Prefer 720p30
-    if (formats[i].width == 1280 && formats[i].height == 720 &&
-        formats[i].frame_rate_numerator == 30 &&
-        formats[i].frame_rate_denominator == 1) {
-      selected = &formats[i];
-      break;
+    const MiniAVVideoInfo *f = &formats[i];
+    if (f->frame_rate_denominator == 0)
+      continue;
+    double fps_off =
+        (double)f->frame_rate_numerator / f->frame_rate_denominator - 30.0;
+    if (fps_off < 0)
+      fps_off = -fps_off;
+    const uint64_t fps_off_milli = (uint64_t)(fps_off * 1000.0 + 0.5);
+    const BOOL near_30 = fps_off_milli < 500;
+    const uint64_t area = (uint64_t)f->width * f->height;
+    const uint64_t area_720p = 1280ull * 720ull;
+    uint64_t key[5];
+    key[0] = !near_30                                    ? 3
+             : (f->width == 1280 && f->height == 720)   ? 0
+             : (f->width == 1920 && f->height == 1080) ? 1
+                                                         : 2;
+    key[1] = (uint64_t)mf_default_format_rank(f->pixel_format);
+    key[2] = near_30 ? 0 : fps_off_milli;
+    key[3] = area > area_720p ? area - area_720p : area_720p - area;
+    key[4] = fps_off_milli;
+    BOOL better = selected == NULL;
+    for (int k = 0; k < 5 && !better; k++) {
+      if (key[k] != best_key[k]) {
+        better = key[k] < best_key[k];
+        break;
+      }
     }
-    // Or 1080p30
-    if (formats[i].width == 1920 && formats[i].height == 1080 &&
-        formats[i].frame_rate_numerator == 30 &&
-        formats[i].frame_rate_denominator == 1) {
+    if (better) {
       selected = &formats[i];
-      break;
-    }
-    // Or any 30fps format
-    if (formats[i].frame_rate_numerator == 30 &&
-        formats[i].frame_rate_denominator == 1) {
-      selected = &formats[i];
+      memcpy(best_key, key, sizeof(key));
     }
   }
+  if (!selected)
+    selected = &formats[0];
 
   *format_out = *selected;
   miniav_free(formats);
@@ -1553,6 +1946,9 @@ static MiniAVResultCode mf_configure(
   // sample-clock epoch — recalibrate the timestamp rebase (start_capture
   // resets it too; this covers reconfigure-while-prepared paths).
   memset(&mf_ctx->timebase, 0, sizeof(mf_ctx->timebase));
+  mf_ctx->logged_notes = 0;
+  mf_ctx->yuv_matrix = MINIAV_YUV_MATRIX_UNKNOWN;
+  mf_ctx->yuv_full_range = 0;
 
   IMFActivate *device_activate =
       NULL; // This will be the specific device to configure
@@ -1560,8 +1956,12 @@ static MiniAVResultCode mf_configure(
   IMFAttributes *reader_attributes = NULL;
   IMFMediaType *target_media_type =
       NULL; // For iterating and setting the chosen format
+  // The camera's MJPEG type at the requested size and rate, kept in case no
+  // uncompressed type matches (see the decode fallback after the type match).
+  IMFMediaType *mjpeg_native_type = NULL;
+  BOOL decoded_mjpeg = FALSE; // the reader decodes that MJPEG type
 
-  float fps_approx = (format->frame_rate_denominator == 0)
+  float fps_approx =(format->frame_rate_denominator == 0)
                          ? 0.0f
                          : (float)format->frame_rate_numerator /
                                format->frame_rate_denominator;
@@ -1590,6 +1990,7 @@ static MiniAVResultCode mf_configure(
   // --- D3D Device and Manager Setup for GPU output preferences ---
   // Release existing D3D resources if any, before creating new ones for this
   // configuration attempt
+  mf_release_copy_fence(mf_ctx);
   if (mf_ctx->d3d_device_context) {
     ID3D11DeviceContext_Release(mf_ctx->d3d_device_context);
     mf_ctx->d3d_device_context = NULL;
@@ -1606,6 +2007,16 @@ static MiniAVResultCode mf_configure(
 
   bool use_gpu_preference =
       format->output_preference == MINIAV_OUTPUT_PREFERENCE_GPU;
+  if (use_gpu_preference && format->pixel_format == MINIAV_PIXEL_FORMAT_MJPEG) {
+    // MJPEG frames are JPEG bytes, delivered on the CPU path whatever the
+    // preference. A reader given a D3D manager cannot deliver them at all:
+    // its first sample failed with MF_E_INVALIDMEDIATYPE, reported as a lost
+    // device.
+    miniav_log(MINIAV_LOG_LEVEL_INFO,
+               "MF: MJPEG is delivered as CPU memory; the GPU output "
+               "preference does not apply to it.");
+    use_gpu_preference = false;
+  }
 
   if (use_gpu_preference) {
     miniav_log(MINIAV_LOG_LEVEL_DEBUG,
@@ -1620,8 +2031,12 @@ static MiniAVResultCode mf_configure(
       // would be a fatal error.
       use_gpu_preference = false; // Disable GPU path as setup failed
     } else {
-      // Create D3D11 device
-      UINT create_device_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+      // Create D3D11 device. VIDEO_SUPPORT lets the reader run its decoder
+      // and video processor on this device (an MJPEG-only mode, see
+      // mf_configure's type match); a device without it is still usable for
+      // frames the camera delivers uncompressed.
+      UINT create_device_flags =
+          D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
 #ifdef _DEBUG
       // create_device_flags |= D3D11_CREATE_DEVICE_DEBUG; // Enable if D3D SDK
       // layers are installed
@@ -1634,6 +2049,17 @@ static MiniAVResultCode mf_configure(
           feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
           &mf_ctx->d3d_device, NULL, &mf_ctx->d3d_device_context);
       if (FAILED(hr)) {
+        miniav_log(MINIAV_LOG_LEVEL_WARN,
+                   "MF: D3D11CreateDevice with video support failed (0x%X); "
+                   "retrying without it.",
+                   hr);
+        create_device_flags &= ~(UINT)D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+        hr = D3D11CreateDevice(
+            NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, create_device_flags,
+            feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
+            &mf_ctx->d3d_device, NULL, &mf_ctx->d3d_device_context);
+      }
+      if (FAILED(hr)) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR, "MF: D3D11CreateDevice failed: 0x%X",
                    hr);
         if (mf_ctx->dxgi_manager) {
@@ -1642,12 +2068,28 @@ static MiniAVResultCode mf_configure(
         }
         use_gpu_preference = false; // Disable GPU path
       } else {
+        // MF works on this device from its own threads while OnReadSample
+        // copies on its immediate context from another, so it must be
+        // multithread-protected, as Media Foundation requires of a device it
+        // is given.
+        ID3D11Multithread *multithread = NULL;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(mf_ctx->d3d_device,
+                                                  &IID_ID3D11Multithread,
+                                                  (void **)&multithread))) {
+          ID3D11Multithread_SetMultithreadProtected(multithread, TRUE);
+          ID3D11Multithread_Release(multithread);
+        } else {
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "MF: ID3D11Multithread unavailable; the capture device "
+                     "is not multithread-protected.");
+        }
         hr = IMFDXGIDeviceManager_ResetDevice(mf_ctx->dxgi_manager,
                                               (IUnknown *)mf_ctx->d3d_device,
                                               mf_ctx->dxgi_manager_reset_token);
         if (FAILED(hr)) {
           miniav_log(MINIAV_LOG_LEVEL_ERROR,
                      "MF: IMFDXGIDeviceManager_ResetDevice failed: 0x%X", hr);
+          mf_release_copy_fence(mf_ctx);
           if (mf_ctx->d3d_device_context) {
             ID3D11DeviceContext_Release(mf_ctx->d3d_device_context);
             mf_ctx->d3d_device_context = NULL;
@@ -1779,11 +2221,22 @@ static MiniAVResultCode mf_configure(
     goto error_cleanup;
   }
 
-  hr = MFCreateAttributes(&reader_attributes, use_gpu_preference ? 2 : 1);
+  const BOOL decode_mjpeg = mf_mode_needs_mjpeg_decode(media_source, format);
+  hr = MFCreateAttributes(&reader_attributes, 4);
   if (FAILED(hr)) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "MF: MFCreateAttributes for reader failed: 0x%X", hr);
     goto error_cleanup;
+  }
+  if (decode_mjpeg) {
+    // The reader decodes this mode (see after the type match), with the video
+    // processor for a format the decoder does not output. Hardware transforms
+    // stay off: with them a BGRA request on a Logitech C922 took about 8 s to
+    // configure (170 ms without), and with no D3D manager the decode failed
+    // on its first sample (E_FAIL).
+    IMFAttributes_SetUINT32(reader_attributes,
+                            &MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING,
+                            TRUE);
   }
   hr = IMFAttributes_SetUnknown(
       reader_attributes, &MF_SOURCE_READER_ASYNC_CALLBACK, (IUnknown *)mf_ctx);
@@ -1890,11 +2343,17 @@ static MiniAVResultCode mf_configure(
       // Frame rate compares as a RATIONAL (cross-multiplied) so equivalent
       // expressions match — the old exact num+den compare rejected e.g. a
       // device's 30000/1001 against a requested 2997/100.
-      if (mt_width == format->width && mt_height == format->height &&
+      const BOOL same_mode =
+          mt_width == format->width && mt_height == format->height &&
           format->frame_rate_denominator != 0 &&
           (uint64_t)mt_fr_num * format->frame_rate_denominator ==
-              (uint64_t)format->frame_rate_numerator * mt_fr_den &&
-          mt_pixel_format == format->pixel_format) {
+              (uint64_t)format->frame_rate_numerator * mt_fr_den;
+      if (decode_mjpeg && same_mode && !mjpeg_native_type &&
+          mt_pixel_format == MINIAV_PIXEL_FORMAT_MJPEG) {
+        mjpeg_native_type = target_media_type;
+        IMFMediaType_AddRef(mjpeg_native_type);
+      }
+      if (same_mode && mt_pixel_format == format->pixel_format) {
 
         hr = IMFSourceReader_SetCurrentMediaType(
             mf_ctx->source_reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL,
@@ -1925,6 +2384,63 @@ static MiniAVResultCode mf_configure(
     goto error_cleanup;
   }
 
+  // An uncompressed format asked for at a mode the camera sends only as MJPEG
+  // (a USB 2.0 camera sends its larger modes compressed): the MJPEG type is
+  // selected on the camera and the requested format set as the reader's
+  // output, which inserts a decoder (and the video processor where the
+  // decoder's output is another format). This used to fail as no matching
+  // type. Windows' camera Frame Server usually lists a decoded NV12 twin of
+  // each MJPEG mode, which the match above takes first.
+  if (!found_match && mjpeg_native_type) {
+    GUID out_subtype = MiniAVPixelFormatToMfSubType(format->pixel_format);
+    IMFMediaType *decoded_type = NULL;
+    HRESULT hr_decode = IsEqualGUID(&out_subtype, &GUID_NULL)
+                            ? MF_E_INVALIDMEDIATYPE
+                            : IMFSourceReader_SetCurrentMediaType(
+                                  mf_ctx->source_reader,
+                                  MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL,
+                                  mjpeg_native_type);
+    if (SUCCEEDED(hr_decode))
+      hr_decode = MFCreateMediaType(&decoded_type);
+    // The output carries the mode's size. Given the subtype alone, the reader
+    // settled on another size (640x480 frames from a 720p request on a
+    // Logitech C922) while the type read back below kept the requested one.
+    if (SUCCEEDED(hr_decode))
+      hr_decode = IMFMediaType_CopyAllItems(mjpeg_native_type,
+                                            (IMFAttributes *)decoded_type);
+    if (SUCCEEDED(hr_decode))
+      hr_decode =
+          IMFMediaType_SetGUID(decoded_type, &MF_MT_SUBTYPE, &out_subtype);
+    if (SUCCEEDED(hr_decode)) {
+      // What described the compressed stream does not describe the output.
+      IMFMediaType_DeleteItem(decoded_type, &MF_MT_COMPRESSED);
+      IMFMediaType_DeleteItem(decoded_type, &MF_MT_SAMPLE_SIZE);
+      IMFMediaType_DeleteItem(decoded_type, &MF_MT_FIXED_SIZE_SAMPLES);
+      IMFMediaType_DeleteItem(decoded_type, &MF_MT_AVG_BITRATE);
+      IMFMediaType_DeleteItem(decoded_type, &MF_MT_DEFAULT_STRIDE);
+    }
+    if (SUCCEEDED(hr_decode))
+      hr_decode = IMFSourceReader_SetCurrentMediaType(
+          mf_ctx->source_reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL,
+          decoded_type);
+    if (decoded_type)
+      IMFMediaType_Release(decoded_type);
+    if (SUCCEEDED(hr_decode)) {
+      found_match = TRUE;
+      decoded_mjpeg = TRUE;
+      mf_disable_frame_rate_conversion(mf_ctx->source_reader);
+      miniav_log(MINIAV_LOG_LEVEL_INFO,
+                 "MF: %ux%u @ %u/%u is offered only as MJPEG; the reader "
+                 "decodes it to PixelFormat %d.",
+                 format->width, format->height, format->frame_rate_numerator,
+                 format->frame_rate_denominator, format->pixel_format);
+    } else {
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "MF: Decoding the MJPEG mode to PixelFormat %d failed: 0x%X",
+                 format->pixel_format, hr_decode);
+    }
+  }
+
   if (!found_match) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "MF: Could not find or set matching media type for "
@@ -1940,6 +2456,8 @@ static MiniAVResultCode mf_configure(
   // so delivered frames and GetConfiguredFormats report reality (this is the
   // pattern the macOS backend already follows).
   MiniAVVideoInfo committed_format = *format;
+  UINT32 mf_matrix = MFVideoTransferMatrix_Unknown;
+  UINT32 mf_range = MFNominalRange_Unknown;
   {
     IMFMediaType *current_type = NULL;
     if (SUCCEEDED(IMFSourceReader_GetCurrentMediaType(
@@ -1968,9 +2486,19 @@ static MiniAVResultCode mf_configure(
           committed_format.pixel_format = committed_pf;
         }
       }
+      // Absent unless the driver or the decoder states them.
+      UINT32 stated = 0;
+      if (SUCCEEDED(IMFMediaType_GetUINT32(current_type, &MF_MT_YUV_MATRIX,
+                                           &stated)))
+        mf_matrix = stated;
+      if (SUCCEEDED(IMFMediaType_GetUINT32(
+              current_type, &MF_MT_VIDEO_NOMINAL_RANGE, &stated)))
+        mf_range = stated;
       IMFMediaType_Release(current_type);
     }
   }
+  mf_set_color(mf_ctx, committed_format.pixel_format, mf_matrix, mf_range,
+               decoded_mjpeg);
   mf_ctx->app_callback_internal = ctx->app_callback;
   mf_ctx->app_callback_user_data_internal = ctx->app_callback_user_data;
   ctx->configured_video_format = committed_format;
@@ -1989,6 +2517,8 @@ static MiniAVResultCode mf_configure(
   if (target_media_type)
     IMFMediaType_Release(
         target_media_type); // Should be NULL if loop exited cleanly
+  if (mjpeg_native_type)
+    IMFMediaType_Release(mjpeg_native_type);
   if (reader_attributes)
     IMFAttributes_Release(reader_attributes);
   if (media_source)
@@ -2006,6 +2536,8 @@ error_cleanup_no_device_activate_release: // For errors before device_activate
                                           // all_video_devices
   if (target_media_type)
     IMFMediaType_Release(target_media_type);
+  if (mjpeg_native_type)
+    IMFMediaType_Release(mjpeg_native_type);
   if (reader_attributes)
     IMFAttributes_Release(reader_attributes);
   if (media_source)
@@ -2024,6 +2556,7 @@ error_cleanup_no_device_activate_release: // For errors before device_activate
   // creation.
   if (FAILED(hr)) { // Ensure D3D resources are cleared if configure fails after
                     // their setup
+    mf_release_copy_fence(mf_ctx);
     if (mf_ctx->d3d_device_context) {
       ID3D11DeviceContext_Release(mf_ctx->d3d_device_context);
       mf_ctx->d3d_device_context = NULL;

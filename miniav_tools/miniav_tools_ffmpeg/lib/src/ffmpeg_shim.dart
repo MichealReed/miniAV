@@ -86,7 +86,7 @@ external Pointer<Void> _d3d11OpenSharedHandle(
 );
 
 @Native<
-  Void Function(
+  Int32 Function(
     Pointer<Void>,
     Pointer<Void>,
     Pointer<Void>,
@@ -95,7 +95,7 @@ external Pointer<Void> _d3d11OpenSharedHandle(
     Uint32,
   )
 >(symbol: 'miniav_shim_d3d11_copy_resource')
-external void _d3d11CopyResource(
+external int _d3d11CopyResource(
   Pointer<Void> device,
   Pointer<Void> immediateContext,
   Pointer<Void> dstTex,
@@ -543,7 +543,15 @@ class FfmpegShim {
   FfmpegShim._();
 
   /// Currently expected shim ABI. Bump in lock-step with `shim.c`.
-  static const int kExpectedAbiVersion = 21;
+  static const int kExpectedAbiVersion = 22;
+
+  /// [d3d11VpBgraToNv12] dropped the frame: the source's keyed mutex was not
+  /// acquired in time. The session stays usable.
+  static const int kVpSourceBusy = -8;
+
+  /// [d3d11VpBgraToNv12] dropped the frame: the blt had not completed in time,
+  /// so the slice holds no defined picture. The session stays usable.
+  static const int kVpBltIncomplete = -9;
 
   static FfmpegShim? _instance;
   static bool _attemptedLoad = false;
@@ -674,7 +682,12 @@ class FfmpegShim {
   /// `Texture2DArray` (one texture, ArraySize = pool size); the slice
   /// index lives in `AVFrame::data[1]` cast through `intptr_t`. All
   /// arguments belong to the same FFmpeg-owned D3D11 device. Windows-only.
-  void d3d11CopyResource(
+  ///
+  /// Returns 0 once the copy has completed, and 1 when the frame was dropped:
+  /// the source's keyed mutex was not acquired, or the copy had not completed,
+  /// within the shim's bounds (100 ms each). A dropped frame's destination
+  /// holds no defined picture and must not be encoded. -1 is a bad argument.
+  int d3d11CopyResource(
     Pointer<Void> device,
     Pointer<Void> immediateContext,
     Pointer<Void> dstTex,
@@ -683,7 +696,7 @@ class FfmpegShim {
     int srcSubresource,
   ) {
     assert(Platform.isWindows, 'd3d11CopyResource is Windows-only');
-    _d3d11CopyResource(
+    return _d3d11CopyResource(
       device,
       immediateContext,
       dstTex,
@@ -756,7 +769,8 @@ class FfmpegShim {
   /// [dstSubresource] is the `Texture2DArray` slice index from `AVFrame::data[1]`.
   /// [dstNv12Tex] is the `Texture2DArray` `ID3D11Texture2D*` from `AVFrame::data[0]`.
   ///
-  /// Returns 0 on success, negative on failure. Windows-only.
+  /// Returns 0 on success, negative on failure. [kVpSourceBusy] and
+  /// [kVpBltIncomplete] drop only the frame. Windows-only.
   int d3d11VpBgraToNv12(
     Pointer<Void> vpCtx,
     Pointer<Void> vpDevice,

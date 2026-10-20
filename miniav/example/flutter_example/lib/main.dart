@@ -5,6 +5,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:miniav/miniav.dart';
+import 'package:minigpu/minigpu.dart' show Minigpu;
 import 'package:minigpu_view/minigpu_view.dart';
 
 void main() {
@@ -201,6 +202,12 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
       MinigpuPreviewController();
   final MinigpuPreviewController _screenPreviewCtrl =
       MinigpuPreviewController();
+  // Windows D3D11 capture handles: each frame is copied into a texture its
+  // pane owns, so the buffer can go back to miniAV once the copy is done.
+  final Minigpu _gpu = Minigpu();
+  Future<void>? _gpuReady;
+  GpuPane? _cameraPane;
+  GpuPane? _screenPane;
   bool _buildingCameraImage = false;
   bool _buildingScreenImage = false;
   int _cameraFrameSkip = 0;
@@ -237,6 +244,13 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     _screenPreview.dispose();
     _cameraPreviewCtrl.dispose();
     _screenPreviewCtrl.dispose();
+    // After a start still in flight, the panes unregister and free their
+    // textures before the device goes.
+    _gpuReady
+        ?.then((_) => Future.wait(
+            [_cameraPane?.dispose(), _screenPane?.dispose()].nonNulls))
+        .whenComplete(_gpu.destroy)
+        .ignore();
     super.dispose();
   }
 
@@ -465,6 +479,12 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     await ctx.startCapture((buffer, userData) {
       if (buffer.type == MiniAVBufferType.video) {
         stats.addFrame(buffer.dataSizeBytes, buffer.timestampUs);
+        // The copy reads the buffer's own handle: release it only afterwards.
+        final copying = _showGpuFrame('camera', buffer);
+        if (copying != null) {
+          copying.whenComplete(() => MiniAV.releaseBuffer(buffer));
+          return;
+        }
         _trySchedulePreview(
           streamKey: 'camera',
           buffer: buffer,
@@ -500,6 +520,12 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     await ctx.startCapture((buffer, userData) {
       if (buffer.type == MiniAVBufferType.video) {
         stats.addFrame(buffer.dataSizeBytes, buffer.timestampUs);
+        // The copy reads the buffer's own handle: release it only afterwards.
+        final copying = _showGpuFrame('screen', buffer);
+        if (copying != null) {
+          copying.whenComplete(() => MiniAV.releaseBuffer(buffer));
+          return;
+        }
         _trySchedulePreview(
           streamKey: 'screen',
           buffer: buffer,
@@ -738,6 +764,28 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
     final dx = (curX - prevX).abs();
     final dy = (curY - prevY).abs();
     return dx > 2000 || dy > 2000;
+  }
+
+  /// Copies a Windows D3D11 capture frame into [streamKey]'s pane. Null when
+  /// the pane cannot take it (a CPU buffer, another handle type, or the GPU
+  /// still starting — those first frames are skipped).
+  Future<void>? _showGpuFrame(String streamKey, MiniAVBuffer buffer) {
+    if (buffer.contentType != MiniAVBufferContentType.gpuD3D11Handle) {
+      return null;
+    }
+    _gpuReady ??= _gpu.init().then((_) {
+      if (!mounted) return;
+      _cameraPane = GpuPane(_gpu, debugLabel: 'camera');
+      _screenPane = GpuPane(_gpu, debugLabel: 'screen');
+    }, onError: (Object e) {
+      _stats[streamKey]!.lastPreviewError = 'GPU unavailable: $e';
+    });
+    final pane = streamKey == 'camera' ? _cameraPane : _screenPane;
+    final frame = pane == null ? null : buffer.asGpuFrame(_gpu);
+    if (pane == null || frame == null) return null;
+    return pane.showChecked(frame).then<void>((_) {}, onError: (Object e) {
+      _stats[streamKey]!.lastPreviewError = 'GPU preview error: $e';
+    });
   }
 
   void _trySchedulePreview({
@@ -1672,8 +1720,9 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
 
   /// Builds the preview widget for camera/screen streams.
   ///
-  /// Shows [MiniavGpuPreview] when a GPU frame has been presented (Windows
-  /// D3D11 zero-copy path); otherwise falls back to the CPU [RawImage] path.
+  /// Shows [MiniavGpuPreview] when a GPU frame has been presented (a pane's
+  /// copy of a Windows D3D11 frame, or a capture resource presented directly);
+  /// otherwise falls back to the CPU [RawImage] path.
   Widget _buildPreviewWidget(String key, StreamStats stats) {
     final ctrl = key == 'camera' ? _cameraPreviewCtrl : _screenPreviewCtrl;
     final cpuPreview = key == 'camera' ? _cameraPreview : _screenPreview;
@@ -1687,12 +1736,19 @@ class _BenchmarkDashboardState extends State<BenchmarkDashboard> {
       );
     }
 
-    // GPU path: controller has a registered textureId.
-    if (ctrl.textureId != null) {
+    // GPU paths: a pane holding copied frames (Windows D3D11), or a
+    // controller presenting the capture's own resource.
+    final pane = key == 'camera' ? _cameraPane : _screenPane;
+    final gpuCtrl = pane != null && pane.hasContent
+        ? pane.controller
+        : ctrl.textureId != null
+            ? ctrl
+            : null;
+    if (gpuCtrl != null) {
       return _previewContainer(
         child: AnimatedBuilder(
-          animation: ctrl,
-          builder: (_, __) => MiniavGpuPreview(controller: ctrl),
+          animation: gpuCtrl,
+          builder: (_, __) => MiniavGpuPreview(controller: gpuCtrl),
         ),
       );
     }

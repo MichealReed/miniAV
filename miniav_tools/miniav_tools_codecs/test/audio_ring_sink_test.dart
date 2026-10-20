@@ -111,39 +111,43 @@ void main() {
       );
     });
 
-    test('declines when the browser will not give the requested rate',
-        () async {
-      // A rate no AudioContext will honour. Stands in for the case that
-      // matters in the field: WebKit ties the context to the hardware audio
-      // session, so a device that ignores the request would otherwise play
-      // every sample at the wrong pitch, for the whole stream, silently. The
-      // sink must decline and let the caller use the path that works.
-      expect(
-        await AudioRingSink.open(
-          sampleRate: 111,
-          channels: _kChannels,
-          workletUrl: _workletUrl,
-        ),
-        isNull,
-      );
-    });
-
-    test('a sink that DOES open runs at exactly the rate it was asked for',
-        () async {
-      // The other half: when it opens, the contract is real. Anything that
-      // reaches the worklet is played at the rate its producer assumed.
-      for (final rate in <int>[48000, 44100]) {
-        final sink = await AudioRingSink.open(
-          sampleRate: rate,
-          channels: _kChannels,
-          workletUrl: _workletUrl,
+    test(
+      'declines when the browser will not give the requested rate',
+      () async {
+        // A rate no AudioContext will honour. Stands in for the case that
+        // matters in the field: WebKit ties the context to the hardware audio
+        // session, so a device that ignores the request would otherwise play
+        // every sample at the wrong pitch, for the whole stream, silently. The
+        // sink must decline and let the caller use the path that works.
+        expect(
+          await AudioRingSink.open(
+            sampleRate: 111,
+            channels: _kChannels,
+            workletUrl: _workletUrl,
+          ),
+          isNull,
         );
-        expect(sink, isNotNull, reason: '$rate Hz should be supported');
-        addTearDown(sink!.close);
-        expect(sink.ring.sampleRate, rate);
-        expect(sink.contextSampleRate, rate);
-      }
-    });
+      },
+    );
+
+    test(
+      'a sink that DOES open runs at exactly the rate it was asked for',
+      () async {
+        // The other half: when it opens, the contract is real. Anything that
+        // reaches the worklet is played at the rate its producer assumed.
+        for (final rate in <int>[48000, 44100]) {
+          final sink = await AudioRingSink.open(
+            sampleRate: rate,
+            channels: _kChannels,
+            workletUrl: _workletUrl,
+          );
+          expect(sink, isNotNull, reason: '$rate Hz should be supported');
+          addTearDown(sink!.close);
+          expect(sink.ring.sampleRate, rate);
+          expect(sink.contextSampleRate, rate);
+        }
+      },
+    );
 
     test('declines when the worklet module will not load', () async {
       expect(
@@ -156,6 +160,29 @@ void main() {
         reason: 'a missing worklet must fall back, not take playback down',
       );
     });
+
+    test(
+      'a cancellable opening selects fallback and releases before claim',
+      () async {
+        final fallback = await AudioRingSink.open(
+          sampleRate: _kRate,
+          channels: 64,
+          fallbackChannels: _kChannels,
+          workletUrl: _workletUrl,
+        );
+        expect(fallback, isNotNull);
+        expect(fallback!.ring.channels, _kChannels);
+        await fallback.close();
+
+        final opening = AudioRingSink.beginOpen(
+          sampleRate: _kRate,
+          channels: _kChannels,
+          workletUrl: _workletUrl,
+        );
+        await opening.cancel();
+        expect(await opening.take(), isNull);
+      },
+    );
   });
 
   group('the audio thread consumes on its own', () {
@@ -226,23 +253,25 @@ void main() {
       );
     });
 
-    test('underruns are counted when the producer really does fall behind',
-        () async {
-      // The honest other half: the sink is not magic. Starve it and it says so,
-      // rather than glitching silently.
-      final sink = await _open(depth: const Duration(milliseconds: 100));
-      addTearDown(sink!.close);
-      await sink.resume();
+    test(
+      'underruns are counted when the producer really does fall behind',
+      () async {
+        // The honest other half: the sink is not magic. Starve it and it says so,
+        // rather than glitching silently.
+        final sink = await _open(depth: const Duration(milliseconds: 100));
+        addTearDown(sink!.close);
+        await sink.resume();
 
-      sink.ring.write(_tone(480, 0), 480); // 10 ms, then nothing
-      await Future<void>.delayed(const Duration(milliseconds: 300));
+        sink.ring.write(_tone(480, 0), 480); // 10 ms, then nothing
+        await Future<void>.delayed(const Duration(milliseconds: 300));
 
-      expect(
-        sink.underruns,
-        greaterThan(0),
-        reason: 'a starved audio thread must report it',
-      );
-    });
+        expect(
+          sink.underruns,
+          greaterThan(0),
+          reason: 'a starved audio thread must report it',
+        );
+      },
+    );
   });
 
   group('controls', () {

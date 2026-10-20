@@ -11,7 +11,7 @@ export 'audio_effect.dart';
 export 'screen_effect.dart';
 export 'screen_scale_policy.dart';
 
-/// Controls how [_VideoTrackRuntime] fills the gap when the capture source
+/// Controls how [VideoTrackRuntime] fills the gap when the capture source
 /// delivers frames at a lower rate than the configured fps (e.g. WGC / DXGI
 /// only sending a frame when content changes).
 enum VideoIdleFramePolicy {
@@ -33,6 +33,53 @@ enum VideoIdleFramePolicy {
   /// which may be as low as 1–2 fps on a mostly-static screen.
   none,
 }
+
+/// What a recorder does when a capture TARGET disappears mid-recording.
+///
+/// This is not the same as a source that has gone quiet. The target is gone:
+/// a display was unplugged or re-routed (Win+P, dock/undock, a mode change),
+/// a session was locked or handed to RDP, a captured window was closed, a
+/// USB microphone was pulled, an HDMI audio endpoint went away with the
+/// monitor it belonged to. The platform says so — Windows Graphics Capture
+/// closes the capture item, WASAPI answers `AUDCLNT_E_DEVICE_INVALIDATED`,
+/// Media Foundation ends the sample stream — and everything downstream keeps
+/// running: the encoders, the muxer, the other tracks, the file.
+///
+/// The choice this enum makes is what happens to the REST of the recording.
+///
+/// A note on what is deliberately absent: nothing here substitutes a
+/// DIFFERENT device for the one that went away. A recorder that silently
+/// starts capturing something else has changed what the file is a recording
+/// of, and no caller can tell from the output that it happened. If the
+/// original target never returns, that track ends — and [Recorder] says so at
+/// stop. Choosing a new target is the application's call, made with a user in
+/// the loop, and it starts a new recording.
+enum CaptureLossPolicy {
+  /// Re-acquire the SAME target and carry on in the same file and the same
+  /// track. The default, because for a long session the tail is usually worth
+  /// more than the gap: a display that comes back after twenty seconds costs
+  /// twenty seconds of frozen picture, where ending the track costs every
+  /// minute after it. For audio the trade is starker still — a track that
+  /// stops is silence to the end of the file.
+  ///
+  /// Retrying is cheap — one re-configure attempt on a backoff that settles
+  /// at [RecorderBuilder.reacquireInterval] — and it stops the moment the
+  /// target returns or the recording does.
+  reacquire,
+
+  /// End this track where the target was lost, and keep recording every
+  /// other one. Choose this when a short file that is KNOWN complete is
+  /// worth more than a long one with a hole in the middle.
+  ///
+  /// The other tracks keep running: an audio track that outlives its video
+  /// track is ordinary in MP4, and the alternative is throwing away media
+  /// that was captured perfectly well.
+  endTrack,
+}
+
+/// The former name of [CaptureLossPolicy], from when only video had a loss
+/// signal wired. Same type; both names work.
+typedef VideoCaptureLossPolicy = CaptureLossPolicy;
 
 sealed class RecorderSource {
   const RecorderSource();
@@ -116,6 +163,32 @@ class ScreenRecorderSource extends RecorderSource {
   /// stay unfilled. Requires [idleFramePolicy] != none for idle-gap fill.
   final bool cfrOutput;
 
+  /// Draw the mouse cursor into the recording. Defaults to false, which is
+  /// the platform default on every backend.
+  ///
+  /// Honoured on Windows WGC (`IsCursorCaptureEnabled`, Windows 10 2004 /
+  /// 10.0.19041 and later), macOS ScreenCaptureKit and Linux PipeWire. Windows
+  /// DXGI cannot draw a cursor at all and captures without one; on web the
+  /// browser's own `getDisplayMedia` decides and this is a no-op.
+  ///
+  /// Where a platform cannot honour it, the recording continues WITHOUT the
+  /// cursor and says so in the log. A cursor is a thing you would like in the
+  /// picture; it is not worth failing a session over.
+  final bool captureCursor;
+
+  /// What to do if the captured display or window goes away mid-recording.
+  /// Defaults to [CaptureLossPolicy.reacquire].
+  final CaptureLossPolicy lossPolicy;
+
+  /// How long to keep trying to re-acquire a lost target before giving up and
+  /// ending the video track. `null` (the default) means for as long as the
+  /// recording runs.
+  ///
+  /// A limit is the right choice when a hole past some length makes the file
+  /// useless anyway; no limit is the right choice when the tail is what you
+  /// are paying for. Ignored under [CaptureLossPolicy.endTrack].
+  final Duration? reacquireLimit;
+
   const ScreenRecorderSource({
     this.displayId,
     this.windowId,
@@ -132,6 +205,9 @@ class ScreenRecorderSource extends RecorderSource {
     this.idleFramePolicy = VideoIdleFramePolicy.duplicate,
     this.adaptiveGpuThrottle = true,
     this.cfrOutput = false,
+    this.captureCursor = false,
+    this.lossPolicy = CaptureLossPolicy.reacquire,
+    this.reacquireLimit,
   });
 }
 
@@ -154,6 +230,17 @@ class CameraRecorderSource extends RecorderSource {
   /// because cameras deliver at a fixed rate and rarely need idle fill.
   final VideoIdleFramePolicy idleFramePolicy;
 
+  /// What to do if the camera is unplugged or reset mid-recording.
+  /// Defaults to [CaptureLossPolicy.reacquire].
+  ///
+  /// A camera IS re-acquirable, unlike a closed window: a USB device that is
+  /// pulled and pushed back in, or one whose driver resets, comes back under
+  /// the same device id. See [ScreenRecorderSource.reacquireLimit].
+  final CaptureLossPolicy lossPolicy;
+
+  /// See [ScreenRecorderSource.reacquireLimit].
+  final Duration? reacquireLimit;
+
   const CameraRecorderSource({
     required this.deviceId,
     required this.codec,
@@ -165,6 +252,8 @@ class CameraRecorderSource extends RecorderSource {
     this.quality,
     this.encoderOptions = const {},
     this.idleFramePolicy = VideoIdleFramePolicy.none,
+    this.lossPolicy = CaptureLossPolicy.reacquire,
+    this.reacquireLimit,
   });
 }
 
@@ -175,12 +264,21 @@ class MicRecorderSource extends RecorderSource {
   final int? sampleRate;
   final int? channels;
 
+  /// What to do if the microphone goes away mid-recording — unplugged,
+  /// preempted, or reset. Defaults to [CaptureLossPolicy.reacquire].
+  final CaptureLossPolicy lossPolicy;
+
+  /// See [ScreenRecorderSource.reacquireLimit].
+  final Duration? reacquireLimit;
+
   const MicRecorderSource({
     required this.deviceId,
     required this.codec,
     this.bitrateBps,
     this.sampleRate,
     this.channels,
+    this.lossPolicy = CaptureLossPolicy.reacquire,
+    this.reacquireLimit,
   });
 }
 
@@ -191,12 +289,26 @@ class LoopbackRecorderSource extends RecorderSource {
   final int? sampleRate;
   final int? channels;
 
+  /// What to do if the render endpoint goes away mid-recording. Defaults to
+  /// [CaptureLossPolicy.reacquire].
+  ///
+  /// Worth leaving on: an HDMI or DisplayPort audio endpoint belongs to the
+  /// monitor it arrives on, so the display transitions that close a capture
+  /// item — Win+P, undock, a mode change — invalidate the endpoint at the
+  /// same instant. Both losses come from one keystroke.
+  final CaptureLossPolicy lossPolicy;
+
+  /// See [ScreenRecorderSource.reacquireLimit].
+  final Duration? reacquireLimit;
+
   const LoopbackRecorderSource({
     required this.deviceId,
     required this.codec,
     this.bitrateBps,
     this.sampleRate,
     this.channels,
+    this.lossPolicy = CaptureLossPolicy.reacquire,
+    this.reacquireLimit,
   });
 }
 
@@ -229,6 +341,18 @@ class MixedAudioRecorderSource extends RecorderSource {
   final List<AudioEffect> loopbackEffects;
   final List<AudioEffect> masterEffects;
 
+  /// What to do if EITHER input goes away mid-recording. Defaults to
+  /// [CaptureLossPolicy.reacquire], and the two are tracked separately: one
+  /// input dying does not end the other.
+  ///
+  /// This matters more here than for a separate pair of tracks. The mix is
+  /// driven by the loopback callback, so a dead render endpoint stops the
+  /// whole track — including the microphone, which is still working.
+  final CaptureLossPolicy lossPolicy;
+
+  /// See [ScreenRecorderSource.reacquireLimit].
+  final Duration? reacquireLimit;
+
   const MixedAudioRecorderSource({
     required this.micDeviceId,
     required this.loopbackDeviceId,
@@ -239,5 +363,7 @@ class MixedAudioRecorderSource extends RecorderSource {
     this.micEffects = const [],
     this.loopbackEffects = const [],
     this.masterEffects = const [],
+    this.lossPolicy = CaptureLossPolicy.reacquire,
+    this.reacquireLimit,
   });
 }

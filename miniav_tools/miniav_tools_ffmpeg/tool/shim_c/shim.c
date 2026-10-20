@@ -258,6 +258,47 @@ MIO_API void* miniav_shim_d3d11_open_shared_handle(void* id3d11device,
     return (void*)tex;
 }
 
+/* Bounds on the shim's GPU waits. Past either one the frame is dropped rather
+ * than read, or handed to the encoder, unfinished. */
+#define MIO_KEYED_MUTEX_WAIT_MS 100
+#define MIO_GPU_DONE_WAIT_MS 100
+
+/* Waits, at most MIO_GPU_DONE_WAIT_MS, for the work submitted to [ctx] so far
+ * to complete. 1 = complete; 0 = not complete in time, a lost device, or no
+ * query to tell by. Spins for the first millisecond (a copy or blt is a
+ * fraction of one), then yields, then sleeps once the GPU is plainly backed up:
+ * a Sleep(1) can cost a 15.6 ms timer quantum, too much for the common case. */
+static int mio_d3d11_wait_done(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    D3D11_QUERY_DESC qd;
+    qd.Query = D3D11_QUERY_EVENT;
+    qd.MiscFlags = 0;
+    ID3D11Query* q = NULL;
+    if (FAILED(dev->lpVtbl->CreateQuery(dev, &qd, &q)) || !q) {
+        ctx->lpVtbl->Flush(ctx);
+        return 0;
+    }
+    ctx->lpVtbl->End(ctx, (ID3D11Asynchronous*)q);
+    ctx->lpVtbl->Flush(ctx);
+    LARGE_INTEGER freq, t0, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    int done = 0;
+    for (;;) {
+        HRESULT gd = ctx->lpVtbl->GetData(ctx, (ID3D11Asynchronous*)q, NULL, 0, 0);
+        if (gd == S_OK) { done = 1; break; }
+        if (gd != S_FALSE) break;
+        QueryPerformanceCounter(&now);
+        double ms = (double)(now.QuadPart - t0.QuadPart) * 1000.0 /
+                    (double)freq.QuadPart;
+        if (ms > MIO_GPU_DONE_WAIT_MS) break;
+        if (ms > 33.0) Sleep(1);
+        else if (ms > 1.0) SwitchToThread();
+        else YieldProcessor();
+    }
+    q->lpVtbl->Release(q);
+    return done;
+}
+
 /* GPU-only copy from one D3D11 texture into another, both bound to the
  * same device (the destination's device, which is the FFmpeg-owned one).
  * No CPU staging \u2014 this is a single CopyResource on the immediate context.
@@ -270,15 +311,20 @@ MIO_API void* miniav_shim_d3d11_open_shared_handle(void* id3d11device,
  * fence yields black / undefined frames on the encoder.
  *
  * Cost: ~0.5\u20132ms per frame; with the producer pipelined this still
- * sustains 60fps at 5K on a discrete GPU. */
-MIO_API void miniav_shim_d3d11_copy_resource(void* id3d11_device,
+ * sustains 60fps at 5K on a discrete GPU.
+ *
+ * Returns 0 when the copy has completed, 1 when the frame was dropped (the
+ * source's keyed mutex was not acquired within MIO_KEYED_MUTEX_WAIT_MS, or the
+ * copy had not completed within MIO_GPU_DONE_WAIT_MS), -1 on a bad argument.
+ * A dropped frame's destination holds no defined picture. */
+MIO_API int miniav_shim_d3d11_copy_resource(void* id3d11_device,
                                              void* id3d11_immediate_context,
                                              void* dst_tex,
                                              unsigned dst_subresource,
                                              void* src_tex,
                                              unsigned src_subresource) {
     if (!id3d11_device || !id3d11_immediate_context || !dst_tex || !src_tex) {
-        return;
+        return -1;
     }
     ID3D11Device* dev = (ID3D11Device*)id3d11_device;
     ID3D11DeviceContext* ctx = (ID3D11DeviceContext*)id3d11_immediate_context;
@@ -290,20 +336,27 @@ MIO_API void miniav_shim_d3d11_copy_resource(void* id3d11_device,
      * queue and we get undefined contents (typically all-zero / black).
      *
      * Dawn signals key 0 on EndAccess after its queue has consumed the
-     * compute work, so AcquireSync(0, INFINITE) blocks until the GPU side
-     * is genuinely done. We re-release with key 0 so Dawn can re-acquire
-     * for the next frame. */
+     * compute work, so AcquireSync(0) blocks until the GPU side is genuinely
+     * done. We re-release with key 0 so Dawn can re-acquire for the next
+     * frame.
+     *
+     * Bounded, never INFINITE: a producer that never releases would hang the
+     * recording. Past the bound the frame is dropped, not copied without the
+     * lock, which would read a texture the producer is still writing. */
     IDXGIKeyedMutex* km = NULL;
     HRESULT khr = ((ID3D11Resource*)src_tex)->lpVtbl->QueryInterface(
         (ID3D11Resource*)src_tex, &IID_IDXGIKeyedMutex, (void**)&km);
     if (SUCCEEDED(khr) && km) {
-        HRESULT ahr = km->lpVtbl->AcquireSync(km, 0, INFINITE);
-        if (FAILED(ahr)) {
+        HRESULT ahr = km->lpVtbl->AcquireSync(km, 0, MIO_KEYED_MUTEX_WAIT_MS);
+        if (ahr != S_OK) {
             fprintf(stderr,
-                "[shim] IDXGIKeyedMutex::AcquireSync(0) FAILED hr=0x%08lX\n",
-                (unsigned long)ahr);
+                "[shim] IDXGIKeyedMutex::AcquireSync(0) did not acquire within "
+                "%d ms (hr=0x%08lX); frame dropped\n",
+                MIO_KEYED_MUTEX_WAIT_MS, (unsigned long)ahr);
+            /* An abandoned mutex is still handed over; give it back. */
+            if (ahr == (HRESULT)WAIT_ABANDONED) km->lpVtbl->ReleaseSync(km, 0);
             km->lpVtbl->Release(km);
-            km = NULL;
+            return 1;
         }
     } else {
         km = NULL; /* not a keyed-mutex texture; nothing to sync via mutex */
@@ -321,28 +374,7 @@ MIO_API void miniav_shim_d3d11_copy_resource(void* id3d11_device,
         (ID3D11Resource*)src_tex, src_subresource,
         NULL);
 
-    D3D11_QUERY_DESC qd;
-    qd.Query = D3D11_QUERY_EVENT;
-    qd.MiscFlags = 0;
-    ID3D11Query* fence = NULL;
-    HRESULT hr = dev->lpVtbl->CreateQuery(dev, &qd, &fence);
-    if (SUCCEEDED(hr) && fence) {
-        ctx->lpVtbl->End(ctx, (ID3D11Asynchronous*)fence);
-        ctx->lpVtbl->Flush(ctx);
-        ULONGLONG t0 = GetTickCount64();
-        for (;;) {
-            HRESULT gd = ctx->lpVtbl->GetData(
-                ctx, (ID3D11Asynchronous*)fence, NULL, 0, 0);
-            if (gd == S_OK) break;
-            if (gd != S_FALSE) break;
-            if (GetTickCount64() - t0 > 50) break; /* 50ms watchdog */
-            YieldProcessor();
-        }
-        fence->lpVtbl->Release(fence);
-    } else {
-        /* Best effort: at least submit the queue. */
-        ctx->lpVtbl->Flush(ctx);
-    }
+    const int done = mio_d3d11_wait_done(dev, ctx);
 
     /* Release the keyed mutex (if any) so the producer can re-acquire it
      * for the next frame. We do this AFTER the fence so that Dawn won't
@@ -351,6 +383,13 @@ MIO_API void miniav_shim_d3d11_copy_resource(void* id3d11_device,
         km->lpVtbl->ReleaseSync(km, 0);
         km->lpVtbl->Release(km);
     }
+    if (!done) {
+        fprintf(stderr,
+            "[shim] d3d11_copy_resource: the copy had not completed after "
+            "%d ms; frame dropped\n", MIO_GPU_DONE_WAIT_MS);
+        return 1;
+    }
+    return 0;
 }
 
 /* Release any IUnknown-derived COM object (ID3D11Texture2D*, etc.). */
@@ -1883,7 +1922,11 @@ MIO_API void miniav_shim_d3d11_vp_destroy(void* vp_ctx) {
  *   (AVFrame::data[1] cast through intptr_t).
  * [dst_nv12_tex]: The Texture2DArray from AVFrame::data[0] (NV12 pool).
  *
- * Returns 0 on success, negative on failure. */
+ * Returns 0 on success, negative on failure. Two failures drop just the frame
+ * and leave the session usable: -8, the source's keyed mutex was not acquired
+ * within MIO_KEYED_MUTEX_WAIT_MS; -9, the blt had not completed within
+ * MIO_GPU_DONE_WAIT_MS, so the slice holds no defined picture and the producer
+ * may already be redrawing the source. */
 MIO_API int miniav_shim_d3d11_vp_bgra_to_nv12(void* vp_ctx,
                                                void* vp_device,
                                                void* vp_context,
@@ -1935,12 +1978,22 @@ MIO_API int miniav_shim_d3d11_vp_bgra_to_nv12(void* vp_ctx,
     }
 
     /* ---------- optional keyed-mutex sync --------------------------------- */
+    /* Bounded, and a timeout drops the frame: see d3d11_copy_resource. */
     IDXGIKeyedMutex* km = NULL;
     ((ID3D11Resource*)src_on_vp)->lpVtbl->QueryInterface(
         (ID3D11Resource*)src_on_vp, &IID_IDXGIKeyedMutex, (void**)&km);
     if (km) {
-        HRESULT ahr = km->lpVtbl->AcquireSync(km, 0, INFINITE);
-        if (FAILED(ahr)) { km->lpVtbl->Release(km); km = NULL; }
+        HRESULT ahr = km->lpVtbl->AcquireSync(km, 0, MIO_KEYED_MUTEX_WAIT_MS);
+        if (ahr != S_OK) {
+            fprintf(stderr,
+                "[shim] vp_bgra_to_nv12: AcquireSync(0) did not acquire within "
+                "%d ms (hr=0x%08lX); frame dropped\n",
+                MIO_KEYED_MUTEX_WAIT_MS, (unsigned long)ahr);
+            if (ahr == (HRESULT)WAIT_ABANDONED) km->lpVtbl->ReleaseSync(km, 0);
+            km->lpVtbl->Release(km);
+            if (cross_device) src_on_vp->lpVtbl->Release(src_on_vp);
+            return -8;
+        }
     }
 
     /* ---------- input view on BGRA source --------------------------------- */
@@ -2025,25 +2078,13 @@ MIO_API int miniav_shim_d3d11_vp_bgra_to_nv12(void* vp_ctx,
         return -7;
     }
 
-    /* GPU fence: ensure VP blt completes before the QSV/MF encoder reads. */
-    {
-        D3D11_QUERY_DESC qd; qd.Query = D3D11_QUERY_EVENT; qd.MiscFlags = 0;
-        ID3D11Query* fence = NULL;
-        if (SUCCEEDED(dev->lpVtbl->CreateQuery(dev, &qd, &fence)) && fence) {
-            ctx->lpVtbl->End(ctx, (ID3D11Asynchronous*)fence);
-            ctx->lpVtbl->Flush(ctx);
-            ULONGLONG t0 = GetTickCount64();
-            for (;;) {
-                HRESULT gd = ctx->lpVtbl->GetData(
-                    ctx, (ID3D11Asynchronous*)fence, NULL, 0, 0);
-                if (gd == S_OK || gd != S_FALSE) break;
-                if (GetTickCount64() - t0 > 50) break;
-                YieldProcessor();
-            }
-            fence->lpVtbl->Release(fence);
-        } else {
-            ctx->lpVtbl->Flush(ctx);
-        }
+    /* GPU fence: ensure the VP blt completes before the QSV/MF encoder reads
+     * the slice, and before the caller lets the producer redraw the source. */
+    if (!mio_d3d11_wait_done(dev, ctx)) {
+        fprintf(stderr,
+            "[shim] vp_bgra_to_nv12: the blt had not completed after %d ms; "
+            "frame dropped\n", MIO_GPU_DONE_WAIT_MS);
+        return -9;
     }
     return 0;
 }
@@ -2081,7 +2122,12 @@ MIO_API unsigned miniav_shim_abi_version(void) {
      * (which outlives the isolate that installed it and aborts the VM) to a
      * Dart native port. The v8/v9 function-pointer entry points remain
      * exported for ABI compatibility. */
-    return 21u;
+    /* v22: miniav_shim_d3d11_copy_resource returns int (0 copied, 1 frame
+     * dropped, -1 bad argument) instead of void, and
+     * miniav_shim_d3d11_vp_bgra_to_nv12 returns -8 / -9 for a dropped frame:
+     * both bound their keyed-mutex and GPU-completion waits and no longer hand
+     * an unfinished texture to the encoder. */
+    return 22u;
 }
 
 /* --- FFmpeg log forwarding ------------------------------------------------

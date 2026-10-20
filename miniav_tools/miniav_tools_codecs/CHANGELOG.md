@@ -1,8 +1,130 @@
 # Changelog
 
+## 0.8.2
+
+- MP4 muxer: an H.264 or HEVC sample that carries parameter sets its track's
+  configuration record does not hold switches the track to a record that does.
+  The samples used to be described by the record alone, with their own
+  parameter sets stripped. AMD's H.264 Media Foundation encoder publishes a
+  sequence header whose SPS differs from the one in its stream (picture order
+  count type and colour description), so no frame of its MP4 recordings
+  decoded correctly.
+- **Behaviour change:** a configuration record no sample was written under is
+  no longer written as an `stsd` sample entry, and `trackConfigCount` counts
+  the entries written. A record replaced before the first sample used to stay
+  in the file as the first entry, which readers that use only the first entry
+  apply to every sample.
+- MP4 muxer: a track opened without a configuration record takes one from the
+  first sample that carries parameter sets, instead of being written without
+  one.
+- Media Foundation encoder: `extraData` follows the parameter sets the stream
+  carries. It starts as the encoder's published sequence header and is
+  replaced when a packet carries different ones.
+
+## 0.8.1
+
+- The bundled web worker payloads (codec, demux and audio playback) are
+  rebuilt with spawn 0.1.2 and this release's sources; they had not been
+  rebuilt since August. Each is about 32 kB larger.
+- Requires spawn ^0.1.2.
+
+## 0.8.0
+
+- Opening the web audio sink can be cancelled while its worklet module loads,
+  and a cancelled opening closes its `AudioContext` even if loading stalls. A
+  declared channel fallback is chosen before any asynchronous step, so it uses
+  the `AudioContext` the user gesture activated.
+- Media Foundation encoder: a texture frame is no longer encoded while its
+  producer may still be drawing it. A frame whose keyed mutex is not acquired
+  within 8 ms, or whose conversion has not finished within 100 ms, is dropped
+  instead of being read unlocked or encoded early; 60 failures in a row still
+  end the session.
+- **Behaviour change:** a producer that releases its texture under a keyed-mutex
+  key other than 0 has its frames dropped (they used to be read unlocked), and
+  the reported reason says so.
+- Media Foundation encoder: a frame passed as a capture's shared handle is
+  copied (or converted, unless it is NV12 at the encoder's size) into the
+  encoder's own surface before `encode` returns, so the capture can reuse its
+  texture once the frame is released. The hardware encoder used to read the
+  capture's texture later; with an NVIDIA encoder, a camera frame faulted the
+  GPU and nothing more was encoded.
+- A removed encoder device is reported as such instead of being blamed on the
+  capture.
+- The build hook registers the native C sources, so editing them rebuilds the
+  library here and in dependent packages.
+- `MfVideoEncoder` implements `FrameRepeatingEncoder`, so a pacer can re-send
+  the last frame through the shared interface.
+- New `mfencCreateGpuOnDevice` (native address
+  `mfencGpuOnDeviceCreateFunction`): a hardware Media Foundation encoder on the
+  caller's own D3D11 device. It never creates its own device or falls back to
+  software, accepts only textures on that device, and reports back-pressure
+  until the encoder has released its samples.
+- Web capability detection no longer throws when compiled with dart2wasm.
+- Requires miniav_platform_interface 0.8.0 and
+  miniav_tools_platform_interface 0.6.0.
+
+## 0.7.7
+
+- Requires spawn ^0.1.1: native transfers actually transfer, and a web message
+  the worker cannot deserialize is reported instead of vanishing.
+
+## 0.7.6
+
+- The MP4 writer accepts a video track before its encoder has published its
+  configuration record; supply the record later with `setTrackConfig`. Some
+  hardware H.264 encoders (Intel Quick Sync) withhold it until their first
+  output, and on those machines recordings fell back to FFmpeg. Output is
+  identical to supplying the record at open.
+- New `Mp4Muxer.tracksMissingConfig` reports a track whose record never arrived
+  instead of throwing: its samples are written but it will not decode, and the
+  other tracks are unaffected.
+
+## 0.7.5
+
+- Increment downstream deps
+
+## 0.7.4
+
+- MP4: a decode timestamp that steps backwards is repaired instead of refused.
+  `finish()` used to throw and leave a file with no `moov` that no player opens,
+  so one reordered packet lost the whole recording. Reordered packets are
+  counted as they arrive and clamped forward when the index is built, both
+  reported by `Mp4Muxer.timingReports`; recordings without reordering are
+  unchanged. `finish()` no longer leaks the file handle when the index cannot be
+  built.
+- MP4: a track's codec configuration record can change mid-recording through
+  `Mp4Muxer.setTrackConfig`, for an encoder reopened after a graphics device
+  reset. A different record gets its own sample entry; an identical one is
+  ignored.
+- Media Foundation: a shared-handle import failure tells an encoder on a
+  different adapter apart from a capture that stopped, instead of always blaming
+  the adapter.
+- `AudioRingSink.open` declines a channel count the destination cannot carry
+  (`destination.maxChannelCount`), so a surround request on stereo hardware
+  falls back cleanly instead of being silently down-mixed. Above two channels
+  the sink maps channels discretely, so a finished multichannel speaker feed is
+  not remixed by Web Audio.
+
+## 0.7.3
+
+- Wasm codecs load inside Web Workers; they used to fall back silently to
+  WebCodecs there.
+
 ## 0.7.2
 
-- Web audio can now play entirely off the main thread: an AudioWorklet reads decoded PCM from shared memory that a worker fills, so a busy main thread no longer starves playback. Fixes two WebCodecs decoder faults: a packet handed to decode() was dropped whenever a frame was already buffered, which broke the reference chain for every frame after it, and both decoders passed the whole backing buffer instead of the packet's view of it. Decoders now wait on the output callback instead of polling a timer the browser clamps to 4ms, taking audio decode from 5.0ms to 0.1ms per packet. Worker-hosted demux and decode are available behind backendOptions['worker'] = 'true'. Also exposes the Media Foundation encoder's bound D3D11 device, and decodes AAC in the decodeAudioData fallback by synthesizing ADTS headers so browsers without WebCodecs audio can play it.
+- Web audio can play entirely off the main thread: an AudioWorklet reads decoded
+  PCM from shared memory that a worker fills, so a busy main thread no longer
+  starves playback.
+- WebCodecs decoders: a packet passed to `decode()` while a frame was buffered
+  was dropped, breaking every later frame, and both decoders passed the whole
+  backing buffer instead of the packet's bytes.
+- Decoders wait on the output callback instead of polling a timer the browser
+  clamps to 4 ms, taking audio decode from 5.0 ms to 0.1 ms per packet.
+- Worker-hosted demux and decode are available with `backendOptions['worker'] =
+  'true'`.
+- Exposes the Media Foundation encoder's bound D3D11 device.
+- The `decodeAudioData` fallback decodes AAC, so browsers without WebCodecs
+  audio can play it.
 
 ## 0.7.1
 
@@ -10,517 +132,218 @@
 
 ## 0.7.0
 
-- **`MfVideoEncoder.flush()` raises instead of returning an empty list when the
-  drain did not finish, or when the session produced nothing at all.** Two
-  genuinely silent failures are now typed `CodecRuntimeException`s: a drain that
-  never reaches `METransformDrainComplete` (previously the 2 s poll expired and
-  the truncated tail was returned as if complete), and a session that ACCEPTED
-  frames yet emitted zero packets across its whole life (a video track with no
-  video, reported as success at every step). The flush deadline is also now
-  measured from the last packet handed back rather than from the start of the
-  flush: every poll is marshalled to the one process-wide MTA worker, so several
-  concurrent sessions can stretch a healthy drain past any absolute budget —
-  "no output at all for 2 s" is the condition that means wedged.
-  Trap: `flush()` returning empty is NOT by itself evidence of lost output.
-  `encode()` returns a packet whenever the async MFT raised
-  `METransformHaveOutput` while that call was in flight, so which of the two
-  delivers a given frame is load-dependent — measured on one box, a single
-  frame's whole 2847 B keyframe came back from `encode()` with `flush()` empty
-  and the drain complete. Callers must SUM both halves; `mf_frame_sources_test`
-  counted only `flush()` and failed on roughly half of default-concurrency runs
-  as a result (0 of 12 after; 8 of 8 fail when the accounting is reverted).
-
-- New (test-only): `mfencSetFault(handle, mode)` /
-  `miniav_shim_mfenc_set_fault` — make ONE encoder session behave like a broken
-  MFT, so the two `flush()` failures above can be reached without one. Mode 1
-  makes the drain never report complete (`mfencDrainState` keeps answering 0);
-  mode 2 accepts input, yields no packets from `mfencReceive`, and reports the
-  drain COMPLETE — that last part is what separates "wedged" from "produced no
-  video at all". Mode 0 (every session's default) is inert, and an unknown mode
-  returns -1 rather than arming anything. Covered by
-  `mf_encoder_flush_faults_test.dart`, which fails if either throw is removed.
-  Trap: the mode is a field on the SESSION, never a global or an environment
-  variable. `dart test` runs each test file in its own isolate inside one
-  process, and these sessions share that process and its single MTA worker, so a
-  process-wide switch injects the fault into whatever else is encoding at the
-  time. Mode 1 also yield-spins ~1 ms per poll on purpose: returning instantly
-  would turn the caller's timeout loop into a marshal storm holding that
-  worker's gate against every other session.
-
-- **libopus is built thread-safe on Windows (`USE_ALLOCA`), not with its
-  process-global pseudostack.** `native/cmake/opus.cmake` gave every MSVC build
-  `NONTHREADSAFE_PSEUDOSTACK` — libopus's last-resort mode, in which all of its
-  per-call scratch arrays come out of ONE process-global 120 000-byte buffer
-  behind an unsynchronised bump pointer. Two threads inside libopus at the same
-  time therefore get handed the SAME scratch bytes and lose each other's updates
-  to the pointer, so it walks off the end of the buffer and libopus memcpys over
-  the heap. Windows now uses `USE_ALLOCA` (per-call, on the calling thread's own
-  stack — what upstream's CMake picks for MSVC); other toolchains keep
-  `VAR_ARRAYS`. Measured with an 8-thread harness under clang-cl ASan: `WRITE of
-  size 4096 … 320 bytes after 120000-byte region allocated by
-  opus_alloc_scratch`, from `run_prefilter` in `celt_encoder.c`, 10 runs out of
-  10 — and 0 out of 10 with `USE_ALLOCA`. `dart test` (default concurrency,
-  597 tests) then went from aborting to 0 aborts in 10 runs, and restoring the
-  one cmake define brings the abort back.
-  New: `miniav_opus_scratch_mode()` (native) / `opusScratchMode()` (Dart) return
-  the compiled mode, and `opus_encode_test.dart` fails on
-  `NONTHREADSAFE_PSEUDOSTACK` so a build-config regression is caught as a test
-  failure instead of as a corrupted process.
-  Trap: this NEVER faults at the culprit. Any decode/encode on any thread can be
-  the one that scribbles; the process dies later wherever it next touches the
-  damaged heap, with a different fault code each run (`0xC0000005`,
-  `0xC0000374`, `0xC0000094`, `0xC0000409`) and a stack pointing at whichever
-  code was unlucky. Two earlier investigations blamed two unrelated subsystems
-  by reading those stacks. Reach for a heap tool, not the crash site.
-- **The Opus encoder writes libopus's real lookahead as the OpusHead pre-skip.**
-  It hard-coded 0, so every file we produced began with the encoder's priming
-  as audible audio and ran ~6.5 ms ahead of video in VLC/Chrome/ffplay. The
-  value now comes from `OPUS_GET_LOOKAHEAD` through a new
-  `miniav_opus_enc_lookahead` native export (also in the WASM module), scaled to
-  48 kHz — the unit RFC 7845 defines the field in, so at 24 kHz the header value
-  is unchanged while libopus reports half as many samples. The MP4 `dOps` and
-  Ogg paths already carried whatever the header said. Trap: a round-trip through
-  our own decoder cannot see this, because the decoder honours whatever pre-skip
-  it reads; the test asserts against the encoder's reported lookahead and
-  cross-correlates decoded output against the input.
-- **WAV demux reads `WAVE_FORMAT_EXTENSIBLE`, 24-bit and 8-bit PCM.** Only fmt 1
-  16-bit and fmt 3 f32 were accepted, which rejects most multichannel/24-bit
-  files, since anything past 2 channels or 16 bits is written as EXTENSIBLE
-  (0xFFFE). The SubFormat GUID now decides the format and `wValidBitsPerSample`
-  is honoured (0 means "the whole container"; anything narrower is refused
-  rather than mis-scaled). Because the platform interface has two PCM codecs,
-  the DEMUXER converts: 8-bit unsigned → `pcmS16le` (`(b-128) << 8`), 24-bit
-  packed → `pcmF32le` (`v / 2^23`) — both exact. The track's codec therefore
-  describes the emitted packets, not the bits on disk. 32-bit integer and
-  64-bit float still fall through to FFmpeg.
-- **The container sniffer requires the RIFF form type to be `WAVE`.** Any RIFF
-  magic was answered `Container.wav`, so `.avi` (and WebP/ANI/RMID) went to the
-  WAV parser — a wasted fall-through on the VM and a hard failure on web, where
-  there is no second demuxer. `ContainerFramingBackend.sniff` is now public so
-  the decision is testable: a wrong guess and a right one both end in a null
-  demuxer, which makes them indistinguishable from outside.
-- **Ogg/Opus timing comes from the packet TOC and page granule positions.**
-  Duration was `packetCount * 20000`, per-packet PTS was `index * 20000`, and
-  `seek` divided by the same constant — but 10/40/60 ms packets are legal and
-  common, so all three were off by up to 3x. Duration is now the final granule
-  minus the pre-skip (which is also what accounts for tail trimming), PTS and
-  packet duration come from each packet's TOC byte, and `seek` binary-searches
-  the resulting timeline. `OggMuxer` writes granule positions from the TOC too
-  instead of assuming 960 samples per page. Packet durations sit on the same
-  pre-skipped timeline as the PTS — each packet ends where the next begins, so
-  the durations add up to `durationUs`; charging packet 0 its full TOC length
-  while its start had been pulled back put a remuxer's sample table (MP4 `stts`
-  is built from `EncodedPacket.durationUs`) at odds with the PTS it was handed.
-- **`Mp4Demuxer.durationUs` includes the last sample's own duration.** It
-  returned `max(pts)`, so every file read back one sample short and a
-  single-sample track reported 0 µs.
-- **`AdtsDemuxer.durationUs` is no longer null.** It is computed by a frame walk
-  (header hops only, no payload touched) on first read and cached, so a plain
-  `.aac` finally shows a seek bar. The walk reuses the normal framing path, so
-  tags and corruption are priced exactly as playback prices them, and it saves
-  and restores the read cursor. Like every other demuxer's, the getter stays
-  readable after `close()`: a player reads `duration` unguarded and does not
-  null its demuxer, so throwing there fires during an ordinary teardown.
-- **`WavMuxer` and `AdtsMuxer` stream to a `FileMuxerOutput`.** Both buffered
-  the entire recording in RAM and only wrote at `finish()`. WAV now writes its
-  44-byte header up front and patches the two RIFF lengths at the end (new
-  `MuxerFileSink.patchU32Le`); ADTS just appends, since it has no length field
-  anywhere. Both expose `ownsFileOutput`, and the backend stops wrapping them in
-  the collect-then-save adapter; `getBytes()` returns null in streaming mode
-  because nothing is retained. Bytes-output behaviour is byte-for-byte
-  unchanged, including after `close()` — it auto-finishes and `getBytes()` has
-  no ordering guard, so neither writer drops its buffer there. Trap: an
-  interrupted streaming recording is a file whose two RIFF lengths were never
-  patched, so `WavDemuxer` reads a 0-length `data` chunk as running to EOF (it
-  used to return zero packets, and since `open()` still succeeded the negotiator
-  never fell through to a demuxer that could recover the audio).
-  `OggMuxer` deliberately still buffers: a page carries a CRC over
-  its own bytes plus a granule position and sequence number, so streaming it
-  means a page-packing policy, and nothing here records into Ogg open-endedly.
-- **The Media Foundation video decoder now crops to the display aperture.** It
-  reported the macroblock/CTU-padded CODED size (240 arrived as 256, 1080 as
-  1088) and the mapped buffer carried those padding rows as picture. The
-  negotiated output type's `MF_MT_MINIMUM_DISPLAY_APERTURE` (then
-  `MF_MT_GEOMETRIC_APERTURE`) is now honoured at open and on every
-  stream-change renegotiation; frames report the display size and
-  `readBytes()` returns exactly `width * height * 3 / 2`. An absent aperture
-  still means no crop, so block-aligned streams are unchanged. The D3D11
-  texture stays coded-size with the valid region at the top-left — import it
-  with the frame's `width`/`height`, not the texture's.
-- **`SwAudioDecoder` no longer withholds MP3 audio until `flush()`.** It buffers
-  because the native entry points take a complete buffer, but returning nothing
-  from every `decode()` starves a streaming consumer: a player wrote no audio
-  for the whole file and then received the entire track as one chunk during its
-  end-of-stream drain, which plays a fraction of a second and reports EOS. Fed
-  more than one packet it now decodes in ~16 KiB batches and emits as it goes,
-  timestamped from each batch's first packet instead of 0. A whole-file feed
-  (one packet, then flush) is unchanged. Trap: a batch is decoded with the
-  previous batch's tail in front of it and trimmed back by
-  `mp3PcmFrameCount`, because a cold `drmp3_init_memory` spends the first frame
-  syncing — without that, every batch dropped a frame (~1 s lost per 30 s).
-  Pinned by a test asserting batched output is sample-identical to a whole-file
-  decode. Batching is MP3-only: an MP3 batch is a run of self-contained frames,
-  while a FLAC or Ogg-Vorbis batch is a slice of a CONTAINER that
-  `drflac_open_memory` / `stb_vorbis_open_memory` reject, so a whole-file feed
-  of either still accumulates and decodes once at `flush()` however many chunks
-  it arrives in.
-- **`SwAudioBackend` no longer claims FLAC or Vorbis decode; they route to
-  FFmpeg.** `SwAudioDecoder` ignores `AudioDecoderConfig.extraData`, which is
-  where a demuxer puts the FLAC STREAMINFO / Vorbis setup headers it strips, and
-  the native entry points (`drflac_open_memory` / `stb_vorbis_open_memory`) need
-  a whole container — so a demuxed stream threw `CodecRuntimeException` on every
-  batch. Streamed FLAC/Vorbis through this backend had therefore never worked.
-  Trap: the claim was not merely optimistic, it was terminal — priority 55
-  outranks FFmpeg and `SwAudioDecoder.open` can never return `null`, so winning
-  the negotiation left nothing to fall through to. Whole-file feeds through
-  `SwAudioDecoder` directly still decode all three codecs; reclaiming the codecs
-  for negotiation needs header synthesis from `extraData` first.
-- **`Mp4Demuxer.seek` lands on a VIDEO keyframe at/before the target.** It
-  scanned every track — audio has no `stss`, so all its samples are flagged as
-  sync points and an interleaved file always seeked into the middle of a video
-  GOP. Trap: the scan also stopped at the first sample with `ptsUs > target`
-  while the sample list is in FILE-OFFSET order, so B-frame reordering
-  terminated it early. Audio-only files keep the any-track rule.
-- **ADTS demux survives ID3 tags and corruption.** `AdtsDemuxer.open` now skips
-  leading ID3v2 tags, matching the sniffer, which had accepted a tagged `.aac`
-  the parser then rejected (fatal on web, where there is no fallback demuxer).
-  `readPacket` treats an ID3v1 `TAG` trailer / trailing ID3v2 as a clean end and
-  resyncs forward past bad headers (double-confirmed, as in `Mp3Demuxer`) rather
-  than returning EOF at the first one — one corrupt frame used to truncate the
-  rest of the file silently. A resync also charges the skipped span to the frame
-  counter: PTS is derived from the number of frames emitted, so hunting past
-  damage without pricing it stamped every remaining packet early by the lost
-  frames' duration, permanently (a 5-frame burst at 44.1 kHz runs the rest of
-  the file ~116 ms ahead of the video). `seek` stops on the frame a resync lands
-  on instead of consuming it. `channel_configuration` 7 now maps to 8 channels
-  on both read and write (it is an enum, not a count); configuration 0 stays
-  rejected.
-- **The MF decoder harvests the HEVC frame size from the SPS, and declines when
-  there is none.** The HEVC decoder MFT requires `MF_MT_FRAME_SIZE` on its input
-  type and rejects every `ProcessInput` without it — but the session still
-  creates successfully, so the negotiator committed to a decoder that accepted
-  packets and produced nothing (a black screen, no error). When
-  `DecoderConfig.width`/`height` are unset, `MfD3d11Decoder.open` now reads
-  `pic_width/height_in_luma_samples` out of the parameter sets in
-  `extraData` — an `hvcC` record or a raw Annex-B sequence header — and hardware
-  decode proceeds; with neither dims nor a parsable SPS — or one whose dimensions
-  exceed what any HEVC level allows — it returns `null` and
-  negotiation falls to the software decoder. H.264 is unaffected throughout: its
-  MFT parses dimensions in-band. Trap: the harvested size is the CODED size, not
-  the display size — the input type describes the CTU grid (1080 codes as 1088),
-  and the output's display aperture still governs what a frame reports. Trap: the
-  size is bounded before use, not just checked for `> 0` — the native side takes
-  it as `Int32` and an out-of-range SPS value would truncate to a negative there,
-  silently dropping `MF_MT_FRAME_SIZE` and reinstating the never-emits decoder.
-- **`Mp4Muxer` writes the `tkhd` display matrix for
-  `VideoTrackInfo.rotationDegrees`.** It always wrote the unity matrix, so a
-  portrait recording round-tripped through this muxer came back as rotation 0
-  and played sideways; `Mp4Demuxer` had read the matrix all along. 0/90/180/270
-  map to the same (a,b,c,d) values ffmpeg's `-display_rotation` writes (degrees
-  CLOCKWISE); anything else writes unity rather than a transform the reader
-  would report as 0. `tkhd` width/height stay the coded size — the matrix alone
-  declares the orientation, and swapping them too rotates the picture twice.
-- Every entry of both MP3 bitrate tables and all three sample rates of each
-  MPEG version are now pinned by an exhaustive header-matrix test (252
-  combinations of version x bitrate index x rate index x padding, checked
-  against hand-transcribed ISO constants); the 0.6.9 fixtures only ever
-  exercised sample-rate index 0.
+- **Behaviour change:** `MfVideoEncoder.flush()` throws a
+  `CodecRuntimeException` instead of returning an empty list when the drain does
+  not finish, or when the session accepted frames but never produced a packet.
+  The flush deadline is 2 s without output, so concurrent sessions no longer cut
+  a healthy drain short. Packets can come back from either `encode()` or
+  `flush()`; count both.
+- New, test-only `mfencSetFault(handle, mode)` makes one encoder session
+  simulate a drain that never completes (mode 1) or a session that produces no
+  packets (mode 2).
+- libopus is built thread-safe on Windows. Its previous build mode shared one
+  scratch buffer across the process, so two threads using Opus at once corrupted
+  the heap and crashed later in unrelated code. New `opusScratchMode()` (native
+  `miniav_opus_scratch_mode()`) reports the compiled mode.
+- The Opus encoder writes libopus's real lookahead as the OpusHead pre-skip (new
+  native export `miniav_opus_enc_lookahead`). It wrote 0, so every file began
+  with the encoder's priming as audible audio and ran ~6.5 ms ahead of video.
+- WAV demux reads `WAVE_FORMAT_EXTENSIBLE`, 24-bit and 8-bit PCM, so most
+  multichannel and 24-bit files open. 8-bit converts to `pcmS16le` and 24-bit to
+  `pcmF32le`, both exactly; 32-bit integer and 64-bit float still go to FFmpeg.
+- The container sniffer requires a RIFF file's form type to be `WAVE`; `.avi`,
+  WebP and other RIFF files went to the WAV parser, which on the web, with no
+  fallback, was fatal. `ContainerFramingBackend.sniff` is public.
+- Ogg/Opus duration, packet timestamps and seeking come from the duration each
+  packet declares and the page granule positions, instead of assuming 20 ms
+  packets, which were off by up to 3x for 10/40/60 ms packets. `OggMuxer` writes
+  granule positions the same way.
+- `Mp4Demuxer.durationUs` includes the last sample's duration; files read back
+  one sample short.
+- `AdtsDemuxer.durationUs` is no longer null: it is computed on first read and
+  cached, so a plain `.aac` file gets a seek bar.
+- `WavMuxer` and `AdtsMuxer` stream to a `FileMuxerOutput` instead of holding
+  the whole recording in memory (both report `ownsFileOutput`; `getBytes()`
+  returns null in that mode; new `MuxerFileSink.patchU32Le`). `WavDemuxer` reads
+  an interrupted recording's unfinished `data` chunk to the end of the file.
+  `OggMuxer` still buffers.
+- The Media Foundation video decoder crops to the display aperture: frames
+  reported the padded coded size (1080 as 1088) with padding rows as picture.
+  `readBytes()` now returns exactly `width * height * 3 / 2`. The D3D11 texture
+  stays at the coded size with the picture top-left, so import it with the
+  frame's `width`/`height`.
+- `SwAudioDecoder` emits MP3 audio as it decodes (in ~16 KiB batches) instead of
+  withholding everything until `flush()`, which left a streaming player silent
+  until the end of the file. Output is sample-identical to a whole-file decode.
+- `SwAudioBackend` no longer claims FLAC or Vorbis decode, which route to
+  FFmpeg: streamed FLAC/Vorbis through it never worked, and it outranked FFmpeg,
+  so nothing took over. `SwAudioDecoder` still decodes whole-file feeds of all
+  three codecs.
+- `Mp4Demuxer.seek` lands on a video keyframe at or before the target; in an
+  interleaved file it used to land in the middle of a video GOP. Audio-only
+  files are unchanged.
+- ADTS demux skips leading and trailing ID3 tags and resyncs past corrupt
+  frames, where one bad frame used to silently truncate the rest of the file;
+  timestamps account for the skipped span. `channel_configuration` 7 maps to 8
+  channels.
+- The Media Foundation HEVC decoder reads the frame size from the SPS in
+  `extraData` when `DecoderConfig.width`/`height` are unset, and declines
+  (falling back to software) when there is none. It used to accept packets and
+  produce nothing: a black screen with no error. H.264 is unaffected.
+- `Mp4Muxer` writes the display matrix for `VideoTrackInfo.rotationDegrees`
+  (0/90/180/270 clockwise, as ffmpeg writes it), so portrait recordings no
+  longer play sideways.
 
 ## 0.6.9
 
 ### Media Foundation video encoder
 
-- **`flush()` no longer wedges the session or drops the tail.** A drain is now
-  tracked as its own state and ended by `METransformDrainComplete`; the next
-  submit re-sends `MFT_MESSAGE_NOTIFY_START_OF_STREAM` and forgets the stale
-  pre-drain input credit, so `flush()` followed by `encode()` keeps encoding.
-  New `mfencDrainState` lets `flush()` wait for the drain to actually complete
-  rather than stopping at the first "nothing right now" — an async hardware MFT
-  answers that long before it has handed back the frames it still holds.
-- **New `MfVideoEncoder.invalidateImports()`.** The D3D11 import cache keys on
-  the producer's texture pointer; it now holds a reference to that texture, so
-  a freed-and-recycled address can no longer resolve to the previous picture
-  (the frozen-frame failure). The cost is that the producer's texture stays
-  resident until the entry is evicted — call `invalidateImports()` on a
-  resolution change or a rebuilt texture ring to release it.
-- CPU NV12/I420 input accepts odd dimensions: stride is `(w+1)&~1` with
-  `(h+1)>>1` chroma rows on both sides, the last column and missing chroma row
-  are replicated, and the media type keeps the real WxH.
-- Texture import failures and back-pressure are now distinct: every native
-  failure path records why (staging exhaustion, `VideoProcessorBlt`,
-  `MFCreateDXGISurfaceBuffer`, both `ProcessInput` shapes, the shared-handle
-  open), and a full input queue no longer reports itself as "could not open the
-  capture texture".
-- `MfVideoEncoder` is `Finalizable` (native session + frame struct), and every
-  native read throws `StateError` after `close()` instead of using a freed
-  handle.
+- `flush()` no longer wedges the session or drops the tail, and `encode()` after
+  `flush()` keeps encoding. New `mfencDrainState` lets `flush()` wait until the
+  drain completes.
+- New `MfVideoEncoder.invalidateImports()`. The D3D11 import cache holds a
+  reference to each producer texture, so a recycled texture address no longer
+  encodes the previous picture (a frozen frame). Call it on a resolution change
+  or a rebuilt texture ring to release those textures.
+- CPU NV12/I420 input accepts odd dimensions.
+- Texture import failures and back-pressure are reported separately, each
+  failure with its cause.
+- `MfVideoEncoder` is `Finalizable`, and its native reads throw `StateError`
+  after `close()` instead of using a freed handle.
 
 ### ISO-BMFF muxer / demuxer
 
-- **B-frame timestamps are correct.** `stts` deltas derive from DTS and a
-  `ctts` box is written whenever any packet has `ptsUs != dtsUs`, with the
-  version-0 non-negative shift undone by the edit list. Strictly decreasing DTS
-  now throws instead of producing a garbage file.
-- 64-bit where required: version-1 `mvhd`/`tkhd`/`mdhd`/`elst` past `u32`,
-  `co64` instead of `stco` past a 4 GiB chunk offset, and an `mdat` largesize.
-  Short files keep the maximally-compatible version-0 layout. Every remaining
-  32-bit field is range-checked and throws rather than silently masking.
-- **A/V sync: each track gets an `edts`/`elst`** carrying its own composition
-  start relative to the earliest track, and the demuxer applies the inverse
-  (movie timescale from `mvhd`, leading empty edit + first real `media_time`) to
-  both PTS and DTS. A negative-PTS decode preroll is trimmed by the edit list
-  rather than presented, so a clip cut at a keyframe starts where it was cut.
-- `stss` is omitted when the key set is empty or when every sample is a key —
-  an empty `stss` had told players nothing was seekable.
-- **Streaming file output.** Given a `FileMuxerOutput`, `Mp4Muxer` writes
-  `ftyp` + `mdat` samples straight to the path as they arrive and appends
-  `moov` at `finish()`; memory is O(sample count), not O(file). Trap: `moov` is
-  at the END (non-faststart, as FFmpeg defaults), and `getBytes()`/
-  `outputParts` return `null` in this mode — the bytes went to the file.
-  `FileMuxerOutput` on a platform with no filesystem is now refused at
-  `createMuxer()` instead of buffering a whole recording that can never be
-  saved.
-- `Mp4Demuxer.open()` is linear in sample count (the `stsc` lookup no longer
-  rescans the table per chunk) — minutes-long interleaved recordings opened in
-  seconds.
-- AAC `esds`: sample rates >= 65536 write 0 in the 16.16 field (recovered from
-  the AudioSpecificConfig on read), 8 channels map to `channelConfiguration` 7,
-  and an unmappable channel count throws instead of being clamped.
+- B-frame timestamps are correct: `stts` is derived from DTS, and a `ctts` box
+  is written when any packet has `ptsUs != dtsUs`. Strictly decreasing DTS
+  throws instead of producing a broken file.
+- Large files use 64-bit fields (durations, chunk offsets past 4 GiB, `mdat`
+  size); short files keep the most compatible layout. Every remaining 32-bit
+  field is range-checked.
+- A/V sync: each track gets an edit list placing its start relative to the
+  earliest track, and the demuxer applies it. A negative-PTS preroll is trimmed,
+  so a clip cut at a keyframe starts where it was cut.
+- `stss` is omitted when no sample, or every sample, is a keyframe; an empty
+  `stss` told players nothing was seekable.
+- Streaming file output: given a `FileMuxerOutput`, `Mp4Muxer` writes samples to
+  the file as they arrive and appends `moov` at `finish()`, so memory grows with
+  the sample count, not the file. `moov` is at the end (not faststart), and
+  `getBytes()`/`outputParts` return `null` in this mode. `FileMuxerOutput` on a
+  platform without a filesystem is refused at `createMuxer()`.
+- `Mp4Demuxer.open()` is linear in the sample count; long interleaved recordings
+  took seconds to open.
+- AAC `esds`: sample rates of 65536 and above and 8 channels are written
+  correctly, and an unmappable channel count throws instead of being clamped.
 
 ### MP3 demux + MPEG/ADTS sync
 
-- **New: first-party MP3 demuxer** — `Mp3Demuxer`, wired into
-  `ContainerFramingBackend` as `Container.mp3` (demux only; nothing here writes
-  mp3). Pure Dart with no `dart:io`/`dart:ffi`, so it runs on web as well as
-  native: natively it pairs with the dr_mp3 decoder, and on web it feeds the
-  WebCodecs `'mp3'` decoder, which previously had no way to frame an `.mp3` file
-  at all (there is no FFmpeg on web).
-- Skips ID3v2 (syncsafe size, footer flag, repeated and appended tags) and the
-  Xing/Info/VBRI metadata frame; indexes every frame at open; resyncs past
-  mid-stream garbage instead of truncating (`resyncCount` reports it). Duration
-  is COUNTED from that index rather than estimated from a bitrate, so VBR files
-  are exact, and `seek()` is a binary search over it. MPEG-1/2/2.5 Layer III;
-  Layer I/II and free-format bitrates are refused at open with a named reason,
-  as is a stream that indexes to zero frames. Trap: packets are WHOLE frames
-  including the 4-byte header — dr_mp3 and WebCodecs both re-read that header,
-  so a stripped payload decodes to nothing.
-- **ADTS sync now also requires layer bits `00`** (`isAdtsSync`). The layer
-  field was unchecked, so bare mp3 frames (`FF FB`/`FA`/`F3`/`F2`, layer `01`)
-  opened as an AAC track, read a "frame length" out of mp3 audio data and hit
-  EOF after a packet or two. The sniffer uses the same helpers
-  (`isAdtsSync`/`isMp3Sync`, mutually exclusive by construction) and steps over
-  an ID3v2 tag before applying them — an `ID3` prefix is legal in front of ADTS
-  too, so it is not by itself an mp3 answer.
+- New first-party MP3 demuxer, `Mp3Demuxer` (`Container.mp3`, demux only). It is
+  pure Dart, so it also runs on web, where it feeds the WebCodecs `'mp3'`
+  decoder; the web could not play an `.mp3` file before.
+- It skips ID3v2 tags and the Xing/Info/VBRI frame, resyncs past garbage
+  (`resyncCount`), and counts duration from a frame index, so VBR files are
+  exact and `seek()` is precise. MPEG-1/2/2.5 Layer III only; other streams are
+  refused at open with a reason.
+- ADTS sync also requires layer bits `00` (`isAdtsSync`), so a bare MP3 file is
+  no longer opened as AAC. The sniffer uses `isAdtsSync`/`isMp3Sync` and looks
+  past an ID3v2 tag before deciding.
 
 ## 0.6.8
 
-- **ODD frame dimensions no longer break the D3D11 texture path.** NV12
-  subsamples chroma 2x2, so a DXGI NV12 surface must have EVEN width and height;
-  `CreateTexture2D` returns E_INVALIDARG otherwise. The staging ring was
-  allocated at the exact frame size, so a capture like 2576x1119 (odd height --
-  window sizes are arbitrary) failed to allocate, `mfenc_ensure_vp` bailed, and
-  every texture frame was refused before the import was even attempted. The
-  staging surface is now padded up to even; the blt writes only the real region
-  via the stream rects and the MFT takes its frame size from the media type, so
-  the spare row is never read. Covered by an odd-dimension test that reproduces
-  the exact field signature when reverted.
+- Odd frame dimensions no longer break the D3D11 texture path: a capture with an
+  odd width or height had every texture frame refused. The NV12 staging surface
+  is padded to even sizes.
 - `MfVideoEncoder` accepts an `existingD3d11Device`, and `MfEncodeBackend`
-  passes `BackendContext.d3d11DeviceHandle` into it. Encoding on the device the
-  frames already live on removes the per-frame shared-handle import entirely --
-  previously the encoder always built its own device via
-  `D3D11CreateDevice(NULL, ...)`, i.e. on the DEFAULT adapter, so every GPU
-  frame had to be exported and re-opened even in the common case.
-- **New: `MfVideoEncoder.lastImportError`** — which step of the D3D11 texture
-  import failed, and its HRESULT, now included in the thrown message. "could not
-  import" covers a QueryInterface miss, a refused `CreateSharedHandle`, a
-  cross-adapter `OpenSharedResource` and a rejected
-  `CreateVideoProcessorInputView`; those have nothing in common except the
-  symptom, and guessing between them from outside produced several confident
-  wrong fixes in a row.
-- The zero-copy test now covers both sharing modes (legacy / NT handle) AND both
-  pixel formats (BGRA / RGBA, the latter being what the recorder's GPU processor
-  actually produces). Each was a case where the test had been agreeing with the
-  encoder rather than with real producers.
+  passes it `BackendContext.d3d11DeviceHandle`, so frames already on that device
+  are encoded without a per-frame shared-handle import.
+- New `MfVideoEncoder.lastImportError`: which step of the D3D11 texture import
+  failed and its HRESULT, also included in the thrown message.
 
 ## 0.6.7
 
-- **New: `MfVideoEncoder.repeatLastFrame(ptsUs)`** — re-encodes the surface most
-  recently handed to the MFT under a new timestamp, without importing anything.
-  This is what a duplicate/CFR-fill frame actually is, and expressing it by
-  re-importing the producer's texture made it depend on a lifetime the producer
-  owns: the idle timer fires exactly when that surface is most likely to have
-  been recycled, and it fails outright in configurations where nothing is
-  writing that texture at all. Returns null when there is nothing to repeat
-  (nothing submitted yet, or the last frame was CPU-side), so the caller can
-  simply skip the slot.
+- New `MfVideoEncoder.repeatLastFrame(ptsUs)` re-encodes the last submitted
+  surface under a new timestamp without importing anything, for duplicate and
+  constant-frame-rate fill frames. Re-importing depended on a producer texture
+  that may already have been recycled. Returns null when there is nothing to
+  repeat.
 
 ## 0.6.6
 
-- **Fixes the D3D11 texture import against real GPU producers.** The importer
-  only tried `IDXGIResource::GetSharedHandle`, the legacy sharing mode. A
-  D3D12/Dawn-backed producer -- minigpu's shared output texture among them --
-  publishes an NT handle from `IDXGIResource1::CreateSharedHandle`, for which
-  the legacy call simply fails. Every frame was refused, and because the encoder
-  skips a refused texture frame the result was a recording with NO VIDEO TRACK
-  and no error anywhere. The import now resolves in three steps: same-device
-  (no import at all), NT handle via `OpenSharedResource1`, then legacy.
-- Sustained failure is no longer silent: 60 consecutive texture-import misses
-  now throw, naming adapter mismatch as the likely cause. A single miss is still
-  skipped, because the idle-frame duplicator legitimately re-submits a recycled
-  texture -- but a run of them is a different fault and must not be quiet.
-- TRAP for whoever touches this next: the zero-copy test built its source with
-  legacy `MISC_SHARED`, so it agreed with the importer rather than with real
-  producers and passed throughout. It now runs both sharing modes, and the
-  NT-handle case was verified to FAIL when the new path is ablated.
+- The D3D11 texture import works with real GPU producers. D3D12/Dawn producers
+  (minigpu's shared output texture among them) publish NT handles, which the
+  importer did not try, so every frame was refused and the recording had no
+  video track and no error. The import now tries the same device, then the NT
+  handle, then the legacy handle.
+- 60 consecutive texture-import failures throw, naming an adapter mismatch as
+  the likely cause; a single miss is still skipped.
 
 ## 0.6.5
 
-- **MP4 assembly no longer multiplies memory.** The writer buffers every packet
-  until `finish()` -- inherent to a whole-file builder -- but it was then
-  copying that media three more times: once per payload into a sample list,
-  again to concatenate `mdat`, and again to concatenate the final file. Peak was
-  4.85x the media at 300 MB of payload; it is now 1.86x, which is the packets
-  themselves plus VM overhead, with the muxer adding ~4 MB over simply holding
-  them. Payloads needing no rewrite are referenced rather than copied, `mdat`
-  offsets are summed instead of concatenated, and the container is emitted as
-  ordered pieces via `Mp4Muxer.outputParts` so a file sink streams them.
-  `getBytes()` is unchanged for callers that want one buffer -- it just costs
-  the concatenation it always did. Measured by
-  `benchmark/mp4_muxer_memory.dart`.
-- This is a bound, not a licence: a whole-file builder still holds the whole
-  file. It suits clips (bounded by the buffer window) and not open-ended
-  recording, which streams through FFmpeg.
+- MP4 assembly no longer copies the media several times: peak memory was 4.85x
+  the media at 300 MB of payload and is now 1.86x. The file is emitted in pieces
+  through `Mp4Muxer.outputParts`; `getBytes()` is unchanged. The muxer still
+  holds the whole file, so it suits clips; open-ended recording streams through
+  FFmpeg.
 
 ## 0.6.4
 
-- **`FileMuxerOutput` now actually writes a file.** Every first-party muxer
-  (WAV, Ogg, ADTS, MP4/M4A) is a whole-file builder that exposes its result
-  through `getBytes()`, and all four ignored the output path completely --
-  `writeHeader`/`writePacket`/`finish`/`close` each returned normally and
-  nothing reached disk. A caller had no way to detect it and would report
-  "saved" to the user. `ContainerFramingBackend.createMuxer` now wraps them so
-  the bytes are written on `finish()`; web builds, which have no filesystem,
-  raise instead of silently doing nothing. Covered by
-  `test/muxer_file_output_test.dart`, which asserts against the filesystem
-  rather than against return values.
+- `FileMuxerOutput` writes a file. Every first-party muxer (WAV, Ogg, ADTS,
+  MP4/M4A) ignored the output path, so nothing reached disk and nothing reported
+  it. `ContainerFramingBackend.createMuxer` now writes the bytes on `finish()`;
+  web builds, which have no filesystem, throw instead.
 
 ## 0.6.3
 
-- **Internal pins are now caret ranges, not exact versions.** Exact pins made
-  every patch cascade: publishing `miniav_tools_platform_interface` 0.5.3 made
-  the already-published `miniav_tools` 0.5.3 and `miniav_tools_ffmpeg` 0.5.3
-  unsatisfiable next to it, because they pinned 0.5.2 exactly and nothing in the
-  set could move independently. `dart pub publish` warns about this. `release.py
-  sync` now normalises to caret so it cannot recur.
+- Internal dependencies are caret ranges instead of exact pins, which made each
+  patch release unsatisfiable next to already-published packages.
 
 ## 0.6.2
 
-- **Fixes a broken 0.6.1.** The four native-assets build-hook dependencies
-  (`code_assets`, `hooks`, `logging`, `native_toolchain_cmake`) were declared in
-  `dev_dependencies`. Consumers do not receive a package's dev_dependencies, so
-  `hook/build.dart` could not resolve its own imports and the native asset never
-  built downstream — in-repo everything worked, because the dev deps are present
-  there. `dart pub publish` reports this as an error; 0.6.1 shipped past it.
-  0.6.1 is unusable as a dependency and should be skipped.
+- Fixes a broken 0.6.1, whose build-hook dependencies (`code_assets`, `hooks`,
+  `logging`, `native_toolchain_cmake`) were dev dependencies, so the native
+  asset never built downstream. Skip 0.6.1.
 
 ## 0.6.1
 
-- **New: `registerFirstPartyBackends()`** — registers every backend in this
-  package in one idempotent call. `miniav_recorder` calls it before negotiating
-  an encoder, so recording apps now get the FFmpeg-free path (Media Foundation
-  hardware H.264/HEVC, OS AAC, first-party MP4 framing) with no per-app setup.
-  Registering does not force the outcome: capability is reported honestly and
-  FFmpeg still wins where it is the better path. Pin or exclude explicitly with
-  `BackendPreference.pinned` / `.excluded`.
-- The README previously said this package "self-registers on import". It never
-  did, and neither did any other: a top-level `final x = register();` in Dart is
-  LAZY, so it runs on first read and nothing reads it. `registerMinigpuBackend`
-  had been a no-op for every consumer that did not call it by hand. Covered by
-  `test/auto_register_test.dart`, which asserts against the registry rather than
-  against the declaration.
-
-- **`Mp4Muxer` now accepts Annex-B H.264/HEVC.** Encoders emit Annex-B
-  (start-code framed, parameter sets repeated in-band); MP4 needs an
-  `avcC`/`hvcC` configuration record plus length-prefixed NAL samples. The muxer
-  decides the framing once from the track's `extraData` — `0x01` means it is
-  already a configuration record and is passed through untouched, so remuxing a
-  demuxed file does not double-convert. Parameter-set NALs are stripped from the
-  samples, which `hvc1` requires.
-- New (exported): `isAnnexB`, `splitAnnexB`, `buildAvcC`, `buildHvcC`,
-  `annexBToLengthPrefixed` in `src/framing/annexb.dart`. `buildHvcC` parses the
-  HEVC SPS (profile_tier_level → chroma_format_idc → bit depths) after removing
-  emulation-prevention bytes.
-- **D3D11 zero-copy input works for both shapes.** `mfencSendD3d11Texture`
-  takes a foreign-device RGBA/BGRA texture (the recorder's GPU processor
-  output), imports it via `GetSharedHandle` + `OpenSharedResource`, and converts
-  it to NV12 with a D3D11 VideoProcessor — entirely in VRAM. Together with the
-  existing shared-NT-handle path this removes the readback from the recorder's
-  scale/effects and direct-passthrough paths; `MfVideoEncoder` reports both
-  `supportsD3d11TextureInput` and `supportsD3d11SharedHandleInput`.
-  Verified by a DIFFERENTIAL test (`test/mf_texture_zero_copy_test.dart`):
-  a gradient and a flat-grey source must encode to different sizes. An earlier
-  revision produced byte-identical output for both — blank video, while
-  reporting success at every step — so "it produced packets" is not a usable
-  check here.
-- **Fixed a tearing hazard in the D3D11 texture path.** The VideoProcessor
-  converted into a single NV12 staging texture, but `ProcessInput` hands the MFT
-  a sample that only *references* that surface, so the next frame's conversion
-  could overwrite a picture the encoder was still reading. It is now a ring, and
-  a slot is only reused once the MFT has released it (detected from the
-  reference `MFCreateDXGISurfaceBuffer` holds, calibrated at construction rather
-  than assumed). When every slot is in flight the encoder reports the same
-  "drain and retry" it uses for `MF_E_NOTACCEPTING`, which is self-clearing.
-- The texture path allocates nothing per frame: the imported source, its input
-  view, the output views, the rects and the blt fence are all built once.
-  `IDXGIKeyedMutex::AcquireSync` no longer waits `INFINITE` — a producer that
-  never released would have hung the recording rather than dropped a frame.
-  Measured cost of the whole path at 2560x1440 fed at 60 fps is 0.60 ms/frame
-  mean, 0.91 ms p99 (`benchmark/mf_texture_bench.dart`); the caching itself is
-  not where that comes from — ablating it moves nothing, so it is kept for the
-  allocation churn rather than for the clock.
-- `MfVideoEncoder.supportsD3d11Input` and `.isHardware` are cached. Both are
-  fixed at session creation, and every native call is marshalled to the MTA
-  worker thread, so re-answering them per frame spent a cross-thread round-trip
-  on a constant.
-- **MF encode now works on an STA thread — i.e. inside Flutter at all.** MF
-  requires MTA; `CoInitializeEx(COINIT_MULTITHREADED)` fails with
-  `RPC_E_CHANGED_MODE` on a thread already initialised STA, which Flutter's UI
-  thread is. Every entry point therefore reported "no MFT" in any Flutter app
-  (measured: `has_mft`=0, `list_hw`=-1) and the encoder silently lost every
-  negotiation. `mf_encoder.c` now owns a dedicated MTA worker thread and
-  marshals every public call onto it — chosen over an isolate host because
-  D3D11 shared handles are process-wide and cross a thread hop for free, so
-  zero-copy survives. Jobs run one at a time; concurrent *sessions* serialise.
-  Pinned by `test/mf_sta_thread_test.dart`.
-- **`MfEncodeBackend` is now the primary Windows H.264/HEVC encoder**: priority
-  45 → 55, and it reports a *hardware* capability. It previously answered
-  `false` to `supportsEncode(codec, hwAccel: true)`, so despite running on the
-  OS hardware MFT it never advertised a hardware path — and `isHardware` outranks
-  priority in the negotiator, so no priority bump alone could have promoted it.
-  The hardware claim is gated on the OS actually listing a hardware MFT, so a
-  software-only machine still ranks below a real hardware FFmpeg path.
+- New `registerFirstPartyBackends()` registers every backend in this package in
+  one idempotent call. `miniav_recorder` calls it before choosing an encoder, so
+  recording apps get the FFmpeg-free path (Media Foundation hardware H.264/HEVC,
+  OS AAC, first-party MP4) without setup. FFmpeg still wins where it is better;
+  `BackendPreference.pinned` / `.excluded` override the choice.
+- The README no longer claims this package registers itself on import. It never
+  did, and `registerMinigpuBackend` must also be called explicitly.
+- `Mp4Muxer` accepts Annex-B H.264/HEVC: it builds the `avcC`/`hvcC` record,
+  length-prefixes the samples and strips parameter sets. A configuration record
+  in `extraData` is passed through, so remuxing does not convert twice.
+- New exports `isAnnexB`, `splitAnnexB`, `buildAvcC`, `buildHvcC` and
+  `annexBToLengthPrefixed`.
+- D3D11 zero-copy input: `mfencSendD3d11Texture` takes a texture from another
+  device (RGBA/BGRA), imports it and converts it to NV12 on the GPU. With the
+  shared NT handle path, this removes the readback from the recorder's GPU
+  paths. `MfVideoEncoder` reports `supportsD3d11TextureInput` and
+  `supportsD3d11SharedHandleInput`, and a handle that cannot be opened throws a
+  `CodecRuntimeException` naming the likely adapter mismatch.
+- Fixed tearing in the D3D11 texture path: the next frame's conversion could
+  overwrite a picture the encoder was still reading. Conversions use a ring of
+  surfaces, each reused only once the encoder has released it; when all are in
+  flight the encoder reports back-pressure.
+- The texture path allocates nothing per frame (about 0.6 ms per frame at
+  2560x1440, 60 fps), and the keyed-mutex wait is bounded, so a producer that
+  never releases costs a frame instead of hanging the recording.
+- `MfVideoEncoder.supportsD3d11Input` and `isHardware` are cached.
+- Media Foundation encoding works on an STA thread, and so inside Flutter: every
+  entry point reported no encoder in a Flutter app, so it silently lost every
+  negotiation. All calls run on a dedicated MTA worker thread; concurrent
+  sessions take turns.
+- `MfEncodeBackend` is the primary Windows H.264/HEVC encoder: priority 45 → 55,
+  and it reports hardware capability when the OS lists a hardware encoder, so a
+  software-only machine still ranks below hardware FFmpeg.
+- `MfEncodeBackend.hasHardwareMft` no longer caches a failure to enumerate: a
+  caller on Flutter's UI thread poisoned the answer for everyone.
 - `MfVideoEncoder` accepts every frame source the backend advertises: CPU NV12
-  and I420, `FrameSource.yuv420p`, and per-plane `miniavBufferCpu` (honouring
-  each plane's stride). Previously anything but a packed `CpuFrameSource` NV12
-  threw — including the D3D11 zero-copy branch's own fallback, which would have
-  killed a recording rather than degrading to a readback.
-- `MfEncodeBackend.hasHardwareMft` no longer caches a *failure to enumerate*.
-  The hardware-MFT answer is per **apartment**, not per machine: MF needs MTA,
-  and on an STA thread (Flutter's UI thread) `mfencListHw` returns -1. Caching
-  that as "no hardware" poisoned the static cache for every later caller,
-  including an MTA isolate where the same machine answers yes. Only a
-  definitive result is cached now.
-- `MfVideoEncoder` reports `supportsD3d11SharedHandleInput` (true whenever the
-  D3D11 device manager bound) and `supportsD3d11TextureInput` = false: it opens
-  a capture's shared NT handle on its own device, but cannot take the GPU
-  processor's foreign-device RGBA texture. The recorder uses these to pick its
-  screen zero-copy path. When the handle cannot be opened the encoder now throws
-  a `CodecRuntimeException` naming the likely adapter mismatch — a GPU-resident
-  buffer has no CPU pixels to fall back to, so the old path reported "needs CPU
-  NV12", which named the symptom and hid the cause.
-- `MfVideoEncoder.extraData` falls back to harvesting the parameter sets from
-  the first keyframe when the MFT publishes no `MF_MT_MPEG_SEQUENCE_HEADER`
-  (NVIDIA's do; this covers the vendors that don't). A null there would fail the
+  and I420, `FrameSource.yuv420p` and per-plane `miniavBufferCpu` with strides.
+  Anything else used to throw, including the zero-copy path's own fallback.
+- `MfVideoEncoder.extraData` falls back to the parameter sets in the first
+  keyframe when the encoder publishes no sequence header; a null failed the
   track at mux time.
 
 ## 0.5.2
@@ -529,7 +352,8 @@
 
 ## 0.5.0
 
-- Version bump to keep the miniav_tools family in lockstep; no changes in this package.
+- Version bump to keep the miniav_tools family in lockstep; no changes in this
+  package.
 
 ## 0.4.10
 
@@ -551,8 +375,7 @@
 
 ## 0.4.5
 
-- Version bump for coordinated release with `miniav_recorder` 0.4.5
-  (`Recorder.sharedGpu` getter, `GpuScreenProcessor` public export).
+- Version bump for the coordinated release with `miniav_recorder` 0.4.5.
 
 ## 0.4.4
 
@@ -664,11 +487,13 @@
 
 ## 0.2.8
 
-- add RecorderLogSource.minigpu: routes native minigpu/Dawn log lines through the unified Recorder log callback; Recorder.minigpuLevelFor public helper for tests; 12 new tests in log_level_test.dart
+- Add `RecorderLogSource.minigpu`, routing native minigpu/Dawn log lines through
+  the unified `Recorder` log callback, and the public `Recorder.minigpuLevelFor`
+  helper.
 
 ## 0.2.7
 
-- fix FormatException on non-UTF-8 bytes in MiniAV log callback: use Utf8Decoder(allowMalformed: true) instead of toDartString()
+- Fix a FormatException on non-UTF-8 bytes in the MiniAV log callback.
 - Increment minigpu to 1.4.4
 
 ## 0.2.5
@@ -679,7 +504,8 @@
 
 ## 0.2.2-WIP
 
-- add unified Recorder.setLogLevel and Recorder.setLogCallback routing all native logs (MiniAV + FFmpeg) through a single Dart callback
+- add unified Recorder.setLogLevel and Recorder.setLogCallback routing all
+  native logs (MiniAV + FFmpeg) through a single Dart callback
 
 ## 0.2.1
 
@@ -729,9 +555,7 @@
 
 - Initial release. Pure-WGSL codec backend for `miniav_tools` running entirely
   on minigpu's WebGPU compute pipeline.
-- MJPEG encoder: RGBA → YCbCr → DCT → quantize → Huffman → JFIF emitted as a
-  self-contained `.jpg` byte stream (plays in browsers, VLC, QuickTime,
-  ffmpeg). No native FFmpeg dependency — works anywhere minigpu works,
-  including web (WebGPU).
-- `crfQuality` 1..31 maps to JPEG quality 90..10 for parity with FFmpeg's
-  `-q:v` semantics.
+- MJPEG encoder producing self-contained JPEG frames that browsers, VLC,
+  QuickTime and ffmpeg play. No FFmpeg needed, so it works wherever minigpu
+  does, including the web.
+- `crfQuality` 1..31 maps to JPEG quality 90..10, matching FFmpeg's `-q:v`.

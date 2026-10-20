@@ -1,6 +1,9 @@
 // IMPORTANT: This file should be compiled as C++
 
 #include "screen_context_win_wgc.h"
+#include "screen_context_win_wgc_strict.h"
+#include "wgc_frame_texture.h"
+#include "wgc_platform_context.h"
 #include "../../../include/miniav.h" // For MiniAV types, MiniAV_GetErrorString
 #include "../../common/miniav_com_win.h"
 #include "../../common/miniav_logging.h"
@@ -35,6 +38,17 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dwmapi.lib")
+
+// Windows.Graphics.Capture.IGraphicsCaptureSession5, which carries
+// GraphicsCaptureSession.MinUpdateInterval (Windows 11 24H2, 10.0.26100). The
+// SDK this builds against predates it, so it is declared here, with the IID
+// and slots of the OS's own metadata; querying the session for it is the
+// runtime check. The interval is a TimeSpan: 100 ns units.
+struct __declspec(uuid("67C0EA62-1F85-5061-925A-239BE0AC09CB"))
+    __declspec(novtable) IWgcCaptureSession5 : ::IInspectable {
+  virtual HRESULT __stdcall get_MinUpdateInterval(INT64 *value) = 0;
+  virtual HRESULT __stdcall put_MinUpdateInterval(INT64 value) = 0;
+};
 
 // --- WinRT and Dispatcher Queue Management ---
 static std::atomic<int> g_wgc_init_count = 0;
@@ -78,7 +92,8 @@ MiniAVResultCode init_winrt_for_wgc() {
       }
     }
     try {
-      g_dispatcher_queue_controller = winrt::Windows::System::DispatcherQueueController::CreateOnDedicatedThread();
+      if (!g_dispatcher_queue_controller)
+        g_dispatcher_queue_controller = winrt::Windows::System::DispatcherQueueController::CreateOnDedicatedThread();
       if (!g_dispatcher_queue_controller) {
         miniav_log(MINIAV_LOG_LEVEL_ERROR,
                    "WGC: Failed to create DispatcherQueueController.");
@@ -105,10 +120,10 @@ MiniAVResultCode init_winrt_for_wgc() {
   return MINIAV_SUCCESS;
 }
 
-void shutdown_winrt_for_wgc() {
+void shutdown_winrt_for_wgc(bool retain_dispatcher = false) {
   std::lock_guard<std::mutex> lock(g_wgc_init_mutex);
   g_wgc_init_count--;
-  if (g_wgc_init_count == 0) {
+  if (g_wgc_init_count == 0 && !retain_dispatcher) {
     if (g_dispatcher_queue_controller) {
       try {
         auto async_shutdown = g_dispatcher_queue_controller.ShutdownQueueAsync();
@@ -134,11 +149,7 @@ void shutdown_winrt_for_wgc() {
 }
 
 // --- Structs ---
-typedef enum WGCCaptureTargetType {
-  WGC_TARGET_NONE,
-  WGC_TARGET_DISPLAY,
-  WGC_TARGET_WINDOW
-} WGCCaptureTargetType;
+
 
 // Payload for releasing WGC frame resources
 typedef struct WGCFrameReleasePayload {
@@ -185,85 +196,81 @@ static void wgc_close_shared_handle(HANDLE h) {
 #define WGC_CTX_MAGIC_LIVE 0x57474331u /* 'WGC1' */
 #define WGC_CTX_MAGIC_DEAD 0xDEADDEADu
 
-typedef struct WGCScreenPlatformContext {
-  volatile ULONG ctx_magic; // WGC_CTX_MAGIC_LIVE while the context is usable
-  MiniAVScreenContext *parent_ctx;
 
-  winrt::com_ptr<ID3D11Device> d3d_device;
-  winrt::com_ptr<ID3D11DeviceContext> d3d_context;
-  winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice
-      d3d_device_winrt{nullptr};
 
-  winrt::Windows::Graphics::Capture::GraphicsCaptureItem capture_item{nullptr};
-  winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool{
-      nullptr};
-  winrt::Windows::Graphics::Capture::GraphicsCaptureSession session{nullptr};
-  winrt::event_token frame_arrived_token{};
-  winrt::event_token item_closed_token{};
-  // One-shot guard so a lost-capture cascade (item closed + device removed +
-  // failing TryGetNextFrame) fires lost_cb exactly once per capture run.
-  std::atomic<BOOL> lost_cb_fired{FALSE};
+static MiniAVResultCode wgc_take_strict_device(
+    void *raw, void **device, void **immediate, void **rt_device) {
+  auto value = static_cast<WGCScreenPlatformContext *>(raw);
+  if (!value->d3d_device || !value->d3d_context || !value->d3d_device_winrt)
+    return MINIAV_ERROR_NOT_INITIALIZED;
+  // Called only after the strict claim, with an operation protecting transfer
+  // or on its sole cleanup worker. Generic use can never coexist with it.
+  *device = value->d3d_device.detach();
+  *immediate = value->d3d_context.detach();
+  *rt_device = winrt::detach_abi(value->d3d_device_winrt);
+  return MINIAV_SUCCESS;
+}
 
-  MiniAVBufferCallback app_callback_internal;
-  void *app_callback_user_data_internal;
+void *miniav_wgc_strict_holder(MiniAVScreenContext *ctx) {
+  if (!ctx || ctx->ops != &g_screen_ops_win_wgc || !ctx->platform_ctx)
+    return nullptr;
+  return static_cast<WGCScreenPlatformContext *>(ctx->platform_ctx)->strict_holder;
+}
 
-  std::atomic<BOOL> is_streaming;
-  // Number of WinRT threadpool callbacks (FrameArrived / item Closed)
-  // currently executing against this context. Teardown drains this to zero
-  // before closing handles or freeing — see the "callback lifetime protocol"
-  // block below wgc_ctx_alive().
-  std::atomic<long> callbacks_in_flight;
-  HANDLE stop_event_handle;          // Manual reset event
-  CRITICAL_SECTION critical_section; // To protect shared members like callback
-                                     // and streaming state
+bool miniav_wgc_context_is_strict(MiniAVScreenContext *ctx) {
+  auto holder = miniav_wgc_strict_holder(ctx);
+  return holder && miniav_wgc_strict_claimed(holder);
+}
 
-  MiniAVVideoInfo
-      configured_video_format; // User's request (FPS, output_preference)
-  UINT target_fps;
-  UINT frame_width;
-  UINT frame_height;
-  // Size the Direct3D11CaptureFramePool was last created/recreated at. The
-  // pool's surfaces are ALWAYS this size; frame.ContentSize() is the live
-  // target size and drifts away from it the moment a captured window is
-  // resized. Tracking it is what lets wgc_on_frame_arrived notice the drift
-  // and call Direct3D11CaptureFramePool::Recreate. Written under
-  // critical_section.
-  UINT pool_width;
-  UINT pool_height;
-  MiniAVPixelFormat pixel_format; // Typically BGRA32
+MiniAVResultCode miniav_wgc_generic_configuration(MiniAVScreenContext *ctx) {
+  auto holder = miniav_wgc_strict_holder(ctx);
+  return holder ? miniav_wgc_strict_claim_generic(holder)
+                : MINIAV_ERROR_NOT_INITIALIZED;
+}
 
-  LARGE_INTEGER qpc_frequency;
+MiniAVResultCode miniav_wgc_route_start(MiniAVScreenContext *ctx,
+    MiniAVBufferCallback callback, void *user_data, bool *handled) {
+  return miniav_wgc_strict_start(miniav_wgc_strict_holder(ctx), callback,
+                                user_data, handled);
+}
 
-  // FPS pacing state (see the tail of wgc_on_frame_arrived): deliveries are
-  // paced against an absolute QPC schedule slept on a high-resolution
-  // waitable timer.
-  LONGLONG pace_interval_qpc;
-  LONGLONG pace_next_deadline_qpc;
-  HANDLE pace_timer;
+MiniAVResultCode miniav_wgc_route_stop(MiniAVScreenContext *ctx, bool *handled) {
+  return miniav_wgc_strict_stop(miniav_wgc_strict_holder(ctx), handled);
+}
 
-  WGCCaptureTargetType current_target_type;
-  char selected_item_id[MINIAV_DEVICE_ID_MAX_LEN]; // e.g., "HMONITOR:0x1234" or
-                                                   // "HWND:0x5678"
-  HWND selected_hwnd;                              // If window capture
-  HMONITOR selected_hmonitor;                      // If display capture
+MiniAVResultCode miniav_wgc_set_lost(MiniAVScreenContext *ctx,
+    MiniAVContextLostCallback callback, void *user_data) {
+  return miniav_wgc_strict_set_lost(miniav_wgc_strict_holder(ctx), callback,
+                                   user_data);
+}
 
-  // --- Audio Loopback Members ---
-  MiniAVLoopbackContextHandle loopback_audio_ctx;
-  BOOL audio_loopback_enabled_and_configured;
-  MiniAVAudioInfo configured_audio_format; // Actual format from loopback
+MiniAVResultCode miniav_wgc_set_cursor(MiniAVScreenContext *ctx, bool enabled) {
+  return miniav_wgc_strict_set_cursor(miniav_wgc_strict_holder(ctx), enabled);
+}
 
-} WGCScreenPlatformContext;
+MiniAVResultCode miniav_wgc_configured_formats(MiniAVScreenContext *ctx,
+    MiniAVVideoInfo *video, MiniAVAudioInfo *audio) {
+  const auto result = miniav_wgc_strict_formats(miniav_wgc_strict_holder(ctx),
+                                               video, audio);
+  // Preserve the generic backend's actual loopback format. It lives in the
+  // platform context, not in the parent's configured_audio_format field.
+  if (result == MINIAV_SUCCESS && audio && !miniav_wgc_context_is_strict(ctx)) {
+    auto platform = static_cast<WGCScreenPlatformContext *>(ctx->platform_ctx);
+    if (platform->audio_loopback_enabled_and_configured)
+      *audio = platform->configured_audio_format;
+  }
+  return result;
+}
 
 // ===========================================================================
 // Threadpool-callback lifetime protocol
 // ===========================================================================
 // WinRT dispatches FrameArrived and GraphicsCaptureItem.Closed on threadpool
-// threads. Revoking an event token does NOT wait for a handler that is already
-// running, and wgc_on_frame_arrived deliberately BLOCKS for up to a frame
-// interval in its FPS pacing loop *after* releasing the critical section. So
-// the owner thread could previously CloseHandle(pace_timer /
-// stop_event_handle), DeleteCriticalSection() and miniav_free() the context
-// while a callback thread was still reading it and waiting on those handles.
+// threads, and the pacing timer (see wgc_pump) fires on one too. Revoking an
+// event token does NOT wait for a handler that is already running, so the
+// owner thread could previously DeleteCriticalSection() and miniav_free() the
+// context while a callback thread was still reading it (a window that a
+// pacing wait outside the critical section once made a frame interval wide).
 //
 // Three pieces close that:
 //
@@ -279,18 +286,18 @@ typedef struct WGCScreenPlatformContext {
 //
 // DEADLOCK-FREEDOM (the reason for the exact ordering in wgc_stop_capture and
 // wgc_destroy_platform):
-//   * An in-flight wgc_on_frame_arrived can block on (a) the context's
-//     critical section, (b) g_wgc_live_mutex, (c) the pacing wait.
+//   * An in-flight callback can block on (a) the context's critical section,
+//     (b) g_wgc_live_mutex, (c) the copy fence (bounded, and under (a)).
 //   * The drain is therefore always performed with the critical section NOT
 //     held. Draining under it would block the very handler we are waiting for
 //     in EnterCriticalSection — a guaranteed hang.
 //   * g_wgc_live_mutex is a leaf: it is never held while acquiring the
 //     critical section, while calling into WinRT/D3D, or while draining. The
 //     acquire/release helpers take it only around a vector scan and one atomic.
-//   * The pacing wait cannot outlast the drain because teardown sets
-//     is_streaming = FALSE and SetEvent(stop_event_handle) *before* draining,
-//     and every branch of the pacing loop either tests is_streaming or waits
-//     on stop_event_handle (including the no-waitable-timer fallback).
+//   * Nothing waits outside the critical section: teardown sets
+//     is_streaming = FALSE under it *before* draining, and a callback that
+//     gets the lock after that only hands its frames back. The pacing timer
+//     is disarmed under the lock and closed after the drain.
 //   * Re-entrancy: the app may call StopCapture/DestroyContext from inside its
 //     own lost_cb, which runs on a threadpool thread that already holds a
 //     reference. The drain discounts references held by the *calling* thread
@@ -369,14 +376,12 @@ static bool wgc_stress_env_flag(const char *name) {
 // Never set these in production.
 //
 //  MINIAV_WGC_STRESS_NO_DRAIN=1   restore the PRE-FIX teardown semantics: no
-//                                 callback drain in stop/destroy, and the
-//                                 pacing loop's no-timer fallback goes back to
-//                                 a bare stop-event-blind Sleep().
-//  MINIAV_WGC_STRESS_PACE_SLEEP=1 force the pacing loop down that no-timer
-//                                 fallback (normally only reached when the
-//                                 waitable timer could not be created or
-//                                 armed). Together the two reproduce the
-//                                 original wide use-after-free window.
+//                                 callback drain in stop/destroy.
+//  MINIAV_WGC_STRESS_PACE_SLEEP=1 park every frame callback for a frame
+//                                 interval outside the lock, blind to
+//                                 teardown, the way the old pacing wait did.
+//                                 Together the two reproduce the original
+//                                 wide use-after-free window.
 static bool wgc_stress_legacy_teardown() {
   static std::atomic<int> cached{-1};
   int v = cached.load(std::memory_order_relaxed);
@@ -462,8 +467,8 @@ static bool wgc_stress_force_pace_sleep() {
     cached.store(v, std::memory_order_relaxed);
     if (v) {
       miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                 "WGC: MINIAV_WGC_STRESS_PACE_SLEEP=1 — pacing loop forced onto "
-                 "the no-waitable-timer fallback (test-only).");
+                 "WGC: MINIAV_WGC_STRESS_PACE_SLEEP=1 — frame callbacks park "
+                 "for a frame interval outside the lock (test-only).");
     }
   }
   return v != 0;
@@ -598,6 +603,185 @@ static void wgc_on_frame_arrived(
     WGCScreenPlatformContext *wgc_ctx,
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender,
     winrt::Windows::Foundation::IInspectable const &args);
+static VOID CALLBACK wgc_on_pace_wake(PTP_CALLBACK_INSTANCE instance,
+                                      PVOID param, PTP_WAIT wait,
+                                      TP_WAIT_RESULT result);
+static VOID CALLBACK wgc_on_window_watch(PTP_CALLBACK_INSTANCE instance,
+                                         PVOID param, PTP_TIMER timer);
+
+// Frame-pool depth: WGC keeps capturing into the third surface while one frame
+// is held for its output slot and the next has just been taken.
+#define WGC_POOL_BUFFERS 3
+
+using WGCFrame = winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame;
+
+// Hands a frame's surface back to the pool. Safe on a null frame.
+static void wgc_close_frame(WGCFrame &frame) {
+  if (!frame)
+    return;
+  try {
+    frame.Close();
+  } catch (...) {
+  }
+  frame = nullptr;
+}
+
+// Now, on the clock SystemRelativeTime reports: QPC, in 100 ns units.
+static LONGLONG wgc_now_100ns(WGCScreenPlatformContext *wgc_ctx) {
+  LARGE_INTEGER freq = wgc_ctx->qpc_frequency;
+  if (freq.QuadPart <= 0)
+    QueryPerformanceFrequency(&freq);
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  return now.QuadPart / freq.QuadPart * 10000000LL +
+         now.QuadPart % freq.QuadPart * 10000000LL / freq.QuadPart;
+}
+
+// Adds one timing to a WGCFrameStats count, sum and maximum.
+static void wgc_stats_time(UINT32 &count, LONGLONG &sum, LONGLONG &max,
+                           LONGLONG t) {
+  count++;
+  sum += t;
+  if (t > max)
+    max = t;
+}
+
+// Output slots (see wgc_pump). Slot k is the instant
+// grid_origin_100ns + k * pace_den / pace_num seconds. 1e7 * pace_den ticks
+// hold exactly pace_num slots, so splitting a time into whole such periods and
+// a remainder keeps the arithmetic exact, with no drift, and every product in
+// range for rates whose terms are at most 100000.
+static LONGLONG wgc_floor_div(LONGLONG a, LONGLONG b) {
+  const LONGLONG q = a / b;
+  return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
+}
+
+// The slot nearest time t.
+static LONGLONG wgc_slot_of(WGCScreenPlatformContext *wgc_ctx, LONGLONG t) {
+  const LONGLONG num = wgc_ctx->pace_num;
+  const LONGLONG period = 10000000LL * wgc_ctx->pace_den;
+  const LONGLONG d = t - wgc_ctx->grid_origin_100ns;
+  const LONGLONG whole = wgc_floor_div(d, period);
+  const LONGLONG rest = d - whole * period;
+  return whole * num + (2 * rest * num + period) / (2 * period);
+}
+
+static LONGLONG wgc_slot_time(WGCScreenPlatformContext *wgc_ctx,
+                              LONGLONG slot) {
+  const LONGLONG num = wgc_ctx->pace_num;
+  const LONGLONG period = 10000000LL * wgc_ctx->pace_den;
+  const LONGLONG whole = wgc_floor_div(slot, num);
+  return wgc_ctx->grid_origin_100ns + whole * period +
+         (slot - whole * num) * period / num;
+}
+
+// When a slot's window closes: half an interval after its time, from where a
+// newer frame belongs to the next slot. Brought forward by a sixteenth of that
+// half to absorb the pacing timer's wake-up latency.
+static LONGLONG wgc_slot_due(WGCScreenPlatformContext *wgc_ctx,
+                             LONGLONG slot) {
+  const LONGLONG half =
+      10000000LL * wgc_ctx->pace_den / (2 * wgc_ctx->pace_num);
+  return wgc_slot_time(wgc_ctx, slot) + half - half / 16;
+}
+
+// Arms the pacing wake to fire once, delay_100ns from now. A threadpool timer
+// fires on the system clock tick, up to 15.6 ms late, which is most of a 60 fps
+// interval; a high-resolution waitable timer is good to about a millisecond.
+// False if it cannot be armed. Under critical_section.
+static bool wgc_arm_pace_wake_locked(WGCScreenPlatformContext *wgc_ctx,
+                                     LONGLONG delay_100ns) {
+  if (!wgc_ctx->pace_tp_wait || !wgc_ctx->pace_wake_timer)
+    return false;
+  LARGE_INTEGER due;
+  due.QuadPart = -delay_100ns; // negative: relative to now
+  if (!SetWaitableTimer(wgc_ctx->pace_wake_timer, &due, 0, NULL, NULL, FALSE))
+    return false;
+  SetThreadpoolWait(wgc_ctx->pace_tp_wait, wgc_ctx->pace_wake_timer, NULL);
+  return true;
+}
+
+// Disarms and closes the pacing wait, first waiting out a callback of it that
+// is already running, unless the caller is a capture callback itself (a stop
+// from inside the app's callback), which would wait for itself. Called after
+// the drain, so such a callback only finds the run stopped; the caller must
+// not hold critical_section otherwise, since the callback takes it. The next
+// start creates a new wait; the waitable timer is kept for it.
+static void wgc_close_pace_wake(WGCScreenPlatformContext *wgc_ctx) {
+  EnterCriticalSection(&wgc_ctx->critical_section);
+  PTP_WAIT wait = wgc_ctx->pace_tp_wait;
+  wgc_ctx->pace_tp_wait = nullptr;
+  if (wgc_ctx->pace_wake_timer)
+    CancelWaitableTimer(wgc_ctx->pace_wake_timer);
+  LeaveCriticalSection(&wgc_ctx->critical_section);
+  if (!wait)
+    return;
+  SetThreadpoolWait(wait, nullptr, nullptr);
+  if (t_wgc_callback_ctx != wgc_ctx)
+    WaitForThreadpoolWaitCallbacks(wait, TRUE);
+  CloseThreadpoolWait(wait);
+}
+
+// How often a window capture checks that its window still exists.
+#define WGC_WINDOW_WATCH_MS 100
+
+// Starts checking that the captured window still exists and belongs to the
+// thread that owned it now. Windows does not raise Closed for every window
+// that goes away (a closed popup whose process lived on never raised it), and
+// the check also catches a handle reused by another window. Without a timer
+// the capture still learns of a close when Closed is raised. Under
+// critical_section.
+static void wgc_arm_window_watch_locked(WGCScreenPlatformContext *wgc_ctx) {
+  wgc_ctx->watched_pid = 0;
+  wgc_ctx->watched_tid =
+      GetWindowThreadProcessId(wgc_ctx->selected_hwnd, &wgc_ctx->watched_pid);
+  if (!wgc_ctx->window_watch)
+    wgc_ctx->window_watch =
+        CreateThreadpoolTimer(wgc_on_window_watch, wgc_ctx, nullptr);
+  if (!wgc_ctx->window_watch) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "WGC: could not create the window check (%lu); a closed "
+               "window is noticed only if Windows reports it.",
+               GetLastError());
+    return;
+  }
+  ULARGE_INTEGER due;
+  due.QuadPart = (ULONGLONG)(-(LONGLONG)WGC_WINDOW_WATCH_MS * 10000);
+  FILETIME first;
+  first.dwLowDateTime = due.LowPart;
+  first.dwHighDateTime = due.HighPart;
+  SetThreadpoolTimer(wgc_ctx->window_watch, &first, WGC_WINDOW_WATCH_MS,
+                     WGC_WINDOW_WATCH_MS / 4);
+}
+
+// Disarms and closes the window check, the way wgc_close_pace_wake closes the
+// pacing wait. The next window capture's start creates a new one.
+static void wgc_close_window_watch(WGCScreenPlatformContext *wgc_ctx) {
+  EnterCriticalSection(&wgc_ctx->critical_section);
+  PTP_TIMER timer = wgc_ctx->window_watch;
+  wgc_ctx->window_watch = nullptr;
+  LeaveCriticalSection(&wgc_ctx->critical_section);
+  if (!timer)
+    return;
+  SetThreadpoolTimer(timer, nullptr, 0, 0);
+  if (t_wgc_callback_ctx != wgc_ctx)
+    WaitForThreadpoolTimerCallbacks(timer, TRUE);
+  CloseThreadpoolTimer(timer);
+}
+
+// Releases the copy fence (see wgc_wait_copy_locked). The next GPU frame
+// creates one on whatever device the context has by then. Under
+// critical_section, or once no callback can run.
+static void wgc_release_copy_fence(WGCScreenPlatformContext *wgc_ctx) {
+  wgc_ctx->copy_fence = nullptr;
+  wgc_ctx->copy_fence_ctx = nullptr;
+  if (wgc_ctx->copy_fence_event) {
+    CloseHandle(wgc_ctx->copy_fence_event);
+    wgc_ctx->copy_fence_event = NULL;
+  }
+  wgc_ctx->copy_fence_value = 0;
+  wgc_ctx->copy_fence_unavailable = false;
+}
 
 // --- Helper to get ID3D11Texture2D from IDirect3DSurface ---
 static winrt::com_ptr<ID3D11Texture2D> GetTextureFromDirect3DSurface(
@@ -865,23 +1049,15 @@ static MiniAVResultCode wgc_init_platform(MiniAVScreenContext *ctx) {
   if (!ctx)
     return MINIAV_ERROR_INVALID_ARG;
 
-  MiniAVResultCode res = init_winrt_for_wgc();
-  if (res != MINIAV_SUCCESS)
-    return res;
-
-  WGCScreenPlatformContext *wgc_ctx = (WGCScreenPlatformContext *)miniav_calloc(
-      1, sizeof(WGCScreenPlatformContext));
+  auto *wgc_ctx = miniav::wgc_platform_storage::allocate();
   if (!wgc_ctx) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WGC: Failed to allocate WGCScreenPlatformContext.");
-    shutdown_winrt_for_wgc();
+               "WGC: Failed to construct WGCScreenPlatformContext.");
     return MINIAV_ERROR_OUT_OF_MEMORY;
   }
 
   ctx->platform_ctx = wgc_ctx;
-  // NOTE: miniav_calloc gives raw zeroed memory — the struct's in-class member
-  // initializers never run, so anything needing a non-zero initial value must
-  // be assigned here explicitly.
+  // The complete C++ object and atomics exist before native activation.
   wgc_ctx->ctx_magic = WGC_CTX_MAGIC_LIVE;
   wgc_ctx->callbacks_in_flight = 0;
   wgc_ctx->parent_ctx = ctx;
@@ -891,12 +1067,33 @@ static MiniAVResultCode wgc_init_platform(MiniAVScreenContext *ctx) {
   wgc_ctx->loopback_audio_ctx = NULL; // Initialize audio loopback members
   wgc_ctx->audio_loopback_enabled_and_configured = FALSE;
 
+  // Complete cold control allocation before WinRT/dispatcher/D3D entry. This
+  // is the legacy unscoped factory, so its unpublished owner has no funding
+  // callbacks and checked disposal cannot refuse. A funded C bootstrap needs
+  // its own original admission and retained-owned failure result, no fallback.
+  wgc_ctx->strict_holder = miniav_wgc_strict_create(ctx, wgc_ctx, wgc_take_strict_device);
+  if (!wgc_ctx->strict_holder) {
+    miniav::wgc_platform_storage::destroy(wgc_ctx);
+    ctx->platform_ctx = nullptr;
+    return MINIAV_ERROR_OUT_OF_MEMORY;
+  }
+  auto discard_unpublished = [&] {
+    (void)miniav_wgc_strict_delete(wgc_ctx->strict_holder);
+    wgc_ctx->strict_holder = nullptr;
+    miniav::wgc_platform_storage::destroy(wgc_ctx);
+    ctx->platform_ctx = nullptr;
+  };
+  MiniAVResultCode res = init_winrt_for_wgc();
+  if (res != MINIAV_SUCCESS) {
+    discard_unpublished();
+    return res;
+  }
+
   wgc_ctx->stop_event_handle =
       CreateEvent(NULL, TRUE, FALSE, NULL); // Manual-reset, non-signaled
   if (wgc_ctx->stop_event_handle == NULL) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "WGC: Failed to create stop event.");
-    miniav_free(wgc_ctx);
-    ctx->platform_ctx = NULL;
+    discard_unpublished();
     shutdown_winrt_for_wgc();
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
   }
@@ -906,21 +1103,21 @@ static MiniAVResultCode wgc_init_platform(MiniAVScreenContext *ctx) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
                "WGC: Failed to initialize critical section.");
     CloseHandle(wgc_ctx->stop_event_handle);
-    miniav_free(wgc_ctx);
-    ctx->platform_ctx = NULL;
+    discard_unpublished();
     shutdown_winrt_for_wgc();
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
   }
 
   res = wgc_init_d3d_device(wgc_ctx);
   if (res != MINIAV_SUCCESS) {
+    wgc_cleanup_d3d_device(wgc_ctx);
     DeleteCriticalSection(&wgc_ctx->critical_section);
     CloseHandle(wgc_ctx->stop_event_handle);
-    miniav_free(wgc_ctx);
-    ctx->platform_ctx = NULL;
+    discard_unpublished();
     shutdown_winrt_for_wgc();
     return res;
   }
+
 
   // Last: only a fully constructed context may be latched onto by a
   // threadpool callback. Every failure path above frees before this point.
@@ -939,6 +1136,29 @@ static MiniAVResultCode wgc_destroy_platform(MiniAVScreenContext *ctx) {
   WGCScreenPlatformContext *wgc_ctx =
       (WGCScreenPlatformContext *)ctx->platform_ctx;
 
+  if (miniav_wgc_strict_claimed(wgc_ctx->strict_holder)) {
+    const auto result = miniav_wgc_strict_prepare_destroy(wgc_ctx->strict_holder);
+    if (result != MINIAV_SUCCESS) return result;
+    // Real strict retirement already closed the per-source producer/device.
+    // Never run the generic callback drain or global dispatcher shutdown here.
+    if (wgc_ctx->stop_event_handle && !CloseHandle(wgc_ctx->stop_event_handle)) {
+      miniav_wgc_strict_cleanup_failed(wgc_ctx->strict_holder,
+                                        MINIAV_ERROR_SYSTEM_CALL_FAILED);
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
+    }
+    wgc_ctx->stop_event_handle = nullptr;
+    const auto disposed = miniav_wgc_strict_delete(wgc_ctx->strict_holder);
+    if (disposed != MINIAV_SUCCESS) return disposed;
+    wgc_ctx->strict_holder = nullptr;
+    DeleteCriticalSection(&wgc_ctx->critical_section);
+    wgc_retire_live(wgc_ctx);
+    wgc_ctx->ctx_magic = WGC_CTX_MAGIC_DEAD;
+    miniav::wgc_platform_storage::destroy(wgc_ctx);
+    ctx->platform_ctx = nullptr;
+    shutdown_winrt_for_wgc(true);
+    return MINIAV_SUCCESS;
+  }
+
   if (wgc_ctx->is_streaming) {
     miniav_log(
         MINIAV_LOG_LEVEL_WARN,
@@ -951,8 +1171,9 @@ static MiniAVResultCode wgc_destroy_platform(MiniAVScreenContext *ctx) {
   }
 
   // --- Teardown ordering (see "Threadpool-callback lifetime protocol") ---
-  // 1. Under the lock: kill the streaming flag, wake any pacing wait, revoke
-  //    the FrameArrived / Closed tokens and close the session + frame pool.
+  // 1. Under the lock: kill the streaming flag, drop the held frame, disarm
+  //    the pacing timer, revoke the FrameArrived / Closed tokens and close the
+  //    session + frame pool.
   EnterCriticalSection(&wgc_ctx->critical_section);
   wgc_ctx->is_streaming = FALSE;
   if (wgc_ctx->stop_event_handle)
@@ -968,6 +1189,12 @@ static MiniAVResultCode wgc_destroy_platform(MiniAVScreenContext *ctx) {
   //    held, because wgc_on_frame_arrived acquires it (holding it here would
   //    turn a rare UAF into a reliable hang).
   wgc_drain_callbacks(wgc_ctx, "destroy_platform");
+  wgc_close_pace_wake(wgc_ctx);
+  wgc_close_window_watch(wgc_ctx);
+  if (wgc_ctx->pace_wake_timer) {
+    CloseHandle(wgc_ctx->pace_wake_timer);
+    wgc_ctx->pace_wake_timer = NULL;
+  }
 
   // 4. From here nothing can be running against wgc_ctx, so its handles,
   //    critical section and memory can be released.
@@ -982,10 +1209,6 @@ static MiniAVResultCode wgc_destroy_platform(MiniAVScreenContext *ctx) {
                "WGC: Loopback audio context destroyed.");
   }
 
-  if (wgc_ctx->pace_timer) {
-    CloseHandle(wgc_ctx->pace_timer);
-    wgc_ctx->pace_timer = NULL;
-  }
   if (wgc_ctx->stop_event_handle) {
     CloseHandle(wgc_ctx->stop_event_handle);
     wgc_ctx->stop_event_handle = NULL;
@@ -1016,8 +1239,11 @@ static MiniAVResultCode wgc_destroy_platform(MiniAVScreenContext *ctx) {
   // freed memory. Then poison the canary so any surviving reader is caught by
   // wgc_ctx_alive() instead of silently working on recycled heap.
   wgc_retire_live(wgc_ctx);
+  const auto disposed = miniav_wgc_strict_delete(wgc_ctx->strict_holder);
+  if (disposed != MINIAV_SUCCESS) return disposed;
+  wgc_ctx->strict_holder = nullptr;
   wgc_ctx->ctx_magic = WGC_CTX_MAGIC_DEAD;
-  miniav_free(wgc_ctx);
+  miniav::wgc_platform_storage::destroy(wgc_ctx);
   ctx->platform_ctx = NULL;
 
   shutdown_winrt_for_wgc();
@@ -1484,32 +1710,58 @@ static MiniAVResultCode wgc_start_capture(MiniAVScreenContext *ctx,
   wgc_ctx->app_callback_internal = callback;
   wgc_ctx->app_callback_user_data_internal = user_data;
 
-  // Reset FPS pacing for this run. Interval from the requested rational
-  // frame rate (falling back to the integral target_fps) so the absolute
-  // schedule carries no cumulative rounding drift.
+  // Reset output pacing for this run (see wgc_pump): a grid of slots at the
+  // requested rational frame rate, falling back to the integral target_fps.
   {
-    LARGE_INTEGER pace_freq;
-    QueryPerformanceFrequency(&pace_freq);
-    UINT pace_num = wgc_ctx->configured_video_format.frame_rate_numerator;
-    UINT pace_den = wgc_ctx->configured_video_format.frame_rate_denominator;
-    if (pace_num == 0 || pace_den == 0) {
-      pace_num = wgc_ctx->target_fps ? wgc_ctx->target_fps : 30;
-      pace_den = 1;
+    LONGLONG num = wgc_ctx->configured_video_format.frame_rate_numerator;
+    LONGLONG den = wgc_ctx->configured_video_format.frame_rate_denominator;
+    if (num <= 0 || den <= 0) {
+      num = wgc_ctx->target_fps ? wgc_ctx->target_fps : 30;
+      den = 1;
     }
-    wgc_ctx->pace_interval_qpc =
-        (LONGLONG)((ULONGLONG)pace_freq.QuadPart * pace_den / pace_num);
-    wgc_ctx->pace_next_deadline_qpc = 0;
-    if (!wgc_ctx->pace_timer) {
-      wgc_ctx->pace_timer = CreateWaitableTimerExW(
+    LONGLONG a = num, b = den;
+    while (b) {
+      const LONGLONG r = a % b;
+      a = b;
+      b = r;
+    }
+    num /= a;
+    den /= a;
+    if (num > 100000 || den > 100000) { // keeps the slot arithmetic in range
+      num = wgc_ctx->target_fps ? wgc_ctx->target_fps : 30;
+      if (num > 100000)
+        num = 100000;
+      den = 1;
+    }
+    wgc_ctx->pace_num = num;
+    wgc_ctx->pace_den = den;
+    wgc_ctx->grid_origin_100ns = -1;
+    wgc_ctx->last_slot = -1;
+    wgc_ctx->held_slot = -1;
+    wgc_ctx->stats = WGCFrameStats{};
+    wgc_ctx->pending_pool_w = 0;
+    wgc_ctx->pending_pool_h = 0;
+    wgc_close_frame(wgc_ctx->held_frame);
+    if (!wgc_ctx->pace_wake_timer) {
+      wgc_ctx->pace_wake_timer = CreateWaitableTimerExW(
           NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-      if (!wgc_ctx->pace_timer) {
-        // Pre-1803 Windows: plain waitable timer (system-tick resolution, but
-        // the absolute schedule still removes the systematic fast bias).
-        wgc_ctx->pace_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+      if (!wgc_ctx->pace_wake_timer) {
+        // Before Windows 10 1803: held frames go out up to a system tick late.
+        wgc_ctx->pace_wake_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
         miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "WGC: high-resolution pacing timer unavailable — pacing "
-                   "resolution limited to the system tick.");
+                   "WGC: high-resolution pacing timer unavailable; held "
+                   "frames may be delivered up to a system tick late.");
       }
+    }
+    if (!wgc_ctx->pace_tp_wait && wgc_ctx->pace_wake_timer)
+      wgc_ctx->pace_tp_wait =
+          CreateThreadpoolWait(wgc_on_pace_wake, wgc_ctx, nullptr);
+    if (!wgc_ctx->pace_tp_wait) {
+      const DWORD err = GetLastError();
+      LeaveCriticalSection(&wgc_ctx->critical_section);
+      miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                 "WGC: could not create the pacing timer (%lu).", err);
+      return MINIAV_ERROR_SYSTEM_CALL_FAILED;
     }
   }
   // Also update parent context's callback info
@@ -1551,7 +1803,7 @@ static MiniAVResultCode wgc_start_capture(MiniAVScreenContext *ctx,
     wgc_ctx->frame_pool =
         winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::
             CreateFreeThreaded(wgc_ctx->d3d_device_winrt, pixel_format_dxgi,
-                               2, // Number of buffers in the pool
+                               WGC_POOL_BUFFERS,
                                item_size);
 
     if (!wgc_ctx->frame_pool) {
@@ -1601,6 +1853,38 @@ static MiniAVResultCode wgc_start_capture(MiniAVScreenContext *ctx,
                    "WGC: setting IsCursorCaptureEnabled failed: %ls (0x%08X); "
                    "continuing without the cursor toggle.",
                    ex.message().c_str(), ex.code().value);
+      }
+    }
+
+    // Have WGC capture at most three frames per output interval
+    // (MinUpdateInterval). The pacer keeps one frame per slot, and the
+    // compositor copies every frame it captures into the pool: eight copies
+    // per frame kept on a 240 Hz display captured at 30 fps. Three keep the
+    // frame delivered for a slot within a third of an interval of it. A whole
+    // interval would leave slots empty wherever display refreshes and slots
+    // drift apart.
+    {
+      const LONGLONG interval_100ns =
+          10000000LL * wgc_ctx->pace_den / wgc_ctx->pace_num;
+      winrt::com_ptr<IWgcCaptureSession5> session5 =
+          wgc_ctx->session.try_as<IWgcCaptureSession5>();
+      if (!session5) {
+        miniav_log(MINIAV_LOG_LEVEL_DEBUG,
+                   "WGC: MinUpdateInterval unavailable on this Windows build "
+                   "(needs 10.0.26100+); capturing at the display's rate.");
+      } else {
+        const HRESULT hr_interval =
+            session5->put_MinUpdateInterval(interval_100ns / 3);
+        if (SUCCEEDED(hr_interval))
+          miniav_log(MINIAV_LOG_LEVEL_INFO,
+                     "WGC: MinUpdateInterval %.2f ms, a third of the %.2f ms "
+                     "frame interval.",
+                     interval_100ns / 30000.0, interval_100ns / 10000.0);
+        else
+          miniav_log(MINIAV_LOG_LEVEL_WARN,
+                     "WGC: setting MinUpdateInterval failed (0x%08X); "
+                     "capturing at the display's rate.",
+                     (unsigned)hr_interval);
       }
     }
 
@@ -1656,6 +1940,8 @@ static MiniAVResultCode wgc_start_capture(MiniAVScreenContext *ctx,
     return MINIAV_ERROR_SYSTEM_CALL_FAILED;
   }
 
+  if (wgc_ctx->current_target_type == WGC_TARGET_WINDOW)
+    wgc_arm_window_watch_locked(wgc_ctx);
   LeaveCriticalSection(&wgc_ctx->critical_section);
   miniav_log(MINIAV_LOG_LEVEL_INFO, "WGC: Capture started for item %s.",
              wgc_ctx->selected_item_id);
@@ -1688,6 +1974,8 @@ static MiniAVResultCode wgc_stop_capture(MiniAVScreenContext *ctx) {
       wgc_ctx
           ->stop_event_handle);  // Signal any waiting in frame handler to stop
   wgc_ctx->is_streaming = FALSE; // Set video streaming flag early
+  wgc_close_frame(wgc_ctx->held_frame); // dropped: the run is over
+  wgc_release_copy_fence(wgc_ctx);
 
   // Unregister event handler and close session/pool for video
   // This needs to happen before releasing wgc_ctx if the lambda captures it.
@@ -1722,14 +2010,15 @@ static MiniAVResultCode wgc_stop_capture(MiniAVScreenContext *ctx) {
 
   LeaveCriticalSection(&wgc_ctx->critical_section);
 
-  // Wait out any FrameArrived/Closed callback still executing — notably one
-  // parked in the FPS pacing loop, which runs outside the critical section and
-  // keeps dereferencing wgc_ctx. is_streaming = FALSE and the stop event are
-  // both already set above, so every pacing branch exits within ~1 ms.
-  // The drain is deliberately AFTER LeaveCriticalSection: an in-flight
-  // wgc_on_frame_arrived takes the same critical section, so draining under it
-  // would deadlock.
+  // Wait out any FrameArrived/Closed/pacing-timer callback still executing.
+  // is_streaming = FALSE is already set above, so one that gets the lock now
+  // only hands its frames back. The drain is deliberately AFTER
+  // LeaveCriticalSection: an in-flight callback takes the same critical
+  // section, so draining under it would deadlock. The pacing wait is closed
+  // after it for the same reason; the next start creates a new one.
   wgc_drain_callbacks(wgc_ctx, "stop_capture");
+  wgc_close_pace_wake(wgc_ctx);
+  wgc_close_window_watch(wgc_ctx);
 
   // --- Stop Audio Loopback Capture ---
   // Check if audio was successfully configured and we *think* it might have
@@ -1756,6 +2045,10 @@ static MiniAVResultCode wgc_stop_capture(MiniAVScreenContext *ctx) {
 
 static MiniAVResultCode wgc_release_buffer(MiniAVScreenContext *ctx,
                                            void *internal_handle_ptr) {
+  if (ctx && internal_handle_ptr && miniav_wgc_context_is_strict(ctx)) {
+    return miniav_wgc_strict_release(miniav_wgc_strict_holder(ctx),
+        static_cast<MiniAVNativeBufferInternalPayload *>(internal_handle_ptr));
+  }
   MINIAV_UNUSED(
       ctx); // ctx might be useful for logging or D3D context if not in payload
 
@@ -1834,9 +2127,10 @@ static MiniAVResultCode wgc_release_buffer(MiniAVScreenContext *ctx,
                        ref_count);
           }
           // OWNERSHIP: miniav closes the shared NT handle here. The app must
-          // have completed its import (OpenSharedResource1 / minigpu
-          // mgpuImportVideoFrame, which copies into a private texture before
-          // returning) before calling MiniAV_ReleaseBuffer. Leaving this to
+          // have completed its import before calling MiniAV_ReleaseBuffer.
+          // Tagged immutable snapshots can remain alive through the consumer's
+          // own COM reference; closing the handle does not revoke that import.
+          // Leaving this to
           // the app leaked one kernel handle per captured frame — every known
           // caller silently never closed it.
           if (frame_payload->gpu_shared_handle_to_close) {
@@ -1916,6 +2210,17 @@ static MiniAVResultCode wgc_init_d3d_device(WGCScreenPlatformContext *wgc_ctx) {
   wgc_ctx->d3d_device = device_com;
   wgc_ctx->d3d_context = context_com;
 
+  // The immediate context is used from two sides: frames are copied out on the
+  // capture callbacks, and CPU frames are unmapped on whichever thread the app
+  // releases them from. Have the runtime serialise the two.
+  if (auto multithread = context_com.try_as<ID3D11Multithread>()) {
+    multithread->SetMultithreadProtected(TRUE);
+  } else {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "WGC: ID3D11Multithread unavailable; a CPU frame released off "
+               "the capture thread is not serialised with capture.");
+  }
+
   // Get the IDirect3DDevice (WinRT type) from the ID3D11Device (COM type)
   try {
     // First, get the IDXGIDevice interface from the ID3D11Device.
@@ -1966,6 +2271,7 @@ static MiniAVResultCode wgc_init_d3d_device(WGCScreenPlatformContext *wgc_ctx) {
 }
 
 static void wgc_cleanup_d3d_device(WGCScreenPlatformContext *wgc_ctx) {
+  wgc_release_copy_fence(wgc_ctx);
   if (wgc_ctx->d3d_device_winrt) {
     wgc_ctx->d3d_device_winrt = nullptr;
   }
@@ -1982,15 +2288,17 @@ static void wgc_cleanup_d3d_device(WGCScreenPlatformContext *wgc_ctx) {
 }
 
 // Marks the capture as lost and notifies the app exactly once. Fired from the
-// GraphicsCaptureItem.Closed event (window closed / display disconnected) and
-// from device-removed detection in the frame-arrived path — previously WGC
+// GraphicsCaptureItem.Closed event (window closed / display disconnected),
+// from the window check (a window that went away without Closed) and from
+// device-removed detection in the frame-arrived path — previously WGC
 // had no loss notification at all: frames just stopped while the app believed
 // capture was still running (unlike DXGI's ACCESS_LOST -> lost_cb handling).
 //
-// LIFETIME: the caller MUST already hold a WGCCallbackRef (both call sites —
-// the item Closed lambda and the device-removed branch of
-// wgc_on_frame_arrived — do), so the context cannot be freed underneath this.
-// Neither call site holds the critical section, so taking it here is safe.
+// LIFETIME: the caller MUST already hold a WGCCallbackRef (every call site —
+// the item Closed lambda, the window check and the device-removed branch of
+// wgc_pump, reached from FrameArrived and from the pacing timer — does), so
+// the context cannot be freed underneath this. No call site holds the
+// critical section, so taking it here is safe.
 static void wgc_notify_capture_lost(WGCScreenPlatformContext *wgc_ctx,
                                     const char *why) {
   if (!wgc_ctx || !wgc_ctx_alive(wgc_ctx, "notify_capture_lost"))
@@ -2010,7 +2318,7 @@ static void wgc_notify_capture_lost(WGCScreenPlatformContext *wgc_ctx,
     miniav_log(MINIAV_LOG_LEVEL_WARN, "WGC: Capture lost (%s) — notifying app.",
                why);
     wgc_ctx->is_streaming = FALSE;
-    SetEvent(wgc_ctx->stop_event_handle); // unblock any in-flight pacing wait
+    SetEvent(wgc_ctx->stop_event_handle);
     MiniAVScreenContext *parent = wgc_ctx->parent_ctx;
     if (parent) {
       parent->is_running = false;
@@ -2030,6 +2338,17 @@ static void wgc_notify_capture_lost(WGCScreenPlatformContext *wgc_ctx,
 
 static void wgc_cleanup_capture_resources(WGCScreenPlatformContext *wgc_ctx) {
   // Critical section should be held by caller if is_streaming is modified
+  // The held frame belongs to the pool closed below. The lock is recursive, so
+  // callers that hold it already are fine.
+  EnterCriticalSection(&wgc_ctx->critical_section);
+  wgc_close_frame(wgc_ctx->held_frame);
+  if (wgc_ctx->pace_tp_wait)
+    SetThreadpoolWait(wgc_ctx->pace_tp_wait, nullptr, nullptr);
+  if (wgc_ctx->pace_wake_timer)
+    CancelWaitableTimer(wgc_ctx->pace_wake_timer);
+  if (wgc_ctx->window_watch)
+    SetThreadpoolTimer(wgc_ctx->window_watch, nullptr, 0, 0);
+  LeaveCriticalSection(&wgc_ctx->critical_section);
   if (wgc_ctx->frame_pool && wgc_ctx->frame_arrived_token.value != 0) {
     try {
       wgc_ctx->frame_pool.FrameArrived(wgc_ctx->frame_arrived_token);
@@ -2068,100 +2387,108 @@ static void wgc_cleanup_capture_resources(WGCScreenPlatformContext *wgc_ctx) {
       "WGC: Capture-specific resources (item, pool, session) cleaned up.");
 }
 
-// --- Frame Arrived Handler ---
-// --- Frame Arrived Handler ---
-static void wgc_on_frame_arrived(
-    WGCScreenPlatformContext *wgc_ctx,
-    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender,
-    winrt::Windows::Foundation::IInspectable const & /*args*/) {
-  // Threadpool entry point. The reference is held for the ENTIRE body,
-  // including the FPS pacing loop at the tail which runs outside the critical
-  // section and can block for a frame interval — that window is exactly where
-  // the context used to be freed underneath this thread.
-  WGCCallbackRef cb_ref(wgc_ctx);
-  if (!cb_ref) {
-    // Context already sealed/destroyed: do NOT dereference wgc_ctx. Still
-    // drain the pool frame (touches only `sender`) so it is not held hostage.
-    if (sender) {
-      try {
-        auto frame = sender.TryGetNextFrame();
-        if (frame)
-          frame.Close();
-      } catch (...) {
-      }
+// --- Frame delivery ---
+
+// How long the GPU path waits for the copy into a frame's private texture
+// before it drops the frame rather than share it unfinished.
+#define WGC_COPY_FENCE_TIMEOUT_MS 100u
+
+// Frames dropped because their copy had not completed within
+// WGC_COPY_FENCE_TIMEOUT_MS, or could not be waited on at all.
+static std::atomic<long> g_wgc_copy_fence_drops{0};
+
+// Waits for the GPU to finish the work queued on the immediate context so far
+// (the copy into a frame's private texture). The consumer opens that texture
+// on ANOTHER device, which does not wait for work queued on this one. Uses an
+// ID3D11Fence where the runtime has one (Windows 10 1703+), an event query
+// otherwise. False when the copy is not done within timeout_ms or the device
+// is gone. Under critical_section.
+static bool wgc_wait_copy_locked(WGCScreenPlatformContext *wgc_ctx,
+                                 DWORD timeout_ms) {
+  if (!wgc_ctx->copy_fence && !wgc_ctx->copy_fence_unavailable) {
+    auto device5 = wgc_ctx->d3d_device.try_as<ID3D11Device5>();
+    auto context4 = wgc_ctx->d3d_context.try_as<ID3D11DeviceContext4>();
+    winrt::com_ptr<ID3D11Fence> fence;
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (device5 && context4 && event &&
+        SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE,
+                                       IID_PPV_ARGS(fence.put())))) {
+      wgc_ctx->copy_fence = fence;
+      wgc_ctx->copy_fence_ctx = context4;
+      wgc_ctx->copy_fence_event = event;
+      wgc_ctx->copy_fence_value = 0;
+    } else {
+      if (event)
+        CloseHandle(event);
+      wgc_ctx->copy_fence_unavailable = true;
+      miniav_log(MINIAV_LOG_LEVEL_WARN,
+                 "WGC: ID3D11Fence unavailable; GPU frames wait on an event "
+                 "query instead.");
     }
-    return;
   }
-  if (!wgc_ctx_alive(wgc_ctx, "on_frame_arrived"))
-    return;
 
-  if (!wgc_ctx->is_streaming) { // Check atomic bool
-    if (sender) { // Try to get next frame to release it back to pool if session
-                  // is active
-      try {
-        auto frame = sender.TryGetNextFrame();
-        if (frame)
-          frame.Close();
-      } catch (...) {
-      }
+  const ULONGLONG start = GetTickCount64();
+  if (wgc_ctx->copy_fence) {
+    const UINT64 value = ++wgc_ctx->copy_fence_value;
+    if (FAILED(wgc_ctx->copy_fence_ctx->Signal(wgc_ctx->copy_fence.get(),
+                                                value)))
+      return false;
+    wgc_ctx->d3d_context->Flush();
+    for (;;) {
+      const UINT64 completed = wgc_ctx->copy_fence->GetCompletedValue();
+      if (completed == UINT64_MAX)
+        return false; // device removed
+      if (completed >= value)
+        return true;
+      const ULONGLONG spent = GetTickCount64() - start;
+      if (spent >= timeout_ms ||
+          FAILED(wgc_ctx->copy_fence->SetEventOnCompletion(
+              value, wgc_ctx->copy_fence_event)))
+        return false;
+      // The event is auto-reset, and the copy of a frame that timed out
+      // earlier can still set it late, so waking up is only a reason to look
+      // at the fence again.
+      WaitForSingleObject(wgc_ctx->copy_fence_event,
+                          (DWORD)(timeout_ms - spent));
     }
-    return;
   }
 
-  // Check stop event
-  if (WaitForSingleObject(wgc_ctx->stop_event_handle, 0) == WAIT_OBJECT_0) {
-    if (sender) {
-      try {
-        auto frame = sender.TryGetNextFrame();
-        if (frame)
-          frame.Close();
-      } catch (...) {
-      }
-    }
-    return;
+  D3D11_QUERY_DESC query_desc{};
+  query_desc.Query = D3D11_QUERY_EVENT;
+  winrt::com_ptr<ID3D11Query> copy_done;
+  if (FAILED(wgc_ctx->d3d_device->CreateQuery(&query_desc, copy_done.put())))
+    return false;
+  wgc_ctx->d3d_context->End(copy_done.get());
+  wgc_ctx->d3d_context->Flush();
+  // A copy usually lands within a millisecond: spin that long before sleeping,
+  // since one Sleep(1) can last a whole scheduler tick.
+  const LONGLONG spin_until = wgc_now_100ns(wgc_ctx) + 10000;
+  for (;;) {
+    BOOL done = FALSE;
+    const HRESULT hr = wgc_ctx->d3d_context->GetData(copy_done.get(), &done,
+                                                     sizeof(done), 0);
+    if (FAILED(hr))
+      return false;
+    if (hr == S_OK && done)
+      return true;
+    if (GetTickCount64() - start >= timeout_ms)
+      return false;
+    if (wgc_now_100ns(wgc_ctx) < spin_until)
+      YieldProcessor();
+    else
+      Sleep(1);
   }
+}
 
-  winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame frame{nullptr};
-  try {
-    frame = sender.TryGetNextFrame();
-  } catch (winrt::hresult_error const &ex) {
-    miniav_log(MINIAV_LOG_LEVEL_WARN, "WGC: TryGetNextFrame failed: %ls",
-               ex.message().c_str());
-    // Distinguish transient hiccups from a genuinely lost capture: a removed
-    // D3D device or a closed session/pool will never produce frames again —
-    // tell the app instead of leaving it waiting forever.
-    HRESULT removed_reason =
-        wgc_ctx->d3d_device ? wgc_ctx->d3d_device->GetDeviceRemovedReason()
-                            : S_OK;
-    if (removed_reason != S_OK ||
-        ex.code() == static_cast<winrt::hresult>(DXGI_ERROR_DEVICE_REMOVED) ||
-        ex.code() == static_cast<winrt::hresult>(RO_E_CLOSED)) {
-      wgc_notify_capture_lost(wgc_ctx, "device removed / session closed");
-    }
-    return;
-  }
-
-  if (!frame) {
-    // miniav_log(MINIAV_LOG_LEVEL_DEBUG, "WGC: No frame available.");
-    return;
-  }
-
-  // Enter CS to safely access app_callback and user_data
-  // This also protects against concurrent stop_capture changing these.
-  EnterCriticalSection(&wgc_ctx->critical_section);
-  if (!wgc_ctx->is_streaming || !wgc_ctx->app_callback_internal) {
-    LeaveCriticalSection(&wgc_ctx->critical_section);
-    if (frame)
-      frame.Close();
-    return;
-  }
-
+// Builds a MiniAVBuffer from one captured frame, stamped timestamp_100ns, and
+// hands it to the app. The caller keeps the frame and closes it. Under
+// critical_section, with is_streaming and app_callback_internal checked.
+static void wgc_deliver_frame_locked(WGCScreenPlatformContext *wgc_ctx,
+                                     WGCFrame const &frame,
+                                     LONGLONG timestamp_100ns) {
   MiniAVBuffer *buffer = (MiniAVBuffer *)miniav_calloc(1, sizeof(MiniAVBuffer));
   if (!buffer) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR, "WGC: Failed to allocate MiniAVBuffer");
-    LeaveCriticalSection(&wgc_ctx->critical_section);
-    if (frame)
-      frame.Close();
     return;
   }
 
@@ -2173,9 +2500,6 @@ static void wgc_on_frame_arrived(
   HANDLE shared_handle_for_app = NULL;
   bool processed_as_gpu = false;
   HRESULT hr = S_OK;
-  // Set when the live content size has drifted from the pool size; the pool is
-  // recreated at the tail of this function (outside the frame's lifetime).
-  UINT pending_pool_w = 0, pending_pool_h = 0;
 
   try {
     auto surface = frame.Surface();
@@ -2188,18 +2512,18 @@ static void wgc_on_frame_arrived(
       throw winrt::hresult_error(E_FAIL, L"Failed to get texture from surface");
     }
 
-    auto timestamp_raw =
-        frame.SystemRelativeTime(); // TimeSpan (100-nanosecond units)
-    buffer->timestamp_us = static_cast<uint64_t>(timestamp_raw.count() /
-                                                 10); // Convert 100ns to us
+    // The time of the output slot the frame was chosen for (see wgc_pump), on
+    // the QPC clock SystemRelativeTime uses.
+    buffer->timestamp_us = static_cast<uint64_t>(timestamp_100ns / 10);
 
     // The surface handed out by the frame pool is ALWAYS pool-sized;
     // frame.ContentSize() is the live size of the capture target and grows the
     // instant a captured window is resized. Describing the buffer with the raw
     // content size while the bytes come from a pool-sized (and therefore
     // smaller) surface is how data_size_bytes used to run past the end of the
-    // mapping. Report what actually exists — the intersection of the two — and
-    // queue a pool recreate so the following frames carry the full content.
+    // mapping. Report what actually exists — the intersection of the two.
+    // wgc_take_frame_locked has queued a pool recreate so the following
+    // frames carry the full content.
     auto frame_content_size = frame.ContentSize();
     D3D11_TEXTURE2D_DESC frame_tex_desc;
     acquired_texture_com->GetDesc(&frame_tex_desc);
@@ -2213,13 +2537,6 @@ static void wgc_on_frame_arrived(
         report_w = frame_tex_desc.Width;
       if (report_h > frame_tex_desc.Height)
         report_h = frame_tex_desc.Height;
-    }
-
-    if ((content_w != wgc_ctx->pool_width ||
-         content_h != wgc_ctx->pool_height) &&
-        content_w > 0 && content_h > 0) {
-      pending_pool_w = content_w;
-      pending_pool_h = content_h;
     }
 
     buffer->data.video.info.width = report_w;
@@ -2237,103 +2554,70 @@ static void wgc_on_frame_arrived(
       D3D11_TEXTURE2D_DESC acquired_desc;
       acquired_texture_com->GetDesc(&acquired_desc);
 
-      winrt::com_ptr<ID3D11Texture2D> texture_to_share_com =
-          acquired_texture_com;
-      bool needs_copy_for_sharing =
-          !(acquired_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) &&
-          !(acquired_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED);
+      // ALWAYS a private copy, even of a surface that happens to be
+      // shareable: the pool surface goes back to WGC, which captures into it
+      // again, the moment the frame is closed.
+      //
+      // And a NEW texture every frame, not a reused ring. Releasing the
+      // buffer only means the consumer's CPU is done with it: reads it has
+      // queued on the GPU can still be pending, and a hardware encoder can be
+      // handed the texture itself and read it whenever it gets to it. A ring
+      // would rewrite such a texture under the reader, so it needs a fence
+      // back from the consumer first.
+      D3D11_TEXTURE2D_DESC shareable_desc = acquired_desc;
+      shareable_desc.Usage = D3D11_USAGE_DEFAULT;
+      shareable_desc.BindFlags =
+          D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+      shareable_desc.CPUAccessFlags = 0;
+      shareable_desc.MiscFlags =
+          D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 
-      winrt::com_ptr<ID3D11Texture2D> shareable_copy_temp_com = nullptr;
-
-      if (needs_copy_for_sharing) {
-        miniav_log(
-            MINIAV_LOG_LEVEL_DEBUG,
-            "WGC: Acquired texture not shareable, creating a shareable copy.");
-        D3D11_TEXTURE2D_DESC shareable_desc = acquired_desc; // Start with copy
-        shareable_desc.Usage = D3D11_USAGE_DEFAULT;
-        shareable_desc.BindFlags =
-            D3D11_BIND_SHADER_RESOURCE |
-            D3D11_BIND_RENDER_TARGET; // Typical for shared
-        shareable_desc.CPUAccessFlags = 0;
-        shareable_desc.MiscFlags =
-            D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
-
-        hr = wgc_ctx->d3d_device->CreateTexture2D(
-            &shareable_desc, nullptr, shareable_copy_temp_com.put());
-        if (SUCCEEDED(hr)) {
-          wgc_ctx->d3d_context->CopyResource(shareable_copy_temp_com.get(),
-                                             acquired_texture_com.get());
-          texture_to_share_com = shareable_copy_temp_com;
-        } else {
-          miniav_log(MINIAV_LOG_LEVEL_ERROR,
-                     "WGC: Failed to create shareable GPU texture copy: 0x%X. "
-                     "Fallback to CPU.",
-                     hr);
-          // Force CPU path by not setting processed_as_gpu
+      winrt::com_ptr<ID3D11Texture2D> shareable_copy_com;
+      hr = wgc_ctx->d3d_device->CreateTexture2D(&shareable_desc, nullptr,
+                                                shareable_copy_com.put());
+      if (FAILED(hr)) {
+        miniav_log(MINIAV_LOG_LEVEL_ERROR,
+                   "WGC: Failed to create shareable GPU texture copy: 0x%X. "
+                   "Fallback to CPU.",
+                   hr);
+      } else {
+        const LONGLONG copy_start = wgc_now_100ns(wgc_ctx);
+        wgc_ctx->d3d_context->CopyResource(shareable_copy_com.get(),
+                                           acquired_texture_com.get());
+        // Share the copy only once it is complete. A copy that is not done in
+        // time is dropped; handing it over anyway was a torn or black frame
+        // under GPU contention.
+        if (!wgc_wait_copy_locked(wgc_ctx, WGC_COPY_FENCE_TIMEOUT_MS)) {
+          wgc_ctx->stats.copy_drops++;
+          const long drops =
+              g_wgc_copy_fence_drops.fetch_add(1, std::memory_order_relaxed) +
+              1;
+          static ULONGLONG s_last_fence_warn_ms = 0;
+          const ULONGLONG now_ms = GetTickCount64();
+          if (now_ms - s_last_fence_warn_ms > 2000) {
+            s_last_fence_warn_ms = now_ms;
+            miniav_log(MINIAV_LOG_LEVEL_WARN,
+                       "WGC: frame copy not complete within %u ms — frame "
+                       "dropped instead of shared (%ld so far).",
+                       WGC_COPY_FENCE_TIMEOUT_MS, drops);
+          }
+          miniav_free(buffer);
+          return;
         }
-      }
+        wgc_stats_time(wgc_ctx->stats.copies, wgc_ctx->stats.copy_sum_100ns,
+                       wgc_ctx->stats.copy_max_100ns,
+                       wgc_now_100ns(wgc_ctx) - copy_start);
 
-      if (SUCCEEDED(hr) &&
-          texture_to_share_com) { // Original was shareable or copy succeeded
         winrt::com_ptr<IDXGIResource1> dxgi_resource_to_share;
-        hr = texture_to_share_com->QueryInterface(
+        hr = shareable_copy_com->QueryInterface(
             IID_PPV_ARGS(dxgi_resource_to_share.put()));
-
         if (SUCCEEDED(hr)) {
           hr = dxgi_resource_to_share->CreateSharedHandle(
               nullptr, DXGI_SHARED_RESOURCE_READ, nullptr,
               &shared_handle_for_app);
           if (SUCCEEDED(hr) && shared_handle_for_app) {
-            // CRITICAL: synchronise the producer device before exposing the
-            // shared NT handle to a different-device consumer (e.g. an FFmpeg
-            // encoder). Without a fence the consumer may read garbage / black
-            // because pending GPU work on texture_to_share_com has not yet
-            // executed. See screen_context_win_dxgi.c for full rationale.
-            {
-              D3D11_QUERY_DESC fence_desc{};
-              fence_desc.Query = D3D11_QUERY_EVENT;
-              winrt::com_ptr<ID3D11Query> copy_done;
-              HRESULT q_hr = wgc_ctx->d3d_device->CreateQuery(
-                  &fence_desc, copy_done.put());
-              if (SUCCEEDED(q_hr) && copy_done) {
-                wgc_ctx->d3d_context->End(copy_done.get());
-                wgc_ctx->d3d_context->Flush();
-                // Wait up to ~16 ms (one 60 fps frame) for the GPU to commit,
-                // then proceed — timeout is now LOGGED (rate-limited) instead
-                // of silently proceeding (real black-frame risk under GPU
-                // contention). True fence handoff is deferred (NATIVE_AUDIT.md).
-                ULONGLONG poll_start = GetTickCount64();
-                bool fence_done = false;
-                for (;;) {
-                  if (wgc_ctx->d3d_context->GetData(copy_done.get(), nullptr, 0,
-                                                    0) != S_FALSE) {
-                    fence_done = true;
-                    break;
-                  }
-                  if (GetTickCount64() - poll_start > 16)
-                    break;
-                  YieldProcessor();
-                }
-                if (!fence_done) {
-                  static ULONGLONG s_last_fence_warn_ms = 0;
-                  ULONGLONG now_ms = GetTickCount64();
-                  if (now_ms - s_last_fence_warn_ms > 2000) {
-                    s_last_fence_warn_ms = now_ms;
-                    miniav_log(MINIAV_LOG_LEVEL_WARN,
-                               "WGC: GPU sync fence did not signal within 16ms "
-                               "— sharing anyway (possible torn/black frame "
-                               "under GPU contention).");
-                  }
-                }
-              } else {
-                wgc_ctx->d3d_context->Flush();
-              }
-            }
-
             texture_for_payload_ref_com =
-                texture_to_share_com; // This is the texture whose handle was
-                                      // shared
-            texture_for_payload_ref_com->AddRef(); // AddRef for payload
+                wgc_retain_frame_texture(shareable_copy_com);
             processed_as_gpu = true;
             // Counted now; every close below goes through
             // wgc_close_shared_handle() so the +1/-1 stay balanced.
@@ -2401,6 +2685,7 @@ static void wgc_on_frame_arrived(
         throw winrt::hresult_error(hr, L"Failed to create CPU staging texture");
       }
 
+      const LONGLONG readback_start = wgc_now_100ns(wgc_ctx);
       wgc_ctx->d3d_context->CopyResource(per_frame_staging_texture_com.get(),
                                          acquired_texture_com.get());
 
@@ -2413,6 +2698,10 @@ static void wgc_on_frame_arrived(
                    hr);
         throw winrt::hresult_error(hr, L"Failed to map CPU staging texture");
       }
+      wgc_stats_time(wgc_ctx->stats.readbacks,
+                     wgc_ctx->stats.readback_sum_100ns,
+                     wgc_ctx->stats.readback_max_100ns,
+                     wgc_now_100ns(wgc_ctx) - readback_start);
 
       buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
 
@@ -2448,10 +2737,10 @@ static void wgc_on_frame_arrived(
       }
       texture_for_payload_ref_com = per_frame_staging_texture_com;
     } else { // GPU Path successful
-      // NOTE: buffer->native_fence is deliberately left zeroed — miniav never
-      // creates an ID3D11Fence. The synchronisation actually performed is the
-      // D3D11_QUERY_EVENT busy-poll above, which PROCEEDS ON TIMEOUT. See
-      // miniav_buffer.h `native_fence` and NATIVE_AUDIT.md P2 §1.
+      // buffer->native_fence stays zeroed: the copy into this texture had
+      // COMPLETED (wgc_wait_copy_locked) before its handle was created, so
+      // the consumer has nothing left to wait for. The ready tag below says
+      // exactly that.
       buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_GPU_D3D11_HANDLE;
 
       // Set up single plane for GPU texture
@@ -2463,14 +2752,16 @@ static void wgc_on_frame_arrived(
           0; // GPU textures don't have stride
       buffer->data.video.planes[0].offset_bytes = 0;
       buffer->data.video.planes[0].subresource_index = 0;
+      buffer->data.video.planes[0].drm_format_modifier =
+          wgc_frame_import_tag(true, S_OK);
       // calculate data size based on width, height, and pixel format
       buffer->data_size_bytes =
           ((size_t)buffer->data.video.info.width *
            buffer->data.video.info.height * 4); // BGRA32 = 4 bytes per pixel
 
-      // Same oracle as the CPU path: the shared texture is the pool-sized
-      // surface (or a same-desc copy of it), so its extent bounds what the
-      // consumer can legally read.
+      // Same oracle as the CPU path: the shared texture is a same-desc copy
+      // of the pool-sized surface, so its extent bounds what the consumer can
+      // legally read.
       {
         const size_t texture_bytes =
             (size_t)frame_tex_desc.Width * frame_tex_desc.Height * 4;
@@ -2539,7 +2830,7 @@ static void wgc_on_frame_arrived(
 
   } catch (winrt::hresult_error const &ex) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WGC: Error in on_frame_arrived: %ls (0x%08X)",
+               "WGC: Error delivering a frame: %ls (0x%08X)",
                ex.message().c_str(), ex.code().value);
     // Cleanup partially created resources
     if (shared_handle_for_app) // From GPU path attempt (counted at creation)
@@ -2578,7 +2869,7 @@ static void wgc_on_frame_arrived(
     }
   } catch (...) {
     miniav_log(MINIAV_LOG_LEVEL_ERROR,
-               "WGC: Unknown error in on_frame_arrived.");
+               "WGC: Unknown error delivering a frame.");
     if (shared_handle_for_app)
       wgc_close_shared_handle(shared_handle_for_app);
 
@@ -2608,148 +2899,321 @@ static void wgc_on_frame_arrived(
       buffer = nullptr;
     }
   }
+}
 
-  LeaveCriticalSection(&wgc_ctx->critical_section);
-  if (frame)
-    frame.Close(); // Release frame back to pool
+// Delivers the held frame, stamped with its slot's time. Under
+// critical_section.
+static void wgc_deliver_held_locked(WGCScreenPlatformContext *wgc_ctx) {
+  WGCFrameStats &stats = wgc_ctx->stats;
+  const LONGLONG offset = wgc_ctx->held_captured_100ns -
+                          wgc_slot_time(wgc_ctx, wgc_ctx->held_slot);
+  if (stats.filled == 0 || offset < stats.offset_min_100ns)
+    stats.offset_min_100ns = offset;
+  if (stats.filled == 0 || offset > stats.offset_max_100ns)
+    stats.offset_max_100ns = offset;
+  stats.filled++;
+  WGCFrame frame{std::move(wgc_ctx->held_frame)};
+  wgc_ctx->held_frame = nullptr;
+  wgc_ctx->last_slot = wgc_ctx->held_slot;
+  wgc_deliver_frame_locked(wgc_ctx, frame,
+                           wgc_slot_time(wgc_ctx, wgc_ctx->held_slot));
+  wgc_close_frame(frame);
+}
 
-  // --- Track content resizes ---
-  // The pool was sized once from capture_item.Size() at StartCapture and never
-  // revisited, so growing a captured window left every later frame arriving on
-  // an undersized surface while frame.ContentSize() reported the new, larger
-  // size. Direct3D11CaptureFramePool::Recreate is the documented remedy and is
-  // safe to call from inside the FrameArrived handler — do it AFTER
-  // frame.Close() so the surface we just read is back in the pool.
-  //
-  // LOCKING: taken under the context's critical section, which is the same
-  // lock wgc_stop_capture holds while it calls frame_pool.Close(). That makes
-  // "pool is being closed" and "pool is being recreated" mutually exclusive,
-  // and re-checking is_streaming inside means a stop that won the race turns
-  // this into a no-op. No deadlock against the callback drain: the drain runs
-  // with the critical section RELEASED, and this block never waits on anything
-  // but the lock itself. cb_ref (top of the function) is still held throughout.
-  if (pending_pool_w && pending_pool_h && !wgc_stress_no_pool_recreate() &&
-      wgc_ctx_alive(wgc_ctx, "pool recreate")) {
-    EnterCriticalSection(&wgc_ctx->critical_section);
-    if (wgc_ctx->is_streaming && wgc_ctx->frame_pool &&
-        wgc_ctx->d3d_device_winrt &&
-        (wgc_ctx->pool_width != pending_pool_w ||
-         wgc_ctx->pool_height != pending_pool_h)) {
+// Files one frame taken from the pool under its output slot: the slot nearest
+// its capture time, and never one already delivered. A newer frame for the
+// held frame's slot replaces it. A frame for a later slot was captured after
+// the held one's window closed, so the held one is delivered first. Under
+// critical_section.
+static void wgc_take_frame_locked(WGCScreenPlatformContext *wgc_ctx,
+                                  WGCFrame &frame, LONGLONG arrived) {
+  wgc_ctx->stats.taken++;
+  LONGLONG captured = arrived;
+  try {
+    captured = frame.SystemRelativeTime().count();
+    const auto size = frame.ContentSize();
+    if (size.Width > 0 && size.Height > 0 &&
+        (static_cast<UINT>(size.Width) != wgc_ctx->pool_width ||
+         static_cast<UINT>(size.Height) != wgc_ctx->pool_height)) {
+      wgc_ctx->pending_pool_w = static_cast<UINT>(size.Width);
+      wgc_ctx->pending_pool_h = static_cast<UINT>(size.Height);
+    }
+  } catch (...) {
+  }
+  // SystemRelativeTime is QPC time. A frame stamped in the future, or more
+  // than a second before it was taken, is placed by its arrival instead.
+  if (captured > arrived + 100000 || arrived - captured > 10000000)
+    captured = arrived;
+
+  if (wgc_ctx->grid_origin_100ns < 0)
+    wgc_ctx->grid_origin_100ns = captured;
+  LONGLONG slot = wgc_slot_of(wgc_ctx, captured);
+  if (slot <= wgc_ctx->last_slot)
+    slot = wgc_ctx->last_slot + 1;
+
+  if (wgc_ctx->held_frame) {
+    if (slot <= wgc_ctx->held_slot) {
+      wgc_close_frame(wgc_ctx->held_frame); // superseded within its slot
+      slot = wgc_ctx->held_slot;
+    } else {
+      wgc_deliver_held_locked(wgc_ctx);
+    }
+  }
+  wgc_ctx->held_frame = std::move(frame);
+  frame = nullptr;
+  wgc_ctx->held_slot = slot;
+  wgc_ctx->held_captured_100ns = captured;
+}
+
+// Logs the period's WGCFrameStats once WGC_STATS_PERIOD_100NS has passed and
+// starts the next. The frames taken from the pool per slot filled show what
+// MinUpdateInterval saves; the offset range, how far the delivered pictures
+// sit from their slots. Under critical_section.
+#define WGC_STATS_PERIOD_100NS (10 * 10000000LL)
+static void wgc_log_stats_locked(WGCScreenPlatformContext *wgc_ctx) {
+  WGCFrameStats &s = wgc_ctx->stats;
+  const LONGLONG now = wgc_now_100ns(wgc_ctx);
+  if (s.start_100ns == 0) {
+    s.start_100ns = now;
+    return;
+  }
+  if (now - s.start_100ns < WGC_STATS_PERIOD_100NS)
+    return;
+  char offsets[64] = "", copy[96] = "", readback[80] = "";
+  if (s.filled)
+    snprintf(offsets, sizeof(offsets), "; capture-to-slot %+.1f..%+.1f ms",
+             s.offset_min_100ns / 10000.0, s.offset_max_100ns / 10000.0);
+  if (s.copies || s.copy_drops)
+    snprintf(copy, sizeof(copy),
+             "; GPU copy mean %.2f max %.2f ms (%u done, %u dropped)",
+             s.copies ? s.copy_sum_100ns / 10000.0 / s.copies : 0.0,
+             s.copy_max_100ns / 10000.0, s.copies, s.copy_drops);
+  if (s.readbacks)
+    snprintf(readback, sizeof(readback),
+             "; CPU readback mean %.2f max %.2f ms (%u)",
+             s.readback_sum_100ns / 10000.0 / s.readbacks,
+             s.readback_max_100ns / 10000.0, s.readbacks);
+  miniav_log(MINIAV_LOG_LEVEL_INFO,
+             "WGC: last %.1f s at %lld/%lld fps: %u frames from the pool for "
+             "%u slots%s%s%s.",
+             (now - s.start_100ns) / 1e7, wgc_ctx->pace_num, wgc_ctx->pace_den,
+             s.taken, s.filled, offsets, copy, readback);
+  s = WGCFrameStats{};
+  s.start_100ns = now;
+}
+
+// --- Track content resizes ---
+// The pool was sized once from capture_item.Size() at StartCapture and never
+// revisited, so growing a captured window left every later frame arriving on
+// an undersized surface while frame.ContentSize() reported the new, larger
+// size. Direct3D11CaptureFramePool::Recreate is the documented remedy and is
+// safe to call from the FrameArrived handler. wgc_pump calls this with no
+// frame from the pool open: it delivers the held frame first.
+//
+// LOCKING: under the context's critical section, which is the same lock
+// wgc_stop_capture holds while it calls frame_pool.Close(). That makes "pool
+// is being closed" and "pool is being recreated" mutually exclusive, and
+// wgc_pump checked is_streaming under it, so a stop that won the race has
+// already turned this into a no-op.
+static void wgc_recreate_pool_locked(WGCScreenPlatformContext *wgc_ctx) {
+  const UINT w = wgc_ctx->pending_pool_w;
+  const UINT h = wgc_ctx->pending_pool_h;
+  wgc_ctx->pending_pool_w = 0;
+  wgc_ctx->pending_pool_h = 0;
+  if (!wgc_ctx->frame_pool || !wgc_ctx->d3d_device_winrt ||
+      (wgc_ctx->pool_width == w && wgc_ctx->pool_height == h))
+    return;
+  try {
+    winrt::Windows::Graphics::SizeInt32 new_size{static_cast<int32_t>(w),
+                                                 static_cast<int32_t>(h)};
+    wgc_ctx->frame_pool.Recreate(
+        wgc_ctx->d3d_device_winrt,
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::
+            B8G8R8A8UIntNormalized,
+        WGC_POOL_BUFFERS, new_size);
+    miniav_log(MINIAV_LOG_LEVEL_INFO,
+               "WGC: capture content resized %ux%u -> %ux%u; frame pool "
+               "recreated.",
+               wgc_ctx->pool_width, wgc_ctx->pool_height, w, h);
+    wgc_ctx->pool_width = w;
+    wgc_ctx->pool_height = h;
+    g_wgc_pool_recreates.fetch_add(1, std::memory_order_relaxed);
+  } catch (winrt::hresult_error const &ex) {
+    // RO_E_CLOSED here just means teardown got the pool first.
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "WGC: frame pool Recreate to %ux%u failed: %ls (0x%08X); "
+               "continuing at the old pool size.",
+               w, h, ex.message().c_str(), ex.code().value);
+  } catch (...) {
+    miniav_log(MINIAV_LOG_LEVEL_WARN,
+               "WGC: frame pool Recreate to %ux%u failed (unknown).", w, h);
+  }
+}
+
+// Takes every frame waiting in the pool, keeps the newest one per output slot,
+// and delivers each held frame once its slot's window has closed, stamped with
+// the slot's time. A 60 Hz compose stream recorded at 30 fps therefore comes
+// out on an even 33.3 ms grid, carrying the newest picture of each slot.
+//
+// This replaces sleeping out the interval on the callback thread. While that
+// thread slept, WGC kept capturing into the pool, so the frame delivered next
+// was the OLDEST queued one, captured up to an interval before its delivery
+// and stamped with that capture time. The consumer's own rate limiter then
+// threw away the newer frame queued behind it, and on a screen that had just
+// stopped changing that newer frame was the last picture there would be.
+// Holding means nothing ever blocks and nothing newer is lost.
+//
+// Runs on WGC's FrameArrived thread and on the pacing timer's. Both hold a
+// WGCCallbackRef and serialise on the critical section, which is held
+// throughout, across the app callback too, as delivery always was.
+static void wgc_pump(WGCScreenPlatformContext *wgc_ctx) {
+  EnterCriticalSection(&wgc_ctx->critical_section);
+  if (!wgc_ctx->is_streaming || !wgc_ctx->frame_pool ||
+      !wgc_ctx->app_callback_internal) {
+    // Stopping, stopped or lost: hand everything back to the pool.
+    wgc_close_frame(wgc_ctx->held_frame);
+    if (wgc_ctx->frame_pool) {
       try {
-        winrt::Windows::Graphics::SizeInt32 new_size{
-            static_cast<int32_t>(pending_pool_w),
-            static_cast<int32_t>(pending_pool_h)};
-        wgc_ctx->frame_pool.Recreate(
-            wgc_ctx->d3d_device_winrt,
-            winrt::Windows::Graphics::DirectX::DirectXPixelFormat::
-                B8G8R8A8UIntNormalized,
-            2, new_size);
-        miniav_log(MINIAV_LOG_LEVEL_INFO,
-                   "WGC: capture content resized %ux%u -> %ux%u; frame pool "
-                   "recreated.",
-                   wgc_ctx->pool_width, wgc_ctx->pool_height, pending_pool_w,
-                   pending_pool_h);
-        wgc_ctx->pool_width = pending_pool_w;
-        wgc_ctx->pool_height = pending_pool_h;
-        g_wgc_pool_recreates.fetch_add(1, std::memory_order_relaxed);
-      } catch (winrt::hresult_error const &ex) {
-        // RO_E_CLOSED here just means teardown got the pool first.
-        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "WGC: frame pool Recreate to %ux%u failed: %ls (0x%08X); "
-                   "continuing at the old pool size.",
-                   pending_pool_w, pending_pool_h, ex.message().c_str(),
-                   ex.code().value);
+        for (WGCFrame stale = wgc_ctx->frame_pool.TryGetNextFrame(); stale;
+             stale = wgc_ctx->frame_pool.TryGetNextFrame())
+          stale.Close();
       } catch (...) {
-        miniav_log(MINIAV_LOG_LEVEL_WARN,
-                   "WGC: frame pool Recreate to %ux%u failed (unknown).",
-                   pending_pool_w, pending_pool_h);
       }
     }
     LeaveCriticalSection(&wgc_ctx->critical_section);
+    return;
   }
 
-  // FPS pacing. WGC is event-driven at the compose rate, so throttling works
-  // by blocking this frame-pool callback thread until the next output slot.
-  // Deliveries are paced against an ABSOLUTE QPC schedule (deadline += exact
-  // interval) slept on a high-resolution waitable timer. The previous
-  // relative Sleep(interval - 2) systematically ran ~5% fast in
-  // timer-resolution-raised processes (any Flutter app): a 30 fps target
-  // delivered ~31.4 fps, and the consumer's fps throttle then deleted the
-  // excess frame every ~20 frames — one double-length presentation hole every
-  // ~0.7 s, a metronomic visible stutter in recordings. The absolute schedule
-  // also self-corrects after a slow frame instead of drifting.
-  //
-  // LIFETIME: this whole block runs with the critical section RELEASED, so it
-  // is only safe because cb_ref (top of the function) is still held —
-  // stop_capture / destroy_platform block in wgc_drain_callbacks() until this
-  // returns. Both set is_streaming = FALSE and signal stop_event_handle before
-  // draining, and every wait below is bounded by one of the two, so the drain
-  // cannot be held up for more than ~1 ms.
-  if (!wgc_ctx_alive(wgc_ctx, "pacing loop"))
-    return;
-  if (wgc_ctx->target_fps > 0 && wgc_ctx->is_streaming &&
-      wgc_ctx->pace_interval_qpc > 0) {
-    LARGE_INTEGER pace_freq;
-    QueryPerformanceFrequency(&pace_freq);
-    LARGE_INTEGER pace_now;
-    QueryPerformanceCounter(&pace_now);
-    if (wgc_ctx->pace_next_deadline_qpc == 0) {
-      wgc_ctx->pace_next_deadline_qpc =
-          pace_now.QuadPart + wgc_ctx->pace_interval_qpc;
-    } else {
-      wgc_ctx->pace_next_deadline_qpc += wgc_ctx->pace_interval_qpc;
-      if (pace_now.QuadPart - wgc_ctx->pace_next_deadline_qpc >
-          wgc_ctx->pace_interval_qpc) {
-        // More than a full interval behind (idle stretch on a static screen,
-        // or a stalled iteration): resync instead of bursting stale catch-up
-        // deliveries. Being behind by LESS than an interval intentionally
-        // skips the wait once, pulling the next delivery back onto schedule.
-        wgc_ctx->pace_next_deadline_qpc = pace_now.QuadPart;
+  const char *lost_why = nullptr;
+  const LONGLONG arrived = wgc_now_100ns(wgc_ctx);
+  for (;;) {
+    WGCFrame frame{nullptr};
+    try {
+      frame = wgc_ctx->frame_pool.TryGetNextFrame();
+    } catch (winrt::hresult_error const &ex) {
+      miniav_log(MINIAV_LOG_LEVEL_WARN, "WGC: TryGetNextFrame failed: %ls",
+                 ex.message().c_str());
+      // Distinguish transient hiccups from a genuinely lost capture: a removed
+      // D3D device or a closed session/pool will never produce frames again —
+      // tell the app instead of leaving it waiting forever.
+      HRESULT removed_reason =
+          wgc_ctx->d3d_device ? wgc_ctx->d3d_device->GetDeviceRemovedReason()
+                              : S_OK;
+      if (removed_reason != S_OK ||
+          ex.code() == static_cast<winrt::hresult>(DXGI_ERROR_DEVICE_REMOVED) ||
+          ex.code() == static_cast<winrt::hresult>(RO_E_CLOSED)) {
+        lost_why = "device removed / session closed";
       }
+      break;
     }
-    // The liveness check is FIRST (short-circuit) on purpose: a context freed
-    // while this thread was parked leaves is_streaming reading as garbage/zero,
-    // which would otherwise exit the loop quietly and hide the violation.
-    while (wgc_ctx_alive(wgc_ctx, "pacing wait") && wgc_ctx->is_streaming) {
-      QueryPerformanceCounter(&pace_now);
-      LONGLONG pace_remaining =
-          wgc_ctx->pace_next_deadline_qpc - pace_now.QuadPart;
-      if (pace_remaining <= 0)
-        break;
-      LONGLONG pace_remaining_100ns =
-          pace_remaining * 10000000LL / pace_freq.QuadPart;
-      if (pace_remaining_100ns < 5000) // <0.5 ms — close enough
-        break;
-      if (wgc_ctx->pace_timer && !wgc_stress_force_pace_sleep()) {
-        LARGE_INTEGER pace_due;
-        pace_due.QuadPart = -pace_remaining_100ns; // negative = relative
-        if (SetWaitableTimer(wgc_ctx->pace_timer, &pace_due, 0, NULL, NULL,
-                             FALSE)) {
-          HANDLE pace_waits[2] = {wgc_ctx->stop_event_handle,
-                                  wgc_ctx->pace_timer};
-          DWORD pace_w = WaitForMultipleObjects(
-              2, pace_waits, FALSE,
-              (DWORD)(pace_remaining_100ns / 10000) + 50);
-          if (pace_w == WAIT_OBJECT_0)
-            break;  // stop requested
-          continue; // timer fired (or timed out) — re-check the deadline
-        }
-      }
-      // Fallback when the high-resolution waitable timer is unavailable or
-      // SetWaitableTimer failed. Still sleeps to the same ABSOLUTE deadline,
-      // but on the stop event instead of a bare Sleep(): the bare version
-      // ignored teardown entirely and parked this thread — and the teardown
-      // drain waiting on it — for a full frame interval (≈1 s at 1 fps).
-      const DWORD pace_fallback_ms = (DWORD)(pace_remaining_100ns / 10000) + 1;
-      if (wgc_stress_legacy_teardown()) {
-        Sleep(pace_fallback_ms); // pre-fix, stop-event-blind (test-only)
-        continue;
-      }
-      if (WaitForSingleObject(wgc_ctx->stop_event_handle, pace_fallback_ms) ==
-          WAIT_OBJECT_0)
-        break; // stop requested
-    }
+    if (!frame)
+      break;
+    wgc_take_frame_locked(wgc_ctx, frame, arrived);
   }
+
+  // The pool must not be recreated while a frame from it is held, so a resize
+  // delivers the held frame early. It carries its slot's time either way.
+  const bool resize = !lost_why && wgc_ctx->pending_pool_w &&
+                      wgc_ctx->pending_pool_h &&
+                      !wgc_stress_no_pool_recreate();
+  if (wgc_ctx->held_frame && !lost_why) {
+    const LONGLONG due = wgc_slot_due(wgc_ctx, wgc_ctx->held_slot);
+    const LONGLONG now = wgc_now_100ns(wgc_ctx);
+    if (resize || now >= due ||
+        !wgc_arm_pace_wake_locked(wgc_ctx, due - now))
+      wgc_deliver_held_locked(wgc_ctx);
+  }
+  if (resize)
+    wgc_recreate_pool_locked(wgc_ctx);
+  wgc_log_stats_locked(wgc_ctx);
+
+  const DWORD park_ms =
+      wgc_stress_force_pace_sleep()
+          ? (DWORD)(1000 * wgc_ctx->pace_den / wgc_ctx->pace_num)
+          : 0;
+  LeaveCriticalSection(&wgc_ctx->critical_section);
+
+  if (park_ms) {
+    // MINIAV_WGC_STRESS_PACE_SLEEP=1 (test-only): park outside the lock,
+    // blind to teardown, the way the pacing wait this replaced did.
+    Sleep(park_ms);
+    if (!wgc_ctx_alive(wgc_ctx, "pacing park"))
+      return;
+  }
+  // Last: the app may stop or destroy the capture from lost_cb.
+  if (lost_why)
+    wgc_notify_capture_lost(wgc_ctx, lost_why);
+}
+
+// Threadpool entry point for the pacing timer, which delivers a held frame
+// whose slot closed without a newer frame arriving to do it.
+static VOID CALLBACK wgc_on_pace_wake(PTP_CALLBACK_INSTANCE /*instance*/,
+                                      PVOID param, PTP_WAIT /*wait*/,
+                                      TP_WAIT_RESULT /*result*/) {
+  WGCScreenPlatformContext *wgc_ctx =
+      static_cast<WGCScreenPlatformContext *>(param);
+  WGCCallbackRef cb_ref(wgc_ctx);
+  if (!cb_ref)
+    return; // context already torn down — must not dereference it
+  if (!wgc_ctx_alive(wgc_ctx, "pace timer"))
+    return;
+  wgc_pump(wgc_ctx);
+}
+
+// Threadpool entry point for the window check (see
+// wgc_arm_window_watch_locked). Ends the capture as lost once the window is
+// gone or its handle names a different window; stops checking once the
+// capture has ended.
+static VOID CALLBACK wgc_on_window_watch(PTP_CALLBACK_INSTANCE /*instance*/,
+                                         PVOID param, PTP_TIMER /*timer*/) {
+  WGCScreenPlatformContext *wgc_ctx =
+      static_cast<WGCScreenPlatformContext *>(param);
+  WGCCallbackRef cb_ref(wgc_ctx);
+  if (!cb_ref)
+    return; // context already torn down — must not dereference it
+  if (!wgc_ctx_alive(wgc_ctx, "window check"))
+    return;
+  EnterCriticalSection(&wgc_ctx->critical_section);
+  const bool streaming = wgc_ctx->is_streaming &&
+                         wgc_ctx->current_target_type == WGC_TARGET_WINDOW;
+  const HWND hwnd = wgc_ctx->selected_hwnd;
+  const DWORD tid = wgc_ctx->watched_tid;
+  const DWORD pid = wgc_ctx->watched_pid;
+  if (!streaming && wgc_ctx->window_watch)
+    SetThreadpoolTimer(wgc_ctx->window_watch, nullptr, 0, 0);
+  LeaveCriticalSection(&wgc_ctx->critical_section);
+  if (!streaming)
+    return;
+  DWORD now_pid = 0;
+  const DWORD now_tid =
+      IsWindow(hwnd) ? GetWindowThreadProcessId(hwnd, &now_pid) : 0;
+  if (now_tid == 0 || now_tid != tid || now_pid != pid)
+    wgc_notify_capture_lost(wgc_ctx, "captured window closed");
+}
+
+// --- Frame Arrived Handler ---
+static void wgc_on_frame_arrived(
+    WGCScreenPlatformContext *wgc_ctx,
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender,
+    winrt::Windows::Foundation::IInspectable const & /*args*/) {
+  // Threadpool entry point: the reference is held for the entire body.
+  WGCCallbackRef cb_ref(wgc_ctx);
+  if (!cb_ref) {
+    // Context already sealed/destroyed: do NOT dereference wgc_ctx. Still
+    // drain the pool frame (touches only `sender`) so it is not held hostage.
+    if (sender) {
+      try {
+        auto frame = sender.TryGetNextFrame();
+        if (frame)
+          frame.Close();
+      } catch (...) {
+      }
+    }
+    return;
+  }
+  if (!wgc_ctx_alive(wgc_ctx, "on_frame_arrived"))
+    return;
+  wgc_pump(wgc_ctx);
 }
 
 // --- Ops struct and Platform Init ---

@@ -11,6 +11,8 @@ import 'dart:typed_data';
 
 import 'package:miniav_platform_interface/miniav_platform_types.dart';
 import 'package:miniav_tools_ffmpeg/miniav_tools_ffmpeg.dart';
+import 'package:miniav_tools_ffmpeg/src/isolate_demuxer.dart'
+    show liveDemuxPipes;
 import 'package:test/test.dart';
 
 const int kW = 320;
@@ -328,6 +330,7 @@ void main() {
     );
     final ctrl = StreamController<List<int>>();
     final backend = FfmpegBackend();
+    final pipesBefore = liveDemuxPipes;
     final open = backend.createDemuxer(
       DemuxerConfig(input: DemuxerInput.byteStream(ctrl.stream)),
     );
@@ -361,6 +364,8 @@ void main() {
     await dem.close().timeout(const Duration(seconds: 5));
     final last = await pending.timeout(const Duration(seconds: 5));
     expect(last, isNull, reason: 'starved read resolves as EOF on close');
+    expect(liveDemuxPipes, pipesBefore,
+        reason: 'close() frees the pipe once the worker has exited');
     await ctrl.close();
   });
 
@@ -376,6 +381,7 @@ void main() {
     );
     final ctrl = StreamController<List<int>>();
     final backend = FfmpegBackend();
+    final pipesBefore = liveDemuxPipes;
     final open = backend.createDemuxer(
       DemuxerConfig(
         input: DemuxerInput.byteStream(ctrl.stream),
@@ -390,6 +396,8 @@ void main() {
       throwsA(isA<CodecInitException>()),
       reason: 'a stalled probe must error within the open timeout, not hang',
     );
+    expect(liveDemuxPipes, pipesBefore,
+        reason: 'a timed-out open frees its pipe once the worker has exited');
     await ctrl.close();
   });
 }

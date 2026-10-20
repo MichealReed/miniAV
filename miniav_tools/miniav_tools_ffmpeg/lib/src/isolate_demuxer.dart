@@ -11,15 +11,17 @@
 ///
 /// Shutdown protocol for a possibly-starved live worker: close the pipe
 /// FIRST (main isolate, unblocks the reader with EOF), then close the worker,
-/// then destroy the pipe. That order is not negotiable and `spawn` cannot do
-/// it for us — killing an isolate does not preempt a blocking native call, so
-/// only the code that owns the pipe can free the reader.
+/// then destroy the pipe once the worker's isolate has EXITED. That order is
+/// not negotiable and `spawn` cannot do it for us — killing an isolate does
+/// not preempt a blocking native call, so only the code that owns the pipe
+/// can free the reader, and only the isolate's exit proves it has let go.
 library;
 
 import 'dart:async';
 import 'dart:ffi';
 import 'dart:typed_data';
 
+import 'package:meta/meta.dart';
 import 'package:miniav_tools_platform_interface/miniav_tools_platform_interface.dart';
 import 'package:spawn/spawn.dart';
 
@@ -28,6 +30,45 @@ import 'ffmpeg_demuxer.dart';
 import 'ffmpeg_shim.dart';
 
 const String _kBackend = 'ffmpeg-demux-isolate';
+
+/// Byte pipes created by [IsolateDemuxer] and not yet destroyed, for tests.
+/// A pipe whose worker never exits stays counted on purpose: leaking it is
+/// the alternative to freeing it under a live reader.
+@visibleForTesting
+int get liveDemuxPipes => _liveDemuxPipes;
+int _liveDemuxPipes = 0;
+
+void _destroyPipe(FfmpegShim shim, Pointer<Void> pipe) {
+  shim.bytepipeDestroy(pipe);
+  _liveDemuxPipes--;
+}
+
+/// Destroys [pipe] once [worker]'s isolate has exited, the only point at which
+/// nothing can still be reading it.
+///
+/// Closing a worker, even killing it, does not get it out of a native call —
+/// the kill waits for the call to return — so only the VM's onExit
+/// ([WorkerTerminationEvidence.nativeOnExit]) proves the isolate has let go.
+/// Waits up to [wait], so a prompt exit frees the pipe before the caller
+/// resumes; after that the destroy stays attached to the exit. An isolate
+/// that never exits (a native call that never returns) leaks the pipe.
+Future<void> _destroyPipeOnExit(
+  Worker worker,
+  FfmpegShim shim,
+  Pointer<Void> pipe, {
+  Duration wait = const Duration(seconds: 2),
+}) async {
+  final destroyed = worker.termination.then((evidence) {
+    if (evidence == WorkerTerminationEvidence.nativeOnExit) {
+      _destroyPipe(shim, pipe);
+    }
+  });
+  try {
+    await destroyed.timeout(wait);
+  } on TimeoutException {
+    // Still inside a native call: the destroy runs when the isolate exits.
+  }
+}
 
 /// Feeds a `Stream<List<int>>` into a shim byte pipe with backpressure:
 /// when the ring fills, the subscription pauses and the remainder retries
@@ -217,19 +258,12 @@ class IsolateDemuxer implements PlatformDemuxer {
           if (pipe == nullptr) {
             throw const CodecInitException(_kBackend, 'bytepipe OOM');
           }
+          _liveDemuxPipes++;
           feeder = _PipeFeeder(shim, pipe, stream);
           mode = 'pipe';
           workerArg = pipe.address;
         case FileDemuxerInput():
           throw StateError('unreachable');
-      }
-    }
-
-    void cleanupPipe() {
-      feeder?.stop();
-      if (pipe != null) {
-        shim!.bytepipeClose(pipe);
-        shim.bytepipeDestroy(pipe);
       }
     }
 
@@ -241,8 +275,22 @@ class IsolateDemuxer implements PlatformDemuxer {
         transfer: transfer,
       );
     } on Object catch (e) {
-      cleanupPipe();
+      // No request was sent, so the worker never read the pipe: free it now.
+      feeder?.stop();
+      if (pipe != null) {
+        shim!.bytepipeClose(pipe);
+        _destroyPipe(shim, pipe);
+      }
       throw CodecInitException(_kBackend, 'worker spawn failed: $e');
+    }
+
+    // From the open request on, the worker may be inside a read of the pipe
+    // until it exits: unblock it, stop it, and free the pipe on its exit.
+    Future<void> abandon() async {
+      feeder?.stop();
+      if (pipe != null) shim!.bytepipeClose(pipe);
+      await worker.close(force: true);
+      if (pipe != null) await _destroyPipeOnExit(worker, shim!, pipe);
     }
 
     // Open timeout: a live byte stream that stalls mid-probe
@@ -260,8 +308,8 @@ class IsolateDemuxer implements PlatformDemuxer {
       return mode == 'pipe' ? 15000 : null;
     }();
 
-    // Deliberately NOT `request(timeout:)`: on a timeout we still need this
-    // future, to learn when the worker has released the pipe.
+    // Deliberately NOT `request(timeout:)`: on a timeout we still want this
+    // future, to let the unblocked worker answer before it is stopped.
     final opening = worker.request<TracksMessage>('open');
     // A late failure must not surface as an unhandled async error after we
     // have already given up on it.
@@ -274,23 +322,15 @@ class IsolateDemuxer implements PlatformDemuxer {
           : await opening;
     } on TimeoutException {
       // Unblock the worker's blocked probe (read cb → EOF → open fails), then
-      // wait briefly for it to unwind and release the pipe before destroying.
+      // wait briefly for it to answer, so it unwinds on its own first.
       if (pipe != null) shim!.bytepipeClose(pipe);
-      var workerReleased = false;
       try {
         await opening.timeout(const Duration(seconds: 2));
-        workerReleased = true; // answered normally
-      } on TimeoutException {
-        // Still blocked inside the native probe — leak the pipe rather than
-        // risk a use-after-free by destroying it under a live reader.
       } on Object {
-        // Answered by throwing: the open failed, which means it unwound out
-        // of the native call and is no longer touching the pipe.
-        workerReleased = true;
+        // Failing is the expected answer. A worker still blocked inside the
+        // native probe is handled by abandon(): its pipe waits for its exit.
       }
-      feeder?.stop();
-      await worker.close(force: true);
-      if (workerReleased && pipe != null) shim!.bytepipeDestroy(pipe);
+      await abandon();
       throw CodecInitException(
         _kBackend,
         'open timed out after ${openTimeoutMs}ms — the stream did not deliver '
@@ -299,8 +339,7 @@ class IsolateDemuxer implements PlatformDemuxer {
     } on Object catch (e) {
       // The worker refused to open: a RemoteWorkerError carrying whatever
       // FfmpegDemuxer threw.
-      await worker.close(force: true);
-      cleanupPipe();
+      await abandon();
       throw CodecInitException(_kBackend, _describe(e));
     }
 
@@ -379,7 +418,8 @@ class IsolateDemuxer implements PlatformDemuxer {
     // worker already died (a native FFmpeg crash on corrupt input), the grace
     // period expires and the kill still happens.
     await _worker.close(grace: const Duration(seconds: 2));
-    if (pipe != null) _shim!.bytepipeDestroy(pipe);
+    // Closed is not exited: the worker may still be leaving its last read.
+    if (pipe != null) await _destroyPipeOnExit(_worker, _shim!, pipe);
   }
 }
 

@@ -185,10 +185,13 @@ void main() {
       final slot1 = slotPts(base, 1);
       // Slot 1's claim window (±half interval) still open → no fill.
       expect(pacer.claimIdleSlot(slot1 + 16000), isNull);
-      // Window closed → fill slot 1.
-      expect(pacer.claimIdleSlot(slot1 + 16667), slot1);
-      // Slot 2 is still in the future → no fill.
-      expect(pacer.claimIdleSlot(slot1 + 16667), isNull);
+      // Window closed, but a frame captured at its far edge may still be on
+      // its way (half an interval of delivery latency) → no fill yet.
+      expect(pacer.claimIdleSlot(slot1 + 33000), isNull);
+      // That allowance spent too → fill slot 1.
+      expect(pacer.claimIdleSlot(slot1 + 33333), slot1);
+      // Slot 2's moment has only just come → no fill.
+      expect(pacer.claimIdleSlot(slot1 + 33333), isNull);
     });
 
     test('live frame whose slot the idle filler took is dropped', () {
@@ -198,8 +201,8 @@ void main() {
       expect(pacer.shouldDropOnArrival(base), isFalse);
       pacer.claimPts(base);
       // Filler takes slots 1 and 2.
-      expect(pacer.claimIdleSlot(slotPts(base, 2) + 16667), isNotNull);
-      expect(pacer.claimIdleSlot(slotPts(base, 2) + 16667), isNotNull);
+      expect(pacer.claimIdleSlot(slotPts(base, 2) + 33334), isNotNull);
+      expect(pacer.claimIdleSlot(slotPts(base, 2) + 33334), isNotNull);
       // A frame captured nearest slot 2 arrives late → arrival gate drops it.
       expect(pacer.shouldDropOnArrival(slotPts(base, 2) + 100), isTrue);
     });
@@ -213,8 +216,8 @@ void main() {
       final t = slotPts(base, 2); // maps to slot 2
       expect(pacer.shouldDropOnArrival(t), isFalse); // accepted → queued
       // Idle filler claims slots 1 and 2 before the queued frame encodes.
-      expect(pacer.claimIdleSlot(slotPts(base, 2) + 16667), isNotNull);
-      expect(pacer.claimIdleSlot(slotPts(base, 2) + 16667), isNotNull);
+      expect(pacer.claimIdleSlot(slotPts(base, 2) + 33334), isNotNull);
+      expect(pacer.claimIdleSlot(slotPts(base, 2) + 33334), isNotNull);
       expect(pacer.claimPts(t), isNull);
     });
 

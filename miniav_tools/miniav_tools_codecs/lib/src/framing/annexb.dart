@@ -9,6 +9,9 @@
 /// This module is the bridge. [buildAvcC] / [buildHvcC] turn an Annex-B
 /// parameter-set blob (the MF sequence header / FFmpeg `extradata`) into the
 /// configuration record; [annexBToLengthPrefixed] rewrites a coded frame.
+/// [leadingParamSets] and its companions compare the parameter sets a frame
+/// carries with the ones a configuration holds. The two can disagree, and the
+/// frame's are the ones it was encoded under.
 ///
 /// The inverse (record → Annex-B, for feeding a decoder) lives in
 /// `mf/mf_d3d11_decoder.dart`.
@@ -123,6 +126,147 @@ Uint8List annexBToLengthPrefixed(Uint8List frame, {required bool hevc,
     o += nal.length;
   }
   return out;
+}
+
+/// The parameter sets at the head of an Annex-B access unit: every SPS/PPS
+/// (and VPS, for HEVC) in front of its first slice, in stream order — the NAL
+/// types [annexBToLengthPrefixed] strips.
+///
+/// Each comes back without trailing zero bytes. A NAL unit never ends in
+/// `0x00`, so any there are byte-stream padding (`trailing_zero_8bits`), and
+/// dropping them lets a set compare equal to the same set held in a record.
+///
+/// Empty when [frame] is not Annex-B or carries none, which for most streams
+/// is every frame but the keyframes. Encoders put parameter sets in front of
+/// the picture, so the scan stops at the first slice: it costs the bytes
+/// before the picture, not the picture.
+List<Uint8List> leadingParamSets(Uint8List frame, {required bool hevc}) {
+  if (!isAnnexB(frame)) return const [];
+  final out = <Uint8List>[];
+  final n = frame.length;
+  var p = _nextStartCode(frame, 0);
+  while (p < n) {
+    final start = p + ((p + 2 < n && frame[p + 2] == 1) ? 3 : 4);
+    if (start >= n) break;
+    final header = frame[start];
+    final type = hevc ? (header >> 1) & 0x3F : header & 0x1F;
+    if (hevc ? type < 32 : type >= 1 && type <= 5) break; // a slice
+    final end = _nextStartCode(frame, start);
+    final nal = _withoutTrailingZeros(Uint8List.sublistView(frame, start, end));
+    if (_isParamSet(nal, hevc: hevc)) out.add(nal);
+    p = end;
+  }
+  return out;
+}
+
+/// The parameter sets a codec configuration holds: an `avcC` / `hvcC` record,
+/// or an Annex-B parameter-set blob such as an encoder's `extraData`. Trailing
+/// zero bytes are dropped as in [leadingParamSets].
+///
+/// Lenient by design. It answers "does this configuration already hold these
+/// sets?", so a truncated or unrecognised record yields whatever parsed
+/// cleanly — possibly nothing, which makes the answer "no".
+List<Uint8List> configParamSets(Uint8List config, {required bool hevc}) {
+  final out = <Uint8List>[];
+  void keep(Uint8List nal) {
+    final set = _withoutTrailingZeros(nal);
+    if (_isParamSet(set, hevc: hevc)) out.add(set);
+  }
+
+  if (isAnnexB(config)) {
+    splitAnnexB(config).forEach(keep);
+    return out;
+  }
+  final n = config.length;
+  if (n == 0 || config[0] != 1) return out; // configurationVersion
+  var p = 0;
+  // A record stores each NAL as a 16-bit length and the bytes. `false` once
+  // the record runs short.
+  bool take() {
+    if (p + 2 > n) return false;
+    final end = p + 2 + ((config[p] << 8) | config[p + 1]);
+    if (end > n) return false;
+    keep(Uint8List.sublistView(config, p + 2, end));
+    p = end;
+    return true;
+  }
+
+  if (hevc) {
+    // 22 bytes of profile, tier, level and stream fields, then numOfArrays;
+    // each array is a type byte, a 16-bit NAL count and the NALs.
+    if (n < 23) return out;
+    p = 23;
+    for (var a = config[22]; a > 0; a--) {
+      if (p + 3 > n) return out;
+      final count = (config[p + 1] << 8) | config[p + 2];
+      p += 3;
+      for (var k = 0; k < count; k++) {
+        if (!take()) return out;
+      }
+    }
+    return out;
+  }
+  // Version, profile, compatibility, level and lengthSizeMinusOne, then the
+  // SPS count in the low five bits; the PPS count follows the SPSs.
+  if (n < 6) return out;
+  p = 6;
+  for (var k = config[5] & 0x1F; k > 0; k--) {
+    if (!take()) return out;
+  }
+  if (p >= n) return out;
+  final ppsCount = config[p++];
+  for (var k = 0; k < ppsCount; k++) {
+    if (!take()) return out;
+  }
+  return out;
+}
+
+/// `true` when every set in [sets] is byte-identical to one in [held].
+bool carriesParamSets(List<Uint8List> held, List<Uint8List> sets) =>
+    sets.every((s) => held.any((h) => _equalBytes(h, s)));
+
+/// [fresh] — parameter sets a stream has just carried — as an Annex-B blob,
+/// completed with the sets of [held] whose NAL type [fresh] does not repeat,
+/// in VPS, SPS, PPS order.
+///
+/// A type the stream repeated replaces every held set of that type; a type it
+/// did not is kept, so an encoder that re-sends only its SPS on a keyframe
+/// keeps the PPS it published before.
+Uint8List mergeParamSets(List<Uint8List> fresh, List<Uint8List> held,
+    {required bool hevc}) {
+  int typeOf(Uint8List nal) => hevc ? _hevcType(nal) : _h264Type(nal);
+  final b = BytesBuilder(copy: false);
+  for (final type in hevc
+      ? const [_hevcVps, _hevcSps, _hevcPps]
+      : const [_h264Sps, _h264Pps]) {
+    final from = fresh.any((nal) => typeOf(nal) == type) ? fresh : held;
+    for (final nal in from) {
+      if (typeOf(nal) != type) continue;
+      b.add(const [0, 0, 0, 1]);
+      b.add(nal);
+    }
+  }
+  return b.toBytes();
+}
+
+bool _isParamSet(Uint8List nal, {required bool hevc}) => hevc
+    ? nal.length >= 2 && _isHevcParamSet(nal)
+    : nal.isNotEmpty && _isH264ParamSet(nal);
+
+Uint8List _withoutTrailingZeros(Uint8List nal) {
+  var end = nal.length;
+  while (end > 0 && nal[end - 1] == 0) {
+    end--;
+  }
+  return end == nal.length ? nal : Uint8List.sublistView(nal, 0, end);
+}
+
+bool _equalBytes(Uint8List a, Uint8List b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
 }
 
 /// Build an `avcC` (`AVCDecoderConfigurationRecord`) from Annex-B SPS/PPS.

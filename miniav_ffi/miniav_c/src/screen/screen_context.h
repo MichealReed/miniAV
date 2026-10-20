@@ -77,6 +77,10 @@ typedef struct MiniAVScreenContext {
   MiniAVContextLostCallback lost_cb;
   void *lost_cb_user_data;
 
+  // Private cold funded allocation owner. NULL for ordinary calloc contexts.
+  // Never free this context through the generic allocation/fallback route.
+  void *strict_control_owner;
+
 } MiniAVScreenContext;
 
 typedef struct {

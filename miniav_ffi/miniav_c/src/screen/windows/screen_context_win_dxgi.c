@@ -1,5 +1,6 @@
 #define COBJMACROS // Enables C-style COM interface calling
 #include "screen_context_win_dxgi.h"
+#include "screen_dxgi_damage.h"
 #include "../../../include/miniav.h"
 #include "../../common/miniav_logging.h"
 #include "../../common/miniav_time.h" // For miniav_get_qpc_microseconds, miniav_get_qpc_frequency
@@ -13,9 +14,18 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 
+#define DXGI_DAMAGE_MAX_METADATA_BYTES (1024U * 1024U)
+
+// Process-wide uniqueness across duplication recreation and separate contexts.
+__declspec(align(8)) static volatile LONG64 g_dxgi_damage_epoch = 0;
+static uint64_t dxgi_next_damage_epoch(void) {
+  return (uint64_t)InterlockedIncrement64(&g_dxgi_damage_epoch);
+}
+
 // Payload for releasing DXGI frame resources
 typedef struct DXGIFrameReleasePayload {
   MiniAVOutputPreference type;
+  DXGIFrameDamage damage;
   union {
     struct {                                      // For CPU
       ID3D11Texture2D *staging_texture_for_frame; // AddRef'd
@@ -64,6 +74,7 @@ typedef struct DXGIScreenPlatformContext {
   UINT frame_width;               // Actual width from DXGI
   UINT frame_height;              // Actual height from DXGI
   MiniAVPixelFormat pixel_format; // Should be BGRA32 for DXGI
+  DXGIDamageChain damage_chain; // Capture thread only while streaming.
 
   LARGE_INTEGER qpc_frequency;
 
@@ -73,6 +84,124 @@ typedef struct DXGIScreenPlatformContext {
   MiniAVAudioInfo configured_audio_format;
 
 } DXGIScreenPlatformContext;
+
+uint32_t miniav_dxgi_copy_damage(const MiniAVBuffer *buffer, uint64_t *words,
+                                uint32_t capacity) {
+  if (!buffer || buffer->type != MINIAV_BUFFER_TYPE_VIDEO ||
+      !buffer->internal_handle)
+    return 0;
+  const MiniAVNativeBufferInternalPayload *payload =
+      (const MiniAVNativeBufferInternalPayload *)buffer->internal_handle;
+  if (payload->handle_type != MINIAV_NATIVE_HANDLE_TYPE_VIDEO_SCREEN ||
+      !payload->context_owner || !payload->native_singular_resource_ptr ||
+      payload->parent_miniav_buffer_ptr != buffer)
+    return 0;
+  const MiniAVScreenContext *ctx =
+      (const MiniAVScreenContext *)payload->context_owner;
+  // Never interpret another backend's private sidecar (especially WGC).
+  if (ctx->ops != &g_screen_ops_win_dxgi)
+    return 0;
+  const DXGIFrameReleasePayload *frame =
+      (const DXGIFrameReleasePayload *)payload->native_singular_resource_ptr;
+  const DXGIFrameDamage *damage = &frame->damage;
+  if (!damage->certified || damage->rect_count > DXGI_DAMAGE_MAX_RECTS ||
+      (!damage->full_frame && !damage->rect_count))
+    return 0;
+  uint32_t required = 6 + 4 * damage->rect_count;
+  if (words && capacity >= required) {
+    words[0] = damage->source_epoch;
+    words[1] = damage->generation;
+    words[2] = damage->width;
+    words[3] = damage->height;
+    words[4] = damage->full_frame;
+    words[5] = damage->rect_count;
+    for (uint32_t i = 0; i < damage->rect_count; ++i)
+      for (uint32_t j = 0; j < 4; ++j)
+        words[6 + 4 * i + j] = damage->rects[i][j];
+  }
+  return required;
+}
+
+// Adds one acquisition's changes to the damage chain while the frame is still
+// acquired. Runs for EVERY acquisition, delivered or not, so the next delivered
+// frame's damage covers them all. Metadata never requires pixel readback.
+static void dxgi_collect_damage(DXGIScreenPlatformContext *ctx,
+                                const DXGI_OUTDUPL_FRAME_INFO *info) {
+  DXGIDamageChain *chain = &ctx->damage_chain;
+  // A pointer-only update leaves the desktop image as it was (Desktop
+  // Duplication frames never contain the cursor).
+  BOOL image_changed =
+      info->LastPresentTime.QuadPart != 0 || info->AccumulatedFrames != 0;
+  UINT bytes = info->TotalMetadataBufferSize;
+  if (chain->pending.full_frame || (!bytes && !image_changed))
+    return;
+  if (!bytes || bytes > DXGI_DAMAGE_MAX_METADATA_BYTES) {
+    dxgi_damage_mark_full(chain);
+    return;
+  }
+  void *metadata = miniav_calloc(1, bytes);
+  if (!metadata) {
+    dxgi_damage_mark_full(chain);
+    return;
+  }
+  UINT reported = 0;
+  UINT needed = 0;
+  HRESULT hr = IDXGIOutputDuplication_GetFrameMoveRects(
+      ctx->output_duplication, bytes, (DXGI_OUTDUPL_MOVE_RECT *)metadata, &needed);
+  BOOL valid = SUCCEEDED(hr) && needed <= bytes &&
+               needed % sizeof(DXGI_OUTDUPL_MOVE_RECT) == 0;
+  if (valid) {
+    const DXGI_OUTDUPL_MOVE_RECT *moves = metadata;
+    reported += needed / sizeof(*moves);
+    for (UINT i = 0; i < needed / sizeof(*moves); ++i) {
+      const RECT *dst = &moves[i].DestinationRect;
+      int64_t width = (int64_t)dst->right - dst->left;
+      int64_t height = (int64_t)dst->bottom - dst->top;
+      // A move changes both where pixels came from and where they went.
+      dxgi_damage_add_rect(chain, dst->left, dst->top, width, height);
+      dxgi_damage_add_rect(chain, moves[i].SourcePoint.x,
+                           moves[i].SourcePoint.y, width, height);
+    }
+  }
+  if (valid) {
+    needed = 0;
+    hr = IDXGIOutputDuplication_GetFrameDirtyRects(
+        ctx->output_duplication, bytes, (RECT *)metadata, &needed);
+    valid = SUCCEEDED(hr) && needed <= bytes && needed % sizeof(RECT) == 0;
+  }
+  if (valid) {
+    const RECT *dirty = metadata;
+    reported += needed / sizeof(*dirty);
+    for (UINT i = 0; i < needed / sizeof(*dirty); ++i) {
+      dxgi_damage_add_rect(chain, dirty[i].left, dirty[i].top,
+                           (int64_t)dirty[i].right - dirty[i].left,
+                           (int64_t)dirty[i].bottom - dirty[i].top);
+    }
+  }
+  miniav_free(metadata);
+  // Failed metadata, or an image update naming no rectangle, is a whole frame.
+  if (!valid || (image_changed && !reported))
+    dxgi_damage_mark_full(chain);
+}
+
+// Rectangles are in the duplicated output's own pixels, so only a frame
+// delivered at that size, unrotated and as BGRA can carry them.
+static BOOL dxgi_damage_frame_fits(DXGIScreenPlatformContext *ctx,
+                                   const D3D11_TEXTURE2D_DESC *texture_desc) {
+  DXGI_OUTDUPL_DESC duplication_desc;
+  IDXGIOutputDuplication_GetDesc(ctx->output_duplication, &duplication_desc);
+  return duplication_desc.Rotation == DXGI_MODE_ROTATION_IDENTITY &&
+         texture_desc->Width == ctx->damage_chain.pending.width &&
+         texture_desc->Height == ctx->damage_chain.pending.height &&
+         texture_desc->Width == ctx->frame_width &&
+         texture_desc->Height == ctx->frame_height &&
+         duplication_desc.ModeDesc.Width == texture_desc->Width &&
+         duplication_desc.ModeDesc.Height == texture_desc->Height &&
+         texture_desc->Format == DXGI_FORMAT_B8G8R8A8_UNORM &&
+         texture_desc->MipLevels == 1 && texture_desc->ArraySize == 1 &&
+         texture_desc->SampleDesc.Count == 1 &&
+         ctx->pixel_format == MINIAV_PIXEL_FORMAT_BGRA32;
+}
 
 // --- Forward declarations for static functions ---
 static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param);
@@ -470,6 +599,9 @@ dxgi_init_d3d_and_duplication(DXGIScreenPlatformContext *dxgi_ctx,
     IDXGIAdapter1_Release(adapter);
   if (factory)
     IDXGIFactory1_Release(factory);
+
+  dxgi_damage_chain_start(&dxgi_ctx->damage_chain, dxgi_next_damage_epoch(),
+                          dxgi_ctx->frame_width, dxgi_ctx->frame_height);
 
   miniav_log(MINIAV_LOG_LEVEL_DEBUG,
              "DXGI: D3D and Duplication initialized for Adapter%u Output%u.",
@@ -909,6 +1041,9 @@ static MiniAVResultCode dxgi_start_capture(MiniAVScreenContext *ctx,
   dxgi_ctx->app_callback_user_data_internal = user_data;
   dxgi_ctx->parent_ctx->app_callback = callback;
   dxgi_ctx->parent_ctx->app_callback_user_data = user_data;
+  // A new capture never builds on frames from an earlier one.
+  dxgi_damage_chain_start(&dxgi_ctx->damage_chain, dxgi_next_damage_epoch(),
+                          dxgi_ctx->frame_width, dxgi_ctx->frame_height);
 
   // --- Start Audio Loopback Capture ---
   if (dxgi_ctx->loopback_audio_ctx &&
@@ -1273,7 +1408,11 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
       }
       continue;
     }
+    if (SUCCEEDED(hr))
+      frame_acquired = TRUE; // Even without a resource it must be released.
     if (FAILED(hr) || !desktop_resource_handle) {
+      // Whatever changed meanwhile is unknown to the damage chain.
+      dxgi_damage_mark_full(&dxgi_ctx->damage_chain);
       miniav_log(MINIAV_LOG_LEVEL_ERROR, "DXGI: AcquireNextFrame failed: 0x%X",
                  hr);
       Sleep(frame_timeout_ms);
@@ -1284,6 +1423,7 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
     // before the next AcquireNextFrame (inline below on success, or at the top
     // of the next iteration on the error/no-content paths).
     frame_acquired = TRUE;
+    dxgi_collect_damage(dxgi_ctx, &frame_info);
 
     if (frame_info.LastPresentTime.QuadPart == 0) {
       if (desktop_resource_handle)
@@ -1321,6 +1461,10 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
     buffer->data.video.info.pixel_format = dxgi_ctx->pixel_format;
     buffer->user_data = dxgi_ctx->app_callback_user_data_internal;
 
+    D3D11_TEXTURE2D_DESC acquired_damage_desc;
+    ID3D11Texture2D_GetDesc(acquired_texture, &acquired_damage_desc);
+    BOOL damage_fits = dxgi_damage_frame_fits(dxgi_ctx, &acquired_damage_desc);
+    BOOL snapshot_complete = FALSE;
     BOOL processed_as_gpu = FALSE;
     ID3D11Texture2D *texture_for_payload_ref = NULL;
     HANDLE shared_handle_for_app = NULL;
@@ -1409,13 +1553,18 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
                 ULONGLONG poll_start = GetTickCount64();
                 BOOL fence_done = FALSE;
                 for (;;) {
-                  if (ID3D11DeviceContext_GetData(
-                          dxgi_ctx->d3d_context,
-                          (ID3D11Asynchronous *)copy_done, NULL, 0, 0) !=
-                      S_FALSE) {
+                  HRESULT ready_hr = ID3D11DeviceContext_GetData(
+                      dxgi_ctx->d3d_context,
+                      (ID3D11Asynchronous *)copy_done, NULL, 0, 0);
+                  if (ready_hr == S_OK) {
                     fence_done = TRUE;
+                    // An acquired shared texture remains mutable after release;
+                    // only our fresh private copy is a certified snapshot.
+                    snapshot_complete = shareable_copy_temp != NULL;
                     break;
                   }
+                  if (FAILED(ready_hr))
+                    break;
                   if (GetTickCount64() - poll_start > 16)
                     break;
                   YieldProcessor();
@@ -1456,8 +1605,7 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
         }
       }
 
-      if (shareable_copy_temp &&
-          texture_for_payload_ref != shareable_copy_temp) {
+      if (shareable_copy_temp) {
         ID3D11Texture2D_Release(shareable_copy_temp);
       }
     }
@@ -1499,6 +1647,7 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
         continue;
       }
 
+      snapshot_complete = TRUE; // Blocking Map completed the fresh copy.
       buffer->content_type = MINIAV_BUFFER_CONTENT_TYPE_CPU;
 
       // Set up single plane for BGRA32 format
@@ -1576,6 +1725,10 @@ static DWORD WINAPI dxgi_capture_thread_proc(LPVOID param) {
       miniav_free(buffer);
       continue;
     }
+
+    dxgi_damage_deliver(&dxgi_ctx->damage_chain,
+                        snapshot_complete && damage_fits,
+                        &frame_release_payload_app->damage);
 
     if (processed_as_gpu) {
       frame_release_payload_app->type = MINIAV_OUTPUT_PREFERENCE_GPU;

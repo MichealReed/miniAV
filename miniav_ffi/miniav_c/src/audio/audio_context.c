@@ -18,6 +18,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+// MSVC has no __atomic_* builtins (they are GCC/Clang extensions), so the
+// mirror-ring cursors above fail to compile with C2065 on Windows. Every use
+// in this file is a 32-bit header slot, so map the three builtins onto
+// Interlocked intrinsics. These are FULL barriers -- strictly stronger than
+// the orders requested -- and the header is touched a handful of times per
+// device callback, so the extra strength costs nothing measurable.
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define __ATOMIC_RELAXED 0
+#define __ATOMIC_ACQUIRE 2
+#define __ATOMIC_RELEASE 3
+#define __atomic_load_n(p, order)   ((uint32_t)_InterlockedCompareExchange((volatile long *)(p), 0, 0))
+#define __atomic_store_n(p, v, order)   ((void)_InterlockedExchange((volatile long *)(p), (long)(v)))
+#define __atomic_fetch_add(p, v, order)   ((uint32_t)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
+#endif
+
 // iOS: capture requires an active record-capable AVAudioSession category
 // before the device starts (see src/audio/ios/miniav_avaudiosession_ios.m).
 // No-ops everywhere else.
@@ -103,7 +119,66 @@ struct MiniAVAudioContext {
   ma_pcm_rb pcm_rb;         // f32 ring; audio thread writes, reader polls
   int rb_inited;           // pcm_rb allocated (needs ma_pcm_rb_uninit)
   int use_buffered_capture;// 1 = data callback fills the ring, not the Dart cb
+
+  // --- Worker-readable capture mirror (web) ---
+  // See MiniAV_Audio_SetCaptureMirror. Written by the audio thread, read by a
+  // consumer that may be ANOTHER THREAD holding the same shared wasm memory.
+  void *mirror_base;
+  uint32_t mirror_capacity_frames;
+  uint32_t mirror_channels;
 };
+
+// Mirror header: 8 u32 slots, so the f32 samples start 8-byte aligned.
+//   [0] write cursor  (frames, monotonic, wraps at 2^32) -- PRODUCER only
+//   [1] read cursor   (frames, monotonic)                -- CONSUMER only
+//   [2] capacity in frames
+//   [3] channels
+//   [4] overrun frames -- frames the producer DROPPED because the consumer
+//       fell behind. Non-zero is lost microphone input, not latency.
+//   [5] sample rate
+//   [6],[7] reserved
+#define MINIAV_MIRROR_HEADER_U32 8
+
+// Copy one callback block into the mirror. Wrap-safe: the cursors are
+// monotonic frame counts and unsigned subtraction gives the true occupancy
+// across a 2^32 wrap, so there is no ambiguous full/empty state and no loop
+// flag to encode.
+static void miniav__mirror_write(MiniAVAudioContext *ctx, const float *src,
+                                 ma_uint32 frames) {
+  uint32_t *hdr = (uint32_t *)ctx->mirror_base;
+  if (!hdr || frames == 0)
+    return;
+  const uint32_t cap = ctx->mirror_capacity_frames;
+  const uint32_t ch = ctx->mirror_channels;
+  if (cap == 0 || ch == 0)
+    return;
+  float *samples = (float *)(hdr + MINIAV_MIRROR_HEADER_U32);
+
+  // Relaxed on our own cursor (sole writer); acquire on theirs so the frames
+  // they consumed are visible before we treat that space as free.
+  uint32_t w = __atomic_load_n(&hdr[0], __ATOMIC_RELAXED);
+  uint32_t r = __atomic_load_n(&hdr[1], __ATOMIC_ACQUIRE);
+
+  const uint32_t used = w - r;
+  const uint32_t space = (used >= cap) ? 0u : (cap - used);
+  if (frames > space) {
+    __atomic_fetch_add(&hdr[4], frames - space, __ATOMIC_RELAXED);
+    frames = space;
+    if (frames == 0)
+      return;
+  }
+
+  const uint32_t off = w % cap;
+  const uint32_t first = (off + frames > cap) ? (cap - off) : frames;
+  memcpy(samples + (size_t)off * ch, src, (size_t)first * ch * sizeof(float));
+  if (first < frames) {
+    memcpy(samples, src + (size_t)first * ch,
+           (size_t)(frames - first) * ch * sizeof(float));
+  }
+  // Release: the samples above must be visible before the cursor that
+  // advertises them.
+  __atomic_store_n(&hdr[0], w + frames, __ATOMIC_RELEASE);
+}
 
 // Helper: Convert miniaudio device info to MiniAVDeviceInfo
 // Uses the actual miniaudio device ID, converting it to a hex string for
@@ -599,6 +674,12 @@ static void ma_data_callback(ma_device *pDevice, void *pOutput,
                                ma_pcm_rb_get_channels(&ctx->pcm_rb))) {
       return;
     }
+    // Mirror FIRST, from the untouched input block: the mirror is the path a
+    // worker drains, and it must not inherit whatever the pcm_rb loop below
+    // decides to drop when the polled reader has fallen behind.
+    if (ctx->mirror_base) {
+      miniav__mirror_write(ctx, (const float *)pInput, frameCount);
+    }
     while (remaining > 0) {
       ma_uint32 n = remaining;
       void *dst = NULL;
@@ -882,6 +963,64 @@ MiniAVResultCode MiniAV_Audio_ConfigureFlat(MiniAVAudioContextHandle context,
 // BEFORE StartCapture. ring_frames = ring depth; 0 => ~200 ms at the
 // configured sample rate. The ring is f32 and the capture device is forced to
 // f32 so a poller can read straight into a Float32List.
+// Hand the capture callback a caller-owned SPSC mirror it also writes into.
+//
+// Why this exists: the buffered ring above is `ma_pcm_rb`, whose cursors are
+// encoded miniaudio internals (offset plus a loop bit). On web the consumer we
+// want is a WORKER sharing the wasm linear memory, and a worker cannot call
+// into wasm to decode those cursors -- reimplementing ma_rb's encoding on the
+// Dart side would couple us to miniaudio's internals. So the producer also
+// fills a mirror whose protocol is ours: monotonic frame cursors, no loop
+// flag, no ambiguous full/empty state.
+//
+// [base] must be `MINIAV_MIRROR_HEADER_U32 * 4 + capacity_frames * channels *
+// sizeof(float)` bytes inside the SHARED wasm heap, allocated by the caller
+// and outliving capture. Pass base = NULL to detach.
+//
+// Independent of EnableBufferedCapture: both may run at once (they do during
+// the migration), and the mirror is filled from the untouched input block.
+MiniAVResultCode
+MiniAV_Audio_SetCaptureMirror(MiniAVAudioContextHandle context, void *base,
+                              uint32_t capacity_frames) {
+  MiniAVAudioContext *ctx = (MiniAVAudioContext *)context;
+  if (!ctx)
+    return MINIAV_ERROR_INVALID_ARG;
+  if (!base) {
+    ctx->mirror_base = NULL;
+    ctx->mirror_capacity_frames = 0;
+    ctx->mirror_channels = 0;
+    return MINIAV_SUCCESS;
+  }
+  if (!ctx->is_configured)
+    return MINIAV_ERROR_NOT_INITIALIZED;
+  if (capacity_frames < 256)
+    return MINIAV_ERROR_INVALID_ARG;
+
+  const uint32_t ch = ctx->format_info.channels;
+  if (ch == 0)
+    return MINIAV_ERROR_NOT_INITIALIZED;
+
+  uint32_t *hdr = (uint32_t *)base;
+  // Publish geometry BEFORE the cursors: a consumer that reads the header
+  // concurrently must never see a capacity of 0 alongside a live cursor.
+  hdr[2] = capacity_frames;
+  hdr[3] = ch;
+  hdr[4] = 0;
+  hdr[5] = ctx->format_info.sample_rate;
+  hdr[6] = 0;
+  hdr[7] = 0;
+  __atomic_store_n(&hdr[1], 0u, __ATOMIC_RELAXED);
+  __atomic_store_n(&hdr[0], 0u, __ATOMIC_RELEASE);
+
+  ctx->mirror_capacity_frames = capacity_frames;
+  ctx->mirror_channels = ch;
+  ctx->mirror_base = base;
+  miniav_log(MINIAV_LOG_LEVEL_INFO,
+             "Audio SetCaptureMirror: %u frames, %u ch @ %u Hz",
+             capacity_frames, ch, ctx->format_info.sample_rate);
+  return MINIAV_SUCCESS;
+}
+
 MiniAVResultCode
 MiniAV_Audio_EnableBufferedCapture(MiniAVAudioContextHandle context,
                                    uint32_t ring_frames) {

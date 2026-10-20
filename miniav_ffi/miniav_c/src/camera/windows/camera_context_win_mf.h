@@ -13,6 +13,11 @@ extern "C" {
 // instance.
 extern const CameraContextInternalOps g_camera_ops_win_mf;
 
+// MiniAV_VideoBuffer_GetColor for a Media Foundation camera frame; 0 for any
+// other buffer.
+uint32_t miniav_mf_get_color(const MiniAVBuffer *buffer, uint32_t *matrix,
+                             uint32_t *full_range);
+
 // Initializes the Windows Media Foundation specific parts of the camera
 // context. This function will set ctx->ops = &g_camera_ops_win_mf; and then
 // call g_camera_ops_win_mf.init_platform(ctx);

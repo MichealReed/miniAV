@@ -281,6 +281,9 @@ typedef _AvFrameMakeWritable = int Function(Pointer<AVFrame>);
 typedef _AvFrameUnrefC = Void Function(Pointer<AVFrame>);
 typedef _AvFrameUnref = void Function(Pointer<AVFrame>);
 
+typedef _AvFrameRefC = Int32 Function(Pointer<AVFrame>, Pointer<AVFrame>);
+typedef _AvFrameRef = int Function(Pointer<AVFrame>, Pointer<AVFrame>);
+
 typedef _AvGetPixFmtC = Int32 Function(Pointer<Utf8>);
 typedef _AvGetPixFmt = int Function(Pointer<Utf8>);
 
@@ -645,6 +648,11 @@ class Ffmpeg {
 
   late final _AvFrameUnref avFrameUnref = _avutil
       .lookupFunction<_AvFrameUnrefC, _AvFrameUnref>('av_frame_unref');
+
+  /// `av_frame_ref(dst, src)`: [dst] (blank) takes a new reference to [src]'s
+  /// buffers and copies its properties. Negative AVERROR on failure.
+  late final _AvFrameRef avFrameRef =
+      _avutil.lookupFunction<_AvFrameRefC, _AvFrameRef>('av_frame_ref');
 
   /// Resolve a pixel-format name (e.g. "rgb0", "nv12", "yuv420p") to its
   /// [AVPixelFormat] enum value. Returns -1 on unknown name.

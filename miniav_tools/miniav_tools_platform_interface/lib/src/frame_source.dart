@@ -80,7 +80,12 @@ sealed class FrameSource {
 
   /// A miniav-produced buffer — backend extracts native handle for zero-copy
   /// when possible.
-  factory FrameSource.miniavBuffer(MiniAVBuffer buffer) = MiniAVBufferSource;
+  ///
+  /// [timestampUs] replaces the capture timestamp the buffer carries. A frame
+  /// submitted twice — an idle duplicate of a retained buffer — needs its own
+  /// time, not the original frame's.
+  factory FrameSource.miniavBuffer(MiniAVBuffer buffer, {int? timestampUs}) =
+      MiniAVBufferSource;
 
   /// A minigpu video texture (e.g. from `gpu.importVideoFrame`).
   factory FrameSource.gpuTexture({
@@ -195,8 +200,10 @@ class Yuv420pFrameSource extends FrameSource {
 
 class MiniAVBufferSource extends FrameSource {
   final MiniAVBuffer buffer;
+  final int? _timestampUs;
 
-  const MiniAVBufferSource(this.buffer);
+  const MiniAVBufferSource(this.buffer, {int? timestampUs})
+      : _timestampUs = timestampUs;
 
   MiniAVVideoBuffer get _video => buffer.data as MiniAVVideoBuffer;
 
@@ -207,7 +214,7 @@ class MiniAVBufferSource extends FrameSource {
   @override
   MiniAVPixelFormat get pixelFormat => _video.pixelFormat;
   @override
-  int get timestampUs => buffer.timestampUs;
+  int get timestampUs => _timestampUs ?? buffer.timestampUs;
 
   @override
   FrameSourceKind get kind {
@@ -222,6 +229,8 @@ class MiniAVBufferSource extends FrameSource {
         return FrameSourceKind.miniavBufferDmabuf;
       case MiniAVBufferContentType.gpuAHardwareBuffer:
         return FrameSourceKind.miniavBufferAHardwareBuffer;
+      case MiniAVBufferContentType.gpuWebVideoFrame:
+        return FrameSourceKind.webVideoFrame;
     }
   }
 }

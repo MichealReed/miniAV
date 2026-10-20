@@ -70,25 +70,59 @@ class AudioRingSink {
   static Future<AudioRingSink?> open({
     required int sampleRate,
     required int channels,
+    int? fallbackChannels,
     Duration depth = kDefaultRingDepth,
     String workletUrl = kWorkletAssetUrl,
-  }) async {
-    if (sampleRate <= 0 || channels <= 0) return null;
+  }) => beginOpen(
+    sampleRate: sampleRate,
+    channels: channels,
+    fallbackChannels: fallbackChannels,
+    depth: depth,
+    workletUrl: workletUrl,
+  ).take();
 
-    final ring = SharedAudioRing.allocate(
-      capacityFrames: (depth.inMicroseconds * sampleRate) ~/ 1000000,
-      channels: channels,
-      sampleRate: sampleRate,
-    );
-    // No shared memory means the worklet would be reading a buffer the
-    // producer's writes never reach. Better to decline than to play silence.
-    if (!ring.isSharedAcrossThreads) return null;
-
+  /// Starts opening synchronously and returns cancellable ownership of it.
+  ///
+  /// [fallbackChannels] is selected before the first asynchronous boundary
+  /// when the destination cannot carry [channels]. This lets both the asked-for
+  /// and fallback layouts use the same gesture-activated audio context.
+  static AudioRingSinkOpening beginOpen({
+    required int sampleRate,
+    required int channels,
+    int? fallbackChannels,
+    Duration depth = kDefaultRingDepth,
+    String workletUrl = kWorkletAssetUrl,
+  }) {
+    if (sampleRate <= 0 || channels <= 0) {
+      return AudioRingSinkOpening._declined();
+    }
+    late final SharedAudioRing requestedRing;
+    try {
+      requestedRing = SharedAudioRing.allocate(
+        capacityFrames: (depth.inMicroseconds * sampleRate) ~/ 1000000,
+        channels: channels,
+        sampleRate: sampleRate,
+      );
+    } on Object {
+      return AudioRingSinkOpening._declined();
+    }
+    // Preserve the old decline behavior: a page without shared memory must not
+    // spend its user activation opening an AudioContext this path cannot use.
+    if (!requestedRing.isSharedAcrossThreads) {
+      return AudioRingSinkOpening._declined();
+    }
     web.AudioContext? context;
     try {
       context = web.AudioContext(
         web.AudioContextOptions(sampleRate: sampleRate.toDouble()),
       );
+
+      // Make the first resume attempt in the SAME synchronous call stack that
+      // created the context. Callers may enter [open] from a user gesture, but
+      // loading the worklet module below crosses an async boundary and browsers
+      // are allowed to expire transient activation there. The later retry stays
+      // too: a browser can keep this suspended until the graph is connected.
+      unawaited(context.resume().toDart.then<void>((_) {}, onError: (_) {}));
 
       // Verify the browser actually HONOURED the requested rate.
       //
@@ -101,8 +135,8 @@ class AudioRingSink {
       // off-thread path on that device and keeps playback correct, which is
       // the right way round.
       if (context.sampleRate.round() != sampleRate) {
-        await context.close().toDart;
-        return null;
+        unawaited(context.close().toDart.then<void>((_) {}, onError: (_) {}));
+        return AudioRingSinkOpening._declined();
       }
 
       // `audioWorklet` is undefined on a browser without it, and reading
@@ -110,38 +144,43 @@ class AudioRingSink {
       // explicitly, because "no AudioWorklet" and "the module failed to load"
       // are different problems and only one of them is a bug worth chasing.
       if (!context.has('audioWorklet')) {
-        await context.close().toDart;
-        return null;
+        unawaited(context.close().toDart.then<void>((_) {}, onError: (_) {}));
+        return AudioRingSinkOpening._declined();
       }
-      await context.audioWorklet.addModule(workletUrl).toDart;
 
-      final node = web.AudioWorkletNode(
-        context,
-        _kProcessor,
-        web.AudioWorkletNodeOptions(
-          numberOfInputs: 0,
-          numberOfOutputs: 1,
-          outputChannelCount: <int>[channels].jsify()! as JSArray<JSNumber>,
-          processorOptions: _processorOptions(ring),
-        ),
-      );
-      final gain = web.GainNode(context);
-      node.connect(gain);
-      gain.connect(context.destination);
+      // Verify the DESTINATION can actually carry the channel count — the
+      // same request-is-not-a-guarantee reasoning as the sample-rate check
+      // above. A worklet emitting 6 channels into a stereo-capped
+      // destination gets silently down-mixed (or worse, per-browser,
+      // dropped), so decline and let the caller fall back to stereo rather
+      // than play a mix whose centre may be gone.
+      var actualChannels = channels;
+      if (actualChannels > context.destination.maxChannelCount) {
+        final fallback = fallbackChannels;
+        if (fallback == null ||
+            fallback <= 0 ||
+            fallback >= actualChannels ||
+            fallback > context.destination.maxChannelCount) {
+          unawaited(context.close().toDart.then<void>((_) {}, onError: (_) {}));
+          return AudioRingSinkOpening._declined();
+        }
+        actualChannels = fallback;
+      }
 
-      // Autoplay policy: a context created before a user gesture starts
-      // suspended. Resuming is best effort — if it is refused the sink still
-      // works and starts when the page resumes it.
-      unawaited(context.resume().toDart.then<void>((_) {}, onError: (_) {}));
+      final ring = actualChannels == channels
+          ? requestedRing
+          : SharedAudioRing.allocate(
+              capacityFrames: (depth.inMicroseconds * sampleRate) ~/ 1000000,
+              channels: actualChannels,
+              sampleRate: sampleRate,
+            );
 
-      return AudioRingSink._(context, node, gain, ring);
+      return AudioRingSinkOpening._(context, ring, actualChannels, workletUrl);
     } on Object {
-      try {
-        await context?.close().toDart;
-      } on Object {
-        // Nothing to salvage; the caller falls back.
+      if (context != null) {
+        unawaited(context.close().toDart.then<void>((_) {}, onError: (_) {}));
       }
-      return null;
+      return AudioRingSinkOpening._declined();
     }
   }
 
@@ -220,5 +259,142 @@ class AudioRingSink {
     } on Object {
       // Already closed.
     }
+  }
+}
+
+/// Cancellable ownership of an [AudioRingSink] while its worklet loads.
+///
+/// Exactly one caller may [take] the sink. Until then [cancel] closes either
+/// the pending context or the completed sink and resolves a waiting take with
+/// null. Closing a pending context does not depend on the module-load future,
+/// so a stalled fetch cannot retain audio resources indefinitely.
+class AudioRingSinkOpening {
+  AudioRingSinkOpening._(
+    this._context,
+    this._ring,
+    this._channels,
+    this._workletUrl,
+  ) {
+    unawaited(_finish());
+  }
+
+  AudioRingSinkOpening._declined()
+    : _context = null,
+      _ring = null,
+      _channels = null,
+      _workletUrl = null {
+    _result.complete(null);
+  }
+
+  web.AudioContext? _context;
+  final SharedAudioRing? _ring;
+  final int? _channels;
+  final String? _workletUrl;
+  final Completer<AudioRingSink?> _result = Completer<AudioRingSink?>();
+  AudioRingSink? _sink;
+  bool _canceled = false;
+  bool _taken = false;
+  Future<void>? _closing;
+
+  Future<void> _finish() async {
+    final context = _context;
+    final ring = _ring;
+    final channels = _channels;
+    final workletUrl = _workletUrl;
+    if (context == null ||
+        ring == null ||
+        channels == null ||
+        workletUrl == null) {
+      if (!_result.isCompleted) _result.complete(null);
+      return;
+    }
+    try {
+      await context.audioWorklet.addModule(workletUrl).toDart;
+      if (_canceled) return;
+
+      final node = web.AudioWorkletNode(
+        context,
+        _kProcessor,
+        web.AudioWorkletNodeOptions(
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: <int>[channels].jsify()! as JSArray<JSNumber>,
+          processorOptions: AudioRingSink._processorOptions(ring),
+        ),
+      );
+      final gain = web.GainNode(context);
+      node.connect(gain);
+      if (channels > 2) {
+        // Preserve a finished speaker feed instead of running Web Audio's
+        // up/down-mix matrix over it.
+        context.destination.channelCount = channels;
+        context.destination.channelInterpretation = 'discrete';
+        gain.channelCount = channels;
+        gain.channelCountMode = 'explicit';
+        gain.channelInterpretation = 'discrete';
+      }
+      gain.connect(context.destination);
+      unawaited(context.resume().toDart.then<void>((_) {}, onError: (_) {}));
+
+      final sink = AudioRingSink._(context, node, gain, ring);
+      _context = null;
+      _sink = sink;
+      if (_canceled) {
+        await sink.close();
+        _sink = null;
+        return;
+      }
+      if (!_result.isCompleted) _result.complete(sink);
+    } on Object {
+      await _closePendingContext();
+      if (!_result.isCompleted) _result.complete(null);
+    }
+  }
+
+  /// Claims the completed sink. A second claim returns null.
+  Future<AudioRingSink?> take() async {
+    final sink = await _result.future;
+    if (_canceled || _taken || sink == null) return null;
+    _taken = true;
+    _sink = null;
+    return sink;
+  }
+
+  /// Re-attempts activation without transferring ownership.
+  ///
+  /// The underlying `resume()` call is issued before this method first awaits,
+  /// so invoking it directly from a gesture preserves transient activation.
+  Future<void> resume() {
+    if (_canceled || _taken) return Future<void>.value();
+    final sink = _sink;
+    if (sink != null) return sink.resume();
+    final context = _context;
+    if (context == null) return Future<void>.value();
+    return context.resume().toDart.then<void>((_) {}, onError: (_) {});
+  }
+
+  /// Cancels unclaimed ownership and releases browser audio resources.
+  Future<void> cancel() async {
+    if (_canceled || _taken) return;
+    _canceled = true;
+    if (!_result.isCompleted) _result.complete(null);
+    final sink = _sink;
+    _sink = null;
+    if (sink != null) {
+      await sink.close();
+      return;
+    }
+    await _closePendingContext();
+  }
+
+  Future<void> _closePendingContext() {
+    final prior = _closing;
+    if (prior != null) return prior;
+    final context = _context;
+    _context = null;
+    if (context == null) return Future<void>.value();
+    final closing = context.close().toDart.then<void>((_) {}, onError: (_) {});
+    _closing = closing;
+    return closing;
   }
 }

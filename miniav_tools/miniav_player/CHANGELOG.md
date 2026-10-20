@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.3.1-WIP
+## 0.3.1
+
+- Requires miniav_tools_codecs ^0.8.2. No other changes.
 
 ## 0.3.0
 

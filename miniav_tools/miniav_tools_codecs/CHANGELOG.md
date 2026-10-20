@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.2-WIP
+## 0.8.2
 
 - MP4 muxer: an H.264 or HEVC sample that carries parameter sets its track's
   configuration record does not hold switches the track to a record that does.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.3
+
+- Requires miniav_tools_codecs ^0.8.2. MP4 recordings made with AMD's H.264
+  Media Foundation encoder decode correctly: that encoder publishes a
+  sequence header that does not match its stream, and the muxer now writes
+  the parameter sets the stream carries.
+
 ## 0.6.2
 
 - Version bump for the miniav_tools 0.6.2 family. No functional change in
